@@ -1,0 +1,32 @@
+# Rust build output
+/target/
+**/*.rs.bk
+
+# Rust/WASM frontend output
+/dist/
+/site/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+
+# Local database state and backups
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.dump
+*.sql.gz
+/backups/
+/data/
+
+# Local tooling and OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
