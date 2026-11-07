@@ -35,13 +35,41 @@ RUN set -eu; \
     rm -rf /tmp/cargo-leptos.tar.gz "/tmp/$name"; \
     cargo leptos --version
 
+# cargo-leptos uses a wasm-bindgen found on PATH before downloading its own.
+# Its own download for aarch64 needs glibc 2.38, newer than bookworm has, so
+# install the static musl build instead. The version must match Cargo.lock;
+# the build step below checks that.
+ARG WASM_BINDGEN_VERSION=0.2.130
+ARG WASM_BINDGEN_SHA256_X86_64=9687f3bb551b9f66f37ed32a40d7913a00f7962db653054e56857bc306c3227f
+ARG WASM_BINDGEN_SHA256_AARCH64=99ffc93ce80081b91632e2b539b782821a8f3439ab0fddc645287462b2f55d3d
+RUN set -eu; \
+    arch="$(uname -m)"; \
+    case "$arch" in \
+      x86_64) sum="$WASM_BINDGEN_SHA256_X86_64" ;; \
+      aarch64) sum="$WASM_BINDGEN_SHA256_AARCH64" ;; \
+      *) echo "no wasm-bindgen binary for $arch" >&2; exit 1 ;; \
+    esac; \
+    name="wasm-bindgen-${WASM_BINDGEN_VERSION}-$arch-unknown-linux-musl"; \
+    curl -fsSLo /tmp/wasm-bindgen.tar.gz \
+      "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${WASM_BINDGEN_VERSION}/$name.tar.gz"; \
+    echo "$sum  /tmp/wasm-bindgen.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/wasm-bindgen.tar.gz -C /tmp; \
+    install -m 0755 "/tmp/$name/wasm-bindgen" /usr/local/cargo/bin/wasm-bindgen; \
+    rm -rf /tmp/wasm-bindgen.tar.gz "/tmp/$name"; \
+    wasm-bindgen --version
+
 WORKDIR /src
 COPY rust-toolchain.toml ./
 # Installs the pinned toolchain plus the wasm32 target it lists.
 RUN rustup toolchain install
 
 COPY . .
-RUN cargo leptos build --release \
+RUN locked="$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/^version = "\(.*\)"$/\1/p')" \
+    && if [ "$locked" != "$WASM_BINDGEN_VERSION" ]; then \
+         echo "Cargo.lock has wasm-bindgen $locked; update WASM_BINDGEN_VERSION and its checksums" >&2; \
+         exit 1; \
+       fi \
+    && cargo leptos build --release \
     && mkdir -p /out/site \
     && cp target/release/supabase-dashboard-server /out/ \
     && cp -r target/site/. /out/site/ \
