@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: dashboard
+          POSTGRES_PASSWORD: ci-only
+          POSTGRES_DB: dashboard
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U dashboard"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      SUPABASE_DASHBOARD_TEST_DATABASE_URL: postgres://dashboard:ci-only@127.0.0.1:5432/dashboard
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Check
+        run: cargo check --workspace --all-targets --locked
+      - name: Clippy (server)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Clippy (browser WASM)
+        run: cargo clippy -p supabase-dashboard-web --target wasm32-unknown-unknown --features hydrate --locked -- -D warnings
+      - name: No server-only crates in the browser build
+        run: |
+          if cargo tree -p supabase-dashboard-web --target wasm32-unknown-unknown --features hydrate -e normal \
+              | grep -E '(^|[^a-z_-])(sqlx|axum|supabase-dashboard-persistence|tokio) v'; then
+            echo "server-only dependency found in the hydrate build" >&2
+            exit 1
+          fi
+      - name: Test
+        run: cargo test --workspace --locked
+
+  site:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-leptos@0.3.11
+      - name: Build server and WASM bundle
+        run: cargo leptos build --release

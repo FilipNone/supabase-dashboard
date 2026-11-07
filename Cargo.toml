@@ -1,0 +1,69 @@
+[workspace]
+resolver = "3"
+members = ["apps/server", "crates/domain", "crates/persistence", "crates/web"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "Apache-2.0"
+repository = "https://github.com/FilipNone/supabase-dashboard"
+publish = false
+
+[workspace.dependencies]
+supabase-dashboard-domain = { path = "crates/domain" }
+supabase-dashboard-persistence = { path = "crates/persistence" }
+supabase-dashboard-web = { path = "crates/web", default-features = false }
+
+axum = { version = "0.8", default-features = false, features = ["http1", "http2", "json", "tokio", "query", "form", "matched-path"] }
+console_error_panic_hook = "0.1"
+http = "1"
+leptos = { version = "0.8" }
+leptos_axum = { version = "0.8" }
+leptos_meta = { version = "0.8" }
+leptos_router = { version = "0.8" }
+secrecy = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "migrate", "macros", "uuid", "time"] }
+thiserror = "2"
+time = { version = "0.3", features = ["serde"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "time"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["request-id", "trace", "limit", "timeout", "util", "set-header", "sensitive-headers"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+wasm-bindgen = "0.2"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[[workspace.metadata.leptos]]
+name = "supabase-dashboard"
+bin-package = "supabase-dashboard-server"
+lib-package = "supabase-dashboard-web"
+lib-features = ["hydrate"]
+bin-features = []
+lib-profile-release = "wasm-release"
+style-file = "style/main.css"
+assets-dir = "assets"
+site-root = "target/site"
+site-pkg-dir = "pkg"
+site-addr = "127.0.0.1:3000"
+reload-port = 3001
+browserquery = "defaults"
