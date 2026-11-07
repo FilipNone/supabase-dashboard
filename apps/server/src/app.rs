@@ -40,6 +40,7 @@ pub fn router(state: AppState, limits: &HttpLimits) -> Router {
         move || health::check(db.clone(), timeout)
     });
     let organizations = state.organizations.clone();
+    let projects = state.projects.clone();
     let auth = state.auth.clone();
     let leptos_options = state.leptos_options.clone();
     let x_request_id = HeaderName::from_static("x-request-id");
@@ -58,6 +59,7 @@ pub fn router(state: AppState, limits: &HttpLimits) -> Router {
             move || {
                 provide_context(probe.clone());
                 provide_context(organizations.clone());
+                provide_context(projects.clone());
                 provide_context(auth.clone());
             },
             move || shell(leptos_options.clone()),
@@ -140,6 +142,7 @@ mod tests {
     use supabase_dashboard_application::{
         auth::{AuthConfig, AuthService},
         organizations::OrganizationService,
+        projects::ProjectService,
     };
     use supabase_dashboard_persistence::{Database, DatabaseSettings};
     use supabase_dashboard_web::{
@@ -147,8 +150,9 @@ mod tests {
         server_fns::{
             AdminListAccounts, AdminSetAccountDisabled, ChangePassword, CreateInvitation,
             CreateOrganization, GetCurrentAccount, GetInstallationHealth, GetOrganization,
-            ListOrganizations, ListSessions, PreviewInvitation, RenameOrganization, RevokeSession,
-            SignUpWithInvitation, UpdateProfile,
+            GetProject, ListOrganizations, ListProjects, ListSessions, PreviewInvitation,
+            RegisterProject, RenameOrganization, RevokeSession, SignUpWithInvitation,
+            UnregisterProject, UpdateProfile,
         },
     };
     use tower::ServiceExt;
@@ -169,6 +173,7 @@ mod tests {
                 .site_root("target/site")
                 .build(),
             organizations: Arc::new(OrganizationService::new(db.clone())),
+            projects: Arc::new(ProjectService::new(db.clone())),
             db,
             readiness_timeout: Duration::from_secs(1),
             auth: Arc::new(auth),
@@ -559,6 +564,139 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(name, "Acme Secret");
+
+        db.close().await;
+        scratch.drop().await;
+    }
+
+    #[tokio::test]
+    async fn projects_are_isolated_over_http() {
+        let Some(scratch) = ScratchDb::create("http_projects").await else {
+            return;
+        };
+        let db = Database::connect(&scratch.settings).await.unwrap();
+        db.migrate().await.unwrap();
+        let router = router_for(db.clone()).await;
+        AuthService::new(db.clone(), AuthConfig::default())
+            .await
+            .unwrap()
+            .bootstrap_owner(
+                "alice@example.test",
+                "Alice",
+                &SecretString::from("correct horse battery staple"),
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO accounts (id, email, display_name, password_hash) \
+             SELECT gen_random_uuid(), 'bob@example.test', 'Bob', password_hash FROM accounts",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let alice = sign_in_cookie(&router, "alice%40example.test").await;
+        let bob = sign_in_cookie(&router, "bob%40example.test").await;
+        let call = |path: &'static str, body: String, cookie: &str| {
+            send(&router, form_post(path, &body, Some(cookie)))
+        };
+        let (_, body) = call(CreateOrganization::PATH, "name=Acme".into(), &alice).await;
+        let acme: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let acme_id = acme["id"].as_str().unwrap().to_owned();
+
+        // The checkbox field is absent when unchecked, so plain HTTP is
+        // refused until the operator confirms it.
+        let (parts, body) = call(
+            RegisterProject::PATH,
+            format!("organization_id={acme_id}&name=Lab&api_url=http%3A%2F%2F10.0.0.5%3A8000"),
+            &alice,
+        )
+        .await;
+        assert!(!parts.status.is_success());
+        assert!(
+            body.contains("plain HTTP") || body.contains("unencrypted"),
+            "{body}"
+        );
+        let (parts, body) = call(
+            RegisterProject::PATH,
+            format!(
+                "organization_id={acme_id}&name=Lab&api_url=http%3A%2F%2F10.0.0.5%3A8000\
+                 &allow_unencrypted=true"
+            ),
+            &alice,
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        let (parts, body) = call(
+            RegisterProject::PATH,
+            format!(
+                "organization_id={acme_id}&name=Acme+Prod\
+                 &api_url=https%3A%2F%2Fsupabase.acme.example%2F"
+            ),
+            &alice,
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        let project: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let project_id = project["id"].as_str().unwrap().to_owned();
+        assert_eq!(project["api_url"], "https://supabase.acme.example");
+
+        let (_, body) = call(
+            ListProjects::PATH,
+            format!("organization_id={acme_id}"),
+            &alice,
+        )
+        .await;
+        assert!(body.contains("Acme Prod") && body.contains("Lab"), "{body}");
+
+        // Bob gets the same answer for Alice's project as for a made-up ID,
+        // and cannot list, register into, or unregister anything of hers.
+        let made_up = uuid::Uuid::now_v7().to_string();
+        let mut answers = Vec::new();
+        for id in [&project_id, &made_up] {
+            let (parts, body) = call(GetProject::PATH, format!("id={id}"), &bob).await;
+            assert!(
+                body.contains("NotFound") && !body.contains("acme"),
+                "{body}"
+            );
+            answers.push((parts.status, body));
+            let (_, body) = call(
+                UnregisterProject::PATH,
+                format!("id={id}&confirmation=Acme+Prod"),
+                &bob,
+            )
+            .await;
+            assert!(body.contains("NotFound"), "{body}");
+        }
+        assert_eq!(answers[0], answers[1]);
+        let (_, body) = call(
+            ListProjects::PATH,
+            format!("organization_id={acme_id}"),
+            &bob,
+        )
+        .await;
+        assert!(body.contains("NotFound"), "{body}");
+        let (_, body) = call(
+            RegisterProject::PATH,
+            format!("organization_id={acme_id}&name=Mine&api_url=https%3A%2F%2Fevil.example"),
+            &bob,
+        )
+        .await;
+        assert!(body.contains("NotFound"), "{body}");
+
+        // The project page renders for Alice and leaks nothing to Bob.
+        let page = format!("/dashboard/project/{project_id}");
+        let (parts, body) = send(&router, get_with_cookie(&page, &bob)).await;
+        assert_eq!(parts.status, StatusCode::OK);
+        assert!(body.contains("Project unavailable"), "{body}");
+        assert!(!body.contains("acme.example"), "{body}");
+        let (_, body) = send(&router, get_with_cookie(&page, &alice)).await;
+        assert!(body.contains("Acme Prod") && body.contains("https://supabase.acme.example"));
+
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM projects")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
 
         db.close().await;
         scratch.drop().await;

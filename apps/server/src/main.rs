@@ -17,6 +17,7 @@ use std::{process::ExitCode, sync::Arc, time::Duration};
 use supabase_dashboard_application::{
     auth::{AuthConfig, AuthError, AuthService, BootstrapError, PasswordResetError},
     organizations::OrganizationService,
+    projects::ProjectService,
 };
 use supabase_dashboard_persistence::{Database, PersistenceError};
 use tokio::net::TcpListener;
@@ -163,6 +164,7 @@ async fn run() -> Result<(), StartupError> {
         readiness_timeout: config.readiness_timeout,
         auth,
         organizations: Arc::new(OrganizationService::new(db.clone())),
+        projects: Arc::new(ProjectService::new(db.clone())),
         cookie: CookieSettings::new(secure_cookie, config.session_lifetime.as_secs()),
         expected_origin: config
             .public_url

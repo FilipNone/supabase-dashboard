@@ -85,7 +85,7 @@ fn OrganizationGrid(list: Vec<OrganizationSummary>) -> impl IntoView {
             {list
                 .into_iter()
                 .map(|org| {
-                    let href = format!("/dashboard/org/{}/general", org.id);
+                    let href = format!("/dashboard/org/{}", org.id);
                     view! {
                         <li>
                             <a class="card-link" href=href>

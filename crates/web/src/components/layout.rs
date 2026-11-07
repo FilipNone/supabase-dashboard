@@ -117,10 +117,9 @@ pub fn DashboardLayout() -> impl IntoView {
 fn OrganizationSwitcher() -> impl IntoView {
     let location = use_location();
     let current_id = Memo::new(move |_| {
-        location
-            .pathname
-            .get()
-            .strip_prefix("/dashboard/org/")
+        let path = location.pathname.get();
+        path.strip_prefix("/dashboard/org/")
+            .or_else(|| path.strip_prefix("/dashboard/new/"))
             .and_then(|rest| rest.split('/').next())
             .and_then(|id| id.parse::<Uuid>().ok())
     });
@@ -141,7 +140,7 @@ fn OrganizationSwitcher() -> impl IntoView {
                     let items = list
                         .into_iter()
                         .map(|org| {
-                            let href = format!("/dashboard/org/{}/general", org.id);
+                            let href = format!("/dashboard/org/{}", org.id);
                             let selected = (Some(org.id) == current).then_some("page");
                             view! {
                                 <li>

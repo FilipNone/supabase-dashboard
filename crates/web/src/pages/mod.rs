@@ -4,5 +4,6 @@ pub mod invite;
 pub mod not_found;
 pub mod organization;
 pub mod organizations;
+pub mod project;
 pub mod sign_in;
 pub mod status;

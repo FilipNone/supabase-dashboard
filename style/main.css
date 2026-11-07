@@ -397,3 +397,27 @@ td { vertical-align: middle; }
   .switcher-button { max-width: 7.5rem; }
   .inline-form.compact .input { width: 100%; }
 }
+
+/* Projects */
+.section-header {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+  gap: var(--space-3); margin-bottom: var(--space-4);
+}
+.section-header .section-title { margin: 0; }
+.section-text { margin: 0 0 var(--space-4); color: var(--color-text-muted); font-size: var(--text-sm); }
+.card-stack { flex-direction: column; align-items: flex-start; justify-content: flex-start; gap: var(--space-2); min-width: 0; }
+.card-stack > * { max-width: 100%; }
+.card-meta { color: var(--color-text-muted); font-size: var(--text-sm); }
+.url-text { overflow-wrap: anywhere; font-family: var(--font-mono, ui-monospace, monospace); }
+.card-meta.url-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.checkbox-field { display: flex; align-items: flex-start; gap: var(--space-2); font-size: var(--text-sm); }
+.checkbox-field input { margin-top: 0.2rem; accent-color: var(--color-accent); }
+.detail-list { display: grid; gap: var(--space-3); margin: 0; }
+.detail-list > div { display: grid; grid-template-columns: 10rem 1fr; gap: var(--space-3); }
+.detail-list dt { color: var(--color-text-muted); font-size: var(--text-sm); }
+.detail-list dd { margin: 0; min-width: 0; }
+.panel-danger { border-color: var(--color-error-text); }
+.panel + .state-panel, .panel + .panel { margin-top: var(--space-4); }
+@media (max-width: 640px) {
+  .detail-list > div { grid-template-columns: 1fr; gap: var(--space-1); }
+}

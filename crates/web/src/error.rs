@@ -45,6 +45,7 @@ mod server {
     use supabase_dashboard_application::{
         auth::{AccountUpdateError, AdminError, AuthError, InvitationSignUpError},
         organizations::OrganizationError,
+        projects::ProjectError,
     };
 
     use super::AppError;
@@ -92,6 +93,22 @@ mod server {
                 | InvitationSignUpError::Input(_) => Self::Rejected(err.to_string()),
                 InvitationSignUpError::Internal(err) => {
                     tracing::error!(error = %err, "invitation sign-up failed");
+                    Self::Unavailable
+                }
+            }
+        }
+    }
+
+    impl From<ProjectError> for AppError {
+        fn from(err: ProjectError) -> Self {
+            match err {
+                ProjectError::NotFound => Self::NotFound,
+                ProjectError::Forbidden => Self::Forbidden,
+                ProjectError::LimitReached
+                | ProjectError::ConfirmationMismatch
+                | ProjectError::Input(_) => Self::Rejected(err.to_string()),
+                ProjectError::Internal(err) => {
+                    tracing::error!(error = %err, "project operation failed");
                     Self::Unavailable
                 }
             }

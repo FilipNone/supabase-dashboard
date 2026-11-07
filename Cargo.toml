@@ -35,6 +35,7 @@ tower-http = { version = "0.6", features = ["request-id", "trace", "limit", "tim
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
+url = "2.5"
 wasm-bindgen = "0.2"
 
 [workspace.lints.rust]

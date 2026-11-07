@@ -8,4 +8,5 @@ pub mod authz;
 pub mod health;
 pub mod invitation;
 pub mod organization;
+pub mod project;
 pub mod theme;

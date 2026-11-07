@@ -1,4 +1,4 @@
-//! Pages for one organization: settings and team.
+//! Pages for one organization: projects, settings, and team.
 //!
 //! Controls are shown or hidden according to the operator's role so the page
 //! only offers actions that can work. The server checks the role again on
@@ -14,6 +14,7 @@ use supabase_dashboard_domain::{
     authz::{OrgRole, Permission},
     invitation::{InvitationSummary, IssuedInvitation},
     organization::{MemberSummary, ORGANIZATION_NAME_MAX_CHARS, OrganizationSummary},
+    project::ProjectSummary,
 };
 use uuid::Uuid;
 
@@ -24,9 +25,10 @@ use crate::{
         page::{StatePanel, StateTone},
     },
     error::AppError,
+    pages::project::project_path,
     server_fns::{
         ChangeMemberRole, CreateInvitation, RemoveMember, RenameOrganization, RevokeInvitation,
-        get_organization, list_invitations, list_members,
+        get_organization, list_invitations, list_members, list_projects,
     },
 };
 
@@ -86,6 +88,7 @@ pub fn OrganizationLayout() -> impl IntoView {
                                     </div>
                                 </header>
                                 <nav class="tabs" aria-label="Organization">
+                                    <A href=base.clone() exact=true attr:class="tab">"Projects"</A>
                                     <A href=format!("{base}/general") attr:class="tab">"General"</A>
                                     <A href=format!("{base}/team") attr:class="tab">"Team"</A>
                                 </nav>
@@ -111,6 +114,90 @@ pub fn OrganizationLayout() -> impl IntoView {
 
 fn loaded_org(ctx: OrgContext) -> Option<OrganizationSummary> {
     ctx.org.get().and_then(Result::ok)
+}
+
+/// The organization's registered projects. The overview page of an
+/// organization, as in the reference dashboard.
+#[component]
+pub fn OrganizationProjectsPage() -> impl IntoView {
+    let Some(ctx) = use_context::<OrgContext>() else {
+        return ().into_any();
+    };
+    let projects = Resource::new(
+        move || ctx.id.get(),
+        |id| async move {
+            match id {
+                Some(id) => list_projects(id).await,
+                None => Err(AppError::NotFound),
+            }
+        },
+    );
+    let can_register =
+        move || loaded_org(ctx).is_some_and(|org| org.role.allows(Permission::ProjectRegister));
+    let new_href = move || ctx.id.get().map(|id| format!("/dashboard/new/{id}"));
+    view! {
+        <div class="section-header">
+            <h2 class="section-title">"Projects"</h2>
+            {move || can_register().then(|| view! {
+                <a class="button button-primary" href=new_href()>"Register project"</a>
+            })}
+        </div>
+        <Transition fallback=|| view! { <p class="loading" role="status">"Loading projects…"</p> }>
+            {move || {
+                projects.get().map(|result| match result {
+                    Ok(list) if list.is_empty() => {
+                        let detail = if can_register() {
+                            "Register an existing self-hosted Supabase stack to manage it here."
+                        } else {
+                            "An owner or administrator can register an existing self-hosted Supabase stack."
+                        };
+                        view! {
+                            <StatePanel
+                                tone=StateTone::Empty
+                                title="No projects yet".to_string()
+                                detail=detail.to_string()
+                            />
+                        }
+                        .into_any()
+                    }
+                    Ok(list) => view! { <ProjectGrid list/> }.into_any(),
+                    Err(err) => view! {
+                        <StatePanel
+                            tone=StateTone::Error
+                            title="Could not load projects".to_string()
+                            detail=err.to_string()
+                        />
+                    }
+                    .into_any(),
+                })
+            }}
+        </Transition>
+    }
+    .into_any()
+}
+
+#[component]
+fn ProjectGrid(list: Vec<ProjectSummary>) -> impl IntoView {
+    view! {
+        <ul class="card-grid" aria-label="Projects">
+            {list
+                .into_iter()
+                .map(|project| {
+                    let insecure = (!project.api_url.is_encrypted())
+                        .then(|| view! { <span class="badge badge-error">"Plain HTTP"</span> });
+                    view! {
+                        <li>
+                            <a class="card-link card-stack" href=project_path(project.id)>
+                                <span class="card-title">{project.name.as_str().to_owned()}</span>
+                                <span class="card-meta url-text">{project.api_url.as_str().to_owned()}</span>
+                                {insecure}
+                            </a>
+                        </li>
+                    }
+                })
+                .collect_view()}
+        </ul>
+    }
 }
 
 /// Organization settings: currently the name.

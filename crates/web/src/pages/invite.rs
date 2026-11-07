@@ -196,7 +196,7 @@ fn AcceptForm(code: String) -> impl IntoView {
     Effect::new(move |_| {
         if let Some(Ok(organization_id)) = accept.value().get() {
             navigate(
-                &format!("/dashboard/org/{organization_id}/general"),
+                &format!("/dashboard/org/{organization_id}"),
                 Default::default(),
             );
         }

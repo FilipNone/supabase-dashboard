@@ -11,6 +11,7 @@ publish.workspace = true
 [dependencies]
 serde.workspace = true
 time.workspace = true
+url.workspace = true
 thiserror.workspace = true
 # Only std and serde: random generation stays on the server so the browser
 # build does not need an entropy source.

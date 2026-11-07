@@ -527,7 +527,7 @@ fn summary(membership: Membership) -> OrganizationSummary {
     }
 }
 
-fn event<'a>(
+pub(crate) fn event<'a>(
     current: &CurrentSession,
     action: &'static str,
     (target_type, target_id): (&'static str, String),

@@ -7,6 +7,7 @@ pub mod accounts;
 pub mod audit;
 pub mod invitations;
 pub mod organizations;
+pub mod projects;
 pub mod sessions;
 
 use std::time::Duration;

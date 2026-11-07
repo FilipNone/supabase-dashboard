@@ -13,6 +13,7 @@ use supabase_dashboard_domain::{
     health::InstallationHealth,
     invitation::{InvitationCode, InvitationPreview, InvitationSummary, IssuedInvitation},
     organization::{MemberSummary, OrganizationSummary},
+    project::ProjectSummary,
 };
 use uuid::Uuid;
 
@@ -77,6 +78,7 @@ mod org_context {
     use supabase_dashboard_application::{
         auth::{AuthService, CurrentSession, RequestContext},
         organizations::OrganizationService,
+        projects::ProjectService,
     };
 
     use crate::error::AppError;
@@ -102,6 +104,13 @@ mod org_context {
     pub fn organizations() -> Result<Arc<OrganizationService>, AppError> {
         use_context::<Arc<OrganizationService>>().ok_or_else(|| {
             tracing::error!("organization service is not configured");
+            AppError::Unavailable
+        })
+    }
+
+    pub fn projects() -> Result<Arc<ProjectService>, AppError> {
+        use_context::<Arc<ProjectService>>().ok_or_else(|| {
+            tracing::error!("project service is not configured");
             AppError::Unavailable
         })
     }
@@ -167,6 +176,62 @@ pub async fn rename_organization(id: Uuid, name: String) -> Result<OrganizationS
     let audit = org_context::AuditContext::current();
     Ok(org_context::organizations()?
         .rename(&session, id, &name, audit.get())
+        .await?)
+}
+
+/// Projects registered in an organization.
+#[server]
+pub async fn list_projects(organization_id: Uuid) -> Result<Vec<ProjectSummary>, AppError> {
+    let session = org_context::session()?;
+    Ok(org_context::projects()?
+        .list(&session, organization_id)
+        .await?)
+}
+
+#[server]
+pub async fn get_project(id: Uuid) -> Result<ProjectSummary, AppError> {
+    let session = org_context::session()?;
+    Ok(org_context::projects()?.get(&session, id).await?)
+}
+
+/// Registers an existing stack. Nothing is sent to it.
+#[server]
+pub async fn register_project(
+    organization_id: Uuid,
+    name: String,
+    api_url: String,
+    // Set by a checkbox, so it is absent when unchecked.
+    #[server(default)] allow_unencrypted: bool,
+) -> Result<ProjectSummary, AppError> {
+    use supabase_dashboard_application::projects::Registration;
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    let input = Registration {
+        name: &name,
+        api_url: &api_url,
+        allow_unencrypted,
+    };
+    Ok(org_context::projects()?
+        .register(&session, organization_id, input, audit.get())
+        .await?)
+}
+
+#[server]
+pub async fn rename_project(id: Uuid, name: String) -> Result<ProjectSummary, AppError> {
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    Ok(org_context::projects()?
+        .rename(&session, id, &name, audit.get())
+        .await?)
+}
+
+/// Removes the registry entry. `confirmation` must be the project's name.
+#[server]
+pub async fn unregister_project(id: Uuid, confirmation: String) -> Result<(), AppError> {
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    Ok(org_context::projects()?
+        .unregister(&session, id, &confirmation, audit.get())
         .await?)
 }
 

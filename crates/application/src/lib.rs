@@ -7,5 +7,6 @@
 pub mod auth;
 pub mod organizations;
 pub mod password;
+pub mod projects;
 pub mod throttle;
 pub mod token;
