@@ -2,6 +2,7 @@
 
 mod app;
 mod config;
+mod error;
 mod health;
 mod state;
 mod telemetry;

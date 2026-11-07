@@ -6,7 +6,7 @@ use axum::{
     Router,
     http::{HeaderName, HeaderValue, Request, StatusCode, header},
     response::Redirect,
-    routing::get,
+    routing::{any, get},
 };
 use leptos::prelude::provide_context;
 use leptos_axum::{LeptosRoutes, generate_route_list};
@@ -24,7 +24,7 @@ use tower_http::{
     trace::TraceLayer,
 };
 
-use crate::{health, state::AppState};
+use crate::{error, health, state::AppState};
 
 pub struct HttpLimits {
     pub max_body_bytes: usize,
@@ -46,6 +46,7 @@ pub fn router(state: AppState, limits: &HttpLimits) -> Router {
         .route("/dashboard", get(home_redirect))
         .route("/healthz", get(health::live))
         .route("/readyz", get(health::ready))
+        .route("/api/{*rest}", any(error::api_not_found))
         .leptos_routes_with_context(
             &state,
             routes,
@@ -221,6 +222,28 @@ mod tests {
             assert_eq!(parts.status, StatusCode::SEE_OTHER, "{path}");
             assert_eq!(parts.headers[header::LOCATION], HOME_PATH);
         }
+    }
+
+    #[tokio::test]
+    async fn unknown_api_paths_return_a_json_error() {
+        let (parts, body) = send(get("/api/v1/does-not-exist")).await;
+        assert_eq!(parts.status, StatusCode::NOT_FOUND);
+        assert_eq!(parts.headers[header::CONTENT_TYPE], "application/json");
+        assert_eq!(
+            body,
+            r#"{"error":{"code":"not_found","message":"the requested API endpoint does not exist"}}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn server_functions_still_resolve_under_api() {
+        let request =
+            Request::post(<supabase_dashboard_web::server_fns::GetInstallationHealth as leptos::server_fn::ServerFn>::PATH)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::empty())
+                .unwrap();
+        let (parts, body) = send(request).await;
+        assert_ne!(parts.status, StatusCode::NOT_FOUND, "{body}");
     }
 
     #[tokio::test]

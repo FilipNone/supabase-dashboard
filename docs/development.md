@@ -59,6 +59,7 @@ All settings are environment variables. Invalid values stop the server at startu
 
 - `GET /healthz`: liveness. Does not touch the database.
 - `GET /readyz`: readiness. 200 when the metadata database answers, 503 otherwise, with a JSON body listing component status. Error details go to the server log, not the response.
+- Unknown paths under `/api/` return `404` with `{"error":{"code":"not_found","message":...}}`. API errors always use this envelope; messages never contain credentials or internal error text.
 - `/dashboard/organizations` and `/dashboard/status`: the UI shell. Organizations is an empty state until M1.
 
 Every response carries an `x-request-id` header (a client-supplied one is kept), and request log lines include it. Logs record method and path only; query strings, headers, and bodies are not logged.
