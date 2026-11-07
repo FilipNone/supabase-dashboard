@@ -8,7 +8,7 @@ Build a self-hosted dashboard in Rust that looks and works like <https://supabas
 
 Repository: <https://github.com/FilipNone/supabase-dashboard>.
 
-Status: M0 nearly complete; M1 started. A Cargo workspace exists with an Axum server, Leptos SSR/hydrated UI shell, control-plane PostgreSQL migrations, and CI (see `docs/development.md` and `docs/adr/0001-stack-and-workspace.md`). There are no accounts, organizations, or project connections yet. Current focus: finish M0, then a secure vertical slice that signs in, registers an existing deployment, and shows its health and schema.
+Status: M0 nearly complete; M1 started. A Cargo workspace exists with an Axum server, Leptos SSR/hydrated UI shell, control-plane PostgreSQL migrations, and CI (see `docs/development.md` and `docs/adr/0001-stack-and-workspace.md`). Operators can be bootstrapped from the command line and can sign in and out; every page and API path requires a session. There are no organizations or project connections yet. Current focus: organizations and membership, then a secure vertical slice that registers an existing deployment and shows its health and schema.
 
 Priority scale: P1 = required for the first usable release; P2 = next release after the foundation; P3 = later or dependent on research. Milestones indicate dependency order, not dates or delivery estimates.
 
@@ -44,12 +44,12 @@ Acceptance: a fresh checkout builds and runs using documented commands; migratio
 
 ### M1: accounts and organizations (P1)
 
-- [ ] Implement secure initial-owner bootstrap, login/logout, account editing, and session revocation. Disable public registration by default.
+- [ ] Implement secure initial-owner bootstrap, login/logout, account editing, and session revocation. Disable public registration by default. (Done: `create-owner` bootstrap that refuses to run twice and never takes the password as an argument; email/password sign-in with Argon2id; sign-out; hashed session tokens with absolute and idle expiry; no public sign-up. Session revocation exists in the application service but has no UI yet. Remaining: account editing and password change.)
 - [ ] Define organization/project permissions and test an initial owner/admin/developer/viewer role matrix server-side. (Started: the matrix and last-owner rule live in `crates/domain/src/authz.rs` with exhaustive unit tests. Not yet enforced, because no application services or endpoints exist.)
 - [ ] Add organization creation/editing, switching, invitations, membership removal, and last-owner protection.
 - [ ] Implement dashboard account security and an initial administrator view for users and registered resources.
-- [ ] Add audit events for security-sensitive actions and admin changes, with secret redaction.
-- [ ] Add CSRF protection, login rate limits, secure cookies, and cross-organization access tests. Establish a tested recovery path for the chosen login method.
+- [ ] Add audit events for security-sensitive actions and admin changes, with secret redaction. (Started: owner bootstrap, sign-in success and denial, sign-out, and session revocation are recorded with actor, target, outcome, and request ID and no credentials. Admin changes come with the features that make them.)
+- [ ] Add CSRF protection, login rate limits, secure cookies, and cross-organization access tests. Establish a tested recovery path for the chosen login method. (Done: `Sec-Fetch-Site`/`Origin` check on every unsafe request, `__Host-` HttpOnly SameSite=Lax cookie over HTTPS, per-email failure throttle. The throttle is in memory, so it is per server process. Remaining: cross-organization tests, which need organizations, and a recovery path.)
 
 Acceptance: two organizations cannot read or mutate each other's records, including through guessed IDs and job/download endpoints. Disabled users and revoked sessions lose access. Invitations expire and cannot be reused. Default/bootstrap credentials cannot remain active unnoticed.
 
@@ -172,6 +172,7 @@ Release checks include a fresh installation, migration from the previous support
 
 ## Revision history
 
+- 2026-11-07: M1 sign-in slice: operator accounts, owner bootstrap command, sessions, sign-in/sign-out pages, Origin check, login throttle, and audit events. Updated M1 notes.
 - 2026-11-07: relicensed the application from Apache-2.0 to `MIT OR Apache-2.0`.
 - 2026-11-07: M0 scaffold landed: workspace, server, UI shell, metadata migrations, CI, and the Supabase fixture. Updated M0 checkboxes with what remains.
 - 2026-11-05: reviewed the initial feature/page list, retained its requested areas, added missing project workflows, and organized implementation around security boundaries, adapter capabilities, milestone dependencies, and testable acceptance criteria.

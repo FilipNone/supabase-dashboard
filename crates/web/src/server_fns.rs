@@ -4,7 +4,7 @@
 //! they must never contain credentials.
 
 use leptos::prelude::*;
-use supabase_dashboard_domain::health::InstallationHealth;
+use supabase_dashboard_domain::{account::AccountSummary, health::InstallationHealth};
 
 #[cfg(feature = "ssr")]
 pub use probe::HealthProbe;
@@ -38,10 +38,18 @@ mod probe {
     }
 }
 
-/// Health of the dashboard's own components.
-///
-/// Unauthenticated in M0 because there are no accounts yet; it exposes only
-/// component names and coarse status. Gate it behind dashboard auth in M1.
+/// The signed-in operator. The server's session guard attaches the summary
+/// to the request; it holds no credentials or session identifiers. Every
+/// server function requires a session, so this is `None` only during SSR of
+/// a public page.
+#[server]
+pub async fn get_current_account() -> Result<Option<AccountSummary>, ServerFnError> {
+    Ok(use_context::<http::request::Parts>()
+        .and_then(|parts| parts.extensions.get::<AccountSummary>().cloned()))
+}
+
+/// Health of the dashboard's own components. Requires a signed-in operator
+/// (enforced by the server's session guard for every server function).
 #[server]
 pub async fn get_installation_health() -> Result<InstallationHealth, ServerFnError> {
     let probe = use_context::<HealthProbe>()

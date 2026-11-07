@@ -2,6 +2,7 @@ use leptos::prelude::*;
 use leptos_router::components::{A, Outlet};
 
 use super::theme_switcher::ThemeSwitcher;
+use crate::server_fns::get_current_account;
 
 /// Primary application frame: sidebar, top bar, and the routed page.
 ///
@@ -36,13 +37,48 @@ pub fn DashboardLayout() -> impl IntoView {
                             "No organization"
                         </span>
                     </nav>
-                    <ThemeSwitcher/>
+                    <div class="topbar-actions">
+                        <ThemeSwitcher/>
+                        <AccountMenu/>
+                    </div>
                 </header>
                 <main id="main-content" class="content" tabindex="-1">
                     <Outlet/>
                 </main>
             </div>
         </div>
+    }
+}
+
+/// Signed-in operator and the sign-out form. Sign-out is a POST so a link
+/// or image on another site cannot end the session.
+#[component]
+fn AccountMenu() -> impl IntoView {
+    let account = Resource::new(|| (), |_| get_current_account());
+    view! {
+        <Transition fallback=|| ()>
+            {move || {
+                account
+                    .get()
+                    .and_then(Result::ok)
+                    .flatten()
+                    .map(|account| {
+                        let email = account.email.to_string();
+                        let title = email.clone();
+                        view! {
+                            <div class="account-menu">
+                                <span class="account-name" title=title>
+                                    {account.display_name.as_str().to_owned()}
+                                    <span class="visually-hidden">" (" {email} ")"</span>
+                                </span>
+                                <form method="post" action="/auth/sign-out">
+                                    <button type="submit" class="button">"Sign out"</button>
+                                </form>
+                            </div>
+                        }
+                    })
+            }}
+        </Transition>
     }
 }
 

@@ -5,10 +5,14 @@ mod cli;
 mod config;
 mod error;
 mod health;
+#[cfg(test)]
+#[path = "../../../crates/persistence/tests/common/mod.rs"]
+mod scratch_db;
+mod session;
 mod state;
 mod telemetry;
 
-use std::process::ExitCode;
+use std::{process::ExitCode, sync::Arc, time::Duration};
 
 use supabase_dashboard_application::auth::{AuthConfig, AuthError, AuthService, BootstrapError};
 use supabase_dashboard_persistence::{Database, PersistenceError};
@@ -17,6 +21,7 @@ use tokio::net::TcpListener;
 use crate::{
     app::HttpLimits,
     config::{Config, ConfigError},
+    session::CookieSettings,
     state::AppState,
 };
 
@@ -118,10 +123,28 @@ async fn run() -> Result<(), StartupError> {
     db.migrate().await?;
     tracing::info!("metadata database migrations are up to date");
 
+    let auth = Arc::new(AuthService::new(db.clone(), auth_config(&config)).await?);
+    if !auth.is_initialized().await? {
+        tracing::warn!(
+            "no operator account exists; create one with `supabase-dashboard-server create-owner`"
+        );
+    }
+    tokio::spawn(prune_sessions(Arc::clone(&auth)));
+
+    let secure_cookie = config
+        .public_url
+        .as_ref()
+        .is_some_and(|u| u.scheme() == "https");
     let state = AppState {
         leptos_options,
         db: db.clone(),
         readiness_timeout: config.readiness_timeout,
+        auth,
+        cookie: CookieSettings::new(secure_cookie, config.session_lifetime.as_secs()),
+        expected_origin: config
+            .public_url
+            .as_ref()
+            .map(|url| url.origin().ascii_serialization()),
     };
     let limits = HttpLimits {
         max_body_bytes: config.max_body_bytes,
@@ -148,6 +171,19 @@ async fn run() -> Result<(), StartupError> {
     db.close().await;
     tracing::info!("shutdown complete");
     Ok(())
+}
+
+/// Deletes unusable sessions once an hour so the table stays small.
+async fn prune_sessions(auth: Arc<AuthService>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(3600));
+    loop {
+        interval.tick().await;
+        match auth.prune_sessions().await {
+            Ok(0) => {}
+            Ok(count) => tracing::info!(count, "pruned expired sessions"),
+            Err(err) => tracing::warn!(error = %err, "could not prune sessions"),
+        }
+    }
 }
 
 /// Resolves on Ctrl-C or SIGTERM. In-flight requests finish (bounded by the

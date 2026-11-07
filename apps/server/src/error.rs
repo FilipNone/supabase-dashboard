@@ -15,18 +15,30 @@ use serde::Serialize;
 pub enum ApiError {
     #[error("the requested API endpoint does not exist")]
     NotFound,
+    #[error("sign in to continue")]
+    Unauthenticated,
+    #[error("cross-origin requests cannot change dashboard state")]
+    CrossOriginRequest,
+    #[error("the dashboard is temporarily unavailable")]
+    Unavailable,
 }
 
 impl ApiError {
     pub const fn status(&self) -> StatusCode {
         match self {
             Self::NotFound => StatusCode::NOT_FOUND,
+            Self::Unauthenticated => StatusCode::UNAUTHORIZED,
+            Self::CrossOriginRequest => StatusCode::FORBIDDEN,
+            Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
     pub const fn code(&self) -> &'static str {
         match self {
             Self::NotFound => "not_found",
+            Self::Unauthenticated => "unauthenticated",
+            Self::CrossOriginRequest => "cross_origin_request",
+            Self::Unavailable => "unavailable",
         }
     }
 }

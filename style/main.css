@@ -258,3 +258,41 @@ code { font-family: var(--font-mono); font-size: var(--text-sm); }
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; }
 }
+
+/* Top bar actions and account */
+.topbar-actions { display: flex; align-items: center; gap: var(--space-3); }
+.account-menu { display: flex; align-items: center; gap: var(--space-2); }
+.account-menu form { margin: 0; }
+.account-name {
+  max-width: 12rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: var(--text-sm); color: var(--color-text-muted);
+}
+
+/* Sign-in */
+.auth-page { min-height: 100vh; display: grid; place-items: center; padding: var(--space-6) var(--space-4); box-sizing: border-box; }
+.auth-card { width: 100%; max-width: 24rem; display: grid; gap: var(--space-6); }
+.auth-title { margin: 0; font-size: 1.75rem; font-weight: 500; }
+.auth-subtitle { margin: var(--space-1) 0 0; color: var(--color-text-muted); }
+.auth-form { display: grid; gap: var(--space-4); }
+.auth-note { margin: 0; font-size: var(--text-sm); color: var(--color-text-muted); }
+.field { display: grid; gap: var(--space-2); }
+.field-label { font-size: var(--text-sm); color: var(--color-text-muted); }
+.input {
+  height: 2.5rem; padding: 0 var(--space-3); box-sizing: border-box; width: 100%;
+  border: 1px solid var(--color-border-strong); border-radius: var(--radius-md);
+  background: var(--color-surface); color: var(--color-text); font: inherit; font-size: var(--text-md);
+}
+.input:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 1px; }
+.button-primary {
+  justify-content: center; height: 2.5rem;
+  background: var(--color-accent); border-color: var(--color-accent); color: var(--color-accent-contrast);
+}
+.button-primary:hover { background: var(--color-accent); filter: brightness(1.08); }
+.form-error {
+  margin: 0; padding: var(--space-3); border-radius: var(--radius-md);
+  background: var(--color-error-bg); color: var(--color-error-text); font-size: var(--text-sm);
+}
+
+@media (max-width: 640px) {
+  .account-name { display: none; }
+}

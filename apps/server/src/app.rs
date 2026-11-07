@@ -5,8 +5,9 @@ use std::time::Duration;
 use axum::{
     Router,
     http::{HeaderName, HeaderValue, Request, StatusCode, header},
+    middleware,
     response::Redirect,
-    routing::{any, get},
+    routing::{any, get, post},
 };
 use leptos::prelude::provide_context;
 use leptos_axum::{LeptosRoutes, generate_route_list};
@@ -24,7 +25,7 @@ use tower_http::{
     trace::TraceLayer,
 };
 
-use crate::{error, health, state::AppState};
+use crate::{error, health, session, state::AppState};
 
 pub struct HttpLimits {
     pub max_body_bytes: usize,
@@ -46,6 +47,8 @@ pub fn router(state: AppState, limits: &HttpLimits) -> Router {
         .route("/dashboard", get(home_redirect))
         .route("/healthz", get(health::live))
         .route("/readyz", get(health::ready))
+        .route("/auth/sign-in", post(session::sign_in))
+        .route("/auth/sign-out", post(session::sign_out))
         .route("/api/{*rest}", any(error::api_not_found))
         .leptos_routes_with_context(
             &state,
@@ -54,6 +57,16 @@ pub fn router(state: AppState, limits: &HttpLimits) -> Router {
             move || shell(leptos_options.clone()),
         )
         .fallback(leptos_axum::file_and_error_handler::<AppState, _>(shell))
+        // Route layers run outer-last: the Origin check runs before the
+        // session guard, so a cross-site POST never touches the database.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            session::guard,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            session::verify_origin,
+        ))
         .with_state(state)
         .layer(
             ServiceBuilder::new()
@@ -112,31 +125,40 @@ fn request_span<B>(request: &Request<B>) -> tracing::Span {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use axum::body::Body;
     use http_body_util::BodyExt;
-    use leptos::config::LeptosOptions;
+    use leptos::{config::LeptosOptions, server_fn::ServerFn};
     use secrecy::SecretString;
+    use supabase_dashboard_application::auth::{AuthConfig, AuthService};
     use supabase_dashboard_persistence::{Database, DatabaseSettings};
+    use supabase_dashboard_web::{
+        app::SIGN_IN_PATH,
+        server_fns::{GetCurrentAccount, GetInstallationHealth},
+    };
     use tower::ServiceExt;
 
     use super::*;
+    use crate::{scratch_db::ScratchDb, session::CookieSettings};
 
-    fn test_router() -> Router {
-        // Port 1 on loopback is never a PostgreSQL server, so readiness fails
-        // quickly without any external dependency.
-        let settings = DatabaseSettings {
-            url: SecretString::from("postgres://u:secret-pw@127.0.0.1:1/db"),
-            max_connections: 1,
-            acquire_timeout: Duration::from_secs(1),
-            statement_timeout: Duration::from_secs(1),
-        };
+    const HOST: &str = "dash.localhost:3000";
+    const ORIGIN: &str = "http://dash.localhost:3000";
+
+    async fn router_for(db: Database) -> Router {
+        let auth = AuthService::new(db.clone(), AuthConfig::default())
+            .await
+            .unwrap();
         let state = AppState {
             leptos_options: LeptosOptions::builder()
                 .output_name("supabase-dashboard")
                 .site_root("target/site")
                 .build(),
-            db: Database::connect_lazy(&settings).unwrap(),
+            db,
             readiness_timeout: Duration::from_secs(1),
+            auth: Arc::new(auth),
+            cookie: CookieSettings::new(false, 3600),
+            expected_origin: None,
         };
         router(
             state,
@@ -147,20 +169,58 @@ mod tests {
         )
     }
 
-    async fn send(request: Request<Body>) -> (http::response::Parts, String) {
-        let response = test_router().oneshot(request).await.unwrap();
+    /// Router whose metadata database is unreachable: port 1 on loopback is
+    /// never PostgreSQL, so anything that touches it fails fast.
+    async fn offline_router() -> Router {
+        let settings = DatabaseSettings {
+            url: SecretString::from("postgres://u:secret-pw@127.0.0.1:1/db"),
+            max_connections: 1,
+            acquire_timeout: Duration::from_secs(1),
+            statement_timeout: Duration::from_secs(1),
+        };
+        router_for(Database::connect_lazy(&settings).unwrap()).await
+    }
+
+    async fn send(router: &Router, request: Request<Body>) -> (http::response::Parts, String) {
+        let response = router.clone().oneshot(request).await.unwrap();
         let (parts, body) = response.into_parts();
         let bytes = body.collect().await.unwrap().to_bytes();
         (parts, String::from_utf8_lossy(&bytes).into_owned())
     }
 
     fn get(path: &str) -> Request<Body> {
-        Request::get(path).body(Body::empty()).unwrap()
+        Request::get(path)
+            .header(header::HOST, HOST)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn get_with_cookie(path: &str, cookie: &str) -> Request<Body> {
+        Request::get(path)
+            .header(header::HOST, HOST)
+            .header(header::COOKIE, cookie)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn form_post(path: &str, body: &str, cookie: Option<&str>) -> Request<Body> {
+        let mut builder = Request::post(path)
+            .header(header::HOST, HOST)
+            .header(header::ORIGIN, ORIGIN)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+        if let Some(cookie) = cookie {
+            builder = builder.header(header::COOKIE, cookie);
+        }
+        builder.body(Body::from(body.to_owned())).unwrap()
+    }
+
+    fn location(parts: &http::response::Parts) -> &str {
+        parts.headers[header::LOCATION].to_str().unwrap()
     }
 
     #[tokio::test]
     async fn liveness_responds_with_request_id_and_security_headers() {
-        let (parts, body) = send(get("/healthz")).await;
+        let (parts, body) = send(&offline_router().await, get("/healthz")).await;
         assert_eq!(parts.status, StatusCode::OK);
         assert_eq!(body, r#"{"status":"ok"}"#);
         assert!(parts.headers.contains_key("x-request-id"));
@@ -174,13 +234,13 @@ mod tests {
             .header("x-request-id", "abc-123")
             .body(Body::empty())
             .unwrap();
-        let (parts, _) = send(request).await;
+        let (parts, _) = send(&offline_router().await, request).await;
         assert_eq!(parts.headers["x-request-id"], "abc-123");
     }
 
     #[tokio::test]
     async fn readiness_reports_unavailable_database_without_leaking_url() {
-        let (parts, body) = send(get("/readyz")).await;
+        let (parts, body) = send(&offline_router().await, get("/readyz")).await;
         assert_eq!(parts.status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(body.contains(r#""status":"unavailable""#), "{body}");
         assert!(!body.contains("secret-pw"));
@@ -193,63 +253,195 @@ mod tests {
             .header(header::CONTENT_LENGTH, "4096")
             .body(Body::from(vec![b'x'; 4096]))
             .unwrap();
-        let (parts, _) = send(request).await;
+        let (parts, _) = send(&offline_router().await, request).await;
         assert_eq!(parts.status, StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]
-    async fn dashboard_shell_renders_on_the_server() {
-        let (parts, body) = send(get("/dashboard/organizations")).await;
-        assert_eq!(parts.status, StatusCode::OK);
-        assert!(body.contains("No organizations yet"), "{body}");
-        assert!(body.contains(r#"data-theme="system""#));
-    }
-
-    #[tokio::test]
-    async fn theme_cookie_selects_initial_theme() {
-        let request = Request::get("/dashboard/organizations")
-            .header(header::COOKIE, "sd-theme=dark")
-            .body(Body::empty())
-            .unwrap();
-        let (_, body) = send(request).await;
-        assert!(body.contains(r#"data-theme="dark""#));
-    }
-
-    #[tokio::test]
-    async fn root_redirects_to_home() {
-        for path in ["/", "/dashboard"] {
-            let (parts, _) = send(get(path)).await;
+    async fn pages_redirect_to_sign_in_without_a_session() {
+        let router = offline_router().await;
+        for path in [
+            "/",
+            "/dashboard",
+            "/dashboard/organizations",
+            "/dashboard/status",
+            "/dashboard/does-not-exist",
+            "/elsewhere",
+        ] {
+            let (parts, _) = send(&router, get(path)).await;
             assert_eq!(parts.status, StatusCode::SEE_OTHER, "{path}");
-            assert_eq!(parts.headers[header::LOCATION], HOME_PATH);
+            assert_eq!(location(&parts), SIGN_IN_PATH, "{path}");
         }
     }
 
     #[tokio::test]
-    async fn unknown_api_paths_return_a_json_error() {
-        let (parts, body) = send(get("/api/v1/does-not-exist")).await;
-        assert_eq!(parts.status, StatusCode::NOT_FOUND);
-        assert_eq!(parts.headers[header::CONTENT_TYPE], "application/json");
-        assert_eq!(
-            body,
-            r#"{"error":{"code":"not_found","message":"the requested API endpoint does not exist"}}"#
+    async fn sign_in_page_is_public_and_themed() {
+        let request = Request::get(SIGN_IN_PATH)
+            .header(header::COOKIE, "sd-theme=dark")
+            .body(Body::empty())
+            .unwrap();
+        let (parts, body) = send(&offline_router().await, request).await;
+        assert_eq!(parts.status, StatusCode::OK);
+        assert!(body.contains(r#"action="/auth/sign-in""#), "{body}");
+        assert!(body.contains(r#"autocomplete="current-password""#));
+        assert!(body.contains(r#"data-theme="dark""#));
+    }
+
+    #[tokio::test]
+    async fn sign_in_errors_are_fixed_messages() {
+        let router = offline_router().await;
+        let (_, body) = send(&router, get(&format!("{SIGN_IN_PATH}?error=throttled"))).await;
+        assert!(body.contains("Too many failed attempts"), "{body}");
+        let (_, body) = send(
+            &router,
+            get(&format!("{SIGN_IN_PATH}?error=echo-marker-42")),
+        )
+        .await;
+        assert!(body.contains("Invalid email or password"));
+        assert!(
+            !body.contains("echo-marker-42"),
+            "unknown codes are not echoed"
         );
     }
 
     #[tokio::test]
-    async fn server_functions_still_resolve_under_api() {
-        let request =
-            Request::post(<supabase_dashboard_web::server_fns::GetInstallationHealth as leptos::server_fn::ServerFn>::PATH)
-                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .body(Body::empty())
-                .unwrap();
-        let (parts, body) = send(request).await;
-        assert_ne!(parts.status, StatusCode::NOT_FOUND, "{body}");
+    async fn api_paths_need_a_session() {
+        let router = offline_router().await;
+        let (parts, body) = send(&router, get("/api/v1/does-not-exist")).await;
+        assert_eq!(parts.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(parts.headers[header::CONTENT_TYPE], "application/json");
+        assert_eq!(
+            body,
+            r#"{"error":{"code":"unauthenticated","message":"sign in to continue"}}"#
+        );
+        let (parts, _) = send(&router, form_post(GetInstallationHealth::PATH, "", None)).await;
+        assert_eq!(parts.status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
-    async fn unknown_pages_return_404() {
-        let (parts, body) = send(get("/dashboard/does-not-exist")).await;
+    async fn cross_origin_posts_are_refused() {
+        let router = offline_router().await;
+        let attempts = [
+            vec![(header::ORIGIN.as_str(), "https://evil.example")],
+            vec![
+                ("sec-fetch-site", "cross-site"),
+                (header::ORIGIN.as_str(), ORIGIN),
+            ],
+            vec![],
+        ];
+        for headers in attempts {
+            let mut builder = Request::post("/auth/sign-in")
+                .header(header::HOST, HOST)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+            for (name, value) in &headers {
+                builder = builder.header(*name, *value);
+            }
+            let request = builder.body(Body::from("email=a&password=b")).unwrap();
+            let (parts, body) = send(&router, request).await;
+            assert_eq!(parts.status, StatusCode::FORBIDDEN, "{headers:?}");
+            assert!(body.contains("cross_origin_request"));
+        }
+    }
+
+    #[tokio::test]
+    async fn sign_in_reports_unavailable_database_generically() {
+        let (parts, _) = send(
+            &offline_router().await,
+            form_post(
+                "/auth/sign-in",
+                "email=a%40b.test&password=whatever-password",
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::SEE_OTHER);
+        assert_eq!(
+            location(&parts),
+            format!("{SIGN_IN_PATH}?error=unavailable")
+        );
+        assert!(!parts.headers.contains_key(header::SET_COOKIE));
+    }
+
+    /// Full browser flow against a scratch metadata database. Skipped
+    /// unless `SUPABASE_DASHBOARD_TEST_DATABASE_URL` is set.
+    #[tokio::test]
+    async fn sign_in_browse_and_sign_out() {
+        let Some(scratch) = ScratchDb::create("http_flow").await else {
+            return;
+        };
+        let db = Database::connect(&scratch.settings).await.unwrap();
+        db.migrate().await.unwrap();
+        let router = router_for(db.clone()).await;
+        let credentials = "email=Owner%40Example.test&password=correct+horse+battery+staple";
+
+        // Fresh installation: the sign-in page explains how to bootstrap.
+        let (parts, _) = send(&router, form_post("/auth/sign-in", credentials, None)).await;
+        assert_eq!(location(&parts), format!("{SIGN_IN_PATH}?error=setup"));
+
+        AuthService::new(db.clone(), AuthConfig::default())
+            .await
+            .unwrap()
+            .bootstrap_owner(
+                "owner@example.test",
+                "Owner",
+                &SecretString::from("correct horse battery staple"),
+            )
+            .await
+            .unwrap();
+
+        let wrong = "email=owner%40example.test&password=wrong+password+here";
+        let (parts, _) = send(&router, form_post("/auth/sign-in", wrong, None)).await;
+        assert_eq!(location(&parts), format!("{SIGN_IN_PATH}?error=invalid"));
+
+        let (parts, _) = send(&router, form_post("/auth/sign-in", credentials, None)).await;
+        assert_eq!(parts.status, StatusCode::SEE_OTHER);
+        assert_eq!(location(&parts), HOME_PATH);
+        let set_cookie = parts.headers[header::SET_COOKIE].to_str().unwrap();
+        assert!(set_cookie.contains("HttpOnly"), "{set_cookie}");
+        assert!(set_cookie.contains("SameSite=Lax"), "{set_cookie}");
+        let cookie = set_cookie.split(';').next().unwrap().to_owned();
+        let token = cookie.split_once('=').unwrap().1;
+        assert_eq!(token.len(), 64);
+
+        let (parts, body) = send(&router, get_with_cookie(HOME_PATH, &cookie)).await;
+        assert_eq!(parts.status, StatusCode::OK);
+        assert_eq!(parts.headers[header::CACHE_CONTROL], "no-store");
+        assert!(body.contains("No organizations yet"), "{body}");
+        assert!(
+            !body.contains(token),
+            "the session token must not reach the page"
+        );
+
+        let (parts, _) = send(&router, get_with_cookie(SIGN_IN_PATH, &cookie)).await;
+        assert_eq!(location(&parts), HOME_PATH);
+        let (parts, _) = send(&router, get_with_cookie("/dashboard/nope", &cookie)).await;
         assert_eq!(parts.status, StatusCode::NOT_FOUND);
-        assert!(body.contains("Page not found"));
+
+        let (parts, body) = send(
+            &router,
+            form_post(GetCurrentAccount::PATH, "", Some(&cookie)),
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        assert!(body.contains("owner@example.test"), "{body}");
+        assert!(!body.contains(token));
+
+        let (parts, _) = send(&router, form_post("/auth/sign-out", "", Some(&cookie))).await;
+        assert_eq!(location(&parts), SIGN_IN_PATH);
+        assert!(
+            parts.headers[header::SET_COOKIE]
+                .to_str()
+                .unwrap()
+                .contains("Max-Age=0")
+        );
+        let (parts, _) = send(&router, get_with_cookie(HOME_PATH, &cookie)).await;
+        assert_eq!(
+            location(&parts),
+            SIGN_IN_PATH,
+            "revoked cookie no longer works"
+        );
+
+        db.close().await;
+        scratch.drop().await;
     }
 }

@@ -44,7 +44,7 @@ jobs:
       - name: No server-only crates in the browser build
         run: |
           if cargo tree -p supabase-dashboard-web --target wasm32-unknown-unknown --features hydrate -e normal \
-              | grep -E '(^|[^a-z_-])(sqlx|axum|supabase-dashboard-persistence|tokio) v'; then
+              | grep -E '(^|[^a-z_-])(sqlx|axum|argon2|supabase-dashboard-persistence|supabase-dashboard-application|tokio) v'; then
             echo "server-only dependency found in the hydrate build" >&2
             exit 1
           fi

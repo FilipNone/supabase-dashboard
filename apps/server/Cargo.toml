@@ -36,6 +36,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 http-body-util = "0.1"
+sqlx.workspace = true
 
 [lints]
 workspace = true

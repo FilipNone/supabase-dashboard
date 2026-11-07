@@ -7,7 +7,9 @@ use leptos_router::{
 use supabase_dashboard_domain::theme::ThemePreference;
 
 use crate::components::layout::DashboardLayout;
-use crate::pages::{not_found::NotFound, organizations::OrganizationsPage, status::StatusPage};
+use crate::pages::{
+    not_found::NotFound, organizations::OrganizationsPage, sign_in::SignInPage, status::StatusPage,
+};
 
 /// Server-rendered HTML document. The theme comes from a non-secret cookie
 /// so the first paint already uses the operator's chosen theme.
@@ -57,6 +59,9 @@ pub fn initial_theme() -> ThemePreference {
 /// code once rendering starts.
 pub const HOME_PATH: &str = "/dashboard/organizations";
 
+/// The only dashboard page reachable without a session.
+pub const SIGN_IN_PATH: &str = "/dashboard/sign-in";
+
 #[component]
 pub fn App() -> impl IntoView {
     provide_meta_context();
@@ -68,6 +73,7 @@ pub fn App() -> impl IntoView {
         }/>
         <Router>
             <Routes fallback=|| view! { <NotFound/> }>
+                <Route path=path!("/dashboard/sign-in") view=SignInPage/>
                 <ParentRoute path=path!("/dashboard") view=DashboardLayout>
                     <Route path=path!("organizations") view=OrganizationsPage/>
                     <Route path=path!("status") view=StatusPage/>
