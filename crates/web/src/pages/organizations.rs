@@ -2,7 +2,10 @@ use leptos::{form::ActionForm, prelude::*};
 use leptos_meta::Title;
 use supabase_dashboard_domain::organization::{ORGANIZATION_NAME_MAX_CHARS, OrganizationSummary};
 
-use crate::components::page::{PageHeader, StatePanel, StateTone};
+use crate::components::{
+    layout::Refresh,
+    page::{PageHeader, StatePanel, StateTone},
+};
 use crate::server_fns::{CreateOrganization, list_organizations};
 
 /// Organizations the signed-in operator belongs to, and a form to create
@@ -10,6 +13,12 @@ use crate::server_fns::{CreateOrganization, list_organizations};
 #[component]
 pub fn OrganizationsPage() -> impl IntoView {
     let create = ServerAction::<CreateOrganization>::new();
+    let refresh = use_context::<Refresh>();
+    Effect::new(move |_| {
+        if let (Some(Ok(_)), Some(refresh)) = (create.value().get(), refresh) {
+            refresh.organizations_changed();
+        }
+    });
     let organizations = Resource::new(move || create.version().get(), |_| list_organizations());
     let create_error = move || {
         create

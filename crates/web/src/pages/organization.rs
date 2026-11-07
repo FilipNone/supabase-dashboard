@@ -19,7 +19,10 @@ use uuid::Uuid;
 
 use crate::{
     app::INVITE_PATH,
-    components::page::{StatePanel, StateTone},
+    components::{
+        layout::Refresh,
+        page::{StatePanel, StateTone},
+    },
     error::AppError,
     server_fns::{
         ChangeMemberRole, CreateInvitation, RemoveMember, RenameOrganization, RevokeInvitation,
@@ -57,6 +60,13 @@ pub fn OrganizationLayout() -> impl IntoView {
         },
     );
     provide_context(OrgContext { id, org, rename });
+    // The top-bar switcher shows the name too.
+    let refresh = use_context::<Refresh>();
+    Effect::new(move |_| {
+        if let (Some(Ok(_)), Some(refresh)) = (rename.value().get(), refresh) {
+            refresh.organizations_changed();
+        }
+    });
 
     view! {
         <Transition fallback=|| view! { <p class="loading" role="status">"Loading organization…"</p> }>
@@ -179,8 +189,12 @@ pub fn OrganizationTeamPage() -> impl IntoView {
 
     // After leaving, this organization is no longer visible.
     let navigate = use_navigate();
+    let refresh = use_context::<Refresh>();
     Effect::new(move |_| {
         if matches!(leave.value().get(), Some(Ok(()))) {
+            if let Some(refresh) = refresh {
+                refresh.organizations_changed();
+            }
             navigate("/dashboard/organizations", Default::default());
         }
     });

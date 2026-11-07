@@ -145,9 +145,10 @@ mod tests {
     use supabase_dashboard_web::{
         app::SIGN_IN_PATH,
         server_fns::{
-            CreateInvitation, CreateOrganization, GetCurrentAccount, GetInstallationHealth,
-            GetOrganization, ListOrganizations, PreviewInvitation, RenameOrganization,
-            SignUpWithInvitation,
+            ChangePassword, CreateInvitation, CreateOrganization, GetCurrentAccount,
+            GetInstallationHealth, GetOrganization, ListOrganizations, ListSessions,
+            PreviewInvitation, RenameOrganization, RevokeSession, SignUpWithInvitation,
+            UpdateProfile,
         },
     };
     use tower::ServiceExt;
@@ -701,6 +702,157 @@ mod tests {
         .await;
         assert!(body.contains(r#""invitation":null"#), "{body}");
         assert!(body.contains("carol@example.test"), "{body}");
+
+        db.close().await;
+        scratch.drop().await;
+    }
+
+    #[tokio::test]
+    async fn account_settings_act_only_on_the_signed_in_account() {
+        let Some(scratch) = ScratchDb::create("http_account").await else {
+            return;
+        };
+        let db = Database::connect(&scratch.settings).await.unwrap();
+        db.migrate().await.unwrap();
+        let router = router_for(db.clone()).await;
+        AuthService::new(db.clone(), AuthConfig::default())
+            .await
+            .unwrap()
+            .bootstrap_owner(
+                "alice@example.test",
+                "Alice",
+                &SecretString::from("correct horse battery staple"),
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO accounts (id, email, display_name, password_hash) \
+             SELECT gen_random_uuid(), 'bob@example.test', 'Bob', password_hash FROM accounts",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let alice = sign_in_cookie(&router, "alice%40example.test").await;
+        let alice_elsewhere = sign_in_cookie(&router, "alice%40example.test").await;
+        let bob = sign_in_cookie(&router, "bob%40example.test").await;
+        let call = |path: &'static str, body: String, cookie: &str| {
+            send(&router, form_post(path, &body, Some(cookie)))
+        };
+
+        // The pages need a session and render for the signed-in operator.
+        let (parts, _) = send(&router, get("/dashboard/account/security")).await;
+        assert_eq!(parts.status, StatusCode::SEE_OTHER);
+        for page in ["/dashboard/account/me", "/dashboard/account/security"] {
+            let (parts, body) = send(&router, get_with_cookie(page, &alice)).await;
+            assert_eq!(parts.status, StatusCode::OK, "{page}");
+            assert!(body.contains("Account settings"), "{page}: {body}");
+        }
+
+        // Sessions: Alice sees her two, with this one marked, and no tokens.
+        let (parts, body) = call(ListSessions::PATH, String::new(), &alice).await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        let sessions: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(
+            sessions.iter().filter(|s| s["is_current"] == true).count(),
+            1
+        );
+        for cookie in [&alice, &alice_elsewhere] {
+            let token = cookie.split_once('=').unwrap().1;
+            assert!(!body.contains(token), "session token leaked");
+        }
+        let current_id = sessions.iter().find(|s| s["is_current"] == true).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // Bob's session ID gets the same answer as a made-up one, and
+        // survives; Alice cannot end her own current session this way.
+        let bob_session: uuid::Uuid = sqlx::query_scalar(
+            "SELECT s.id FROM sessions s JOIN accounts a ON a.id = s.account_id \
+             WHERE a.email = 'bob@example.test'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        for id in [bob_session, uuid::Uuid::now_v7()] {
+            let (_, body) = call(RevokeSession::PATH, format!("session_id={id}"), &alice).await;
+            assert!(body.contains("NotFound"), "{body}");
+        }
+        let (parts, _) = call(ListSessions::PATH, String::new(), &bob).await;
+        assert_eq!(parts.status, StatusCode::OK);
+        let (_, body) = call(
+            RevokeSession::PATH,
+            format!("session_id={current_id}"),
+            &alice,
+        )
+        .await;
+        assert!(body.contains("Use Sign out"), "{body}");
+
+        // Profile changes apply to Alice only.
+        let (parts, body) =
+            call(UpdateProfile::PATH, "display_name=Alice+Ops".into(), &alice).await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        let (_, body) = call(GetCurrentAccount::PATH, String::new(), &alice).await;
+        assert!(body.contains("Alice Ops"), "{body}");
+        let (_, body) = call(GetCurrentAccount::PATH, String::new(), &bob).await;
+        assert!(body.contains("\"Bob\""), "{body}");
+
+        // Password changes need the current password and matching new ones.
+        let new = "new_password=a+brand+new+passphrase";
+        let (_, body) = call(
+            ChangePassword::PATH,
+            format!(
+                "current_password=correct+horse+battery+staple&{new}&new_password_confirmation=other+passphrase+x"
+            ),
+            &alice,
+        )
+        .await;
+        assert!(body.contains("do not match"), "{body}");
+        let (_, body) = call(
+            ChangePassword::PATH,
+            format!(
+                "current_password=a+wrong+guess+here&{new}&new_password_confirmation=a+brand+new+passphrase"
+            ),
+            &alice,
+        )
+        .await;
+        assert!(body.contains("not correct"), "{body}");
+        assert!(!body.contains("brand"), "{body}");
+
+        // A cross-site form cannot change it, even with the cookie.
+        let forged = Request::post(ChangePassword::PATH)
+            .header(header::HOST, HOST)
+            .header(header::ORIGIN, "https://evil.example")
+            .header(header::COOKIE, &alice)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(format!(
+                "current_password=correct+horse+battery+staple&{new}&new_password_confirmation=a+brand+new+passphrase"
+            )))
+            .unwrap();
+        let (parts, _) = send(&router, forged).await;
+        assert_eq!(parts.status, StatusCode::FORBIDDEN);
+
+        let (parts, body) = call(
+            ChangePassword::PATH,
+            format!(
+                "current_password=correct+horse+battery+staple&{new}&new_password_confirmation=a+brand+new+passphrase"
+            ),
+            &alice,
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        assert_eq!(body, "1", "one other session signed out");
+        let (parts, _) = call(ListSessions::PATH, String::new(), &alice_elsewhere).await;
+        assert_eq!(parts.status, StatusCode::UNAUTHORIZED);
+        let (parts, _) = call(ListSessions::PATH, String::new(), &alice).await;
+        assert_eq!(parts.status, StatusCode::OK);
+        let (parts, _) = call(ListSessions::PATH, String::new(), &bob).await;
+        assert_eq!(parts.status, StatusCode::OK, "Bob is not affected");
+
+        let body = "email=alice%40example.test&password=a+brand+new+passphrase";
+        let (parts, _) = send(&router, form_post("/auth/sign-in", body, None)).await;
+        assert_eq!(location(&parts), HOME_PATH);
 
         db.close().await;
         scratch.drop().await;

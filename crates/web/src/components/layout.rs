@@ -8,12 +8,30 @@ use uuid::Uuid;
 use super::theme_switcher::ThemeSwitcher;
 use crate::server_fns::{get_current_account, list_organizations};
 
+/// Counters that pages bump after changing something the frame shows, so
+/// the top bar reloads it.
+#[derive(Clone, Copy)]
+pub struct Refresh {
+    pub account: RwSignal<u32>,
+    pub organizations: RwSignal<u32>,
+}
+
+impl Refresh {
+    pub fn organizations_changed(self) {
+        self.organizations.update(|n| *n = n.wrapping_add(1));
+    }
+}
+
 /// Primary application frame: sidebar, top bar, and the routed page.
 ///
 /// Only routes that exist are linked. The project switcher arrives with
 /// projects in M2.
 #[component]
 pub fn DashboardLayout() -> impl IntoView {
+    provide_context(Refresh {
+        account: RwSignal::new(0),
+        organizations: RwSignal::new(0),
+    });
     view! {
         <a class="skip-link" href="#main-content">"Skip to content"</a>
         <div class="app-frame">
@@ -29,6 +47,10 @@ pub fn DashboardLayout() -> impl IntoView {
                     <A href="/dashboard/status" attr:class="nav-item">
                         <NavIcon kind=Icon::Status/>
                         <span class="nav-label">"Status"</span>
+                    </A>
+                    <A href="/dashboard/account/me" attr:class="nav-item">
+                        <NavIcon kind=Icon::Account/>
+                        <span class="nav-label">"Account"</span>
                     </A>
                 </nav>
             </aside>
@@ -66,7 +88,8 @@ fn OrganizationSwitcher() -> impl IntoView {
             .and_then(|rest| rest.split('/').next())
             .and_then(|id| id.parse::<Uuid>().ok())
     });
-    let organizations = Resource::new(|| (), |_| list_organizations());
+    let refresh = use_context::<Refresh>().map(|r| r.organizations);
+    let organizations = Resource::new(move || refresh.map(|r| r.get()), |_| list_organizations());
     view! {
         <Transition fallback=|| view! { <span class="crumb-empty">"Organizations"</span> }>
             {move || {
@@ -117,7 +140,8 @@ fn OrganizationSwitcher() -> impl IntoView {
 /// or image on another site cannot end the session.
 #[component]
 fn AccountMenu() -> impl IntoView {
-    let account = Resource::new(|| (), |_| get_current_account());
+    let refresh = use_context::<Refresh>().map(|r| r.account);
+    let account = Resource::new(move || refresh.map(|r| r.get()), |_| get_current_account());
     view! {
         <Transition fallback=|| ()>
             {move || {
@@ -130,10 +154,10 @@ fn AccountMenu() -> impl IntoView {
                         let title = email.clone();
                         view! {
                             <div class="account-menu">
-                                <span class="account-name" title=title>
+                                <a class="account-name" href="/dashboard/account/me" title=title>
                                     {account.display_name.as_str().to_owned()}
-                                    <span class="visually-hidden">" (" {email} ")"</span>
-                                </span>
+                                    <span class="visually-hidden">" (" {email} "), account settings"</span>
+                                </a>
                                 <form method="post" action="/auth/sign-out">
                                     <button type="submit" class="button">"Sign out"</button>
                                 </form>
@@ -149,6 +173,7 @@ fn AccountMenu() -> impl IntoView {
 enum Icon {
     Organizations,
     Status,
+    Account,
 }
 
 #[component]
@@ -156,6 +181,7 @@ fn NavIcon(kind: Icon) -> impl IntoView {
     let path = match kind {
         Icon::Organizations => "M3 21V7l9-4 9 4v14M9 21v-6h6v6M3 21h18",
         Icon::Status => "M3 12h4l3-8 4 16 3-8h4",
+        Icon::Account => "M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM4 21a8 8 0 0 1 16 0",
     };
     view! {
         <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">

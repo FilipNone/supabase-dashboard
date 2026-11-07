@@ -134,4 +134,87 @@ impl Database {
         })
         .transpose()
     }
+
+    /// Renames an account and records `audit` in the same transaction.
+    /// Returns `false` when the account does not exist.
+    pub async fn update_display_name(
+        &self,
+        account_id: Uuid,
+        display_name: &DisplayName,
+        audit: &AuditEvent<'_>,
+    ) -> Result<bool, PersistenceError> {
+        let mut tx = self.pool.begin().await.map_err(PersistenceError::Query)?;
+        let updated =
+            sqlx::query("UPDATE accounts SET display_name = $2, updated_at = now() WHERE id = $1")
+                .bind(account_id)
+                .bind(display_name.as_str())
+                .execute(&mut *tx)
+                .await
+                .map_err(PersistenceError::Query)?
+                .rows_affected()
+                == 1;
+        if updated {
+            insert_audit_event(&mut *tx, audit).await?;
+        }
+        tx.commit().await.map_err(PersistenceError::Query)?;
+        Ok(updated)
+    }
+
+    /// The stored password hash of an enabled account.
+    pub async fn find_password_hash(
+        &self,
+        account_id: Uuid,
+    ) -> Result<Option<String>, PersistenceError> {
+        sqlx::query_scalar(
+            "SELECT password_hash FROM accounts WHERE id = $1 AND disabled_at IS NULL",
+        )
+        .bind(account_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(PersistenceError::Query)
+    }
+
+    /// Replaces a password hash, but only if it is still `expected_hash`,
+    /// so a change verified against an older password cannot overwrite a
+    /// newer one. In the same transaction it revokes every other session of
+    /// the account except `keep_session` and records `audit`. Returns the
+    /// number of sessions revoked, or `None` when nothing was changed.
+    pub async fn change_password(
+        &self,
+        account_id: Uuid,
+        expected_hash: &str,
+        new_hash: &str,
+        keep_session: Uuid,
+        audit: &AuditEvent<'_>,
+    ) -> Result<Option<u64>, PersistenceError> {
+        let mut tx = self.pool.begin().await.map_err(PersistenceError::Query)?;
+        let updated = sqlx::query(
+            "UPDATE accounts SET password_hash = $3, updated_at = now() \
+             WHERE id = $1 AND password_hash = $2 AND disabled_at IS NULL",
+        )
+        .bind(account_id)
+        .bind(expected_hash)
+        .bind(new_hash)
+        .execute(&mut *tx)
+        .await
+        .map_err(PersistenceError::Query)?
+        .rows_affected()
+            == 1;
+        if !updated {
+            return Ok(None);
+        }
+        let revoked = sqlx::query(
+            "UPDATE sessions SET revoked_at = now() \
+             WHERE account_id = $1 AND revoked_at IS NULL AND id <> $2",
+        )
+        .bind(account_id)
+        .bind(keep_session)
+        .execute(&mut *tx)
+        .await
+        .map_err(PersistenceError::Query)?
+        .rows_affected();
+        insert_audit_event(&mut *tx, audit).await?;
+        tx.commit().await.map_err(PersistenceError::Query)?;
+        Ok(Some(revoked))
+    }
 }

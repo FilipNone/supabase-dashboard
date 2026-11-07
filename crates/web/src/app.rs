@@ -8,6 +8,7 @@ use supabase_dashboard_domain::theme::ThemePreference;
 
 use crate::components::layout::DashboardLayout;
 use crate::pages::{
+    account::{AccountLayout, AccountProfilePage, AccountSecurityPage},
     invite::InvitePage,
     not_found::NotFound,
     organization::{OrganizationGeneralPage, OrganizationLayout, OrganizationTeamPage},
@@ -92,6 +93,10 @@ pub fn App() -> impl IntoView {
                 <ParentRoute path=path!("/dashboard") view=DashboardLayout>
                     <Route path=path!("organizations") view=OrganizationsPage/>
                     <Route path=path!("status") view=StatusPage/>
+                    <ParentRoute path=path!("account") view=AccountLayout>
+                        <Route path=path!("me") view=AccountProfilePage/>
+                        <Route path=path!("security") view=AccountSecurityPage/>
+                    </ParentRoute>
                     <ParentRoute path=path!("org/:org_id") view=OrganizationLayout>
                         <Route path=path!("general") view=OrganizationGeneralPage/>
                         <Route path=path!("team") view=OrganizationTeamPage/>

@@ -2694,6 +2694,7 @@ dependencies = [
  "supabase-dashboard-application",
  "supabase-dashboard-domain",
  "thiserror 2.0.21",
+ "time",
  "tracing",
  "uuid",
  "wasm-bindgen",

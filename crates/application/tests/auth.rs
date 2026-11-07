@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use secrecy::SecretString;
 use supabase_dashboard_application::{
-    auth::{AuthConfig, AuthService, BootstrapError, RequestContext, SignInError},
+    auth::{
+        AccountUpdateError, AuthConfig, AuthService, BootstrapError, RequestContext, SignInError,
+    },
     throttle::ThrottleConfig,
 };
 use supabase_dashboard_persistence::Database;
@@ -216,6 +218,14 @@ async fn sessions_can_be_listed_and_revoked_only_by_their_owner() {
     let sessions = auth.list_sessions(&current).await.unwrap();
     assert_eq!(sessions.len(), 3);
     assert_eq!(sessions[0].user_agent.as_deref(), Some("integration-test"));
+    assert_eq!(
+        sessions
+            .iter()
+            .filter(|s| s.is_current)
+            .map(|s| s.id)
+            .collect::<Vec<_>>(),
+        vec![current.session_id]
+    );
 
     let other = auth
         .authenticate(second.token.expose_cookie_value())
@@ -259,6 +269,166 @@ async fn sessions_can_be_listed_and_revoked_only_by_their_owner() {
         "the current session survives"
     );
     assert_eq!(auth.prune_sessions().await.unwrap(), 2);
+    db.close().await;
+    scratch.drop().await;
+}
+
+#[tokio::test]
+async fn display_name_changes_are_validated_and_audited() {
+    let Some(scratch) = ScratchDb::create("app_profile").await else {
+        return;
+    };
+    let (db, auth) = service(&scratch).await;
+    bootstrap(&auth).await;
+    let signed_in = auth
+        .sign_in("owner@example.test", &SecretString::from(PASSWORD), ctx())
+        .await
+        .unwrap();
+    let current = auth
+        .authenticate(signed_in.token.expose_cookie_value())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let empty = auth.update_display_name(&current, "   ", ctx()).await;
+    assert!(matches!(empty, Err(AccountUpdateError::Input(_))));
+
+    let summary = auth
+        .update_display_name(&current, "  Ada Owner ", ctx())
+        .await
+        .unwrap();
+    assert_eq!(summary.display_name.as_str(), "Ada Owner");
+    assert_eq!(summary.email.as_str(), "owner@example.test");
+    let reloaded = auth
+        .authenticate(signed_in.token.expose_cookie_value())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reloaded.account.display_name.as_str(), "Ada Owner");
+    assert_eq!(
+        db.count_audit_events("account.update_profile")
+            .await
+            .unwrap(),
+        1
+    );
+    db.close().await;
+    scratch.drop().await;
+}
+
+#[tokio::test]
+async fn password_change_checks_the_old_password_and_signs_out_elsewhere() {
+    let Some(scratch) = ScratchDb::create("app_password").await else {
+        return;
+    };
+    let (db, auth) = service(&scratch).await;
+    bootstrap(&auth).await;
+    let password = SecretString::from(PASSWORD);
+    let here = auth
+        .sign_in("owner@example.test", &password, ctx())
+        .await
+        .unwrap();
+    let elsewhere = auth
+        .sign_in("owner@example.test", &password, ctx())
+        .await
+        .unwrap();
+    let current = auth
+        .authenticate(here.token.expose_cookie_value())
+        .await
+        .unwrap()
+        .unwrap();
+    let new_password = SecretString::from("a different long passphrase");
+
+    let weak = auth
+        .change_password(&current, &password, &SecretString::from("short"), ctx())
+        .await;
+    assert!(matches!(weak, Err(AccountUpdateError::Input(_))));
+
+    let wrong = auth
+        .change_password(
+            &current,
+            &SecretString::from("not the password"),
+            &new_password,
+            ctx(),
+        )
+        .await;
+    assert!(matches!(wrong, Err(AccountUpdateError::WrongPassword)));
+
+    let revoked = auth
+        .change_password(&current, &password, &new_password, ctx())
+        .await
+        .unwrap();
+    assert_eq!(revoked, 1);
+    assert!(
+        auth.authenticate(elsewhere.token.expose_cookie_value())
+            .await
+            .unwrap()
+            .is_none(),
+        "other sessions are signed out"
+    );
+    assert!(
+        auth.authenticate(here.token.expose_cookie_value())
+            .await
+            .unwrap()
+            .is_some(),
+        "the session that changed the password stays signed in"
+    );
+    assert!(matches!(
+        auth.sign_in("owner@example.test", &password, ctx()).await,
+        Err(SignInError::InvalidCredentials)
+    ));
+    auth.sign_in("owner@example.test", &new_password, ctx())
+        .await
+        .unwrap();
+    assert_eq!(
+        db.count_audit_events("account.password_change")
+            .await
+            .unwrap(),
+        2,
+        "one refusal and one success"
+    );
+    let stored: String = sqlx::query_scalar("SELECT password_hash FROM accounts")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert!(!stored.contains("a different long passphrase"));
+    db.close().await;
+    scratch.drop().await;
+}
+
+#[tokio::test]
+async fn wrong_current_passwords_share_the_sign_in_throttle() {
+    let Some(scratch) = ScratchDb::create("app_password_throttle").await else {
+        return;
+    };
+    let (db, auth) = service(&scratch).await;
+    bootstrap(&auth).await;
+    let password = SecretString::from(PASSWORD);
+    let here = auth
+        .sign_in("owner@example.test", &password, ctx())
+        .await
+        .unwrap();
+    let current = auth
+        .authenticate(here.token.expose_cookie_value())
+        .await
+        .unwrap()
+        .unwrap();
+    let guess = SecretString::from("a wrong guess here");
+    let new_password = SecretString::from("a different long passphrase");
+    for _ in 0..3 {
+        let result = auth
+            .change_password(&current, &guess, &new_password, ctx())
+            .await;
+        assert!(matches!(result, Err(AccountUpdateError::WrongPassword)));
+    }
+    // Blocked now, even with the right password, here and at sign-in.
+    let blocked = auth
+        .change_password(&current, &password, &new_password, ctx())
+        .await;
+    assert!(matches!(blocked, Err(AccountUpdateError::Throttled { .. })));
+    assert!(matches!(
+        auth.sign_in("owner@example.test", &password, ctx()).await,
+        Err(SignInError::Throttled { .. })
+    ));
     db.close().await;
     scratch.drop().await;
 }

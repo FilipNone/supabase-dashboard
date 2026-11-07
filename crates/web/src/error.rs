@@ -43,10 +43,33 @@ impl FromServerFnError for AppError {
 #[cfg(feature = "ssr")]
 mod server {
     use supabase_dashboard_application::{
-        auth::InvitationSignUpError, organizations::OrganizationError,
+        auth::{AccountUpdateError, AuthError, InvitationSignUpError},
+        organizations::OrganizationError,
     };
 
     use super::AppError;
+
+    impl From<AuthError> for AppError {
+        fn from(err: AuthError) -> Self {
+            tracing::error!(error = %err, "account operation failed");
+            Self::Unavailable
+        }
+    }
+
+    impl From<AccountUpdateError> for AppError {
+        fn from(err: AccountUpdateError) -> Self {
+            match err {
+                AccountUpdateError::WrongPassword
+                | AccountUpdateError::Conflict
+                | AccountUpdateError::Input(_) => Self::Rejected(err.to_string()),
+                AccountUpdateError::Throttled { retry_after } => Self::Rejected(format!(
+                    "Too many failed attempts. Try again in {} minutes.",
+                    retry_after.as_secs().div_ceil(60).max(1)
+                )),
+                AccountUpdateError::Internal(err) => err.into(),
+            }
+        }
+    }
 
     impl From<InvitationSignUpError> for AppError {
         fn from(err: InvitationSignUpError) -> Self {

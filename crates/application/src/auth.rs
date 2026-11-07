@@ -5,7 +5,9 @@ use std::time::{Duration, Instant};
 
 use secrecy::SecretString;
 use supabase_dashboard_domain::{
-    account::{AccountInputError, AccountSummary, DisplayName, Email, check_new_password},
+    account::{
+        AccountInputError, AccountSummary, DisplayName, Email, SessionSummary, check_new_password,
+    },
     invitation::InvitationPreview,
 };
 use supabase_dashboard_persistence::{
@@ -13,7 +15,7 @@ use supabase_dashboard_persistence::{
     accounts::{AccountRecord, NewAccount},
     audit::{AuditEvent, AuditOutcome},
     invitations::AcceptNewAccountOutcome,
-    sessions::{NewSession, SessionInfo},
+    sessions::NewSession,
 };
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -115,6 +117,34 @@ pub enum InvitationSignUpError {
 
 impl From<PersistenceError> for InvitationSignUpError {
     fn from(err: PersistenceError) -> Self {
+        Self::Internal(err.into())
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AccountUpdateError {
+    /// The current password given to confirm a change is wrong.
+    #[error("the current password is not correct")]
+    WrongPassword,
+    #[error("too many failed attempts")]
+    Throttled { retry_after: Duration },
+    /// The account was disabled or its password changed meanwhile.
+    #[error("your account changed while this was being saved; reload the page and try again")]
+    Conflict,
+    #[error(transparent)]
+    Input(#[from] AccountInputError),
+    #[error(transparent)]
+    Internal(#[from] AuthError),
+}
+
+impl From<PersistenceError> for AccountUpdateError {
+    fn from(err: PersistenceError) -> Self {
+        Self::Internal(err.into())
+    }
+}
+
+impl From<PasswordError> for AccountUpdateError {
+    fn from(err: PasswordError) -> Self {
         Self::Internal(err.into())
     }
 }
@@ -342,14 +372,113 @@ impl AuthService {
         Ok(())
     }
 
+    /// The operator's live sessions, newest first, with the one making
+    /// this request marked.
     pub async fn list_sessions(
         &self,
         current: &CurrentSession,
-    ) -> Result<Vec<SessionInfo>, AuthError> {
-        Ok(self
+    ) -> Result<Vec<SessionSummary>, AuthError> {
+        let sessions = self
             .db
             .list_live_sessions(current.account.id, self.config.idle_timeout)
-            .await?)
+            .await?;
+        Ok(sessions
+            .into_iter()
+            .map(|s| SessionSummary {
+                id: s.id,
+                created_at: s.created_at,
+                last_seen_at: s.last_seen_at,
+                expires_at: s.expires_at,
+                user_agent: s.user_agent,
+                is_current: s.id == current.session_id,
+            })
+            .collect())
+    }
+
+    /// Changes the operator's display name.
+    pub async fn update_display_name(
+        &self,
+        current: &CurrentSession,
+        display_name: &str,
+        ctx: RequestContext<'_>,
+    ) -> Result<AccountSummary, AccountUpdateError> {
+        let display_name = DisplayName::parse(display_name)?;
+        let event = AuditEvent {
+            actor_account_id: Some(current.account.id),
+            action: "account.update_profile",
+            target_type: Some("account"),
+            target_id: Some(current.account.id.to_string()),
+            outcome: AuditOutcome::Success,
+            request_id: ctx.request_id,
+        };
+        if !self
+            .db
+            .update_display_name(current.account.id, &display_name, &event)
+            .await?
+        {
+            return Err(AccountUpdateError::Conflict);
+        }
+        Ok(AccountSummary {
+            display_name,
+            ..current.summary()
+        })
+    }
+
+    /// Changes the operator's password after checking the current one, and
+    /// signs out every other session. Wrong current passwords count toward
+    /// the same throttle as failed sign-ins, so a stolen session cannot be
+    /// used to guess the password faster than the sign-in form allows.
+    /// Returns how many other sessions were signed out.
+    pub async fn change_password(
+        &self,
+        current: &CurrentSession,
+        current_password: &SecretString,
+        new_password: &SecretString,
+        ctx: RequestContext<'_>,
+    ) -> Result<u64, AccountUpdateError> {
+        use secrecy::ExposeSecret as _;
+        check_new_password(new_password.expose_secret())?;
+        let key = current.account.email.as_str();
+        self.throttle
+            .check(key, Instant::now())
+            .map_err(|retry_after| AccountUpdateError::Throttled { retry_after })?;
+        let stored = self
+            .db
+            .find_password_hash(current.account.id)
+            .await?
+            .ok_or(AccountUpdateError::Conflict)?;
+        if !self.hashing.verify(current_password, &stored).await? {
+            self.throttle.record_failure(key, Instant::now());
+            self.audit(
+                Some(current.account.id),
+                "account.password_change",
+                Some(("account", current.account.id)),
+                AuditOutcome::Denied,
+                ctx,
+            )
+            .await;
+            return Err(AccountUpdateError::WrongPassword);
+        }
+        self.throttle.record_success(key);
+        let new_hash = self.hashing.hash(new_password).await?;
+        let event = AuditEvent {
+            actor_account_id: Some(current.account.id),
+            action: "account.password_change",
+            target_type: Some("account"),
+            target_id: Some(current.account.id.to_string()),
+            outcome: AuditOutcome::Success,
+            request_id: ctx.request_id,
+        };
+        self.db
+            .change_password(
+                current.account.id,
+                &stored,
+                &new_hash,
+                current.session_id,
+                &event,
+            )
+            .await?
+            .ok_or(AccountUpdateError::Conflict)
     }
 
     /// Revokes one of the current operator's own sessions. Returns `false`

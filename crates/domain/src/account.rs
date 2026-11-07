@@ -155,6 +155,20 @@ pub struct AccountSummary {
     pub is_installation_admin: bool,
 }
 
+/// One of the operator's own signed-in sessions, as listed on the account
+/// security page. The ID is an identifier for revocation, not a credential:
+/// the session token itself is never stored or sent back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub id: uuid::Uuid,
+    pub created_at: time::OffsetDateTime,
+    pub last_seen_at: time::OffsetDateTime,
+    pub expires_at: time::OffsetDateTime,
+    pub user_agent: Option<String>,
+    /// The session making this request.
+    pub is_current: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

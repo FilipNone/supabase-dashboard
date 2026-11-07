@@ -8,7 +8,7 @@ use std::fmt;
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 use supabase_dashboard_domain::{
-    account::AccountSummary,
+    account::{AccountSummary, SessionSummary},
     authz::OrgRole,
     health::InstallationHealth,
     invitation::{InvitationCode, InvitationPreview, InvitationSummary, IssuedInvitation},
@@ -299,5 +299,78 @@ pub async fn sign_up_with_invitation(
     let audit = org_context::AuditContext::current();
     Ok(org_context::auth()?
         .accept_invitation_with_new_account(code.expose(), &display_name, &password, audit.get())
+        .await?)
+}
+
+/// Changes the signed-in operator's display name.
+#[server]
+pub async fn update_profile(display_name: String) -> Result<AccountSummary, AppError> {
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    Ok(org_context::auth()?
+        .update_display_name(&session, &display_name, audit.get())
+        .await?)
+}
+
+/// Changes the signed-in operator's password and signs out their other
+/// sessions. Returns how many were signed out.
+#[server]
+pub async fn change_password(
+    current_password: PasswordInput,
+    new_password: PasswordInput,
+    new_password_confirmation: PasswordInput,
+) -> Result<u64, AppError> {
+    let session = org_context::session()?;
+    if new_password.0 != new_password_confirmation.0 {
+        return Err(AppError::Rejected(
+            "The new passwords do not match.".to_string(),
+        ));
+    }
+    let audit = org_context::AuditContext::current();
+    Ok(org_context::auth()?
+        .change_password(
+            &session,
+            &secrecy::SecretString::from(current_password.0),
+            &secrecy::SecretString::from(new_password.0),
+            audit.get(),
+        )
+        .await?)
+}
+
+/// The signed-in operator's live sessions.
+#[server]
+pub async fn list_sessions() -> Result<Vec<SessionSummary>, AppError> {
+    let session = org_context::session()?;
+    Ok(org_context::auth()?.list_sessions(&session).await?)
+}
+
+/// Signs out one of the operator's other sessions. The current session
+/// ends through the regular sign-out form instead.
+#[server]
+pub async fn revoke_session(session_id: Uuid) -> Result<(), AppError> {
+    let session = org_context::session()?;
+    if session_id == session.session_id {
+        return Err(AppError::Rejected(
+            "Use Sign out to end the session you are using.".to_string(),
+        ));
+    }
+    let audit = org_context::AuditContext::current();
+    if org_context::auth()?
+        .revoke_own_session(&session, session_id, audit.get())
+        .await?
+    {
+        Ok(())
+    } else {
+        Err(AppError::NotFound)
+    }
+}
+
+/// Signs out every session of the operator except this one.
+#[server]
+pub async fn revoke_other_sessions() -> Result<u64, AppError> {
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    Ok(org_context::auth()?
+        .revoke_other_sessions(&session, audit.get())
         .await?)
 }
