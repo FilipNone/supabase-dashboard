@@ -17,7 +17,10 @@ use supabase_dashboard_domain::{
 use uuid::Uuid;
 
 use crate::{
-    components::page::{PageHeader, StatePanel, StateTone},
+    components::{
+        layout::Refresh,
+        page::{PageHeader, StatePanel, StateTone},
+    },
     error::AppError,
     server_fns::{
         RegisterProject, RenameProject, UnregisterProject, get_organization, get_project,
@@ -58,8 +61,12 @@ pub fn NewProjectPage() -> impl IntoView {
     );
     let register = ServerAction::<RegisterProject>::new();
     let navigate = use_navigate();
+    let refresh = use_context::<Refresh>();
     Effect::new(move |_| {
         if let Some(Ok(project)) = register.value().get() {
+            if let Some(refresh) = refresh {
+                refresh.projects_changed();
+            }
             navigate(&project_path(project.id), Default::default());
         }
     });
@@ -180,6 +187,13 @@ pub fn ProjectLayout() -> impl IntoView {
         },
     );
     provide_context(ProjectContext { project, rename });
+    // A new name shows in the top bar's project menu too.
+    let refresh = use_context::<Refresh>();
+    Effect::new(move |_| {
+        if let (Some(Ok(_)), Some(refresh)) = (rename.value().get(), refresh) {
+            refresh.projects_changed();
+        }
+    });
 
     view! {
         <Transition fallback=|| view! { <p class="loading" role="status">"Loading project…"</p> }>
@@ -279,9 +293,13 @@ pub fn ProjectSettingsPage() -> impl IntoView {
     let unregister = ServerAction::<UnregisterProject>::new();
     let navigate = use_navigate();
     let organization = Memo::new(move |_| loaded_project(ctx).map(|p| p.organization_id));
+    let refresh = use_context::<Refresh>();
     Effect::new(move |_| {
         if let (Some(Ok(())), Some(org)) = (unregister.value().get(), organization.get_untracked())
         {
+            if let Some(refresh) = refresh {
+                refresh.projects_changed();
+            }
             navigate(&org_path(org), Default::default());
         }
     });

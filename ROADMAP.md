@@ -36,7 +36,7 @@ The main technical risks are privileged credentials, isolation between organizat
 - [x] Record the architecture decision, Rust toolchain, selected framework versions, and application license; verify any reused upstream licenses separately. (ADR 0001, `MIT OR Apache-2.0`; the fixture compose is adapted from Apache-2.0 upstream files with attribution.)
 - [x] Create a minimal Cargo workspace with a running server, Rust UI, health endpoint, configuration validation, and graceful shutdown.
 - [x] Establish separate control-plane PostgreSQL storage, versioned migrations, secret-storage strategy, and backup/recovery requirements. (Strategy and requirements are documented in ADR 0001; encryption is implemented when M2 first stores credentials; the tested restore runbook is an M4 item.)
-- [ ] Build the reference-style shell: primary sidebar, organization/project switchers, page headers, tables, dialogs, dark/light/system themes, and responsive navigation. (Done: sidebar, top bar, page header, table, empty/error states, themes, responsive navigation, checked at 1280px and 390px in both themes. The organization switcher in the top bar lists the operator's organizations and marks the current one. Remaining: dialogs, and the project switcher. Projects exist now, but the top bar does not show the current project yet.)
+- [ ] Build the reference-style shell: primary sidebar, organization/project switchers, page headers, tables, dialogs, dark/light/system themes, and responsive navigation. (Done: sidebar, top bar, page header, table, empty/error states, themes, responsive navigation, checked at 1280px and 390px in both themes. The organization switcher in the top bar lists the operator's organizations and marks the current one. Inside an organization a project switcher lists its projects; on a project page both show the project's organization and the project, and phones show only the innermost menu. Checked at 1280px dark and 390px light. Remaining: dialogs.)
 - [x] Add structured redacted logs, request IDs, typed API errors, bounded requests, and documented local development setup. (`ApiError` gives a JSON envelope with stable codes; new variants are added with the endpoints that need them.)
 - [x] Add formatting, clippy, unit/integration checks, server/UI builds, and a synthetic disposable Supabase fixture with pinned component versions. Document an explicit supported-version baseline. (`docs/supabase-compatibility.md`; the fixture covers db, auth, rest, and meta.)
 
@@ -172,6 +172,7 @@ Release checks include a fresh installation, migration from the previous support
 
 ## Revision history
 
+- 2026-11-07: added the top-bar project switcher; the M0 shell item now only lacks dialogs.
 - 2026-11-07: the administrator view now lists every organization and registered project, read-only. Marked the M1 administrator item done.
 - 2026-11-07: M2 project registry: register an existing stack by API URL (plain HTTP needs explicit confirmation), list, rename, and unregister with typed confirmation. Marked the M2 unregister item done; connections, credentials, and health are still open.
 - 2026-11-07: added the installation admin account list with disable and enable; the M1 administrator item stays open until projects exist.

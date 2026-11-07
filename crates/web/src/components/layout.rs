@@ -5,10 +5,14 @@ use leptos_router::{
 };
 use uuid::Uuid;
 
-use super::theme_switcher::ThemeSwitcher;
-use supabase_dashboard_domain::account::AccountSummary;
+use serde::{Deserialize, Serialize};
+use supabase_dashboard_domain::{account::AccountSummary, project::ProjectSummary};
 
-use crate::server_fns::{get_current_account, list_organizations};
+use super::theme_switcher::ThemeSwitcher;
+use crate::{
+    pages::project::project_path,
+    server_fns::{get_current_account, get_project, list_organizations, list_projects},
+};
 
 /// Counters that pages bump after changing something the frame shows, so
 /// the top bar reloads it.
@@ -16,11 +20,16 @@ use crate::server_fns::{get_current_account, list_organizations};
 pub struct Refresh {
     pub account: RwSignal<u32>,
     pub organizations: RwSignal<u32>,
+    pub projects: RwSignal<u32>,
 }
 
 impl Refresh {
     pub fn organizations_changed(self) {
         self.organizations.update(|n| *n = n.wrapping_add(1));
+    }
+
+    pub fn projects_changed(self) {
+        self.projects.update(|n| *n = n.wrapping_add(1));
     }
 }
 
@@ -44,13 +53,13 @@ impl CurrentAccount {
 
 /// Primary application frame: sidebar, top bar, and the routed page.
 ///
-/// Only routes that exist are linked. The project switcher arrives with
-/// projects in M2.
+/// Only routes that exist are linked.
 #[component]
 pub fn DashboardLayout() -> impl IntoView {
     let refresh = Refresh {
         account: RwSignal::new(0),
         organizations: RwSignal::new(0),
+        projects: RwSignal::new(0),
     };
     provide_context(refresh);
     let account = CurrentAccount(Resource::new(
@@ -95,7 +104,7 @@ pub fn DashboardLayout() -> impl IntoView {
                     <nav class="breadcrumbs" aria-label="Context">
                         <span class="crumb-static">"Dashboard"</span>
                         <span class="crumb-sep" aria-hidden="true">"/"</span>
-                        <OrganizationSwitcher/>
+                        <ContextSwitchers/>
                     </nav>
                     <div class="topbar-actions">
                         <ThemeSwitcher/>
@@ -110,64 +119,165 @@ pub fn DashboardLayout() -> impl IntoView {
     }
 }
 
-/// Breadcrumb menu listing the operator's organizations. It is a
-/// `<details>` element, so it opens with the keyboard and works before the
-/// WASM bundle loads.
-#[component]
-fn OrganizationSwitcher() -> impl IntoView {
-    let location = use_location();
-    let current_id = Memo::new(move |_| {
-        let path = location.pathname.get();
-        path.strip_prefix("/dashboard/org/")
-            .or_else(|| path.strip_prefix("/dashboard/new/"))
+/// Which organization or project the current page belongs to, read from
+/// the path. These are identifiers only; the server checks access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PageScope {
+    None,
+    Organization(Uuid),
+    Project(Uuid),
+}
+
+fn page_scope(path: &str) -> PageScope {
+    let id_after = |prefix: &str| {
+        path.strip_prefix(prefix)
             .and_then(|rest| rest.split('/').next())
             .and_then(|id| id.parse::<Uuid>().ok())
-    });
-    let refresh = use_context::<Refresh>().map(|r| r.organizations);
-    let organizations = Resource::new(move || refresh.map(|r| r.get()), |_| list_organizations());
+    };
+    if let Some(id) = id_after("/dashboard/project/") {
+        PageScope::Project(id)
+    } else if let Some(id) = id_after("/dashboard/org/").or_else(|| id_after("/dashboard/new/")) {
+        PageScope::Organization(id)
+    } else {
+        PageScope::None
+    }
+}
+
+/// The organization and project the current page belongs to, and that
+/// organization's projects for the project menu.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct ScopeContext {
+    organization: Option<Uuid>,
+    project: Option<Uuid>,
+    projects: Vec<ProjectSummary>,
+}
+
+async fn load_scope(scope: PageScope) -> ScopeContext {
+    let (organization, project) = match scope {
+        PageScope::None => return ScopeContext::default(),
+        PageScope::Organization(id) => (id, None),
+        // On a project page the organization comes from the project.
+        PageScope::Project(id) => match get_project(id).await {
+            Ok(project) => (project.organization_id, Some(project.id)),
+            Err(_) => return ScopeContext::default(),
+        },
+    };
+    ScopeContext {
+        organization: Some(organization),
+        project,
+        projects: list_projects(organization).await.unwrap_or_default(),
+    }
+}
+
+/// Breadcrumb menus for the organization and, inside one, its projects.
+/// They are `<details>` elements, so they open with the keyboard and work
+/// before the WASM bundle loads. Phones show only the innermost one.
+#[component]
+fn ContextSwitchers() -> impl IntoView {
+    let location = use_location();
+    let scope = Memo::new(move |_| page_scope(&location.pathname.get()));
+    let refresh = use_context::<Refresh>();
+    let organizations = Resource::new(
+        move || refresh.map(|r| r.organizations.get()),
+        |_| list_organizations(),
+    );
+    let context = Resource::new(
+        move || (scope.get(), refresh.map(|r| r.projects.get())),
+        |(scope, _)| load_scope(scope),
+    );
     view! {
         <Transition fallback=|| view! { <span class="crumb-empty">"Organizations"</span> }>
             {move || {
-                organizations.get().map(|result| {
-                    let list = result.unwrap_or_default();
-                    let current = current_id.get();
-                    let label = current
-                        .and_then(|id| list.iter().find(|org| org.id == id))
-                        .map_or_else(
-                            || "Select organization".to_owned(),
-                            |org| org.name.as_str().to_owned(),
-                        );
-                    let items = list
-                        .into_iter()
-                        .map(|org| {
-                            let href = format!("/dashboard/org/{}", org.id);
-                            let selected = (Some(org.id) == current).then_some("page");
-                            view! {
-                                <li>
-                                    <a href=href aria-current=selected>
-                                        {org.name.as_str().to_owned()}
-                                    </a>
-                                </li>
-                            }
-                        })
-                        .collect_view();
+                let list = organizations.get()?.unwrap_or_default();
+                let context = context.get()?;
+                let organization = context
+                    .organization
+                    .and_then(|id| list.iter().find(|org| org.id == id).cloned());
+                let in_project = context.project.is_some();
+                let project_menu = organization.as_ref().map(|org| {
                     view! {
-                        <details class="switcher">
-                            <summary class="switcher-button">
-                                <span class="visually-hidden">"Organization: "</span>
-                                {label}
-                            </summary>
-                            <div class="switcher-menu">
-                                <ul>{items}</ul>
-                                <a class="switcher-all" href="/dashboard/organizations">
-                                    "All organizations"
-                                </a>
-                            </div>
-                        </details>
+                        <span class="crumb-sep" aria-hidden="true">"/"</span>
+                        <ProjectMenu
+                            organization=org.id
+                            current=context.project
+                            projects=context.projects.clone()
+                        />
                     }
+                });
+                let items = list
+                    .iter()
+                    .map(|org| {
+                        let href = format!("/dashboard/org/{}", org.id);
+                        let selected = (context.organization == Some(org.id)).then_some("page");
+                        view! {
+                            <li>
+                                <a href=href aria-current=selected>{org.name.as_str().to_owned()}</a>
+                            </li>
+                        }
+                    })
+                    .collect_view();
+                let label = organization.map_or_else(
+                    || "Select organization".to_owned(),
+                    |org| org.name.as_str().to_owned(),
+                );
+                Some(view! {
+                    <details class="switcher" class:crumb-outer=in_project>
+                        <summary class="switcher-button">
+                            <span class="visually-hidden">"Organization: "</span>
+                            {label}
+                        </summary>
+                        <div class="switcher-menu">
+                            <ul>{items}</ul>
+                            <a class="switcher-all" href="/dashboard/organizations">
+                                "All organizations"
+                            </a>
+                        </div>
+                    </details>
+                    {project_menu}
                 })
             }}
         </Transition>
+    }
+}
+
+#[component]
+fn ProjectMenu(
+    organization: Uuid,
+    current: Option<Uuid>,
+    projects: Vec<ProjectSummary>,
+) -> impl IntoView {
+    let label = current
+        .and_then(|id| projects.iter().find(|p| p.id == id))
+        .map_or_else(
+            || "Select project".to_owned(),
+            |p| p.name.as_str().to_owned(),
+        );
+    let items = projects
+        .into_iter()
+        .map(|project| {
+            let selected = (current == Some(project.id)).then_some("page");
+            view! {
+                <li>
+                    <a href=project_path(project.id) aria-current=selected>
+                        {project.name.as_str().to_owned()}
+                    </a>
+                </li>
+            }
+        })
+        .collect_view();
+    view! {
+        <details class="switcher" class:crumb-outer=current.is_none()>
+            <summary class="switcher-button">
+                <span class="visually-hidden">"Project: "</span>
+                {label}
+            </summary>
+            <div class="switcher-menu">
+                <ul>{items}</ul>
+                <a class="switcher-all" href=format!("/dashboard/org/{organization}")>
+                    "All projects"
+                </a>
+            </div>
+        </details>
     }
 }
 
@@ -225,5 +335,37 @@ fn NavIcon(kind: Icon) -> impl IntoView {
             <path d=path fill="none" stroke="currentColor" stroke-width="1.6"
                 stroke-linecap="round" stroke-linejoin="round"/>
         </svg>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PageScope, page_scope};
+
+    #[test]
+    fn page_scope_reads_ids_from_known_paths_only() {
+        let id = uuid::Uuid::nil();
+        assert_eq!(
+            page_scope(&format!("/dashboard/project/{id}/settings")),
+            PageScope::Project(id)
+        );
+        assert_eq!(
+            page_scope(&format!("/dashboard/project/{id}")),
+            PageScope::Project(id)
+        );
+        assert_eq!(
+            page_scope(&format!("/dashboard/org/{id}/team")),
+            PageScope::Organization(id)
+        );
+        assert_eq!(
+            page_scope(&format!("/dashboard/new/{id}")),
+            PageScope::Organization(id)
+        );
+        assert_eq!(page_scope("/dashboard/project/not-a-uuid"), PageScope::None);
+        assert_eq!(page_scope("/dashboard/organizations"), PageScope::None);
+        assert_eq!(
+            page_scope(&format!("/elsewhere/project/{id}")),
+            PageScope::None
+        );
     }
 }

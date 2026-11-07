@@ -368,7 +368,7 @@ code { font-family: var(--font-mono); font-size: var(--text-sm); }
   .inline-form.compact { flex-wrap: wrap; }
 }
 
-/* Organization switcher */
+/* Organization and project switchers */
 .switcher { position: relative; min-width: 0; }
 .switcher-button {
   list-style: none; display: inline-flex; align-items: center; gap: var(--space-1);
@@ -398,6 +398,8 @@ td { vertical-align: middle; }
   .breadcrumbs .crumb-static, .breadcrumbs .crumb-sep { display: none; }
   .breadcrumbs { flex-shrink: 1; }
   .switcher-button { max-width: 7.5rem; }
+  /* Phones show only the innermost context menu. */
+  .breadcrumbs .crumb-outer { display: none; }
   .inline-form.compact .input { width: 100%; }
 }
 
