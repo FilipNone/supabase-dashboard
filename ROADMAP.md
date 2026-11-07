@@ -33,7 +33,7 @@ The main technical risks are privileged credentials, isolation between organizat
 
 ### M0: foundation (P1)
 
-- [x] Record the architecture decision, Rust toolchain, selected framework versions, and application license; verify any reused upstream licenses separately. (ADR 0001, Apache-2.0; the fixture compose is adapted from Apache-2.0 upstream files with attribution.)
+- [x] Record the architecture decision, Rust toolchain, selected framework versions, and application license; verify any reused upstream licenses separately. (ADR 0001, `MIT OR Apache-2.0`; the fixture compose is adapted from Apache-2.0 upstream files with attribution.)
 - [x] Create a minimal Cargo workspace with a running server, Rust UI, health endpoint, configuration validation, and graceful shutdown.
 - [x] Establish separate control-plane PostgreSQL storage, versioned migrations, secret-storage strategy, and backup/recovery requirements. (Strategy and requirements are documented in ADR 0001; encryption is implemented when M2 first stores credentials; the tested restore runbook is an M4 item.)
 - [ ] Build the reference-style shell: primary sidebar, organization/project switchers, page headers, tables, dialogs, dark/light/system themes, and responsive navigation. (Done: sidebar, top bar, page header, table, empty/error states, themes, responsive navigation, checked at 1280px and 390px in both themes. Remaining: dialogs and working switchers, which need M1 organizations to show anything real.)
@@ -172,5 +172,6 @@ Release checks include a fresh installation, migration from the previous support
 
 ## Revision history
 
+- 2026-11-07: relicensed the application from Apache-2.0 to `MIT OR Apache-2.0`.
 - 2026-11-07: M0 scaffold landed: workspace, server, UI shell, metadata migrations, CI, and the Supabase fixture. Updated M0 checkboxes with what remains.
 - 2026-11-05: reviewed the initial feature/page list, retained its requested areas, added missing project workflows, and organized implementation around security boundaries, adapter capabilities, milestone dependencies, and testable acceptance criteria.

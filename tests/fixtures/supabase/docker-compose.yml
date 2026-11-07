@@ -1,6 +1,7 @@
 # Disposable self-hosted Supabase subset for adapter tests.
 #
-# Adapted from supabase/supabase docker/docker-compose.yml (Apache-2.0),
+# Adapted from supabase/supabase docker/docker-compose.yml. This file stays
+# under Apache-2.0 (see LICENSE-APACHE), not the MIT option. It is
 # reduced to the services the dashboard talks to first. Image tags match the
 # upstream file as of 2026-11-07. All ports bind to 127.0.0.1 and there is
 # no persistent volume: `down` discards everything.

@@ -59,7 +59,9 @@ No managed-project credentials are stored in M0. When M2 adds them:
 
 ## License
 
-The application is licensed under Apache-2.0 (see `LICENSE`). This matches the license used by most of the Supabase repositories, which keeps reuse simple if code is borrowed later. Any reused upstream file still needs its license and notices checked individually; Supabase trademarks and logos are not covered by any code license.
+The application is dual licensed under `MIT OR Apache-2.0` (see `LICENSE-MIT` and `LICENSE-APACHE`), the usual choice for Rust projects. Users can take the MIT terms, which only require keeping the copyright notice, or the Apache-2.0 terms, which add an explicit patent grant. Apache-2.0 alone was used at first and was replaced because it is the stricter of the two.
+
+Files adapted from Apache-2.0 upstream sources, such as the Supabase fixture compose file, stay under Apache-2.0 and say so in their header. Any other reused upstream file still needs its license and notices checked individually. Supabase trademarks and logos are not covered by any code license.
 
 ## Consequences
 
