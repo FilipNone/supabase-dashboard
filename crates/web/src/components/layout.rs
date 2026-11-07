@@ -6,6 +6,8 @@ use leptos_router::{
 use uuid::Uuid;
 
 use super::theme_switcher::ThemeSwitcher;
+use supabase_dashboard_domain::account::AccountSummary;
+
 use crate::server_fns::{get_current_account, list_organizations};
 
 /// Counters that pages bump after changing something the frame shows, so
@@ -22,16 +24,40 @@ impl Refresh {
     }
 }
 
+/// The signed-in operator, loaded once per frame and shared with the top
+/// bar and sidebar.
+#[derive(Clone, Copy)]
+pub struct CurrentAccount(pub Resource<Result<Option<AccountSummary>, ServerFnError>>);
+
+impl CurrentAccount {
+    pub fn get(self) -> Option<AccountSummary> {
+        self.0.get().and_then(Result::ok).flatten()
+    }
+
+    /// Whether to show administrator links. The server checks the flag
+    /// again on every administrator call.
+    pub fn admin(self) -> bool {
+        self.get()
+            .is_some_and(|account| account.is_installation_admin)
+    }
+}
+
 /// Primary application frame: sidebar, top bar, and the routed page.
 ///
 /// Only routes that exist are linked. The project switcher arrives with
 /// projects in M2.
 #[component]
 pub fn DashboardLayout() -> impl IntoView {
-    provide_context(Refresh {
+    let refresh = Refresh {
         account: RwSignal::new(0),
         organizations: RwSignal::new(0),
-    });
+    };
+    provide_context(refresh);
+    let account = CurrentAccount(Resource::new(
+        move || refresh.account.get(),
+        |_| get_current_account(),
+    ));
+    provide_context(account);
     view! {
         <a class="skip-link" href="#main-content">"Skip to content"</a>
         <div class="app-frame">
@@ -52,6 +78,16 @@ pub fn DashboardLayout() -> impl IntoView {
                         <NavIcon kind=Icon::Account/>
                         <span class="nav-label">"Account"</span>
                     </A>
+                    <Transition fallback=|| ()>
+                        {move || {
+                            account.admin().then(|| view! {
+                                <A href="/dashboard/admin" attr:class="nav-item">
+                                    <NavIcon kind=Icon::Admin/>
+                                    <span class="nav-label">"Admin"</span>
+                                </A>
+                            })
+                        }}
+                    </Transition>
                 </nav>
             </aside>
             <div class="frame-main">
@@ -140,15 +176,14 @@ fn OrganizationSwitcher() -> impl IntoView {
 /// or image on another site cannot end the session.
 #[component]
 fn AccountMenu() -> impl IntoView {
-    let refresh = use_context::<Refresh>().map(|r| r.account);
-    let account = Resource::new(move || refresh.map(|r| r.get()), |_| get_current_account());
+    let Some(account) = use_context::<CurrentAccount>() else {
+        return ().into_any();
+    };
     view! {
         <Transition fallback=|| ()>
             {move || {
                 account
                     .get()
-                    .and_then(Result::ok)
-                    .flatten()
                     .map(|account| {
                         let email = account.email.to_string();
                         let title = email.clone();
@@ -167,6 +202,7 @@ fn AccountMenu() -> impl IntoView {
             }}
         </Transition>
     }
+    .into_any()
 }
 
 #[derive(Clone, Copy)]
@@ -174,6 +210,7 @@ enum Icon {
     Organizations,
     Status,
     Account,
+    Admin,
 }
 
 #[component]
@@ -182,6 +219,7 @@ fn NavIcon(kind: Icon) -> impl IntoView {
         Icon::Organizations => "M3 21V7l9-4 9 4v14M9 21v-6h6v6M3 21h18",
         Icon::Status => "M3 12h4l3-8 4 16 3-8h4",
         Icon::Account => "M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM4 21a8 8 0 0 1 16 0",
+        Icon::Admin => "M12 3l8 3v6c0 4.5-3.4 8.2-8 9-4.6-.8-8-4.5-8-9V6l8-3zM9 12l2 2 4-4",
     };
     view! {
         <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">

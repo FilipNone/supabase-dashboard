@@ -43,7 +43,7 @@ impl FromServerFnError for AppError {
 #[cfg(feature = "ssr")]
 mod server {
     use supabase_dashboard_application::{
-        auth::{AccountUpdateError, AuthError, InvitationSignUpError},
+        auth::{AccountUpdateError, AdminError, AuthError, InvitationSignUpError},
         organizations::OrganizationError,
     };
 
@@ -53,6 +53,19 @@ mod server {
         fn from(err: AuthError) -> Self {
             tracing::error!(error = %err, "account operation failed");
             Self::Unavailable
+        }
+    }
+
+    impl From<AdminError> for AppError {
+        fn from(err: AdminError) -> Self {
+            match err {
+                AdminError::Forbidden => Self::Forbidden,
+                AdminError::NotFound => Self::NotFound,
+                AdminError::CannotDisableSelf | AdminError::LastAdmin => {
+                    Self::Rejected(err.to_string())
+                }
+                AdminError::Internal(err) => err.into(),
+            }
         }
     }
 

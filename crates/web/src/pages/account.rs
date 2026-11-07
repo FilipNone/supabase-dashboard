@@ -281,9 +281,9 @@ fn SessionTable(
             view! {
                 <tr>
                     <td title=full_agent>{device}</td>
-                    <td>{utc_minutes(session.created_at)}</td>
-                    <td>{utc_minutes(session.last_seen_at)}</td>
-                    <td>{utc_minutes(session.expires_at)}</td>
+                    <td class="nowrap">{utc_minutes(session.created_at)}</td>
+                    <td class="nowrap">{utc_minutes(session.last_seen_at)}</td>
+                    <td class="nowrap">{utc_minutes(session.expires_at)}</td>
                     <td>{action}</td>
                 </tr>
             }

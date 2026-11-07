@@ -145,10 +145,10 @@ mod tests {
     use supabase_dashboard_web::{
         app::SIGN_IN_PATH,
         server_fns::{
-            ChangePassword, CreateInvitation, CreateOrganization, GetCurrentAccount,
-            GetInstallationHealth, GetOrganization, ListOrganizations, ListSessions,
-            PreviewInvitation, RenameOrganization, RevokeSession, SignUpWithInvitation,
-            UpdateProfile,
+            AdminListAccounts, AdminSetAccountDisabled, ChangePassword, CreateInvitation,
+            CreateOrganization, GetCurrentAccount, GetInstallationHealth, GetOrganization,
+            ListOrganizations, ListSessions, PreviewInvitation, RenameOrganization, RevokeSession,
+            SignUpWithInvitation, UpdateProfile,
         },
     };
     use tower::ServiceExt;
@@ -853,6 +853,89 @@ mod tests {
         let body = "email=alice%40example.test&password=a+brand+new+passphrase";
         let (parts, _) = send(&router, form_post("/auth/sign-in", body, None)).await;
         assert_eq!(location(&parts), HOME_PATH);
+
+        db.close().await;
+        scratch.drop().await;
+    }
+
+    #[tokio::test]
+    async fn only_installation_admins_reach_account_administration() {
+        let Some(scratch) = ScratchDb::create("http_admin").await else {
+            return;
+        };
+        let db = Database::connect(&scratch.settings).await.unwrap();
+        db.migrate().await.unwrap();
+        let router = router_for(db.clone()).await;
+        AuthService::new(db.clone(), AuthConfig::default())
+            .await
+            .unwrap()
+            .bootstrap_owner(
+                "alice@example.test",
+                "Alice",
+                &SecretString::from("correct horse battery staple"),
+            )
+            .await
+            .unwrap();
+        let bob_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO accounts (id, email, display_name, password_hash) \
+             SELECT gen_random_uuid(), 'bob@example.test', 'Bob', password_hash FROM accounts \
+             RETURNING id",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let alice = sign_in_cookie(&router, "alice%40example.test").await;
+        let bob = sign_in_cookie(&router, "bob%40example.test").await;
+        let call = |path: &'static str, body: String, cookie: &str| {
+            send(&router, form_post(path, &body, Some(cookie)))
+        };
+
+        // Bob is not an administrator: refused, and the page shows nothing.
+        let (parts, body) = call(AdminListAccounts::PATH, String::new(), &bob).await;
+        assert!(!parts.status.is_success());
+        assert!(
+            body.contains("Forbidden") && !body.contains("alice"),
+            "{body}"
+        );
+        let alice_id: uuid::Uuid =
+            sqlx::query_scalar("SELECT id FROM accounts WHERE email = 'alice@example.test'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let (_, body) = call(
+            AdminSetAccountDisabled::PATH,
+            format!("account_id={alice_id}&disabled=true"),
+            &bob,
+        )
+        .await;
+        assert!(body.contains("Forbidden"), "{body}");
+        let (parts, body) = send(&router, get_with_cookie("/dashboard/admin", &bob)).await;
+        assert_eq!(parts.status, StatusCode::OK);
+        assert!(body.contains("Administrators only"), "{body}");
+        assert!(!body.contains("alice@example.test"), "{body}");
+
+        // Alice lists both accounts and disables Bob, who is signed out.
+        let (parts, body) = call(AdminListAccounts::PATH, String::new(), &alice).await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        assert!(body.contains("bob@example.test"), "{body}");
+        assert!(!body.contains("argon2"), "{body}");
+        let (_, body) = call(
+            AdminSetAccountDisabled::PATH,
+            format!("account_id={alice_id}&disabled=true"),
+            &alice,
+        )
+        .await;
+        assert!(body.contains("your own account"), "{body}");
+        let (parts, body) = call(
+            AdminSetAccountDisabled::PATH,
+            format!("account_id={bob_id}&disabled=true"),
+            &alice,
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        assert_eq!(body, "true");
+        let (parts, _) = call(ListSessions::PATH, String::new(), &bob).await;
+        assert_eq!(parts.status, StatusCode::UNAUTHORIZED);
 
         db.close().await;
         scratch.drop().await;

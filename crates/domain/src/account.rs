@@ -155,6 +155,20 @@ pub struct AccountSummary {
     pub is_installation_admin: bool,
 }
 
+/// An account as listed for installation administrators.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminAccountSummary {
+    pub id: uuid::Uuid,
+    pub email: Email,
+    pub display_name: DisplayName,
+    pub is_installation_admin: bool,
+    pub disabled: bool,
+    pub created_at: time::OffsetDateTime,
+    pub organization_count: i64,
+    /// The administrator viewing the list.
+    pub is_you: bool,
+}
+
 /// One of the operator's own signed-in sessions, as listed on the account
 /// security page. The ID is an identifier for revocation, not a credential:
 /// the session token itself is never stored or sent back.

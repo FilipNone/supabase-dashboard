@@ -8,7 +8,7 @@ use std::fmt;
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 use supabase_dashboard_domain::{
-    account::{AccountSummary, SessionSummary},
+    account::{AccountSummary, AdminAccountSummary, SessionSummary},
     authz::OrgRole,
     health::InstallationHealth,
     invitation::{InvitationCode, InvitationPreview, InvitationSummary, IssuedInvitation},
@@ -372,5 +372,29 @@ pub async fn revoke_other_sessions() -> Result<u64, AppError> {
     let audit = org_context::AuditContext::current();
     Ok(org_context::auth()?
         .revoke_other_sessions(&session, audit.get())
+        .await?)
+}
+
+/// Every account of the installation. Installation administrators only.
+#[server]
+pub async fn admin_list_accounts() -> Result<Vec<AdminAccountSummary>, AppError> {
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    Ok(org_context::auth()?
+        .admin_list_accounts(&session, audit.get())
+        .await?)
+}
+
+/// Disables or re-enables another account. Installation administrators
+/// only.
+#[server]
+pub async fn admin_set_account_disabled(
+    account_id: Uuid,
+    disabled: bool,
+) -> Result<bool, AppError> {
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    Ok(org_context::auth()?
+        .admin_set_account_disabled(&session, account_id, disabled, audit.get())
         .await?)
 }

@@ -8,12 +8,16 @@ use std::time::Duration;
 use secrecy::SecretString;
 use supabase_dashboard_application::{
     auth::{
-        AccountUpdateError, AuthConfig, AuthService, BootstrapError, PasswordResetError,
-        RequestContext, SignInError,
+        AccountUpdateError, AdminError, AuthConfig, AuthService, BootstrapError, CurrentSession,
+        PasswordResetError, RequestContext, SignInError,
     },
     throttle::ThrottleConfig,
 };
-use supabase_dashboard_persistence::Database;
+use supabase_dashboard_persistence::{
+    Database,
+    accounts::SetDisabledOutcome,
+    audit::{AuditEvent, AuditOutcome},
+};
 
 // Shares the scratch-database helper with the persistence tests.
 #[path = "../../persistence/tests/common/mod.rs"]
@@ -483,6 +487,133 @@ async fn password_reset_replaces_the_password_and_ends_every_session() {
             .await
             .unwrap(),
         1
+    );
+    db.close().await;
+    scratch.drop().await;
+}
+
+async fn add_account(db: &Database, email: &str, name: &str, admin: bool) -> uuid::Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO accounts (id, email, display_name, password_hash, is_installation_admin) \
+         SELECT gen_random_uuid(), $1, $2, password_hash, $3 FROM accounts \
+         ORDER BY created_at LIMIT 1 RETURNING id",
+    )
+    .bind(email)
+    .bind(name)
+    .bind(admin)
+    .fetch_one(db.pool())
+    .await
+    .unwrap()
+}
+
+async fn session_for(auth: &AuthService, email: &str) -> (String, CurrentSession) {
+    let signed_in = auth
+        .sign_in(email, &SecretString::from(PASSWORD), ctx())
+        .await
+        .unwrap();
+    let cookie = signed_in.token.expose_cookie_value().to_owned();
+    let current = auth.authenticate(&cookie).await.unwrap().unwrap();
+    (cookie, current)
+}
+
+#[tokio::test]
+async fn only_installation_admins_manage_accounts() {
+    let Some(scratch) = ScratchDb::create("app_admin").await else {
+        return;
+    };
+    let (db, auth) = service(&scratch).await;
+    bootstrap(&auth).await;
+    let bob_id = add_account(&db, "bob@example.test", "Bob", false).await;
+    let carol_id = add_account(&db, "carol@example.test", "Carol", true).await;
+    let (_, owner) = session_for(&auth, "owner@example.test").await;
+    let (bob_cookie, bob) = session_for(&auth, "bob@example.test").await;
+
+    // A non-admin is refused, and the refusal is audited.
+    assert!(matches!(
+        auth.admin_list_accounts(&bob, ctx()).await,
+        Err(AdminError::Forbidden)
+    ));
+    assert!(matches!(
+        auth.admin_set_account_disabled(&bob, carol_id, true, ctx())
+            .await,
+        Err(AdminError::Forbidden)
+    ));
+    assert_eq!(
+        db.count_audit_events("admin.account_disable")
+            .await
+            .unwrap(),
+        1
+    );
+
+    let accounts = auth.admin_list_accounts(&owner, ctx()).await.unwrap();
+    assert_eq!(accounts.len(), 3);
+    assert_eq!(
+        accounts.iter().filter(|a| a.is_you).count(),
+        1,
+        "{accounts:?}"
+    );
+    assert!(accounts[0].is_you && accounts[0].is_installation_admin);
+
+    assert!(matches!(
+        auth.admin_set_account_disabled(&owner, owner.account.id, true, ctx())
+            .await,
+        Err(AdminError::CannotDisableSelf)
+    ));
+    assert!(matches!(
+        auth.admin_set_account_disabled(&owner, uuid::Uuid::now_v7(), true, ctx())
+            .await,
+        Err(AdminError::NotFound)
+    ));
+
+    // Disabling ends Bob's sessions and blocks sign-in; enabling restores it.
+    assert!(
+        auth.admin_set_account_disabled(&owner, bob_id, true, ctx())
+            .await
+            .unwrap()
+    );
+    assert!(auth.authenticate(&bob_cookie).await.unwrap().is_none());
+    assert!(matches!(
+        auth.sign_in("bob@example.test", &SecretString::from(PASSWORD), ctx())
+            .await,
+        Err(SignInError::InvalidCredentials)
+    ));
+    assert!(
+        !auth
+            .admin_set_account_disabled(&owner, bob_id, true, ctx())
+            .await
+            .unwrap(),
+        "already disabled"
+    );
+    assert!(
+        auth.admin_set_account_disabled(&owner, bob_id, false, ctx())
+            .await
+            .unwrap()
+    );
+    assert!(
+        auth.authenticate(&bob_cookie).await.unwrap().is_none(),
+        "old sessions stay revoked"
+    );
+    session_for(&auth, "bob@example.test").await;
+
+    // With Carol disabled, the owner is the last enabled administrator.
+    assert!(
+        auth.admin_set_account_disabled(&owner, carol_id, true, ctx())
+            .await
+            .unwrap()
+    );
+    let event = AuditEvent {
+        actor_account_id: None,
+        action: "test.disable",
+        target_type: None,
+        target_id: None,
+        outcome: AuditOutcome::Success,
+        request_id: None,
+    };
+    assert_eq!(
+        db.set_account_disabled(owner.account.id, true, &event)
+            .await
+            .unwrap(),
+        SetDisabledOutcome::LastAdmin
     );
     db.close().await;
     scratch.drop().await;

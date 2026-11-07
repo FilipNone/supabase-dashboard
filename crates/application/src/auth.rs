@@ -6,13 +6,14 @@ use std::time::{Duration, Instant};
 use secrecy::SecretString;
 use supabase_dashboard_domain::{
     account::{
-        AccountInputError, AccountSummary, DisplayName, Email, SessionSummary, check_new_password,
+        AccountInputError, AccountSummary, AdminAccountSummary, DisplayName, Email, SessionSummary,
+        check_new_password,
     },
     invitation::InvitationPreview,
 };
 use supabase_dashboard_persistence::{
     Database, PersistenceError,
-    accounts::{AccountRecord, NewAccount},
+    accounts::{AccountRecord, NewAccount, SetDisabledOutcome},
     audit::{AuditEvent, AuditOutcome},
     invitations::AcceptNewAccountOutcome,
     sessions::NewSession,
@@ -116,6 +117,27 @@ pub enum InvitationSignUpError {
 }
 
 impl From<PersistenceError> for InvitationSignUpError {
+    fn from(err: PersistenceError) -> Self {
+        Self::Internal(err.into())
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AdminError {
+    /// Only installation administrators manage accounts.
+    #[error("only installation administrators can manage accounts")]
+    Forbidden,
+    #[error("account not found")]
+    NotFound,
+    #[error("you cannot disable your own account")]
+    CannotDisableSelf,
+    #[error("at least one installation administrator must stay enabled")]
+    LastAdmin,
+    #[error(transparent)]
+    Internal(#[from] AuthError),
+}
+
+impl From<PersistenceError> for AdminError {
     fn from(err: PersistenceError) -> Self {
         Self::Internal(err.into())
     }
@@ -444,6 +466,94 @@ impl AuthService {
             .reset_password(account.id, &password_hash, &event)
             .await?
             .ok_or(PasswordResetError::UnknownAccount)
+    }
+
+    /// Every account of the installation, for installation administrators.
+    pub async fn admin_list_accounts(
+        &self,
+        current: &CurrentSession,
+        ctx: RequestContext<'_>,
+    ) -> Result<Vec<AdminAccountSummary>, AdminError> {
+        self.require_admin(current, "admin.account_list", None, ctx)
+            .await?;
+        let accounts = self.db.list_accounts().await?;
+        Ok(accounts
+            .into_iter()
+            .map(|listing| AdminAccountSummary {
+                is_you: listing.account.id == current.account.id,
+                id: listing.account.id,
+                email: listing.account.email,
+                display_name: listing.account.display_name,
+                is_installation_admin: listing.account.is_installation_admin,
+                disabled: listing.account.disabled,
+                created_at: listing.created_at,
+                organization_count: listing.organization_count,
+            })
+            .collect())
+    }
+
+    /// Disables or re-enables another account. A disabled account cannot
+    /// sign in and loses its sessions; its organization memberships stay,
+    /// so re-enabling restores its access. Returns whether anything changed.
+    pub async fn admin_set_account_disabled(
+        &self,
+        current: &CurrentSession,
+        account_id: Uuid,
+        disabled: bool,
+        ctx: RequestContext<'_>,
+    ) -> Result<bool, AdminError> {
+        let action = if disabled {
+            "admin.account_disable"
+        } else {
+            "admin.account_enable"
+        };
+        self.require_admin(current, action, Some(account_id), ctx)
+            .await?;
+        if account_id == current.account.id {
+            return Err(AdminError::CannotDisableSelf);
+        }
+        let event = AuditEvent {
+            actor_account_id: Some(current.account.id),
+            action,
+            target_type: Some("account"),
+            target_id: Some(account_id.to_string()),
+            outcome: AuditOutcome::Success,
+            request_id: ctx.request_id,
+        };
+        match self
+            .db
+            .set_account_disabled(account_id, disabled, &event)
+            .await?
+        {
+            SetDisabledOutcome::Changed { .. } => Ok(true),
+            SetDisabledOutcome::Unchanged => Ok(false),
+            SetDisabledOutcome::NotFound => Err(AdminError::NotFound),
+            SetDisabledOutcome::LastAdmin => Err(AdminError::LastAdmin),
+        }
+    }
+
+    /// Refuses, and audits the refusal, unless the operator is an
+    /// installation administrator. The flag is read from the database on
+    /// every request, so revoking it takes effect immediately.
+    async fn require_admin(
+        &self,
+        current: &CurrentSession,
+        action: &'static str,
+        target: Option<Uuid>,
+        ctx: RequestContext<'_>,
+    ) -> Result<(), AdminError> {
+        if current.account.is_installation_admin {
+            return Ok(());
+        }
+        self.audit(
+            Some(current.account.id),
+            action,
+            target.map(|id| ("account", id)),
+            AuditOutcome::Denied,
+            ctx,
+        )
+        .await;
+        Err(AdminError::Forbidden)
     }
 
     /// Changes the operator's display name.
