@@ -11,6 +11,9 @@ publish.workspace = true
 [dependencies]
 serde.workspace = true
 thiserror.workspace = true
+# Only std and serde: random generation stays on the server so the browser
+# build does not need an entropy source.
+uuid = { version = "1", default-features = false, features = ["std", "serde"] }
 
 [dev-dependencies]
 serde_json.workspace = true

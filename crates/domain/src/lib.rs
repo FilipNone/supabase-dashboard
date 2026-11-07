@@ -6,4 +6,5 @@
 pub mod account;
 pub mod authz;
 pub mod health;
+pub mod organization;
 pub mod theme;

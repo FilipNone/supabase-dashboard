@@ -5,6 +5,7 @@
 
 pub mod accounts;
 pub mod audit;
+pub mod organizations;
 pub mod sessions;
 
 use std::time::Duration;

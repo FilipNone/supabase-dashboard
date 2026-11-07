@@ -33,6 +33,21 @@ impl OrgRole {
         }
     }
 
+    /// Stable machine name, used in storage and in serialized form.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::Admin => "admin",
+            Self::Developer => "developer",
+            Self::Viewer => "viewer",
+        }
+    }
+
+    /// Inverse of [`Self::as_str`].
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|role| role.as_str() == name)
+    }
+
     /// Whether this role grants `permission`.
     pub const fn allows(self, permission: Permission) -> bool {
         use Permission as P;
@@ -237,6 +252,18 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn role_names_round_trip_and_match_serde() {
+        for role in OrgRole::ALL {
+            assert_eq!(OrgRole::from_name(role.as_str()), Some(role));
+            assert_eq!(
+                serde_json::to_string(&role).unwrap(),
+                format!("\"{}\"", role.as_str())
+            );
+        }
+        assert_eq!(OrgRole::from_name("Owner"), None);
     }
 
     #[test]

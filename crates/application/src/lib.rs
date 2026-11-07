@@ -5,6 +5,7 @@
 //! Server-only: this crate must never be a dependency of the browser build.
 
 pub mod auth;
+pub mod organizations;
 pub mod password;
 pub mod throttle;
 pub mod token;
