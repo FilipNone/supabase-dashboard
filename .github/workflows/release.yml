@@ -167,7 +167,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          path: assets
+          path: release-files
           pattern: linux-*
           merge-multiple: true
       - name: Package the Docker deploy bundle
@@ -177,9 +177,9 @@ jobs:
           cp deploy/compose.yaml deploy/Caddyfile deploy/.env.example "bundle/$name/"
           cp docs/deployment.md "bundle/$name/README.md"
           cp LICENSE-MIT LICENSE-APACHE "bundle/$name/"
-          tar -C bundle -czf "assets/$name.tar.gz" "$name"
-          (cd assets && sha256sum -- *.tar.gz > SHA256SUMS)
-          cat assets/SHA256SUMS
+          tar -C bundle -czf "release-files/$name.tar.gz" "$name"
+          (cd release-files && sha256sum -- *.tar.gz > SHA256SUMS)
+          cat release-files/SHA256SUMS
       - name: Create the GitHub release
         run: |
           cat > notes.md <<EOF
@@ -201,7 +201,7 @@ jobs:
           fi
           flags=()
           if [ "$PRERELEASE" = "true" ]; then flags+=(--prerelease); fi
-          gh release create "$GITHUB_REF_NAME" assets/* \
+          gh release create "$GITHUB_REF_NAME" release-files/* \
             --title "supabase-dashboard $VERSION" \
             --notes-file notes.md \
             --generate-notes \
