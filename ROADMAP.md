@@ -8,7 +8,7 @@ Build a self-hosted dashboard in Rust that looks and works like <https://supabas
 
 Repository: <https://github.com/FilipNone/supabase-dashboard>.
 
-Status: M0 in progress. A Cargo workspace exists with an Axum server, Leptos SSR/hydrated UI shell, control-plane PostgreSQL migrations, and CI (see `docs/development.md` and `docs/adr/0001-stack-and-workspace.md`). There are no accounts, organizations, or project connections yet. Current focus: finish M0, then a secure vertical slice that signs in, registers an existing deployment, and shows its health and schema.
+Status: M0 nearly complete; M1 started. A Cargo workspace exists with an Axum server, Leptos SSR/hydrated UI shell, control-plane PostgreSQL migrations, and CI (see `docs/development.md` and `docs/adr/0001-stack-and-workspace.md`). There are no accounts, organizations, or project connections yet. Current focus: finish M0, then a secure vertical slice that signs in, registers an existing deployment, and shows its health and schema.
 
 Priority scale: P1 = required for the first usable release; P2 = next release after the foundation; P3 = later or dependent on research. Milestones indicate dependency order, not dates or delivery estimates.
 
@@ -45,7 +45,7 @@ Acceptance: a fresh checkout builds and runs using documented commands; migratio
 ### M1: accounts and organizations (P1)
 
 - [ ] Implement secure initial-owner bootstrap, login/logout, account editing, and session revocation. Disable public registration by default.
-- [ ] Define organization/project permissions and test an initial owner/admin/developer/viewer role matrix server-side.
+- [ ] Define organization/project permissions and test an initial owner/admin/developer/viewer role matrix server-side. (Started: the matrix and last-owner rule live in `crates/domain/src/authz.rs` with exhaustive unit tests. Not yet enforced, because no application services or endpoints exist.)
 - [ ] Add organization creation/editing, switching, invitations, membership removal, and last-owner protection.
 - [ ] Implement dashboard account security and an initial administrator view for users and registered resources.
 - [ ] Add audit events for security-sensitive actions and admin changes, with secret redaction.
