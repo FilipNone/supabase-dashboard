@@ -9,6 +9,7 @@ use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 use supabase_dashboard_domain::{
     account::{AccountSummary, AdminAccountSummary, SessionSummary},
+    admin::RegisteredResources,
     authz::OrgRole,
     health::InstallationHealth,
     invitation::{InvitationCode, InvitationPreview, InvitationSummary, IssuedInvitation},
@@ -447,6 +448,17 @@ pub async fn admin_list_accounts() -> Result<Vec<AdminAccountSummary>, AppError>
     let audit = org_context::AuditContext::current();
     Ok(org_context::auth()?
         .admin_list_accounts(&session, audit.get())
+        .await?)
+}
+
+/// Every organization and registered project. Installation administrators
+/// only; the list grants no access to the projects themselves.
+#[server]
+pub async fn admin_list_resources() -> Result<RegisteredResources, AppError> {
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    Ok(org_context::auth()?
+        .admin_list_resources(&session, audit.get())
         .await?)
 }
 

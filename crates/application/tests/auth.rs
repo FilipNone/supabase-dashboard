@@ -618,3 +618,78 @@ async fn only_installation_admins_manage_accounts() {
     db.close().await;
     scratch.drop().await;
 }
+
+#[tokio::test]
+async fn only_installation_admins_list_registered_resources() {
+    let Some(scratch) = ScratchDb::create("app_admin_resources").await else {
+        return;
+    };
+    let (db, auth) = service(&scratch).await;
+    bootstrap(&auth).await;
+    let bob_id = add_account(&db, "bob@example.test", "Bob", false).await;
+    let (_, owner) = session_for(&auth, "owner@example.test").await;
+    let (_, bob) = session_for(&auth, "bob@example.test").await;
+
+    let empty = auth.admin_list_resources(&owner, ctx()).await.unwrap();
+    assert!(empty.organizations.is_empty() && empty.projects.is_empty());
+
+    // Bob's organization, which the administrator is not a member of.
+    let org = uuid::Uuid::now_v7();
+    sqlx::query("INSERT INTO organizations (id, name) VALUES ($1, 'Bob Co')")
+        .bind(org)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO organization_members (organization_id, account_id, role) \
+         VALUES ($1, $2, 'owner')",
+    )
+    .bind(org)
+    .bind(bob_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    for (name, url) in [
+        ("Prod", "https://supabase.example.test"),
+        ("Lab", "http://10.0.0.5:8000"),
+    ] {
+        sqlx::query(
+            "INSERT INTO projects (id, organization_id, name, api_url) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(uuid::Uuid::now_v7())
+        .bind(org)
+        .bind(name)
+        .bind(url)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    }
+
+    assert!(matches!(
+        auth.admin_list_resources(&bob, ctx()).await,
+        Err(AdminError::Forbidden)
+    ));
+    assert_eq!(
+        db.count_audit_events("admin.resource_list").await.unwrap(),
+        1
+    );
+
+    let listed = auth.admin_list_resources(&owner, ctx()).await.unwrap();
+    assert!(!listed.organizations_truncated && !listed.projects_truncated);
+    assert_eq!(listed.organizations.len(), 1);
+    let summary = &listed.organizations[0];
+    assert_eq!(summary.name.as_str(), "Bob Co");
+    assert_eq!((summary.member_count, summary.project_count), (1, 2));
+    let names: Vec<_> = listed.projects.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["Prod", "Lab"]);
+    assert!(
+        listed
+            .projects
+            .iter()
+            .all(|p| p.organization_name.as_str() == "Bob Co")
+    );
+    assert!(!listed.projects[1].api_url.is_encrypted());
+
+    db.close().await;
+    scratch.drop().await;
+}

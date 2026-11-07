@@ -4,6 +4,7 @@
 //! (`hydrate`) build.
 
 pub mod accounts;
+pub mod admin;
 pub mod audit;
 pub mod invitations;
 pub mod organizations;

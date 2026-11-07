@@ -4,6 +4,7 @@
 //! libraries. Everything here compiles for both the server and `wasm32`.
 
 pub mod account;
+pub mod admin;
 pub mod authz;
 pub mod health;
 pub mod invitation;

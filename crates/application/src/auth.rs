@@ -9,6 +9,7 @@ use supabase_dashboard_domain::{
         AccountInputError, AccountSummary, AdminAccountSummary, DisplayName, Email, SessionSummary,
         check_new_password,
     },
+    admin::{ADMIN_RESOURCE_LIST_LIMIT, RegisteredResources},
     invitation::InvitationPreview,
 };
 use supabase_dashboard_persistence::{
@@ -124,8 +125,8 @@ impl From<PersistenceError> for InvitationSignUpError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum AdminError {
-    /// Only installation administrators manage accounts.
-    #[error("only installation administrators can manage accounts")]
+    /// Only installation administrators use the administration view.
+    #[error("only installation administrators can do this")]
     Forbidden,
     #[error("account not found")]
     NotFound,
@@ -490,6 +491,22 @@ impl AuthService {
                 organization_count: listing.organization_count,
             })
             .collect())
+    }
+
+    /// Every organization and registered project of the installation, for
+    /// installation administrators. Listing them grants no access: opening a
+    /// project still requires membership in its organization.
+    pub async fn admin_list_resources(
+        &self,
+        current: &CurrentSession,
+        ctx: RequestContext<'_>,
+    ) -> Result<RegisteredResources, AdminError> {
+        self.require_admin(current, "admin.resource_list", None, ctx)
+            .await?;
+        Ok(self
+            .db
+            .list_registered_resources(ADMIN_RESOURCE_LIST_LIMIT)
+            .await?)
     }
 
     /// Disables or re-enables another account. A disabled account cannot
