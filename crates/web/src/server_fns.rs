@@ -3,11 +3,15 @@
 //! Each function runs on the server. Inputs and outputs are serialized, so
 //! they must never contain credentials.
 
+use std::fmt;
+
 use leptos::prelude::*;
+use serde::{Deserialize, Serialize};
 use supabase_dashboard_domain::{
     account::AccountSummary,
     authz::OrgRole,
     health::InstallationHealth,
+    invitation::{InvitationCode, InvitationPreview, InvitationSummary, IssuedInvitation},
     organization::{MemberSummary, OrganizationSummary},
 };
 use uuid::Uuid;
@@ -71,7 +75,7 @@ mod org_context {
 
     use leptos::prelude::use_context;
     use supabase_dashboard_application::{
-        auth::{CurrentSession, RequestContext},
+        auth::{AuthService, CurrentSession, RequestContext},
         organizations::OrganizationService,
     };
 
@@ -79,9 +83,20 @@ mod org_context {
 
     /// The signed-in session attached by the server's session guard.
     pub fn session() -> Result<CurrentSession, AppError> {
+        optional_session().ok_or(AppError::Unauthenticated)
+    }
+
+    /// The session on paths the guard lets through without one.
+    pub fn optional_session() -> Option<CurrentSession> {
         use_context::<http::request::Parts>()
             .and_then(|parts| parts.extensions.get::<CurrentSession>().cloned())
-            .ok_or(AppError::Unauthenticated)
+    }
+
+    pub fn auth() -> Result<Arc<AuthService>, AppError> {
+        use_context::<Arc<AuthService>>().ok_or_else(|| {
+            tracing::error!("auth service is not configured");
+            AppError::Unavailable
+        })
     }
 
     pub fn organizations() -> Result<Arc<OrganizationService>, AppError> {
@@ -184,5 +199,105 @@ pub async fn remove_member(organization_id: Uuid, account_id: Uuid) -> Result<()
     let audit = org_context::AuditContext::current();
     Ok(org_context::organizations()?
         .remove_member(&session, organization_id, account_id, audit.get())
+        .await?)
+}
+
+/// Open invitations of an organization.
+#[server]
+pub async fn list_invitations(organization_id: Uuid) -> Result<Vec<InvitationSummary>, AppError> {
+    let session = org_context::session()?;
+    Ok(org_context::organizations()?
+        .invitations(&session, organization_id)
+        .await?)
+}
+
+/// Creates an invitation. The response carries the invitation code, once.
+#[server]
+pub async fn create_invitation(
+    organization_id: Uuid,
+    email: String,
+    role: OrgRole,
+) -> Result<IssuedInvitation, AppError> {
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    Ok(org_context::organizations()?
+        .invite(&session, organization_id, &email, role, audit.get())
+        .await?)
+}
+
+#[server]
+pub async fn revoke_invitation(organization_id: Uuid, invitation_id: Uuid) -> Result<(), AppError> {
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    Ok(org_context::organizations()?
+        .revoke_invitation(&session, organization_id, invitation_id, audit.get())
+        .await?)
+}
+
+/// Accepts an invitation as the signed-in operator. Returns the
+/// organization joined.
+#[server]
+pub async fn accept_invitation(code: InvitationCode) -> Result<Uuid, AppError> {
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    Ok(org_context::organizations()?
+        .accept_invitation(&session, code.expose(), audit.get())
+        .await?)
+}
+
+/// What the invitation page shows for a code.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InvitationPageData {
+    /// `None` when the code is not an open invitation.
+    pub invitation: Option<InvitationPreview>,
+    pub signed_in_as: Option<AccountSummary>,
+}
+
+/// Public: the code is the credential. The server's session guard lets this
+/// exact path through without a session and attaches one when present.
+#[server(prefix = "/auth/invitation", endpoint = "preview")]
+pub async fn preview_invitation(code: InvitationCode) -> Result<InvitationPageData, AppError> {
+    let invitation = org_context::auth()?
+        .preview_invitation(code.expose())
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, "invitation lookup failed");
+            AppError::Unavailable
+        })?;
+    Ok(InvitationPageData {
+        invitation,
+        signed_in_as: org_context::optional_session().map(|session| session.summary()),
+    })
+}
+
+/// A password typed into a form. Never printed.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PasswordInput(String);
+
+impl fmt::Debug for PasswordInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PasswordInput([REDACTED])")
+    }
+}
+
+/// Public: creates an account for the invited email and joins the
+/// organization. The invitee signs in afterwards.
+#[server(prefix = "/auth/invitation", endpoint = "sign-up")]
+pub async fn sign_up_with_invitation(
+    code: InvitationCode,
+    display_name: String,
+    password: PasswordInput,
+    password_confirmation: PasswordInput,
+) -> Result<Uuid, AppError> {
+    if password.0 != password_confirmation.0 {
+        return Err(AppError::Rejected(
+            "The passwords do not match.".to_string(),
+        ));
+    }
+    let password = secrecy::SecretString::from(password.0);
+    let audit = org_context::AuditContext::current();
+    Ok(org_context::auth()?
+        .accept_invitation_with_new_account(code.expose(), &display_name, &password, audit.get())
         .await?)
 }

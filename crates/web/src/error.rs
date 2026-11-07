@@ -42,9 +42,25 @@ impl FromServerFnError for AppError {
 
 #[cfg(feature = "ssr")]
 mod server {
-    use supabase_dashboard_application::organizations::OrganizationError;
+    use supabase_dashboard_application::{
+        auth::InvitationSignUpError, organizations::OrganizationError,
+    };
 
     use super::AppError;
+
+    impl From<InvitationSignUpError> for AppError {
+        fn from(err: InvitationSignUpError) -> Self {
+            match err {
+                InvitationSignUpError::InvalidInvitation
+                | InvitationSignUpError::AccountExists
+                | InvitationSignUpError::Input(_) => Self::Rejected(err.to_string()),
+                InvitationSignUpError::Internal(err) => {
+                    tracing::error!(error = %err, "invitation sign-up failed");
+                    Self::Unavailable
+                }
+            }
+        }
+    }
 
     impl From<OrganizationError> for AppError {
         fn from(err: OrganizationError) -> Self {

@@ -12,7 +12,9 @@ use axum::{
 use secrecy::SecretString;
 use serde::Deserialize;
 use supabase_dashboard_application::auth::{RequestContext, SignInError};
-use supabase_dashboard_web::app::{HOME_PATH, SIGN_IN_PATH};
+use supabase_dashboard_web::app::{
+    HOME_PATH, INVITE_PATH, INVITE_PREVIEW_PATH, INVITE_SIGN_UP_PATH, SIGN_IN_PATH,
+};
 
 use crate::{error::ApiError, state::AppState};
 
@@ -76,6 +78,10 @@ enum Access {
     Public,
     /// The sign-in page: public, but signed-in operators are sent home.
     SignInPage,
+    /// The invitation page and its two server functions: public, with the
+    /// session attached when there is one. The invitation code is the
+    /// credential there.
+    Optional,
     /// JSON API and server functions: 401 without a session.
     Api,
     /// Everything else, including unknown paths: redirect to sign-in.
@@ -88,6 +94,7 @@ fn classify(path: &str) -> Access {
             Access::Public
         }
         SIGN_IN_PATH => Access::SignInPage,
+        INVITE_PATH | INVITE_PREVIEW_PATH | INVITE_SIGN_UP_PATH => Access::Optional,
         _ if path.starts_with("/pkg/") => Access::Public,
         _ if path.starts_with("/api/") || path.starts_with("/auth/") => Access::Api,
         _ => Access::Page,
@@ -106,7 +113,9 @@ pub async fn guard(State(state): State<AppState>, mut request: Request, next: Ne
             Err(err) => {
                 tracing::error!(error = %err, "session lookup failed");
                 return match access {
-                    Access::Public | Access::SignInPage => next.run(request).await,
+                    Access::Public | Access::SignInPage | Access::Optional => {
+                        next.run(request).await
+                    }
                     Access::Api => ApiError::Unavailable.into_response(),
                     Access::Page => (
                         StatusCode::SERVICE_UNAVAILABLE,
@@ -123,19 +132,23 @@ pub async fn guard(State(state): State<AppState>, mut request: Request, next: Ne
         (Access::Api, None) => ApiError::Unauthenticated.into_response(),
         (Access::Page, None) => Redirect::to(SIGN_IN_PATH).into_response(),
         (Access::Public | Access::SignInPage, None) => next.run(request).await,
+        (Access::Optional, None) => no_store(next.run(request).await),
         (_, Some(session)) => {
             request.extensions_mut().insert(session.summary());
             request.extensions_mut().insert(session);
-            let mut response = next.run(request).await;
             // Authenticated pages must not be stored by shared caches or the
             // browser's back-forward cache after sign-out.
-            response
-                .headers_mut()
-                .entry(header::CACHE_CONTROL)
-                .or_insert(HeaderValue::from_static("no-store"));
-            response
+            no_store(next.run(request).await)
         }
     }
+}
+
+fn no_store(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .entry(header::CACHE_CONTROL)
+        .or_insert(HeaderValue::from_static("no-store"));
+    response
 }
 
 /// Rejects state-changing requests that a browser marks as cross-site.
@@ -273,6 +286,11 @@ mod tests {
         assert_eq!(classify("/auth/other"), Access::Api);
         assert_eq!(classify("/dashboard/organizations"), Access::Page);
         assert_eq!(classify("/dashboard/sign-in/extra"), Access::Page);
+        assert_eq!(classify(INVITE_PATH), Access::Optional);
+        assert_eq!(classify("/auth/invitation/preview"), Access::Optional);
+        assert_eq!(classify("/auth/invitation/sign-up"), Access::Optional);
+        assert_eq!(classify("/auth/invitation/other"), Access::Api);
+        assert_eq!(classify("/dashboard/invite/extra"), Access::Page);
         assert_eq!(classify("/anything-else"), Access::Page);
     }
 

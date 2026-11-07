@@ -12,15 +12,18 @@ use leptos_router::{
 };
 use supabase_dashboard_domain::{
     authz::{OrgRole, Permission},
+    invitation::{InvitationSummary, IssuedInvitation},
     organization::{MemberSummary, ORGANIZATION_NAME_MAX_CHARS, OrganizationSummary},
 };
 use uuid::Uuid;
 
 use crate::{
+    app::INVITE_PATH,
     components::page::{StatePanel, StateTone},
     error::AppError,
     server_fns::{
-        ChangeMemberRole, RemoveMember, RenameOrganization, get_organization, list_members,
+        ChangeMemberRole, CreateInvitation, RemoveMember, RenameOrganization, RevokeInvitation,
+        get_organization, list_invitations, list_members,
     },
 };
 
@@ -195,11 +198,14 @@ pub fn OrganizationTeamPage() -> impl IntoView {
     };
 
     view! {
+        {move || {
+            loaded_org(ctx)
+                .filter(|org| org.role.allows(Permission::MembersManage))
+                .map(|org| view! { <InviteMember org/> })
+        }}
+        <Invitations ctx/>
         <section class="panel" aria-labelledby="team-title">
-            <h2 class="section-title" id="team-title">"Team"</h2>
-            <p class="field-hint">
-                "Invitations are not available yet. Members can be added once they land."
-            </p>
+            <h2 class="section-title" id="team-title">"Members"</h2>
             {action_error}
             <Transition fallback=|| view! { <p class="loading" role="status">"Loading members…"</p> }>
                 {move || {
@@ -258,9 +264,7 @@ fn MemberTable(
             let target = (org_id.clone(), member.account_id.to_string());
             let name = member.display_name.as_str().to_owned();
             let controls = if editable {
-                let options = OrgRole::ALL
-                    .into_iter()
-                    .filter(|role| actor == OrgRole::Owner || *role != OrgRole::Owner)
+                let options = assignable_roles(actor)
                     .map(|role| {
                         view! {
                             <option value=role.as_str() selected=role == member.role>
@@ -329,6 +333,226 @@ fn MemberTable(
                         <th scope="col">"Name"</th>
                         <th scope="col">"Email"</th>
                         <th scope="col">"Role"</th>
+                        <th scope="col"><span class="visually-hidden">"Actions"</span></th>
+                    </tr>
+                </thead>
+                <tbody>{rows}</tbody>
+            </table>
+        </div>
+    }
+}
+
+/// Roles `actor` may hand out. Mirrors the server rule that only owners
+/// grant the owner role.
+fn assignable_roles(actor: OrgRole) -> impl Iterator<Item = OrgRole> {
+    OrgRole::ALL
+        .into_iter()
+        .filter(move |role| actor == OrgRole::Owner || *role != OrgRole::Owner)
+}
+
+/// The full link for an invitation code. The code goes in the fragment so
+/// it is not sent to the server when the link is opened.
+fn invitation_link(code: &str) -> String {
+    #[cfg(feature = "hydrate")]
+    if let Ok(origin) = window().location().origin() {
+        return format!("{origin}{INVITE_PATH}#{code}");
+    }
+    format!("{INVITE_PATH}#{code}")
+}
+
+#[component]
+fn InviteMember(org: OrganizationSummary) -> impl IntoView {
+    let Some(ctx) = use_context::<InvitationActions>() else {
+        return ().into_any();
+    };
+    let create = ctx.create;
+    let options = assignable_roles(org.role)
+        .map(|role| {
+            view! {
+                <option value=role.as_str() selected=role == OrgRole::Developer>{role.label()}</option>
+            }
+        })
+        .collect_view();
+    let result = move || {
+        create.value().get().map(|result| match result {
+            Ok(issued) => view! { <IssuedLink issued/> }.into_any(),
+            Err(err) => {
+                view! { <p class="form-error" role="alert">{err.to_string()}</p> }.into_any()
+            }
+        })
+    };
+    view! {
+        <section class="panel" aria-labelledby="invite-title">
+            <h2 class="section-title" id="invite-title">"Invite a member"</h2>
+            <ActionForm action=create attr:class="inline-form">
+                <input type="hidden" name="organization_id" value=org.id.to_string()/>
+                <label class="field">
+                    <span class="field-label">"Email"</span>
+                    <input class="input" type="email" name="email" required autocomplete="off" maxlength="254"/>
+                </label>
+                <label class="field">
+                    <span class="field-label">"Role"</span>
+                    <select class="input" name="role">{options}</select>
+                </label>
+                <button type="submit" class="button button-primary" disabled=move || create.pending().get()>
+                    "Create invitation"
+                </button>
+            </ActionForm>
+            {result}
+        </section>
+    }
+    .into_any()
+}
+
+/// The link for a new invitation. Shown once: the server keeps only a hash
+/// of the code and cannot show it again.
+#[component]
+fn IssuedLink(issued: IssuedInvitation) -> impl IntoView {
+    let link = invitation_link(issued.code.expose());
+    let note = format!(
+        "Send this link to {} yourself; the dashboard does not send email yet. \
+         It is shown only once, works for that address only, and expires on {} (UTC).",
+        issued.invitation.email.as_str(),
+        issued.invitation.expires_at.date(),
+    );
+    view! {
+        <div class="issued-link" role="status">
+            <label class="field">
+                <span class="field-label">"Invitation link"</span>
+                <input class="input mono" readonly value=link aria-describedby="issued-link-note"/>
+            </label>
+            <p class="field-hint" id="issued-link-note">{note}</p>
+        </div>
+    }
+}
+
+/// Invitation actions shared by the invite form and the invitation list,
+/// so the list refreshes after either changes something.
+#[derive(Clone, Copy)]
+struct InvitationActions {
+    create: ServerAction<CreateInvitation>,
+    revoke: ServerAction<RevokeInvitation>,
+}
+
+#[component]
+fn Invitations(ctx: OrgContext) -> impl IntoView {
+    let actions = InvitationActions {
+        create: ServerAction::<CreateInvitation>::new(),
+        revoke: ServerAction::<RevokeInvitation>::new(),
+    };
+    provide_context(actions);
+    let invitations = Resource::new(
+        move || {
+            (
+                ctx.id.get(),
+                actions.create.version().get(),
+                actions.revoke.version().get(),
+            )
+        },
+        |(id, _, _)| async move {
+            match id {
+                Some(id) => list_invitations(id).await,
+                None => Err(AppError::NotFound),
+            }
+        },
+    );
+    let revoke_error = move || {
+        actions
+            .revoke
+            .value()
+            .get()
+            .and_then(Result::err)
+            .map(|err| view! { <p class="form-error" role="alert">{err.to_string()}</p> })
+    };
+    view! {
+        <Transition fallback=|| ()>
+            {move || {
+                let actor = loaded_org(ctx).map(|org| org.role);
+                invitations.get().map(|result| match (result, actor) {
+                    (Ok(list), _) if list.is_empty() => ().into_any(),
+                    (Ok(list), Some(actor)) => {
+                        let org_id = ctx.id.get().map(|id| id.to_string()).unwrap_or_default();
+                        view! {
+                            <section class="panel" aria-labelledby="invitations-title">
+                                <h2 class="section-title" id="invitations-title">"Open invitations"</h2>
+                                {revoke_error}
+                                <InvitationTable list actor org_id revoke=actions.revoke/>
+                            </section>
+                        }
+                        .into_any()
+                    }
+                    (Ok(_), None) => ().into_any(),
+                    (Err(err), _) => view! {
+                        <StatePanel
+                            tone=StateTone::Error
+                            title="Could not load invitations".to_string()
+                            detail=err.to_string()
+                        />
+                    }
+                    .into_any(),
+                })
+            }}
+        </Transition>
+    }
+}
+
+#[component]
+fn InvitationTable(
+    list: Vec<InvitationSummary>,
+    actor: OrgRole,
+    org_id: String,
+    revoke: ServerAction<RevokeInvitation>,
+) -> impl IntoView {
+    let can_manage = actor.allows(Permission::MembersManage);
+    let rows = list
+        .into_iter()
+        .map(|invitation| {
+            let email = invitation.email.as_str().to_owned();
+            let withdrawable =
+                can_manage && (actor == OrgRole::Owner || invitation.role != OrgRole::Owner);
+            let controls = withdrawable.then(|| {
+                let org_id = org_id.clone();
+                let invitation_id = invitation.id.to_string();
+                let confirm = format!("Withdraw invitation for {email}");
+                view! {
+                    <div class="row-actions">
+                        <details class="confirm">
+                            <summary class="button">"Withdraw"</summary>
+                            <ActionForm action=revoke attr:class="confirm-body">
+                                <input type="hidden" name="organization_id" value=org_id/>
+                                <input type="hidden" name="invitation_id" value=invitation_id/>
+                                <p>"The link stops working immediately."</p>
+                                <button type="submit" class="button button-danger">{confirm}</button>
+                            </ActionForm>
+                        </details>
+                    </div>
+                }
+            });
+            view! {
+                <tr>
+                    <td>{email.clone()}</td>
+                    <td>{invitation.role.label()}</td>
+                    <td>
+                        {invitation
+                            .invited_by
+                            .map_or_else(|| "Deleted account".to_owned(), |name| name.as_str().to_owned())}
+                    </td>
+                    <td>{invitation.expires_at.date().to_string()}</td>
+                    <td>{controls}</td>
+                </tr>
+            }
+        })
+        .collect_view();
+    view! {
+        <div class="table-wrap">
+            <table class="data-table">
+                <caption class="visually-hidden">"Open invitations"</caption>
+                <thead>
+                    <tr>
+                        <th scope="col">"Email"</th>
+                        <th scope="col">"Role"</th>
+                        <th scope="col">"Invited by"</th>
+                        <th scope="col">"Expires (UTC)"</th>
                         <th scope="col"><span class="visually-hidden">"Actions"</span></th>
                     </tr>
                 </thead>

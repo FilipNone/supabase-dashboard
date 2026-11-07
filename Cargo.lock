@@ -2689,6 +2689,7 @@ dependencies = [
  "leptos_axum",
  "leptos_meta",
  "leptos_router",
+ "secrecy",
  "serde",
  "supabase-dashboard-application",
  "supabase-dashboard-domain",

@@ -8,6 +8,7 @@ use supabase_dashboard_domain::theme::ThemePreference;
 
 use crate::components::layout::DashboardLayout;
 use crate::pages::{
+    invite::InvitePage,
     not_found::NotFound,
     organization::{OrganizationGeneralPage, OrganizationLayout, OrganizationTeamPage},
     organizations::OrganizationsPage,
@@ -63,8 +64,17 @@ pub fn initial_theme() -> ThemePreference {
 /// code once rendering starts.
 pub const HOME_PATH: &str = "/dashboard/organizations";
 
-/// The only dashboard page reachable without a session.
+/// Reachable without a session; signed-in operators are sent home.
 pub const SIGN_IN_PATH: &str = "/dashboard/sign-in";
+
+/// Reachable with or without a session. Invitation links point here with
+/// the code in the fragment.
+pub const INVITE_PATH: &str = "/dashboard/invite";
+
+/// Public server functions behind the invitation page. They must match the
+/// `prefix` and `endpoint` of their `#[server]` attributes.
+pub const INVITE_PREVIEW_PATH: &str = "/auth/invitation/preview";
+pub const INVITE_SIGN_UP_PATH: &str = "/auth/invitation/sign-up";
 
 #[component]
 pub fn App() -> impl IntoView {
@@ -78,6 +88,7 @@ pub fn App() -> impl IntoView {
         <Router>
             <Routes fallback=|| view! { <NotFound/> }>
                 <Route path=path!("/dashboard/sign-in") view=SignInPage/>
+                <Route path=path!("/dashboard/invite") view=InvitePage/>
                 <ParentRoute path=path!("/dashboard") view=DashboardLayout>
                     <Route path=path!("organizations") view=OrganizationsPage/>
                     <Route path=path!("status") view=StatusPage/>

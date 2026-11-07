@@ -48,7 +48,7 @@ pub fn SignInPage() -> impl IntoView {
                     <button type="submit" class="button button-primary">"Sign in"</button>
                 </form>
                 <p class="auth-note">
-                    "Accounts are created by an administrator of this installation. There is no public sign-up."
+                    "There is no public sign-up. To join, ask an organization owner or admin for an invitation link."
                 </p>
             </div>
         </main>

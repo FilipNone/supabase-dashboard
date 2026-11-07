@@ -1,3 +1,4 @@
+pub mod invite;
 pub mod not_found;
 pub mod organization;
 pub mod organizations;

@@ -40,6 +40,7 @@ pub fn router(state: AppState, limits: &HttpLimits) -> Router {
         move || health::check(db.clone(), timeout)
     });
     let organizations = state.organizations.clone();
+    let auth = state.auth.clone();
     let leptos_options = state.leptos_options.clone();
     let x_request_id = HeaderName::from_static("x-request-id");
 
@@ -57,6 +58,7 @@ pub fn router(state: AppState, limits: &HttpLimits) -> Router {
             move || {
                 provide_context(probe.clone());
                 provide_context(organizations.clone());
+                provide_context(auth.clone());
             },
             move || shell(leptos_options.clone()),
         )
@@ -143,8 +145,9 @@ mod tests {
     use supabase_dashboard_web::{
         app::SIGN_IN_PATH,
         server_fns::{
-            CreateOrganization, GetCurrentAccount, GetInstallationHealth, GetOrganization,
-            ListOrganizations, RenameOrganization,
+            CreateInvitation, CreateOrganization, GetCurrentAccount, GetInstallationHealth,
+            GetOrganization, ListOrganizations, PreviewInvitation, RenameOrganization,
+            SignUpWithInvitation,
         },
     };
     use tower::ServiceExt;
@@ -555,6 +558,149 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(name, "Acme Secret");
+
+        db.close().await;
+        scratch.drop().await;
+    }
+
+    #[tokio::test]
+    async fn invitation_links_work_without_a_session() {
+        let Some(scratch) = ScratchDb::create("http_invites").await else {
+            return;
+        };
+        let db = Database::connect(&scratch.settings).await.unwrap();
+        db.migrate().await.unwrap();
+        let router = router_for(db.clone()).await;
+        AuthService::new(db.clone(), AuthConfig::default())
+            .await
+            .unwrap()
+            .bootstrap_owner(
+                "alice@example.test",
+                "Alice",
+                &SecretString::from("correct horse battery staple"),
+            )
+            .await
+            .unwrap();
+        let alice = sign_in_cookie(&router, "alice%40example.test").await;
+        let (_, body) = send(
+            &router,
+            form_post(CreateOrganization::PATH, "name=Acme", Some(&alice)),
+        )
+        .await;
+        let acme: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let acme_id = acme["id"].as_str().unwrap().to_owned();
+        let (parts, body) = send(
+            &router,
+            form_post(
+                CreateInvitation::PATH,
+                &format!("organization_id={acme_id}&email=Carol%40Example.test&role=developer"),
+                Some(&alice),
+            ),
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        let issued: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let code = issued["code"].as_str().unwrap().to_owned();
+        assert_eq!(code.len(), 64);
+        assert_eq!(issued["invitation"]["email"], "carol@example.test");
+
+        // The page and the preview need no session, and are not cached.
+        let (parts, _) = send(&router, get("/dashboard/invite")).await;
+        assert_eq!(parts.status, StatusCode::OK);
+        assert_eq!(parts.headers[header::CACHE_CONTROL], "no-store");
+        let (parts, body) = send(
+            &router,
+            form_post(PreviewInvitation::PATH, &format!("code={code}"), None),
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        assert_eq!(parts.headers[header::CACHE_CONTROL], "no-store");
+        let preview: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(preview["invitation"]["organization_name"], "Acme");
+        assert_eq!(preview["invitation"]["account_exists"], false);
+        assert!(preview["signed_in_as"].is_null());
+        let wrong = "0".repeat(64);
+        let (_, body) = send(
+            &router,
+            form_post(PreviewInvitation::PATH, &format!("code={wrong}"), None),
+        )
+        .await;
+        assert!(body.contains(r#""invitation":null"#), "{body}");
+
+        // Other paths under the same prefix still need a session.
+        let (parts, _) = send(&router, form_post("/auth/invitation/other", "", None)).await;
+        assert_eq!(parts.status, StatusCode::UNAUTHORIZED);
+
+        let sign_up = |password_confirmation: &str| {
+            format!(
+                "code={code}&display_name=Carol&password=correct+horse+battery+staple\
+                 &password_confirmation={password_confirmation}"
+            )
+        };
+        // A cross-site form cannot create the account.
+        let forged = Request::post(SignUpWithInvitation::PATH)
+            .header(header::HOST, HOST)
+            .header(header::ORIGIN, "https://evil.example")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(sign_up("correct+horse+battery+staple")))
+            .unwrap();
+        let (parts, _) = send(&router, forged).await;
+        assert_eq!(parts.status, StatusCode::FORBIDDEN);
+        let (parts, body) = send(
+            &router,
+            form_post(
+                SignUpWithInvitation::PATH,
+                &sign_up("different+password+here"),
+                None,
+            ),
+        )
+        .await;
+        assert!(!parts.status.is_success());
+        assert!(body.contains("passwords do not match"), "{body}");
+
+        let (parts, body) = send(
+            &router,
+            form_post(
+                SignUpWithInvitation::PATH,
+                &sign_up("correct+horse+battery+staple"),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        assert!(!parts.headers.contains_key(header::SET_COOKIE));
+        let (parts, _) = send(
+            &router,
+            form_post(
+                SignUpWithInvitation::PATH,
+                &sign_up("correct+horse+battery+staple"),
+                None,
+            ),
+        )
+        .await;
+        assert!(!parts.status.is_success(), "the code is single use");
+
+        let carol = sign_in_cookie(&router, "carol%40example.test").await;
+        let (_, body) = send(
+            &router,
+            form_post(ListOrganizations::PATH, "", Some(&carol)),
+        )
+        .await;
+        assert!(
+            body.contains("Acme") && body.contains("developer"),
+            "{body}"
+        );
+        let (_, body) = send(
+            &router,
+            form_post(
+                PreviewInvitation::PATH,
+                &format!("code={code}"),
+                Some(&carol),
+            ),
+        )
+        .await;
+        assert!(body.contains(r#""invitation":null"#), "{body}");
+        assert!(body.contains("carol@example.test"), "{body}");
 
         db.close().await;
         scratch.drop().await;

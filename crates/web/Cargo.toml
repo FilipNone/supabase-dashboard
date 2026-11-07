@@ -21,11 +21,12 @@ serde.workspace = true
 thiserror.workspace = true
 uuid = { version = "1", default-features = false, features = ["std", "serde"] }
 wasm-bindgen = { workspace = true, optional = true }
-web-sys = { version = "0.3", optional = true, features = ["HtmlDocument"] }
+web-sys = { version = "0.3", optional = true, features = ["HtmlDocument", "History", "Location"] }
 http = { workspace = true, optional = true }
 leptos_axum = { workspace = true, optional = true }
 # Server-only: compiled into the SSR build, never into the WASM bundle.
 supabase-dashboard-application = { workspace = true, optional = true }
+secrecy = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 
 [features]
@@ -38,6 +39,7 @@ ssr = [
     "dep:http",
     "dep:leptos_axum",
     "dep:supabase-dashboard-application",
+    "dep:secrecy",
     "dep:tracing",
 ]
 
