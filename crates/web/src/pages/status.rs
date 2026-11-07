@@ -14,7 +14,7 @@ pub fn StatusPage() -> impl IntoView {
         <Title text="Status"/>
         <PageHeader
             title="Installation status"
-            description="Health of this dashboard's own components. Managed project health is shown per project."
+            description="Health of this dashboard's own components. Managed projects are not included."
         >
             <button type="button" class="button" on:click=move |_| health.refetch()>
                 "Refresh"

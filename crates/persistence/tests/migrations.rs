@@ -3,6 +3,8 @@
 //! own database, so the server only needs CREATEDB permission. Without the
 //! variable the tests are skipped with a message.
 
+#![allow(clippy::unwrap_used)] // test-only crate; failures should abort the test
+
 use std::time::Duration;
 
 use secrecy::SecretString;

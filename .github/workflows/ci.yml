@@ -63,3 +63,23 @@ jobs:
           tool: cargo-leptos@0.3.11
       - name: Build server and WASM bundle
         run: cargo leptos build --release
+
+  fixture:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start disposable Supabase fixture
+        run: |
+          docker compose -f tests/fixtures/supabase/docker-compose.yml \
+            --env-file tests/fixtures/supabase/fixture.env -p sd-fixture up -d --wait --wait-timeout 300
+      - name: Probe service endpoints
+        run: |
+          curl -fsS http://127.0.0.1:54399/health
+          curl -fsS -o /dev/null http://127.0.0.1:54330/
+          curl -fsS -o /dev/null http://127.0.0.1:54380/
+      - name: Show logs on failure
+        if: failure()
+        run: docker compose -p sd-fixture logs --no-color --tail 100
+      - name: Tear down
+        if: always()
+        run: docker compose -p sd-fixture down -v

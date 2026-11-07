@@ -1,6 +1,6 @@
 # Supabase Dashboard roadmap
 
-Updated: 2026-11-05
+Updated: 2026-11-07
 
 ## Goal and status
 
@@ -8,7 +8,7 @@ Build a self-hosted dashboard in Rust that looks and works like <https://supabas
 
 Repository: <https://github.com/FilipNone/supabase-dashboard>.
 
-Status: planning. The repository currently contains project guidance and this roadmap, with no Rust workspace or working application. All implementation checkboxes below are pending. Current focus: M0, followed by a secure vertical slice that signs in, registers an existing deployment, and shows its health and schema.
+Status: M0 in progress. A Cargo workspace exists with an Axum server, Leptos SSR/hydrated UI shell, control-plane PostgreSQL migrations, and CI (see `docs/development.md` and `docs/adr/0001-stack-and-workspace.md`). There are no accounts, organizations, or project connections yet. Current focus: finish M0, then a secure vertical slice that signs in, registers an existing deployment, and shows its health and schema.
 
 Priority scale: P1 = required for the first usable release; P2 = next release after the foundation; P3 = later or dependent on research. Milestones indicate dependency order, not dates or delivery estimates.
 
@@ -33,12 +33,12 @@ The main technical risks are privileged credentials, isolation between organizat
 
 ### M0: foundation (P1)
 
-- [ ] Record the architecture decision, Rust toolchain, selected framework versions, and application license; verify any reused upstream licenses separately.
-- [ ] Create a minimal Cargo workspace with a running server, Rust UI, health endpoint, configuration validation, and graceful shutdown.
-- [ ] Establish separate control-plane PostgreSQL storage, versioned migrations, secret-storage strategy, and backup/recovery requirements.
-- [ ] Build the reference-style shell: primary sidebar, organization/project switchers, page headers, tables, dialogs, dark/light/system themes, and responsive navigation.
-- [ ] Add structured redacted logs, request IDs, typed API errors, bounded requests, and documented local development setup.
-- [ ] Add formatting, clippy, unit/integration checks, server/UI builds, and a synthetic disposable Supabase fixture with pinned component versions. Document an explicit supported-version baseline.
+- [x] Record the architecture decision, Rust toolchain, selected framework versions, and application license; verify any reused upstream licenses separately. (ADR 0001, Apache-2.0; the fixture compose is adapted from Apache-2.0 upstream files with attribution.)
+- [x] Create a minimal Cargo workspace with a running server, Rust UI, health endpoint, configuration validation, and graceful shutdown.
+- [x] Establish separate control-plane PostgreSQL storage, versioned migrations, secret-storage strategy, and backup/recovery requirements. (Strategy and requirements are documented in ADR 0001; encryption is implemented when M2 first stores credentials; the tested restore runbook is an M4 item.)
+- [ ] Build the reference-style shell: primary sidebar, organization/project switchers, page headers, tables, dialogs, dark/light/system themes, and responsive navigation. (Done: sidebar, top bar, page header, table, empty/error states, themes, responsive navigation, checked at 1280px and 390px in both themes. Remaining: dialogs and working switchers, which need M1 organizations to show anything real.)
+- [ ] Add structured redacted logs, request IDs, typed API errors, bounded requests, and documented local development setup. (Done except a typed JSON API error envelope, which lands with the first JSON mutation endpoints.)
+- [x] Add formatting, clippy, unit/integration checks, server/UI builds, and a synthetic disposable Supabase fixture with pinned component versions. Document an explicit supported-version baseline. (`docs/supabase-compatibility.md`; the fixture covers db, auth, rest, and meta.)
 
 Acceptance: a fresh checkout builds and runs using documented commands; migrations work on a fresh database; server and browser builds pass; the shell is reviewed at desktop/mobile widths in both themes. No production credentials are required.
 
@@ -172,4 +172,5 @@ Release checks include a fresh installation, migration from the previous support
 
 ## Revision history
 
+- 2026-11-07: M0 scaffold landed: workspace, server, UI shell, metadata migrations, CI, and the Supabase fixture. Updated M0 checkboxes with what remains.
 - 2026-11-05: reviewed the initial feature/page list, retained its requested areas, added missing project workflows, and organized implementation around security boundaries, adapter capabilities, milestone dependencies, and testable acceptance criteria.
