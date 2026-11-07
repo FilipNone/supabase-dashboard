@@ -23,7 +23,8 @@ use crate::{
     },
     error::AppError,
     server_fns::{
-        RegisterProject, RenameProject, UnregisterProject, get_organization, get_project,
+        ChangeProjectUrl, RegisterProject, RenameProject, UnregisterProject, get_organization,
+        get_project,
     },
 };
 
@@ -168,6 +169,7 @@ pub fn NewProjectPage() -> impl IntoView {
 struct ProjectContext {
     project: Resource<Result<ProjectSummary, AppError>>,
     rename: ServerAction<RenameProject>,
+    change_url: ServerAction<ChangeProjectUrl>,
 }
 
 /// `/dashboard/project/:project_id`: loads the project and renders its tabs.
@@ -177,8 +179,12 @@ struct ProjectContext {
 pub fn ProjectLayout() -> impl IntoView {
     let id = param_uuid("project_id");
     let rename = ServerAction::<RenameProject>::new();
+    let change_url = ServerAction::<ChangeProjectUrl>::new();
+    // Reload only after a save succeeds. A refused save keeps the form as the
+    // user left it, so they can correct the value or confirm plain HTTP.
+    let saved = RwSignal::new(0u32);
     let project = Resource::new(
-        move || (id.get(), rename.version().get()),
+        move || (id.get(), saved.get()),
         |(id, _)| async move {
             match id {
                 Some(id) => get_project(id).await,
@@ -186,12 +192,24 @@ pub fn ProjectLayout() -> impl IntoView {
             }
         },
     );
-    provide_context(ProjectContext { project, rename });
+    provide_context(ProjectContext {
+        project,
+        rename,
+        change_url,
+    });
     // A new name shows in the top bar's project menu too.
     let refresh = use_context::<Refresh>();
     Effect::new(move |_| {
-        if let (Some(Ok(_)), Some(refresh)) = (rename.value().get(), refresh) {
-            refresh.projects_changed();
+        if let Some(Ok(_)) = rename.value().get() {
+            saved.update(|n| *n = n.wrapping_add(1));
+            if let Some(refresh) = refresh {
+                refresh.projects_changed();
+            }
+        }
+    });
+    Effect::new(move |_| {
+        if let Some(Ok(_)) = change_url.value().get() {
+            saved.update(|n| *n = n.wrapping_add(1));
         }
     });
 
@@ -321,6 +339,7 @@ pub fn ProjectSettingsPage() -> impl IntoView {
             let id = project.id.to_string();
             let name = project.name.as_str().to_owned();
             let danger_zone = can_unregister.then(|| unregister_section(unregister, id.clone(), name.clone()));
+            let url_zone = url_section(ctx.change_url, id.clone(), project.api_url.as_str().to_owned(), can_rename);
             view! {
                 <section class="panel" aria-labelledby="project-general-title">
                     <h2 class="section-title" id="project-general-title">"General settings"</h2>
@@ -347,11 +366,80 @@ pub fn ProjectSettingsPage() -> impl IntoView {
                     })}
                     {rename_feedback}
                 </section>
+                {url_zone}
                 {danger_zone}
             }
         })}
     }
     .into_any()
+}
+
+/// Moving a project to a new address only changes the registry entry;
+/// neither the old nor the new address is contacted.
+fn url_section(
+    change_url: ServerAction<ChangeProjectUrl>,
+    id: String,
+    current: String,
+    can_change: bool,
+) -> impl IntoView {
+    let url = RwSignal::new(current.clone());
+    let plain_http = move || {
+        url.read()
+            .trim_start()
+            .to_ascii_lowercase()
+            .starts_with("http://")
+    };
+    let feedback = move || {
+        change_url.value().get().map(|result| match result {
+            Ok(_) => view! { <p class="form-ok" role="status">"API URL saved."</p> }.into_any(),
+            Err(err) => {
+                view! { <p class="form-error" role="alert">{err.to_string()}</p> }.into_any()
+            }
+        })
+    };
+    view! {
+        <section class="panel" aria-labelledby="project-url-title">
+            <h2 class="section-title" id="project-url-title">"API URL"</h2>
+            <ActionForm action=change_url attr:class="stacked-form">
+                <input type="hidden" name="id" value=id/>
+                <label class="field">
+                    <span class="field-label">"API URL"</span>
+                    <input
+                        class="input" name="api_url" type="url" required
+                        autocomplete="off" spellcheck="false" inputmode="url"
+                        maxlength=PROJECT_URL_MAX_LEN.to_string()
+                        value=current
+                        readonly=!can_change
+                        aria-describedby="project-url-hint"
+                        on:input=move |ev| url.set(event_target_value(&ev))
+                    />
+                    <span class="field-hint" id="project-url-hint">
+                        "Use this when the stack moved to a new address. Changing it does not move or contact the stack."
+                    </span>
+                </label>
+                {move || (can_change && plain_http()).then(|| view! {
+                    <label class="checkbox-field">
+                        <input type="checkbox" name="allow_unencrypted" value="true"/>
+                        <span>
+                            "This URL uses plain HTTP. I confirm that the network between the dashboard and this stack is trusted."
+                        </span>
+                    </label>
+                })}
+                {can_change.then(|| view! {
+                    <div>
+                        <button type="submit" class="button button-primary"
+                            disabled=move || change_url.pending().get()>
+                            "Save URL"
+                        </button>
+                    </div>
+                })}
+            </ActionForm>
+            {(!can_change).then(|| view! {
+                <p class="field-hint">"Only owners and administrators can change the API URL."</p>
+            })}
+            {feedback}
+        </section>
+    }
 }
 
 fn unregister_section(

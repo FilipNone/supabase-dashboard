@@ -8,7 +8,7 @@ Build a self-hosted dashboard in Rust that looks and works like <https://supabas
 
 Repository: <https://github.com/FilipNone/supabase-dashboard>.
 
-Status: M0 nearly complete; M1 started. A Cargo workspace exists with an Axum server, Leptos SSR/hydrated UI shell, control-plane PostgreSQL migrations, and CI (see `docs/development.md` and `docs/adr/0001-stack-and-workspace.md`). Operators can be bootstrapped from the command line, sign in and out, edit their profile, change their password, and sign out other sessions. Installation admins can list accounts, disable or re-enable them, and see every organization and registered project. Every page and API path requires a session, except the invitation page. Operators can create and rename organizations, switch between them, and manage member roles, removal, and leaving from the browser. Owners and admins can invite people by email; the invitee accepts with an existing account or creates one from the link. Owners and admins can register an existing stack as a project by its API URL, rename it, and unregister it; every member can see the organization's projects. The dashboard does not connect to registered stacks yet. Current focus: a secure vertical slice that registers an existing deployment and shows its health and schema.
+Status: M0 nearly complete; M1 started. A Cargo workspace exists with an Axum server, Leptos SSR/hydrated UI shell, control-plane PostgreSQL migrations, and CI (see `docs/development.md` and `docs/adr/0001-stack-and-workspace.md`). Operators can be bootstrapped from the command line, sign in and out, edit their profile, change their password, and sign out other sessions. Installation admins can list accounts, disable or re-enable them, and see every organization and registered project. Every page and API path requires a session, except the invitation page. Operators can create and rename organizations, switch between them, and manage member roles, removal, and leaving from the browser. Owners and admins can invite people by email; the invitee accepts with an existing account or creates one from the link. Owners and admins can register an existing stack as a project by its API URL, rename it, change its API URL, and unregister it; every member can see the organization's projects. The dashboard does not connect to registered stacks yet. Current focus: a secure vertical slice that registers an existing deployment and shows its health and schema.
 
 Priority scale: P1 = required for the first usable release; P2 = next release after the foundation; P3 = later or dependent on research. Milestones indicate dependency order, not dates or delivery estimates.
 
@@ -57,7 +57,7 @@ Acceptance: two organizations cannot read or mutate each other's records, includ
 
 - [ ] Add a project connection wizard for explicitly enrolled self-hosted targets, with TLS verification and server-side credential storage.
 - [ ] Detect reachable services, component versions, permissions, and supported capabilities; distinguish unknown health from failure.
-- [ ] Show project cards, project overview, service health, and connection diagnostics. Support metadata edits and explicit credential replacement. (Started: the organization page lists project cards, and each project has an overview and a settings page where it can be renamed. Health, diagnostics, and credentials come with the connection wizard.)
+- [ ] Show project cards, project overview, service health, and connection diagnostics. Support metadata edits and explicit credential replacement. (Started: the organization page lists project cards, and each project has an overview and a settings page where it can be renamed or pointed at a new API URL (same checks as registration, audited, and nothing is sent to the stack). Health, diagnostics, and credentials come with the connection wizard.)
 - [ ] Implement schema/table/column browsing and bounded, paginated read-only data access, with safe identifier handling.
 - [x] Add disconnect/unregister behavior that preserves the remote stack and its data. (Unregistering requires typing the project name and deletes only the registry row. Nothing is sent to the stack.)
 - [ ] Test forbidden destinations, redirects/DNS changes, expired credentials, unreachable services, permission errors, and unsupported versions.
@@ -172,6 +172,7 @@ Release checks include a fresh installation, migration from the previous support
 
 ## Revision history
 
+- 2026-11-07: owners and admins can change a project's API URL from its settings page. The M2 project item stays open.
 - 2026-11-07: added the top-bar project switcher; the M0 shell item now only lacks dialogs.
 - 2026-11-07: the administrator view now lists every organization and registered project, read-only. Marked the M1 administrator item done.
 - 2026-11-07: M2 project registry: register an existing stack by API URL (plain HTTP needs explicit confirmation), list, rename, and unregister with typed confirmation. Marked the M2 unregister item done; connections, credentials, and health are still open.

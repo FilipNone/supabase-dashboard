@@ -339,3 +339,95 @@ async fn registration_validates_input_and_limits() {
     f.db.close().await;
     scratch.drop().await;
 }
+
+#[tokio::test]
+async fn url_changes_are_checked_authorized_and_audited() {
+    let Some(scratch) = ScratchDb::create("project_url").await else {
+        return;
+    };
+    let f = setup(&scratch).await;
+    let owner = account(&f.db, "Owner").await;
+    let developer = account(&f.db, "Developer").await;
+    let outsider = account(&f.db, "Outsider").await;
+    let org = f.orgs.create(&owner, "Acme", ctx()).await.unwrap().id;
+    add_member(&f.db, org, &developer, OrgRole::Developer).await;
+    let project = f
+        .projects
+        .register(&owner, org, registration("Prod"), ctx())
+        .await
+        .unwrap();
+    let new_url = "https://new.example.test";
+
+    assert!(matches!(
+        f.projects
+            .change_url(&developer, project.id, new_url, false, ctx())
+            .await,
+        Err(ProjectError::Forbidden)
+    ));
+    assert_eq!(audit_count(&f.db, "project.change_url", "denied").await, 1);
+    assert!(matches!(
+        f.projects
+            .change_url(&outsider, project.id, new_url, false, ctx())
+            .await,
+        Err(ProjectError::NotFound)
+    ));
+
+    // The same URL rules as registration.
+    assert!(matches!(
+        f.projects
+            .change_url(&owner, project.id, "http://10.0.0.5:8000", false, ctx())
+            .await,
+        Err(ProjectError::Input(
+            ProjectInputError::UnencryptedNotConfirmed
+        ))
+    ));
+    assert!(matches!(
+        f.projects
+            .change_url(
+                &owner,
+                project.id,
+                "https://u:p@new.example.test",
+                false,
+                ctx()
+            )
+            .await,
+        Err(ProjectError::Input(ProjectInputError::UrlCredentials))
+    ));
+    assert_eq!(
+        f.projects
+            .get(&developer, project.id)
+            .await
+            .unwrap()
+            .api_url
+            .as_str(),
+        "https://supabase.example.test",
+        "refused changes leave the URL alone"
+    );
+
+    let changed = f
+        .projects
+        .change_url(&owner, project.id, new_url, false, ctx())
+        .await
+        .unwrap();
+    assert_eq!(changed.api_url.as_str(), new_url);
+    assert_eq!(changed.name.as_str(), "Prod");
+    let plain = f
+        .projects
+        .change_url(&owner, project.id, "http://10.0.0.5:8000", true, ctx())
+        .await
+        .unwrap();
+    assert!(!plain.api_url.is_encrypted());
+    assert_eq!(
+        f.projects
+            .get(&developer, project.id)
+            .await
+            .unwrap()
+            .api_url
+            .as_str(),
+        "http://10.0.0.5:8000"
+    );
+    assert_eq!(audit_count(&f.db, "project.change_url", "success").await, 2);
+
+    f.db.close().await;
+    scratch.drop().await;
+}

@@ -226,6 +226,21 @@ pub async fn rename_project(id: Uuid, name: String) -> Result<ProjectSummary, Ap
         .await?)
 }
 
+/// Points a project at a different API URL. Nothing is sent to it.
+#[server]
+pub async fn change_project_url(
+    id: Uuid,
+    api_url: String,
+    // Set by a checkbox, so it is absent when unchecked.
+    #[server(default)] allow_unencrypted: bool,
+) -> Result<ProjectSummary, AppError> {
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    Ok(org_context::projects()?
+        .change_url(&session, id, &api_url, allow_unencrypted, audit.get())
+        .await?)
+}
+
 /// Removes the registry entry. `confirmation` must be the project's name.
 #[server]
 pub async fn unregister_project(id: Uuid, confirmation: String) -> Result<(), AppError> {

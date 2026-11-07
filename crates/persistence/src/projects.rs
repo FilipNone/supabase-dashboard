@@ -199,6 +199,31 @@ impl Database {
         Ok(true)
     }
 
+    /// Points a project at a different API URL. Returns `false` when it
+    /// does not exist.
+    pub async fn change_project_url(
+        &self,
+        project_id: Uuid,
+        api_url: &ProjectUrl,
+        audit: &AuditEvent<'_>,
+    ) -> Result<bool, PersistenceError> {
+        let mut tx = self.pool.begin().await.map_err(query_err)?;
+        let updated =
+            sqlx::query("UPDATE projects SET api_url = $2, updated_at = now() WHERE id = $1")
+                .bind(project_id)
+                .bind(api_url.as_str())
+                .execute(&mut *tx)
+                .await
+                .map_err(query_err)?
+                .rows_affected();
+        if updated == 0 {
+            return Ok(false);
+        }
+        insert_audit_event(&mut *tx, audit).await?;
+        tx.commit().await.map_err(query_err)?;
+        Ok(true)
+    }
+
     /// Removes a project's registry entry. The stack itself is not touched.
     /// Returns `false` when the entry does not exist.
     pub async fn delete_project(

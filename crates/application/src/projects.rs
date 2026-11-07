@@ -186,6 +186,42 @@ impl ProjectService {
         ))
     }
 
+    /// Points the project at a different API URL, with the same checks as
+    /// registration. Nothing is sent to either address.
+    pub async fn change_url(
+        &self,
+        current: &CurrentSession,
+        project_id: Uuid,
+        api_url: &str,
+        allow_unencrypted: bool,
+        ctx: RequestContext<'_>,
+    ) -> Result<ProjectSummary, ProjectError> {
+        let action = "project.change_url";
+        let access = self
+            .audited_access(current, project_id, Permission::ProjectUpdate, action, ctx)
+            .await?;
+        let api_url = check_registration_url(api_url, allow_unencrypted)?;
+        let target = ("project", project_id.to_string());
+        let changed = self
+            .db
+            .change_project_url(
+                project_id,
+                &api_url,
+                &event(current, action, target, AuditOutcome::Success, ctx),
+            )
+            .await?;
+        if !changed {
+            return Err(ProjectError::NotFound);
+        }
+        Ok(summary(
+            ProjectRecord {
+                api_url,
+                ..access.project
+            },
+            access.role,
+        ))
+    }
+
     /// Removes the registry entry after the operator typed the project's
     /// name. The stack, its services, and its data are left as they are.
     pub async fn unregister(
