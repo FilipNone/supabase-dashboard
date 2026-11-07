@@ -9,13 +9,18 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+supabase-dashboard-domain.workspace = true
 secrecy.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
+time.workspace = true
 tokio.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
+time.workspace = true
 tokio.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true

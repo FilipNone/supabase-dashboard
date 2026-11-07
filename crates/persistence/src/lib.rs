@@ -3,6 +3,10 @@
 //! This crate is server-only. It must never be a dependency of the browser
 //! (`hydrate`) build.
 
+pub mod accounts;
+pub mod audit;
+pub mod sessions;
+
 use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
@@ -25,6 +29,10 @@ pub enum PersistenceError {
     Query(#[source] sqlx::Error),
     #[error("metadata database did not respond within {0:?}")]
     Timeout(Duration),
+    /// A stored value no longer passes domain validation. Names the column,
+    /// never the value.
+    #[error("metadata database holds an invalid value in {0}")]
+    InvalidRow(&'static str),
 }
 
 /// Connection settings for the metadata database.

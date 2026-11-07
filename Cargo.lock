@@ -458,6 +458,9 @@ name = "deranged"
 version = "0.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e9de72ce2ad1f90dc62fa25f0f430ef85eb4b0d8fa0be4f30373bc40a21d28e"
+dependencies = [
+ "serde_core",
+]
 
 [[package]]
 name = "derive-where"
@@ -2545,8 +2548,11 @@ version = "0.1.0"
 dependencies = [
  "secrecy",
  "sqlx",
+ "supabase-dashboard-domain",
  "thiserror 2.0.21",
+ "time",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
