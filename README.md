@@ -6,16 +6,13 @@ This is an independent project. It is not made, endorsed, or supported by Supaba
 
 ## Status
 
-Early development (milestone M0). What works today:
+Early development (milestones M0 and M1, M2 started). Operators can sign in, manage organizations, members, and invitations, and register existing self-hosted stacks by API URL. The dashboard does not connect to registered stacks yet. `ROADMAP.md` has the plan and current status.
 
-- Axum server with Leptos server rendering and WASM hydration
-- Control-plane PostgreSQL connection with embedded migrations
-- Liveness and readiness endpoints, request IDs, body and time limits
-- The dashboard shell with light, dark, and system themes
+## Install
 
-There are no accounts, organizations, or project connections yet. `ROADMAP.md` has the plan and current status.
+Development releases ship a prebuilt container image for linux/amd64 and linux/arm64, `ghcr.io/filipnone/supabase-dashboard`, and a Docker Compose bundle on the [releases page](https://github.com/FilipNone/supabase-dashboard/releases). Nothing is compiled on the server. See [docs/deployment.md](docs/deployment.md).
 
-## Getting started
+## Development
 
 See [docs/development.md](docs/development.md).
 

@@ -1,0 +1,6 @@
+# Used by `docker compose --profile caddy up -d`. Caddy obtains and renews a
+# certificate for SUPABASE_DASHBOARD_DOMAIN and forwards to the dashboard.
+{$SUPABASE_DASHBOARD_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy dashboard:3000
+}

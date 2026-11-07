@@ -113,7 +113,7 @@ Acceptance: each integration has documented credentials, scopes, version support
 - [ ] Define cluster support precisely: server grouping/scheduling, PostgreSQL HA, replication, failover, and backups are separate capabilities. Choose supported infrastructure before promising availability guarantees.
 - [ ] Add capacity placement and multi-server operation only after failure/recovery tests for the selected architecture.
 - [ ] Add organization security controls, supported application integrations, organization documents, and audit-log drains with delivery/retention guarantees.
-- [ ] Publish installation, upgrade, migration, recovery, and troubleshooting documentation; publish a GitHub wiki when the core deployment flow is stable.
+- [ ] Publish installation, upgrade, migration, recovery, and troubleshooting documentation; publish a GitHub wiki when the core deployment flow is stable. (Started: `docs/deployment.md` covers Docker install, upgrade, backup, and restore for the dev releases; the restore steps were checked by hand once and have no automated test.)
 - [ ] Track reference-dashboard workflow and visual parity with screenshots, keyboard tests, capability mappings, and explicit unsupported features.
 
 Acceptance: no cluster/HA claim ships without tested failure and recovery behavior. A new operator can install, upgrade, back up, and restore the dashboard using published instructions.
@@ -172,6 +172,7 @@ Release checks include a fresh installation, migration from the previous support
 
 ## Revision history
 
+- 2026-11-08: first development release `v0.1.0-dev.1`: a multi-arch container image on GHCR, a Docker Compose deploy bundle with optional Caddy TLS, and Linux tarballs, built by `.github/workflows/release.yml`. Started the M7 installation documentation item.
 - 2026-11-07: owners and admins can change a project's API URL from its settings page. The M2 project item stays open.
 - 2026-11-07: added the top-bar project switcher; the M0 shell item now only lacks dialogs.
 - 2026-11-07: the administrator view now lists every organization and registered project, read-only. Marked the M1 administrator item done.

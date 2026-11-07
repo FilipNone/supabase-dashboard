@@ -2611,7 +2611,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "supabase-dashboard-application"
-version = "0.1.0"
+version = "0.1.0-dev.1"
 dependencies = [
  "argon2",
  "getrandom 0.4.3",
@@ -2629,7 +2629,7 @@ dependencies = [
 
 [[package]]
 name = "supabase-dashboard-domain"
-version = "0.1.0"
+version = "0.1.0-dev.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2641,7 +2641,7 @@ dependencies = [
 
 [[package]]
 name = "supabase-dashboard-persistence"
-version = "0.1.0"
+version = "0.1.0-dev.1"
 dependencies = [
  "secrecy",
  "sqlx",
@@ -2654,7 +2654,7 @@ dependencies = [
 
 [[package]]
 name = "supabase-dashboard-server"
-version = "0.1.0"
+version = "0.1.0-dev.1"
 dependencies = [
  "axum",
  "http",
@@ -2682,7 +2682,7 @@ dependencies = [
 
 [[package]]
 name = "supabase-dashboard-web"
-version = "0.1.0"
+version = "0.1.0-dev.1"
 dependencies = [
  "console_error_panic_hook",
  "http",
