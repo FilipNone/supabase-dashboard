@@ -1,0 +1,78 @@
+//! The error type every server function returns to the browser.
+//!
+//! Messages are fixed or come from input validation, so nothing internal
+//! (SQL, file paths, connection details) can reach the browser through
+//! them. Internal failures are logged on the server and arrive here as
+//! [`AppError::Unavailable`].
+
+use leptos::server_fn::{
+    codec::JsonEncoding,
+    error::{FromServerFnError, ServerFnErrorErr},
+};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+pub enum AppError {
+    #[error("Your session has ended. Sign in again to continue.")]
+    Unauthenticated,
+    /// Also returned for records the operator may not see, so their
+    /// existence is not revealed.
+    #[error("This was not found, or you do not have access to it.")]
+    NotFound,
+    #[error("Your role does not allow this action.")]
+    Forbidden,
+    /// A validation or business-rule message meant for the operator.
+    #[error("{0}")]
+    Rejected(String),
+    #[error("The dashboard could not complete the request. Try again shortly.")]
+    Unavailable,
+    /// The request did not reach the server function, or its response could
+    /// not be read. Details stay out of the UI.
+    #[error("The request could not be sent. Check your connection and try again.")]
+    Transport,
+}
+
+impl FromServerFnError for AppError {
+    type Encoder = JsonEncoding;
+
+    fn from_server_fn_error(_value: ServerFnErrorErr) -> Self {
+        Self::Transport
+    }
+}
+
+#[cfg(feature = "ssr")]
+mod server {
+    use supabase_dashboard_application::organizations::OrganizationError;
+
+    use super::AppError;
+
+    impl From<OrganizationError> for AppError {
+        fn from(err: OrganizationError) -> Self {
+            match err {
+                OrganizationError::NotFound | OrganizationError::MemberNotFound => Self::NotFound,
+                OrganizationError::Forbidden => Self::Forbidden,
+                OrganizationError::LimitReached
+                | OrganizationError::Input(_)
+                | OrganizationError::Membership(_) => Self::Rejected(err.to_string()),
+                OrganizationError::Internal(err) => {
+                    tracing::error!(error = %err, "organization operation failed");
+                    Self::Unavailable
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transport_details_are_dropped() {
+        let err = AppError::from_server_fn_error(ServerFnErrorErr::ServerError(
+            "connection to 10.0.0.5:5432 refused".into(),
+        ));
+        assert_eq!(err, AppError::Transport);
+        assert!(!err.to_string().contains("10.0.0.5"));
+    }
+}

@@ -8,7 +8,11 @@ use supabase_dashboard_domain::theme::ThemePreference;
 
 use crate::components::layout::DashboardLayout;
 use crate::pages::{
-    not_found::NotFound, organizations::OrganizationsPage, sign_in::SignInPage, status::StatusPage,
+    not_found::NotFound,
+    organization::{OrganizationGeneralPage, OrganizationLayout, OrganizationTeamPage},
+    organizations::OrganizationsPage,
+    sign_in::SignInPage,
+    status::StatusPage,
 };
 
 /// Server-rendered HTML document. The theme comes from a non-secret cookie
@@ -77,6 +81,10 @@ pub fn App() -> impl IntoView {
                 <ParentRoute path=path!("/dashboard") view=DashboardLayout>
                     <Route path=path!("organizations") view=OrganizationsPage/>
                     <Route path=path!("status") view=StatusPage/>
+                    <ParentRoute path=path!("org/:org_id") view=OrganizationLayout>
+                        <Route path=path!("general") view=OrganizationGeneralPage/>
+                        <Route path=path!("team") view=OrganizationTeamPage/>
+                    </ParentRoute>
                 </ParentRoute>
             </Routes>
         </Router>

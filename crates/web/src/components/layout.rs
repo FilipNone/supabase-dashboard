@@ -1,13 +1,17 @@
 use leptos::prelude::*;
-use leptos_router::components::{A, Outlet};
+use leptos_router::{
+    components::{A, Outlet},
+    hooks::use_location,
+};
+use uuid::Uuid;
 
 use super::theme_switcher::ThemeSwitcher;
-use crate::server_fns::get_current_account;
+use crate::server_fns::{get_current_account, list_organizations};
 
 /// Primary application frame: sidebar, top bar, and the routed page.
 ///
-/// Only routes that exist are linked. Organization and project switchers show
-/// an explicit empty state until accounts and organizations land (M1).
+/// Only routes that exist are linked. The project switcher arrives with
+/// projects in M2.
 #[component]
 pub fn DashboardLayout() -> impl IntoView {
     view! {
@@ -33,9 +37,7 @@ pub fn DashboardLayout() -> impl IntoView {
                     <nav class="breadcrumbs" aria-label="Context">
                         <span class="crumb-static">"Dashboard"</span>
                         <span class="crumb-sep" aria-hidden="true">"/"</span>
-                        <span class="crumb-empty" title="Organizations are not available yet">
-                            "No organization"
-                        </span>
+                        <OrganizationSwitcher/>
                     </nav>
                     <div class="topbar-actions">
                         <ThemeSwitcher/>
@@ -47,6 +49,67 @@ pub fn DashboardLayout() -> impl IntoView {
                 </main>
             </div>
         </div>
+    }
+}
+
+/// Breadcrumb menu listing the operator's organizations. It is a
+/// `<details>` element, so it opens with the keyboard and works before the
+/// WASM bundle loads.
+#[component]
+fn OrganizationSwitcher() -> impl IntoView {
+    let location = use_location();
+    let current_id = Memo::new(move |_| {
+        location
+            .pathname
+            .get()
+            .strip_prefix("/dashboard/org/")
+            .and_then(|rest| rest.split('/').next())
+            .and_then(|id| id.parse::<Uuid>().ok())
+    });
+    let organizations = Resource::new(|| (), |_| list_organizations());
+    view! {
+        <Transition fallback=|| view! { <span class="crumb-empty">"Organizations"</span> }>
+            {move || {
+                organizations.get().map(|result| {
+                    let list = result.unwrap_or_default();
+                    let current = current_id.get();
+                    let label = current
+                        .and_then(|id| list.iter().find(|org| org.id == id))
+                        .map_or_else(
+                            || "Select organization".to_owned(),
+                            |org| org.name.as_str().to_owned(),
+                        );
+                    let items = list
+                        .into_iter()
+                        .map(|org| {
+                            let href = format!("/dashboard/org/{}/general", org.id);
+                            let selected = (Some(org.id) == current).then_some("page");
+                            view! {
+                                <li>
+                                    <a href=href aria-current=selected>
+                                        {org.name.as_str().to_owned()}
+                                    </a>
+                                </li>
+                            }
+                        })
+                        .collect_view();
+                    view! {
+                        <details class="switcher">
+                            <summary class="switcher-button">
+                                <span class="visually-hidden">"Organization: "</span>
+                                {label}
+                            </summary>
+                            <div class="switcher-menu">
+                                <ul>{items}</ul>
+                                <a class="switcher-all" href="/dashboard/organizations">
+                                    "All organizations"
+                                </a>
+                            </div>
+                        </details>
+                    }
+                })
+            }}
+        </Transition>
     }
 }
 

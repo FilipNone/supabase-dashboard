@@ -2689,7 +2689,11 @@ dependencies = [
  "leptos_meta",
  "leptos_router",
  "serde",
+ "supabase-dashboard-application",
  "supabase-dashboard-domain",
+ "thiserror 2.0.21",
+ "tracing",
+ "uuid",
  "wasm-bindgen",
  "web-sys",
 ]

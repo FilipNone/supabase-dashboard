@@ -1,0 +1,339 @@
+//! Pages for one organization: settings and team.
+//!
+//! Controls are shown or hidden according to the operator's role so the page
+//! only offers actions that can work. The server checks the role again on
+//! every call; hiding a control is not the authorization.
+
+use leptos::{form::ActionForm, prelude::*};
+use leptos_meta::Title;
+use leptos_router::{
+    components::{A, Outlet},
+    hooks::{use_navigate, use_params_map},
+};
+use supabase_dashboard_domain::{
+    authz::{OrgRole, Permission},
+    organization::{MemberSummary, ORGANIZATION_NAME_MAX_CHARS, OrganizationSummary},
+};
+use uuid::Uuid;
+
+use crate::{
+    components::page::{StatePanel, StateTone},
+    error::AppError,
+    server_fns::{
+        ChangeMemberRole, RemoveMember, RenameOrganization, get_organization, list_members,
+    },
+};
+
+#[derive(Clone, Copy)]
+struct OrgContext {
+    id: Memo<Option<Uuid>>,
+    org: Resource<Result<OrganizationSummary, AppError>>,
+    rename: ServerAction<RenameOrganization>,
+}
+
+/// Loads the organization named in the URL and renders its tabs. A
+/// malformed ID, an unknown organization, and one the operator does not
+/// belong to all show the same not-found state.
+#[component]
+pub fn OrganizationLayout() -> impl IntoView {
+    let params = use_params_map();
+    let id = Memo::new(move |_| {
+        params
+            .read()
+            .get("org_id")
+            .and_then(|raw| raw.parse::<Uuid>().ok())
+    });
+    let rename = ServerAction::<RenameOrganization>::new();
+    let org = Resource::new(
+        move || (id.get(), rename.version().get()),
+        |(id, _)| async move {
+            match id {
+                Some(id) => get_organization(id).await,
+                None => Err(AppError::NotFound),
+            }
+        },
+    );
+    provide_context(OrgContext { id, org, rename });
+
+    view! {
+        <Transition fallback=|| view! { <p class="loading" role="status">"Loading organization…"</p> }>
+            {move || {
+                org.get()
+                    .map(|result| match result {
+                        Ok(org) => {
+                            let base = format!("/dashboard/org/{}", org.id);
+                            view! {
+                                <Title text=org.name.as_str().to_owned()/>
+                                <header class="page-header">
+                                    <div>
+                                        <h1 class="page-title">{org.name.as_str().to_owned()}</h1>
+                                        <p class="page-description">
+                                            "Your role: " {org.role.label()}
+                                        </p>
+                                    </div>
+                                </header>
+                                <nav class="tabs" aria-label="Organization">
+                                    <A href=format!("{base}/general") attr:class="tab">"General"</A>
+                                    <A href=format!("{base}/team") attr:class="tab">"Team"</A>
+                                </nav>
+                                <Outlet/>
+                            }
+                            .into_any()
+                        }
+                        Err(err) => view! {
+                            <Title text="Organization"/>
+                            <StatePanel
+                                tone=StateTone::Error
+                                title="Organization unavailable".to_string()
+                                detail=err.to_string()
+                            />
+                            <p><a href="/dashboard/organizations">"Back to organizations"</a></p>
+                        }
+                        .into_any(),
+                    })
+            }}
+        </Transition>
+    }
+}
+
+fn loaded_org(ctx: OrgContext) -> Option<OrganizationSummary> {
+    ctx.org.get().and_then(Result::ok)
+}
+
+/// Organization settings: currently the name.
+#[component]
+pub fn OrganizationGeneralPage() -> impl IntoView {
+    let Some(ctx) = use_context::<OrgContext>() else {
+        return ().into_any();
+    };
+    let rename = ctx.rename;
+    let feedback = move || {
+        rename.value().get().map(|result| match result {
+            Ok(_) => {
+                view! { <p class="form-ok" role="status">"Organization name saved."</p> }.into_any()
+            }
+            Err(err) => {
+                view! { <p class="form-error" role="alert">{err.to_string()}</p> }.into_any()
+            }
+        })
+    };
+    view! {
+        {move || {
+            loaded_org(ctx).map(|org| {
+                let can_edit = org.role.allows(Permission::OrgUpdate);
+                view! {
+                    <section class="panel" aria-labelledby="org-general-title">
+                        <h2 class="section-title" id="org-general-title">"General settings"</h2>
+                        <ActionForm action=rename attr:class="inline-form">
+                            <input type="hidden" name="id" value=org.id.to_string()/>
+                            <label class="field">
+                                <span class="field-label">"Organization name"</span>
+                                <input
+                                    class="input" name="name" required autocomplete="off"
+                                    maxlength=ORGANIZATION_NAME_MAX_CHARS.to_string()
+                                    value=org.name.as_str().to_owned()
+                                    readonly=!can_edit
+                                />
+                            </label>
+                            {can_edit.then(|| view! {
+                                <button type="submit" class="button button-primary"
+                                    disabled=move || rename.pending().get()>
+                                    "Save"
+                                </button>
+                            })}
+                        </ActionForm>
+                        {(!can_edit).then(|| view! {
+                            <p class="field-hint">"Only owners and administrators can rename the organization."</p>
+                        })}
+                        {feedback}
+                    </section>
+                }
+            })
+        }}
+    }
+    .into_any()
+}
+
+/// Members of the organization, with role changes and removal for those
+/// allowed to manage members, and a way to leave for everyone.
+#[component]
+pub fn OrganizationTeamPage() -> impl IntoView {
+    let Some(ctx) = use_context::<OrgContext>() else {
+        return ().into_any();
+    };
+    let change = ServerAction::<ChangeMemberRole>::new();
+    let remove = ServerAction::<RemoveMember>::new();
+    let leave = ServerAction::<RemoveMember>::new();
+    let members = Resource::new(
+        move || (ctx.id.get(), change.version().get(), remove.version().get()),
+        |(id, _, _)| async move {
+            match id {
+                Some(id) => list_members(id).await,
+                None => Err(AppError::NotFound),
+            }
+        },
+    );
+
+    // After leaving, this organization is no longer visible.
+    let navigate = use_navigate();
+    Effect::new(move |_| {
+        if matches!(leave.value().get(), Some(Ok(()))) {
+            navigate("/dashboard/organizations", Default::default());
+        }
+    });
+
+    let action_error = move || {
+        [
+            change.value().get(),
+            remove.value().get(),
+            leave.value().get(),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(Result::err)
+        .map(|err| view! { <p class="form-error" role="alert">{err.to_string()}</p> })
+    };
+
+    view! {
+        <section class="panel" aria-labelledby="team-title">
+            <h2 class="section-title" id="team-title">"Team"</h2>
+            <p class="field-hint">
+                "Invitations are not available yet. Members can be added once they land."
+            </p>
+            {action_error}
+            <Transition fallback=|| view! { <p class="loading" role="status">"Loading members…"</p> }>
+                {move || {
+                    let actor = loaded_org(ctx).map(|org| org.role);
+                    members
+                        .get()
+                        .map(|result| match (result, actor) {
+                            (Ok(list), Some(actor)) => {
+                                let org_id = ctx.id.get().map(|id| id.to_string()).unwrap_or_default();
+                                view! { <MemberTable list actor org_id change remove leave/> }.into_any()
+                            }
+                            (Err(err), _) => view! {
+                                <StatePanel
+                                    tone=StateTone::Error
+                                    title="Could not load members".to_string()
+                                    detail=err.to_string()
+                                />
+                            }
+                            .into_any(),
+                            (Ok(_), None) => ().into_any(),
+                        })
+                }}
+            </Transition>
+        </section>
+    }
+    .into_any()
+}
+
+/// Hidden fields naming the organization and member a form acts on.
+#[component]
+fn MemberTarget(target: (String, String)) -> impl IntoView {
+    let (organization_id, account_id) = target;
+    view! {
+        <input type="hidden" name="organization_id" value=organization_id/>
+        <input type="hidden" name="account_id" value=account_id/>
+    }
+}
+
+#[component]
+fn MemberTable(
+    list: Vec<MemberSummary>,
+    actor: OrgRole,
+    org_id: String,
+    change: ServerAction<ChangeMemberRole>,
+    remove: ServerAction<RemoveMember>,
+    leave: ServerAction<RemoveMember>,
+) -> impl IntoView {
+    let can_manage = actor.allows(Permission::MembersManage);
+    let rows = list
+        .into_iter()
+        .map(|member| {
+            // Mirrors the server rule: only owners touch the owner role.
+            let editable = can_manage
+                && !member.is_you
+                && (actor == OrgRole::Owner || member.role != OrgRole::Owner);
+            let target = (org_id.clone(), member.account_id.to_string());
+            let name = member.display_name.as_str().to_owned();
+            let controls = if editable {
+                let options = OrgRole::ALL
+                    .into_iter()
+                    .filter(|role| actor == OrgRole::Owner || *role != OrgRole::Owner)
+                    .map(|role| {
+                        view! {
+                            <option value=role.as_str() selected=role == member.role>
+                                {role.label()}
+                            </option>
+                        }
+                    })
+                    .collect_view();
+                let select_label = format!("Role for {name}");
+                let confirm = format!("Remove {name}");
+                let remove_target = target.clone();
+                view! {
+                    <div class="row-actions">
+                        <ActionForm action=change attr:class="inline-form compact">
+                            <MemberTarget target=target.clone()/>
+                            <select class="input" name="role" aria-label=select_label>{options}</select>
+                            <button type="submit" class="button">"Change role"</button>
+                        </ActionForm>
+                        <details class="confirm">
+                            <summary class="button">"Remove"</summary>
+                            <ActionForm action=remove attr:class="confirm-body">
+                                <MemberTarget target=remove_target.clone()/>
+                                <p>"They lose access to this organization immediately."</p>
+                                <button type="submit" class="button button-danger">{confirm}</button>
+                            </ActionForm>
+                        </details>
+                    </div>
+                }
+                .into_any()
+            } else if member.is_you {
+                view! {
+                    <div class="row-actions">
+                    <details class="confirm">
+                        <summary class="button">"Leave"</summary>
+                        <ActionForm action=leave attr:class="confirm-body">
+                            <MemberTarget target=target.clone()/>
+                            <p>"You lose access until someone adds you again."</p>
+                            <button type="submit" class="button button-danger">"Leave organization"</button>
+                        </ActionForm>
+                    </details>
+                    </div>
+                }
+                .into_any()
+            } else {
+                ().into_any()
+            };
+            view! {
+                <tr>
+                    <td>
+                        {name.clone()}
+                        {member.is_you.then(|| view! { <span class="badge badge-muted">"You"</span> })}
+                    </td>
+                    <td>{member.email.to_string()}</td>
+                    <td>{member.role.label()}</td>
+                    <td>{controls}</td>
+                </tr>
+            }
+        })
+        .collect_view();
+    view! {
+        <div class="table-wrap">
+            <table class="data-table">
+                <caption class="visually-hidden">"Organization members"</caption>
+                <thead>
+                    <tr>
+                        <th scope="col">"Name"</th>
+                        <th scope="col">"Email"</th>
+                        <th scope="col">"Role"</th>
+                        <th scope="col"><span class="visually-hidden">"Actions"</span></th>
+                    </tr>
+                </thead>
+                <tbody>{rows}</tbody>
+            </table>
+        </div>
+    }
+}

@@ -39,6 +39,7 @@ pub fn router(state: AppState, limits: &HttpLimits) -> Router {
         let timeout = state.readiness_timeout;
         move || health::check(db.clone(), timeout)
     });
+    let organizations = state.organizations.clone();
     let leptos_options = state.leptos_options.clone();
     let x_request_id = HeaderName::from_static("x-request-id");
 
@@ -53,7 +54,10 @@ pub fn router(state: AppState, limits: &HttpLimits) -> Router {
         .leptos_routes_with_context(
             &state,
             routes,
-            move || provide_context(probe.clone()),
+            move || {
+                provide_context(probe.clone());
+                provide_context(organizations.clone());
+            },
             move || shell(leptos_options.clone()),
         )
         .fallback(leptos_axum::file_and_error_handler::<AppState, _>(shell))
@@ -131,11 +135,17 @@ mod tests {
     use http_body_util::BodyExt;
     use leptos::{config::LeptosOptions, server_fn::ServerFn};
     use secrecy::SecretString;
-    use supabase_dashboard_application::auth::{AuthConfig, AuthService};
+    use supabase_dashboard_application::{
+        auth::{AuthConfig, AuthService},
+        organizations::OrganizationService,
+    };
     use supabase_dashboard_persistence::{Database, DatabaseSettings};
     use supabase_dashboard_web::{
         app::SIGN_IN_PATH,
-        server_fns::{GetCurrentAccount, GetInstallationHealth},
+        server_fns::{
+            CreateOrganization, GetCurrentAccount, GetInstallationHealth, GetOrganization,
+            ListOrganizations, RenameOrganization,
+        },
     };
     use tower::ServiceExt;
 
@@ -154,6 +164,7 @@ mod tests {
                 .output_name("supabase-dashboard")
                 .site_root("target/site")
                 .build(),
+            organizations: Arc::new(OrganizationService::new(db.clone())),
             db,
             readiness_timeout: Duration::from_secs(1),
             auth: Arc::new(auth),
@@ -406,7 +417,10 @@ mod tests {
         let (parts, body) = send(&router, get_with_cookie(HOME_PATH, &cookie)).await;
         assert_eq!(parts.status, StatusCode::OK);
         assert_eq!(parts.headers[header::CACHE_CONTROL], "no-store");
-        assert!(body.contains("No organizations yet"), "{body}");
+        assert!(
+            body.contains("You are not a member of any organization"),
+            "{body}"
+        );
         assert!(
             !body.contains(token),
             "the session token must not reach the page"
@@ -440,6 +454,107 @@ mod tests {
             SIGN_IN_PATH,
             "revoked cookie no longer works"
         );
+
+        db.close().await;
+        scratch.drop().await;
+    }
+
+    /// Signs in and returns the `name=value` cookie pair.
+    async fn sign_in_cookie(router: &Router, email: &str) -> String {
+        let body = format!("email={email}&password=correct+horse+battery+staple");
+        let (parts, _) = send(router, form_post("/auth/sign-in", &body, None)).await;
+        assert_eq!(location(&parts), HOME_PATH);
+        let set_cookie = parts.headers[header::SET_COOKIE].to_str().unwrap();
+        set_cookie.split(';').next().unwrap().to_owned()
+    }
+
+    #[tokio::test]
+    async fn organizations_are_isolated_over_http() {
+        let Some(scratch) = ScratchDb::create("http_orgs").await else {
+            return;
+        };
+        let db = Database::connect(&scratch.settings).await.unwrap();
+        db.migrate().await.unwrap();
+        let router = router_for(db.clone()).await;
+        AuthService::new(db.clone(), AuthConfig::default())
+            .await
+            .unwrap()
+            .bootstrap_owner(
+                "alice@example.test",
+                "Alice",
+                &SecretString::from("correct horse battery staple"),
+            )
+            .await
+            .unwrap();
+        // A second operator with the same password; invitations will
+        // replace this direct insert.
+        sqlx::query(
+            "INSERT INTO accounts (id, email, display_name, password_hash) \
+             SELECT gen_random_uuid(), 'bob@example.test', 'Bob', password_hash FROM accounts",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let alice = sign_in_cookie(&router, "alice%40example.test").await;
+        let bob = sign_in_cookie(&router, "bob%40example.test").await;
+
+        let call = |path: &'static str, body: String, cookie: &str| {
+            send(&router, form_post(path, &body, Some(cookie)))
+        };
+        let (parts, body) = call(CreateOrganization::PATH, "name=Acme+Secret".into(), &alice).await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        let acme: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let acme_id = acme["id"].as_str().unwrap().to_owned();
+        assert_eq!(acme["role"], "owner");
+        let (parts, _) = call(CreateOrganization::PATH, "name=Globex".into(), &bob).await;
+        assert_eq!(parts.status, StatusCode::OK);
+
+        // Bob sees only his own organization.
+        let (_, body) = call(ListOrganizations::PATH, String::new(), &bob).await;
+        assert!(body.contains("Globex") && !body.contains("Acme"), "{body}");
+
+        // Alice's organization ID gets the same answer as a made-up one.
+        let made_up = uuid::Uuid::now_v7().to_string();
+        let mut answers = Vec::new();
+        for id in [&acme_id, &made_up] {
+            let (parts, body) = call(GetOrganization::PATH, format!("id={id}"), &bob).await;
+            assert!(!parts.status.is_success());
+            assert!(
+                body.contains("NotFound") && !body.contains("Acme"),
+                "{body}"
+            );
+            answers.push((parts.status, body));
+            let (_, body) =
+                call(RenameOrganization::PATH, format!("id={id}&name=Mine"), &bob).await;
+            assert!(body.contains("NotFound"), "{body}");
+        }
+        assert_eq!(answers[0], answers[1]);
+
+        // The page for Alice's organization does not leak its name either.
+        let page = format!("/dashboard/org/{acme_id}/general");
+        let (parts, body) = send(&router, get_with_cookie(&page, &bob)).await;
+        assert_eq!(parts.status, StatusCode::OK);
+        assert!(body.contains("Organization unavailable"), "{body}");
+        assert!(!body.contains("Acme"), "{body}");
+        let (_, body) = send(&router, get_with_cookie(&page, &alice)).await;
+        assert!(body.contains("Acme Secret"), "{body}");
+
+        // A cross-site form cannot rename it, even with Alice's cookie.
+        let forged = Request::post(RenameOrganization::PATH)
+            .header(header::HOST, HOST)
+            .header(header::ORIGIN, "https://evil.example")
+            .header(header::COOKIE, &alice)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(format!("id={acme_id}&name=Pwned")))
+            .unwrap();
+        let (parts, _) = send(&router, forged).await;
+        assert_eq!(parts.status, StatusCode::FORBIDDEN);
+        let name: String = sqlx::query_scalar("SELECT name FROM organizations WHERE id = $1::uuid")
+            .bind(&acme_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(name, "Acme Secret");
 
         db.close().await;
         scratch.drop().await;
