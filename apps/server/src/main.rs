@@ -1,6 +1,7 @@
 //! supabase-dashboard HTTP server.
 
 mod app;
+mod cli;
 mod config;
 mod error;
 mod health;
@@ -9,6 +10,7 @@ mod telemetry;
 
 use std::process::ExitCode;
 
+use supabase_dashboard_application::auth::{AuthConfig, AuthError, AuthService, BootstrapError};
 use supabase_dashboard_persistence::{Database, PersistenceError};
 use tokio::net::TcpListener;
 
@@ -35,11 +37,28 @@ enum StartupError {
     },
     #[error("server error: {0}")]
     Serve(std::io::Error),
+    #[error("{0}\n\n{usage}", usage = cli::USAGE)]
+    Usage(String),
+    #[error(transparent)]
+    PasswordInput(#[from] cli::PasswordInputError),
+    #[error("could not create the owner account: {0}")]
+    Bootstrap(#[from] BootstrapError),
+    #[error("authentication setup failed: {0}")]
+    Auth(#[from] AuthError),
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    match run().await {
+    let result = match cli::parse(std::env::args().skip(1)) {
+        Ok(cli::Command::Serve) => run().await,
+        Ok(cli::Command::CreateOwner { email, name }) => create_owner(&email, &name).await,
+        Ok(cli::Command::Help) => {
+            println!("{}", cli::USAGE);
+            Ok(())
+        }
+        Err(message) => Err(StartupError::Usage(message)),
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             // Logging may not be initialized yet, so also print to stderr.
@@ -47,6 +66,44 @@ async fn main() -> ExitCode {
             eprintln!("supabase-dashboard: {err}");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn auth_config(config: &Config) -> AuthConfig {
+    AuthConfig {
+        session_lifetime: config.session_lifetime,
+        idle_timeout: config.session_idle_timeout,
+        ..AuthConfig::default()
+    }
+}
+
+async fn create_owner(email: &str, name: &str) -> Result<(), StartupError> {
+    let config = Config::from_env()?;
+    telemetry::init(config.log_format)?;
+    let db = Database::connect(&config.database).await?;
+    db.migrate().await?;
+    let auth = AuthService::new(db.clone(), auth_config(&config)).await?;
+    // Check before prompting, so the operator does not type a password for
+    // nothing.
+    if auth.is_initialized().await? {
+        return Err(BootstrapError::AlreadyInitialized.into());
+    }
+    let password = cli::read_new_password()?;
+    auth.bootstrap_owner(email, name, &password).await?;
+    db.close().await;
+    let sign_in = config.public_url.as_ref().map_or_else(
+        || "/dashboard/sign-in".to_owned(),
+        |url| format!("{}dashboard/sign-in", ensure_trailing_slash(url.as_str())),
+    );
+    println!("Created the owner account. Sign in at {sign_in}");
+    Ok(())
+}
+
+fn ensure_trailing_slash(url: &str) -> String {
+    if url.ends_with('/') {
+        url.to_owned()
+    } else {
+        format!("{url}/")
     }
 }
 

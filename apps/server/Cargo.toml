@@ -13,11 +13,13 @@ name = "supabase-dashboard-server"
 path = "src/main.rs"
 
 [dependencies]
+supabase-dashboard-application.workspace = true
 supabase-dashboard-domain.workspace = true
 supabase-dashboard-persistence.workspace = true
 supabase-dashboard-web = { workspace = true, features = ["ssr"] }
 axum.workspace = true
 http.workspace = true
+rpassword = "7"
 leptos = { workspace = true, features = ["ssr"] }
 leptos_axum.workspace = true
 secrecy.workspace = true

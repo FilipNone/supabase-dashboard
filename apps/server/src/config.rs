@@ -32,6 +32,10 @@ pub struct Config {
     pub request_timeout: Duration,
     pub readiness_timeout: Duration,
     pub log_format: LogFormat,
+    /// A session unused for this long stops working.
+    pub session_idle_timeout: Duration,
+    /// Absolute session lifetime from sign-in.
+    pub session_lifetime: Duration,
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -87,6 +91,16 @@ impl Config {
         let max_body_bytes = bounded(&get, "MAX_BODY_BYTES", 1024 * 1024, 1024, 64 * 1024 * 1024)?;
         let request_timeout = secs(bounded(&get, "REQUEST_TIMEOUT_SECS", 30, 1, 600)?);
         let readiness_timeout = secs(bounded(&get, "READINESS_TIMEOUT_SECS", 2, 1, 30)?);
+        let session_idle_timeout =
+            secs(bounded(&get, "SESSION_IDLE_TIMEOUT_MINS", 60, 5, 24 * 60)? * 60);
+        let session_lifetime =
+            secs(bounded(&get, "SESSION_LIFETIME_HOURS", 12, 1, 30 * 24)? * 3600);
+        if session_idle_timeout > session_lifetime {
+            return Err(invalid(
+                "SESSION_IDLE_TIMEOUT_MINS",
+                "must not exceed SUPABASE_DASHBOARD_SESSION_LIFETIME_HOURS",
+            ));
+        }
 
         let log_format = match get("LOG_FORMAT").as_deref() {
             Some("json") => LogFormat::Json,
@@ -105,6 +119,8 @@ impl Config {
             request_timeout,
             readiness_timeout,
             log_format,
+            session_idle_timeout,
+            session_lifetime,
         })
     }
 }
@@ -256,6 +272,24 @@ mod tests {
         assert!(load(&[DB, dev, ("REQUEST_TIMEOUT_SECS", "abc")]).is_err());
         let config = load(&[DB, dev, ("MAX_BODY_BYTES", "2048")]).unwrap();
         assert_eq!(config.max_body_bytes, 2048);
+    }
+
+    #[test]
+    fn session_timeouts_are_bounded_and_consistent() {
+        let dev = ("ENV", "development");
+        let config = load(&[DB, dev]).unwrap();
+        assert_eq!(config.session_idle_timeout, Duration::from_secs(3600));
+        assert_eq!(config.session_lifetime, Duration::from_secs(12 * 3600));
+        assert!(load(&[DB, dev, ("SESSION_IDLE_TIMEOUT_MINS", "1")]).is_err());
+        assert!(load(&[DB, dev, ("SESSION_LIFETIME_HOURS", "0")]).is_err());
+        let err = load(&[
+            DB,
+            dev,
+            ("SESSION_IDLE_TIMEOUT_MINS", "120"),
+            ("SESSION_LIFETIME_HOURS", "1"),
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("must not exceed"));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["apps/server", "crates/domain", "crates/persistence", "crates/web"]
+members = ["apps/server", "crates/application", "crates/domain", "crates/persistence", "crates/web"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,6 +11,7 @@ repository = "https://github.com/FilipNone/supabase-dashboard"
 publish = false
 
 [workspace.dependencies]
+supabase-dashboard-application = { path = "crates/application" }
 supabase-dashboard-domain = { path = "crates/domain" }
 supabase-dashboard-persistence = { path = "crates/persistence" }
 supabase-dashboard-web = { path = "crates/web", default-features = false }
