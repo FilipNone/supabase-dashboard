@@ -15,7 +15,7 @@ mod telemetry;
 use std::{process::ExitCode, sync::Arc, time::Duration};
 
 use supabase_dashboard_application::{
-    auth::{AuthConfig, AuthError, AuthService, BootstrapError},
+    auth::{AuthConfig, AuthError, AuthService, BootstrapError, PasswordResetError},
     organizations::OrganizationService,
 };
 use supabase_dashboard_persistence::{Database, PersistenceError};
@@ -53,6 +53,8 @@ enum StartupError {
     Bootstrap(#[from] BootstrapError),
     #[error("authentication setup failed: {0}")]
     Auth(#[from] AuthError),
+    #[error("could not reset the password: {0}")]
+    PasswordReset(#[from] PasswordResetError),
 }
 
 #[tokio::main]
@@ -60,6 +62,7 @@ async fn main() -> ExitCode {
     let result = match cli::parse(std::env::args().skip(1)) {
         Ok(cli::Command::Serve) => run().await,
         Ok(cli::Command::CreateOwner { email, name }) => create_owner(&email, &name).await,
+        Ok(cli::Command::ResetPassword { email }) => reset_password(&email).await,
         Ok(cli::Command::Help) => {
             println!("{}", cli::USAGE);
             Ok(())
@@ -104,6 +107,22 @@ async fn create_owner(email: &str, name: &str) -> Result<(), StartupError> {
         |url| format!("{}dashboard/sign-in", ensure_trailing_slash(url.as_str())),
     );
     println!("Created the owner account. Sign in at {sign_in}");
+    Ok(())
+}
+
+async fn reset_password(email: &str) -> Result<(), StartupError> {
+    let config = Config::from_env()?;
+    telemetry::init(config.log_format)?;
+    let db = Database::connect(&config.database).await?;
+    db.migrate().await?;
+    let auth = AuthService::new(db.clone(), auth_config(&config)).await?;
+    let password = cli::read_new_password()?;
+    let revoked = auth.reset_password(email, &password).await?;
+    db.close().await;
+    println!(
+        "Password changed. {revoked} session(s) signed out. If sign-in is blocked after failed \
+         attempts, it unblocks when the throttle window ends or the server restarts."
+    );
     Ok(())
 }
 

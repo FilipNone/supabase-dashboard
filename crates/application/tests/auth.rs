@@ -8,7 +8,8 @@ use std::time::Duration;
 use secrecy::SecretString;
 use supabase_dashboard_application::{
     auth::{
-        AccountUpdateError, AuthConfig, AuthService, BootstrapError, RequestContext, SignInError,
+        AccountUpdateError, AuthConfig, AuthService, BootstrapError, PasswordResetError,
+        RequestContext, SignInError,
     },
     throttle::ThrottleConfig,
 };
@@ -429,6 +430,60 @@ async fn wrong_current_passwords_share_the_sign_in_throttle() {
         auth.sign_in("owner@example.test", &password, ctx()).await,
         Err(SignInError::Throttled { .. })
     ));
+    db.close().await;
+    scratch.drop().await;
+}
+
+#[tokio::test]
+async fn password_reset_replaces_the_password_and_ends_every_session() {
+    let Some(scratch) = ScratchDb::create("app_password_reset").await else {
+        return;
+    };
+    let (db, auth) = service(&scratch).await;
+    bootstrap(&auth).await;
+    let old = SecretString::from(PASSWORD);
+    let signed_in = auth
+        .sign_in("owner@example.test", &old, ctx())
+        .await
+        .unwrap();
+    let new = SecretString::from("recovered long passphrase");
+
+    assert!(matches!(
+        auth.reset_password("nobody@example.test", &new).await,
+        Err(PasswordResetError::UnknownAccount)
+    ));
+    assert!(matches!(
+        auth.reset_password("owner@example.test", &SecretString::from("short"))
+            .await,
+        Err(PasswordResetError::Input(_))
+    ));
+
+    assert_eq!(
+        auth.reset_password(" Owner@Example.test ", &new)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(
+        auth.authenticate(signed_in.token.expose_cookie_value())
+            .await
+            .unwrap()
+            .is_none(),
+        "existing sessions end"
+    );
+    assert!(matches!(
+        auth.sign_in("owner@example.test", &old, ctx()).await,
+        Err(SignInError::InvalidCredentials)
+    ));
+    auth.sign_in("owner@example.test", &new, ctx())
+        .await
+        .unwrap();
+    assert_eq!(
+        db.count_audit_events("account.password_reset")
+            .await
+            .unwrap(),
+        1
+    );
     db.close().await;
     scratch.drop().await;
 }

@@ -122,6 +122,22 @@ impl From<PersistenceError> for InvitationSignUpError {
 }
 
 #[derive(Debug, thiserror::Error)]
+pub enum PasswordResetError {
+    #[error("no account uses this email address")]
+    UnknownAccount,
+    #[error(transparent)]
+    Input(#[from] AccountInputError),
+    #[error(transparent)]
+    Internal(#[from] AuthError),
+}
+
+impl From<PersistenceError> for PasswordResetError {
+    fn from(err: PersistenceError) -> Self {
+        Self::Internal(err.into())
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
 pub enum AccountUpdateError {
     /// The current password given to confirm a change is wrong.
     #[error("the current password is not correct")]
@@ -393,6 +409,41 @@ impl AuthService {
                 is_current: s.id == current.session_id,
             })
             .collect())
+    }
+
+    /// Sets a new password for the account with this email and signs out
+    /// all of its sessions. This is the recovery path for a forgotten
+    /// password: it runs from the server command line, so it needs the same
+    /// access as creating the first owner, and it is audited without an
+    /// actor. It does not re-enable a disabled account. Returns how many
+    /// sessions were signed out.
+    pub async fn reset_password(
+        &self,
+        email: &str,
+        password: &SecretString,
+    ) -> Result<u64, PasswordResetError> {
+        use secrecy::ExposeSecret as _;
+        let email = Email::parse(email)?;
+        check_new_password(password.expose_secret())?;
+        let account = self
+            .db
+            .find_credentials_by_email(&email)
+            .await?
+            .ok_or(PasswordResetError::UnknownAccount)?
+            .account;
+        let password_hash = self.hashing.hash(password).await.map_err(AuthError::from)?;
+        let event = AuditEvent {
+            actor_account_id: None,
+            action: "account.password_reset",
+            target_type: Some("account"),
+            target_id: Some(account.id.to_string()),
+            outcome: AuditOutcome::Success,
+            request_id: None,
+        };
+        self.db
+            .reset_password(account.id, &password_hash, &event)
+            .await?
+            .ok_or(PasswordResetError::UnknownAccount)
     }
 
     /// Changes the operator's display name.

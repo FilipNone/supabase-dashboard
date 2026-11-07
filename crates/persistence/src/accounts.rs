@@ -217,4 +217,41 @@ impl Database {
         tx.commit().await.map_err(PersistenceError::Query)?;
         Ok(Some(revoked))
     }
+
+    /// Sets a new password hash without checking the old one, revokes every
+    /// session of the account, and records `audit`, in one transaction.
+    /// For out-of-band recovery by someone with server access. Returns the
+    /// number of sessions revoked, or `None` when the account does not
+    /// exist.
+    pub async fn reset_password(
+        &self,
+        account_id: Uuid,
+        new_hash: &str,
+        audit: &AuditEvent<'_>,
+    ) -> Result<Option<u64>, PersistenceError> {
+        let mut tx = self.pool.begin().await.map_err(PersistenceError::Query)?;
+        let updated =
+            sqlx::query("UPDATE accounts SET password_hash = $2, updated_at = now() WHERE id = $1")
+                .bind(account_id)
+                .bind(new_hash)
+                .execute(&mut *tx)
+                .await
+                .map_err(PersistenceError::Query)?
+                .rows_affected()
+                == 1;
+        if !updated {
+            return Ok(None);
+        }
+        let revoked = sqlx::query(
+            "UPDATE sessions SET revoked_at = now() WHERE account_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(PersistenceError::Query)?
+        .rows_affected();
+        insert_audit_event(&mut *tx, audit).await?;
+        tx.commit().await.map_err(PersistenceError::Query)?;
+        Ok(Some(revoked))
+    }
 }
