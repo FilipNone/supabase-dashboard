@@ -1,6 +1,10 @@
-//! Session tokens: 256 random bits, sent to the browser as 64 lowercase hex
-//! characters in an HttpOnly cookie. The database stores only SHA-256 of the
-//! raw bytes, so a leaked metadata database does not yield usable sessions.
+//! Random bearer tokens: 256 random bits, encoded as 64 lowercase hex
+//! characters. The database stores only SHA-256 of the raw bytes, so a
+//! leaked metadata database does not yield usable sessions or invitations.
+//!
+//! Session tokens travel in an HttpOnly cookie. Invitation codes travel in
+//! the fragment of an invitation link, which browsers do not send to the
+//! server or in `Referer` headers.
 
 use std::fmt;
 
@@ -14,19 +18,25 @@ const TOKEN_HEX_LEN: usize = TOKEN_BYTES * 2;
 #[error("the operating system random number generator failed")]
 pub struct RandomnessError;
 
-pub struct SessionToken {
+pub struct RandomToken {
     encoded: SecretString,
     hash: [u8; 32],
 }
 
-impl SessionToken {
+/// The value of a session cookie.
+pub type SessionToken = RandomToken;
+
+/// The secret part of an invitation link.
+pub type InvitationToken = RandomToken;
+
+impl RandomToken {
     pub fn generate() -> Result<Self, RandomnessError> {
         let mut bytes = [0u8; TOKEN_BYTES];
         getrandom::fill(&mut bytes).map_err(|_| RandomnessError)?;
         Ok(Self::from_bytes(&bytes))
     }
 
-    /// Parses a cookie value. Anything other than exactly 64 lowercase hex
+    /// Parses an encoded token. Anything other than exactly 64 lowercase hex
     /// characters is rejected before it reaches the database.
     pub fn parse(value: &str) -> Option<Self> {
         if value.len() != TOKEN_HEX_LEN {
@@ -56,14 +66,20 @@ impl SessionToken {
         self.encoded.expose_secret()
     }
 
+    /// The encoded token, for the one response that hands an invitation
+    /// code to the operator who created it.
+    pub fn expose_code(&self) -> &str {
+        self.encoded.expose_secret()
+    }
+
     pub fn hash(&self) -> &[u8; 32] {
         &self.hash
     }
 }
 
-impl fmt::Debug for SessionToken {
+impl fmt::Debug for RandomToken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("SessionToken([REDACTED])")
+        f.write_str("RandomToken([REDACTED])")
     }
 }
 

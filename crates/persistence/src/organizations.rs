@@ -86,11 +86,11 @@ impl TryFrom<MembershipRow> for Membership {
     }
 }
 
-fn parse_role(role: &str) -> Result<OrgRole, PersistenceError> {
+pub(crate) fn parse_role(role: &str) -> Result<OrgRole, PersistenceError> {
     OrgRole::from_name(role).ok_or(PersistenceError::InvalidRow("organization_members.role"))
 }
 
-fn query_err(err: sqlx::Error) -> PersistenceError {
+pub(crate) fn query_err(err: sqlx::Error) -> PersistenceError {
     PersistenceError::Query(err)
 }
 

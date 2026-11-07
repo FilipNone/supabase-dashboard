@@ -7,7 +7,12 @@
 //! so organization IDs cannot be probed.
 
 use supabase_dashboard_domain::{
+    account::{AccountInputError, Email},
     authz::{MembershipChange, MembershipError, OrgRole, Permission, check_membership_change},
+    invitation::{
+        INVITATION_LIFETIME, InvitationCode, InvitationSummary, IssuedInvitation,
+        MAX_OPEN_INVITATIONS_PER_ORGANIZATION, check_invitation,
+    },
     organization::{
         MAX_MEMBERS_PER_ORGANIZATION, MAX_ORGANIZATIONS_PER_ACCOUNT, MemberSummary,
         OrganizationInputError, OrganizationName, OrganizationSummary,
@@ -16,11 +21,16 @@ use supabase_dashboard_domain::{
 use supabase_dashboard_persistence::{
     Database, PersistenceError,
     audit::{AuditEvent, AuditOutcome},
+    invitations::{AcceptOutcome, InvitationChangeOutcome, NewInvitation},
     organizations::{CreateOrganizationOutcome, Membership, MembershipChangeOutcome},
 };
+use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::auth::{CurrentSession, RequestContext};
+use crate::{
+    auth::{CurrentSession, RequestContext},
+    token::{InvitationToken, RandomnessError},
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum OrganizationError {
@@ -34,13 +44,34 @@ pub enum OrganizationError {
     MemberNotFound,
     #[error("you already belong to the maximum of {MAX_ORGANIZATIONS_PER_ACCOUNT} organizations")]
     LimitReached,
+    #[error("that person is already a member of this organization")]
+    AlreadyMember,
+    #[error(
+        "this organization already has {MAX_OPEN_INVITATIONS_PER_ORGANIZATION} open invitations; \
+         withdraw some before sending more"
+    )]
+    TooManyInvitations,
+    #[error("that invitation is no longer open")]
+    InvitationNotFound,
+    /// Unknown, used, withdrawn, or expired code. Not distinguished.
+    #[error("this invitation is not valid: it may have expired, been used, or been withdrawn")]
+    InvitationInvalid,
+    #[error(
+        "this invitation was sent to a different email address; \
+         sign in with that address to accept it"
+    )]
+    InvitationEmailMismatch,
     #[error(transparent)]
     Input(#[from] OrganizationInputError),
+    #[error(transparent)]
+    AccountInput(#[from] AccountInputError),
     #[error(transparent)]
     Membership(#[from] MembershipError),
     /// Internal failure. The message is for server logs only.
     #[error(transparent)]
     Internal(#[from] PersistenceError),
+    #[error(transparent)]
+    Randomness(#[from] RandomnessError),
 }
 
 pub struct OrganizationService {
@@ -268,6 +299,188 @@ impl OrganizationService {
                     other => OrganizationError::Membership(other),
                 })
             }
+        }
+    }
+
+    /// Invites `email` to join as `role`. Inviting an address that already
+    /// has an open invitation replaces it with a new code. The code is
+    /// returned once and only its hash is stored.
+    pub async fn invite(
+        &self,
+        current: &CurrentSession,
+        organization_id: Uuid,
+        email: &str,
+        role: OrgRole,
+        ctx: RequestContext<'_>,
+    ) -> Result<IssuedInvitation, OrganizationError> {
+        let email = Email::parse(email)?;
+        let token = InvitationToken::generate()?;
+        let id = Uuid::now_v7();
+        // Whole seconds, so the returned value matches what the database
+        // stores (microsecond precision).
+        let expires_at = OffsetDateTime::now_utc()
+            .checked_add(INVITATION_LIFETIME)
+            .and_then(|at| at.replace_nanosecond(0).ok())
+            .ok_or(OrganizationError::InvitationInvalid)?;
+        let action = "organization.invitation_create";
+        let target = ("organization_invitation", id.to_string());
+        let outcome = self
+            .db
+            .create_invitation(
+                &NewInvitation {
+                    id,
+                    organization_id,
+                    email: &email,
+                    role,
+                    token_hash: token.hash(),
+                    invited_by: current.account.id,
+                    expires_at,
+                },
+                |snapshot| {
+                    check_invitation(snapshot.actor_role, role)?;
+                    if snapshot.already_member {
+                        return Err(OrganizationError::AlreadyMember);
+                    }
+                    if snapshot.open_invitations >= MAX_OPEN_INVITATIONS_PER_ORGANIZATION {
+                        return Err(OrganizationError::TooManyInvitations);
+                    }
+                    Ok(())
+                },
+                &event(current, action, target.clone(), AuditOutcome::Success, ctx),
+            )
+            .await?;
+        match outcome {
+            InvitationChangeOutcome::Applied => Ok(IssuedInvitation {
+                invitation: InvitationSummary {
+                    id,
+                    email,
+                    role,
+                    invited_by: Some(current.account.display_name.clone()),
+                    expires_at,
+                },
+                code: InvitationCode::new(token.expose_code().to_owned()),
+            }),
+            InvitationChangeOutcome::ActorNotMember
+            | InvitationChangeOutcome::InvitationNotFound => Err(OrganizationError::NotFound),
+            InvitationChangeOutcome::Refused(refusal) => {
+                Err(self.refused(current, action, target, ctx, refusal).await)
+            }
+        }
+    }
+
+    /// Open invitations, visible to anyone who can see the member list.
+    pub async fn invitations(
+        &self,
+        current: &CurrentSession,
+        organization_id: Uuid,
+    ) -> Result<Vec<InvitationSummary>, OrganizationError> {
+        self.authorize(current, organization_id, Permission::MembersRead)
+            .await?;
+        let invitations = self
+            .db
+            .list_open_invitations(organization_id, MAX_OPEN_INVITATIONS_PER_ORGANIZATION)
+            .await?;
+        Ok(invitations
+            .into_iter()
+            .map(|record| InvitationSummary {
+                id: record.id,
+                email: record.email,
+                role: record.role,
+                invited_by: record.invited_by,
+                expires_at: record.expires_at,
+            })
+            .collect())
+    }
+
+    /// Withdraws an open invitation. The same rules apply as for creating
+    /// it, so only an owner can withdraw an invitation to the owner role.
+    pub async fn revoke_invitation(
+        &self,
+        current: &CurrentSession,
+        organization_id: Uuid,
+        invitation_id: Uuid,
+        ctx: RequestContext<'_>,
+    ) -> Result<(), OrganizationError> {
+        let action = "organization.invitation_revoke";
+        let target = ("organization_invitation", invitation_id.to_string());
+        let outcome = self
+            .db
+            .revoke_invitation(
+                organization_id,
+                invitation_id,
+                current.account.id,
+                |actor_role, invited_role| {
+                    check_invitation(actor_role, invited_role).map_err(OrganizationError::from)
+                },
+                &event(current, action, target.clone(), AuditOutcome::Success, ctx),
+            )
+            .await?;
+        match outcome {
+            InvitationChangeOutcome::Applied => Ok(()),
+            InvitationChangeOutcome::ActorNotMember => Err(OrganizationError::NotFound),
+            InvitationChangeOutcome::InvitationNotFound => {
+                Err(OrganizationError::InvitationNotFound)
+            }
+            InvitationChangeOutcome::Refused(refusal) => {
+                Err(self.refused(current, action, target, ctx, refusal).await)
+            }
+        }
+    }
+
+    /// Accepts an invitation as the signed-in operator, whose email must be
+    /// the invited one. Returns the organization joined. Accepting when
+    /// already a member succeeds without using the invitation.
+    pub async fn accept_invitation(
+        &self,
+        current: &CurrentSession,
+        code: &str,
+        ctx: RequestContext<'_>,
+    ) -> Result<Uuid, OrganizationError> {
+        let token = InvitationToken::parse(code).ok_or(OrganizationError::InvitationInvalid)?;
+        let invitation = self
+            .db
+            .find_open_invitation_by_token(token.hash())
+            .await?
+            .ok_or(OrganizationError::InvitationInvalid)?;
+        let action = "organization.invitation_accept";
+        let target = ("organization_invitation", invitation.id.to_string());
+        let outcome = self
+            .db
+            .accept_invitation(
+                invitation.id,
+                token.hash(),
+                current.account.id,
+                MAX_ORGANIZATIONS_PER_ACCOUNT,
+                &event(current, action, target.clone(), AuditOutcome::Success, ctx),
+            )
+            .await?;
+        match outcome {
+            AcceptOutcome::Joined { organization_id }
+            | AcceptOutcome::AlreadyMember { organization_id } => Ok(organization_id),
+            AcceptOutcome::Invalid => Err(OrganizationError::InvitationInvalid),
+            AcceptOutcome::LimitReached => Err(OrganizationError::LimitReached),
+            AcceptOutcome::EmailMismatch => {
+                self.deny(current, action, target, ctx).await;
+                Err(OrganizationError::InvitationEmailMismatch)
+            }
+        }
+    }
+
+    /// Audits a refusal from a decision callback and maps it for the caller.
+    async fn refused(
+        &self,
+        current: &CurrentSession,
+        action: &'static str,
+        target: (&'static str, String),
+        ctx: RequestContext<'_>,
+        refusal: OrganizationError,
+    ) -> OrganizationError {
+        self.deny(current, action, target, ctx).await;
+        match refusal {
+            OrganizationError::Membership(MembershipError::NotPermitted) => {
+                OrganizationError::Forbidden
+            }
+            other => other,
         }
     }
 

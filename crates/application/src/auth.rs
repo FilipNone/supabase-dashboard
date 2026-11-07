@@ -4,13 +4,15 @@
 use std::time::{Duration, Instant};
 
 use secrecy::SecretString;
-use supabase_dashboard_domain::account::{
-    AccountInputError, AccountSummary, DisplayName, Email, check_new_password,
+use supabase_dashboard_domain::{
+    account::{AccountInputError, AccountSummary, DisplayName, Email, check_new_password},
+    invitation::InvitationPreview,
 };
 use supabase_dashboard_persistence::{
     Database, PersistenceError,
     accounts::{AccountRecord, NewAccount},
     audit::{AuditEvent, AuditOutcome},
+    invitations::AcceptNewAccountOutcome,
     sessions::{NewSession, SessionInfo},
 };
 use time::OffsetDateTime;
@@ -19,7 +21,7 @@ use uuid::Uuid;
 use crate::{
     password::{PasswordError, PasswordHashing},
     throttle::{LoginThrottle, ThrottleConfig},
-    token::{RandomnessError, SessionToken},
+    token::{InvitationToken, RandomnessError, SessionToken},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -94,6 +96,25 @@ impl From<PersistenceError> for SignInError {
 
 impl From<PasswordError> for SignInError {
     fn from(err: PasswordError) -> Self {
+        Self::Internal(err.into())
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum InvitationSignUpError {
+    /// Unknown, used, withdrawn, or expired code. Not distinguished.
+    #[error("this invitation is not valid: it may have expired, been used, or been withdrawn")]
+    InvalidInvitation,
+    #[error("an account with this email already exists; sign in to accept the invitation")]
+    AccountExists,
+    #[error(transparent)]
+    Input(#[from] AccountInputError),
+    #[error(transparent)]
+    Internal(#[from] AuthError),
+}
+
+impl From<PersistenceError> for InvitationSignUpError {
+    fn from(err: PersistenceError) -> Self {
         Self::Internal(err.into())
     }
 }
@@ -384,6 +405,95 @@ impl AuthService {
             .db
             .delete_dead_sessions(self.config.idle_timeout)
             .await?)
+    }
+
+    /// What an invitation code is for, or `None` when it is malformed,
+    /// unknown, used, withdrawn, or expired. Needs no session: the code is
+    /// the credential.
+    pub async fn preview_invitation(
+        &self,
+        code: &str,
+    ) -> Result<Option<InvitationPreview>, AuthError> {
+        let Some(token) = InvitationToken::parse(code) else {
+            return Ok(None);
+        };
+        let invitation = self.db.find_open_invitation_by_token(token.hash()).await?;
+        Ok(invitation.map(|invitation| InvitationPreview {
+            organization_name: invitation.organization_name,
+            email: invitation.email,
+            role: invitation.role,
+            expires_at: invitation.expires_at,
+            account_exists: invitation.account_exists,
+        }))
+    }
+
+    /// Creates an operator account for the invited email and joins the
+    /// organization. The new account is never an installation
+    /// administrator. Returns the organization joined; the invitee then
+    /// signs in as usual.
+    pub async fn accept_invitation_with_new_account(
+        &self,
+        code: &str,
+        display_name: &str,
+        password: &SecretString,
+        ctx: RequestContext<'_>,
+    ) -> Result<Uuid, InvitationSignUpError> {
+        use secrecy::ExposeSecret as _;
+        let display_name = DisplayName::parse(display_name)?;
+        check_new_password(password.expose_secret())?;
+        let token = InvitationToken::parse(code).ok_or(InvitationSignUpError::InvalidInvitation)?;
+        // Look the code up before hashing the password, so an invalid code
+        // costs no Argon2 work.
+        let invitation = self
+            .db
+            .find_open_invitation_by_token(token.hash())
+            .await?
+            .ok_or(InvitationSignUpError::InvalidInvitation)?;
+        if invitation.account_exists {
+            return Err(InvitationSignUpError::AccountExists);
+        }
+        let password_hash = self.hashing.hash(password).await.map_err(AuthError::from)?;
+        let account_id = Uuid::now_v7();
+        let audit = [
+            AuditEvent {
+                actor_account_id: Some(account_id),
+                action: "account.create_from_invitation",
+                target_type: Some("account"),
+                target_id: Some(account_id.to_string()),
+                outcome: AuditOutcome::Success,
+                request_id: ctx.request_id,
+            },
+            AuditEvent {
+                actor_account_id: Some(account_id),
+                action: "organization.invitation_accept",
+                target_type: Some("organization_invitation"),
+                target_id: Some(invitation.id.to_string()),
+                outcome: AuditOutcome::Success,
+                request_id: ctx.request_id,
+            },
+        ];
+        let outcome = self
+            .db
+            .accept_invitation_with_new_account(
+                invitation.id,
+                token.hash(),
+                &NewAccount {
+                    id: account_id,
+                    email: &invitation.email,
+                    display_name: &display_name,
+                    password_hash: &password_hash,
+                    is_installation_admin: false,
+                },
+                &audit,
+            )
+            .await?;
+        match outcome {
+            AcceptNewAccountOutcome::Joined { organization_id } => Ok(organization_id),
+            AcceptNewAccountOutcome::Invalid | AcceptNewAccountOutcome::EmailMismatch => {
+                Err(InvitationSignUpError::InvalidInvitation)
+            }
+            AcceptNewAccountOutcome::AccountExists => Err(InvitationSignUpError::AccountExists),
+        }
     }
 
     /// Audit writes are best effort for sign-in and sign-out: a failure is

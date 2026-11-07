@@ -52,9 +52,19 @@ mod server {
                 OrganizationError::NotFound | OrganizationError::MemberNotFound => Self::NotFound,
                 OrganizationError::Forbidden => Self::Forbidden,
                 OrganizationError::LimitReached
+                | OrganizationError::AlreadyMember
+                | OrganizationError::TooManyInvitations
+                | OrganizationError::InvitationNotFound
+                | OrganizationError::InvitationInvalid
+                | OrganizationError::InvitationEmailMismatch
                 | OrganizationError::Input(_)
+                | OrganizationError::AccountInput(_)
                 | OrganizationError::Membership(_) => Self::Rejected(err.to_string()),
                 OrganizationError::Internal(err) => {
+                    tracing::error!(error = %err, "organization operation failed");
+                    Self::Unavailable
+                }
+                OrganizationError::Randomness(err) => {
                     tracing::error!(error = %err, "organization operation failed");
                     Self::Unavailable
                 }
