@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 use crate::{
     app::INVITE_PATH,
+    components::dialog::{ConfirmDialog, DialogCancel},
     components::{
         layout::Refresh,
         page::{StatePanel, StateTone},
@@ -384,28 +385,32 @@ fn MemberTable(
                             <select class="input" name="role" aria-label=select_label>{options}</select>
                             <button type="submit" class="button">"Change role"</button>
                         </ActionForm>
-                        <details class="confirm">
-                            <summary class="button">"Remove"</summary>
-                            <ActionForm action=remove attr:class="confirm-body">
+                        <ConfirmDialog trigger="Remove" title=format!("{}?", confirm)>
+                            <ActionForm action=remove attr:class="dialog-form">
                                 <MemberTarget target=remove_target.clone()/>
                                 <p>"They lose access to this organization immediately."</p>
-                                <button type="submit" class="button button-danger">{confirm}</button>
+                                <div class="dialog-actions">
+                                    <DialogCancel/>
+                                    <button type="submit" class="button button-danger">{confirm}</button>
+                                </div>
                             </ActionForm>
-                        </details>
+                        </ConfirmDialog>
                     </div>
                 }
                 .into_any()
             } else if member.is_you {
                 view! {
                     <div class="row-actions">
-                    <details class="confirm">
-                        <summary class="button">"Leave"</summary>
-                        <ActionForm action=leave attr:class="confirm-body">
+                    <ConfirmDialog trigger="Leave" title="Leave organization?">
+                        <ActionForm action=leave attr:class="dialog-form">
                             <MemberTarget target=target.clone()/>
                             <p>"You lose access until someone adds you again."</p>
-                            <button type="submit" class="button button-danger">"Leave organization"</button>
+                            <div class="dialog-actions">
+                                <DialogCancel/>
+                                <button type="submit" class="button button-danger">"Leave organization"</button>
+                            </div>
                         </ActionForm>
-                    </details>
+                    </ConfirmDialog>
                     </div>
                 }
                 .into_any()
@@ -617,15 +622,17 @@ fn InvitationTable(
                 let confirm = format!("Withdraw invitation for {email}");
                 view! {
                     <div class="row-actions">
-                        <details class="confirm">
-                            <summary class="button">"Withdraw"</summary>
-                            <ActionForm action=revoke attr:class="confirm-body">
+                        <ConfirmDialog trigger="Withdraw" title=format!("{}?", confirm)>
+                            <ActionForm action=revoke attr:class="dialog-form">
                                 <input type="hidden" name="organization_id" value=org_id/>
                                 <input type="hidden" name="invitation_id" value=invitation_id/>
                                 <p>"The link stops working immediately."</p>
-                                <button type="submit" class="button button-danger">{confirm}</button>
+                                <div class="dialog-actions">
+                                    <DialogCancel/>
+                                    <button type="submit" class="button button-danger">{confirm}</button>
+                                </div>
                             </ActionForm>
-                        </details>
+                        </ConfirmDialog>
                     </div>
                 }
             });

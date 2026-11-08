@@ -12,6 +12,7 @@ use supabase_dashboard_domain::account::{
 use time::OffsetDateTime;
 
 use crate::{
+    components::dialog::{ConfirmDialog, DialogCancel},
     components::{
         layout::Refresh,
         page::{PageHeader, StatePanel, StateTone},
@@ -266,14 +267,16 @@ fn SessionTable(
                 let confirm = format!("Sign out {device}");
                 view! {
                     <div class="row-actions">
-                        <details class="confirm">
-                            <summary class="button">"Sign out"</summary>
-                            <ActionForm action=revoke attr:class="confirm-body">
+                        <ConfirmDialog trigger="Sign out" title=format!("{}?", confirm)>
+                            <ActionForm action=revoke attr:class="dialog-form">
                                 <input type="hidden" name="session_id" value=session.id.to_string()/>
                                 <p>"That browser has to sign in again."</p>
-                                <button type="submit" class="button button-danger">{confirm}</button>
+                                <div class="dialog-actions">
+                                    <DialogCancel/>
+                                    <button type="submit" class="button button-danger">{confirm}</button>
+                                </div>
                             </ActionForm>
-                        </details>
+                        </ConfirmDialog>
                     </div>
                 }
                 .into_any()
@@ -306,13 +309,15 @@ fn SessionTable(
             </table>
         </div>
         {has_others.then(|| view! {
-            <details class="confirm">
-                <summary class="button">"Sign out all other sessions"</summary>
-                <ActionForm action=revoke_others attr:class="confirm-body">
+            <ConfirmDialog trigger="Sign out all other sessions" title="Sign out other sessions?">
+                <ActionForm action=revoke_others attr:class="dialog-form">
                     <p>"Every other browser has to sign in again. This one stays signed in."</p>
-                    <button type="submit" class="button button-danger">"Sign out other sessions"</button>
+                    <div class="dialog-actions">
+                        <DialogCancel/>
+                        <button type="submit" class="button button-danger">"Sign out other sessions"</button>
+                    </div>
                 </ActionForm>
-            </details>
+            </ConfirmDialog>
         })}
     }
 }

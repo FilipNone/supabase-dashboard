@@ -219,7 +219,9 @@ code { font-family: var(--font-mono); font-size: var(--text-sm); }
 
 /* Tables */
 .table-wrap {
-  overflow-x: auto;
+  /* Positioned, so visually hidden header text stays inside the scroll box
+     instead of widening the page. */
+  position: relative; overflow-x: auto;
   border: 1px solid var(--color-border); border-radius: var(--radius-md);
   background: var(--color-surface);
 }
@@ -359,15 +361,17 @@ code { font-family: var(--font-mono); font-size: var(--text-sm); }
 
 /* Member rows */
 .row-actions { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: flex-end; gap: var(--space-2); }
-.confirm > summary { list-style: none; }
-.confirm > summary::-webkit-details-marker { display: none; }
-.confirm[open] > summary { background: var(--color-surface-raised); }
-.confirm-body {
-  display: grid; gap: var(--space-2); margin-top: var(--space-2); padding: var(--space-3); max-width: 18rem;
-  border: 1px solid var(--color-border-strong); border-radius: var(--radius-md); background: var(--color-surface);
-  font-size: var(--text-sm);
+.dialog {
+  width: min(28rem, calc(100vw - 2rem)); padding: var(--space-6); margin: auto;
+  border: 1px solid var(--color-border-strong); border-radius: var(--radius-md);
+  background: var(--color-surface); color: var(--color-text);
 }
-.confirm-body p { margin: 0; }
+.dialog-trigger { justify-self: start; }
+.dialog::backdrop { background: rgb(0 0 0 / 0.55); }
+.dialog-title { margin: 0 0 var(--space-3); font-size: var(--text-lg); font-weight: 600; overflow-wrap: anywhere; }
+.dialog-form { display: grid; gap: var(--space-4); font-size: var(--text-md); }
+.dialog-form p { margin: 0; color: var(--color-text-muted); }
+.dialog-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--space-2); }
 .badge + .badge, td > .badge { margin-left: var(--space-2); }
 
 @media (max-width: 640px) {

@@ -13,6 +13,7 @@ use supabase_dashboard_domain::{
 };
 
 use crate::{
+    components::dialog::{ConfirmDialog, DialogCancel},
     components::page::{PageHeader, StatePanel, StateTone},
     error::AppError,
     server_fns::{AdminSetAccountDisabled, admin_list_accounts, admin_list_resources},
@@ -236,15 +237,17 @@ fn AccountTable(
                 let confirm = format!("Disable {name}");
                 view! {
                     <div class="row-actions">
-                        <details class="confirm">
-                            <summary class="button">"Disable"</summary>
-                            <ActionForm action=toggle attr:class="confirm-body">
+                        <ConfirmDialog trigger="Disable" title=format!("{}?", confirm)>
+                            <ActionForm action=toggle attr:class="dialog-form">
                                 <input type="hidden" name="account_id" value=account.id.to_string()/>
                                 <input type="hidden" name="disabled" value="true"/>
                                 <p>"They are signed out everywhere and cannot sign in until enabled again."</p>
-                                <button type="submit" class="button button-danger">{confirm}</button>
+                                <div class="dialog-actions">
+                                    <DialogCancel/>
+                                    <button type="submit" class="button button-danger">{confirm}</button>
+                                </div>
                             </ActionForm>
-                        </details>
+                        </ConfirmDialog>
                     </div>
                 }
                 .into_any()
