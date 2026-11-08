@@ -1,4 +1,4 @@
-//! Read-only browsing of a project's database structure.
+//! Read-only browsing of a project's database structure and table rows.
 //!
 //! The structure comes from the stack's postgres-meta service through its
 //! API gateway, using the stored service role key on the server. Members
@@ -12,7 +12,10 @@ use supabase_dashboard_domain::{
     authz::Permission,
     connection::CredentialKind,
     project::ProjectUrl,
-    schema::{MetaUnavailable, SchemaListing, SchemaName, TableDetail, TableListing},
+    schema::{
+        MetaUnavailable, RowPage, RowPageNumber, SchemaListing, SchemaName, TableDetail,
+        TableListing,
+    },
 };
 use supabase_dashboard_persistence::{Database, PersistenceError, projects::ProjectAccess};
 use tokio::sync::Semaphore;
@@ -51,6 +54,17 @@ pub trait SchemaSource: Send + Sync {
         key: &'a SecretString,
         table_id: u32,
     ) -> MetaFuture<'a, Option<TableDetail>>;
+
+    /// One page of `table`'s rows, read in a read-only transaction with a
+    /// statement timeout. `table` must have been read from the same stack
+    /// just before, since column and table names come from it.
+    fn rows<'a>(
+        &'a self,
+        api_url: &'a ProjectUrl,
+        key: &'a SecretString,
+        table: &'a TableDetail,
+        page: RowPageNumber,
+    ) -> MetaFuture<'a, RowPage>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -147,6 +161,30 @@ impl SchemaService {
             Ok(None) => Err(SchemaError::TableNotFound),
             Err(state) => Ok(Err(state)),
         }
+    }
+
+    /// One page of a table's rows. The table is looked up again first, so
+    /// the query uses the names the database has now.
+    pub async fn rows(
+        &self,
+        current: &CurrentSession,
+        project_id: Uuid,
+        table_id: u32,
+        page: RowPageNumber,
+    ) -> Result<Browse<RowPage>, SchemaError> {
+        let access = self.access(current, project_id).await?;
+        let key = match self.service_key(&access).await? {
+            Ok(key) => key,
+            Err(state) => return Ok(Err(state)),
+        };
+        let _permit = self.permit().await?;
+        let api_url = &access.project.api_url;
+        let detail = match self.source.table(api_url, &key, table_id).await {
+            Ok(Some(detail)) => detail,
+            Ok(None) => return Err(SchemaError::TableNotFound),
+            Err(state) => return Ok(Err(state)),
+        };
+        Ok(self.source.rows(api_url, &key, &detail, page).await)
     }
 
     /// postgres-meta is limited to the service role in the standard gateway

@@ -20,7 +20,7 @@ Not in the fixture yet: Studio, Realtime, Storage, imgproxy, Edge Functions, Sup
 
 ## Fixture
 
-`tests/fixtures/supabase/` holds a reduced compose file adapted from upstream (Apache-2.0) with synthetic, test-only credentials in `fixture.env`. Every port binds to `127.0.0.1` and no volume persists data. `db/sample.sql` adds a small synthetic schema (an enum, a `todos` table with RLS enabled, and a `tags` table with a composite primary key) for the schema browsing tests.
+`tests/fixtures/supabase/` holds a reduced compose file adapted from upstream (Apache-2.0) with synthetic, test-only credentials in `fixture.env`. Every port binds to `127.0.0.1` and no volume persists data. `db/sample.sql` adds a small synthetic schema (an enum, a `todos` table with RLS enabled, a `tags` table with a composite primary key, and an `Event "Log"` table with no primary key, a name that needs quoting, 120 rows, and one value longer than the dashboard keeps) for the schema browsing and row paging tests.
 
 ```sh
 docker compose -f tests/fixtures/supabase/docker-compose.yml \
@@ -38,6 +38,7 @@ docker compose -p sd-fixture down -v
 | Wrong key reported as rejected (401) | Verified | same test |
 | Envoy gateway, new-style `sb_publishable_`/`sb_secret_` keys | Not tested | No fixture yet |
 | Schema, table, and column listing through postgres-meta at `/pg/` (service role key; the gateway refuses the anon key with 403) | Verified against postgres-meta v0.100.0 via Kong 3.9.3 | `fixture_meta_lists_structure` in `crates/adapters/tests/gateway_fixture.rs` |
-| Table rows, SQL, Auth users, Storage | Not implemented | Later M2 and M3 work |
+| Read-only table rows through postgres-meta `POST /pg/query` (generated `SELECT` in a read-only transaction with a local statement timeout; ordered by primary key; 50 rows per page) | Verified against postgres-meta v0.100.0 and PostgreSQL 17.6 via Kong 3.9.3 | same test |
+| Row editing, SQL editor, Auth users, Storage | Not implemented | M3 and later |
 
 Update the baseline only together with a fixture change and a passing CI run.

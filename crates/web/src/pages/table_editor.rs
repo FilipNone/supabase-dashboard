@@ -1,5 +1,7 @@
 //! `/dashboard/project/:project_id/editor[/:table_id]`: the project's
-//! schemas, tables, and columns, read through the stack's postgres-meta.
+//! schemas and tables, and for the chosen table either a page of its rows
+//! (`Data`, the default) or its columns (`?view=definition`), read through
+//! the stack's postgres-meta.
 //!
 //! Read-only for now. Each view reads the stack when it opens; nothing is
 //! cached, so what is shown is current as of the page load.
@@ -11,7 +13,8 @@ use leptos_router::{
     hooks::{use_navigate, use_params_map, use_query_map},
 };
 use supabase_dashboard_domain::schema::{
-    ColumnSummary, DEFAULT_SCHEMA, MetaUnavailable, SchemaListing, TableDetail, TableListing,
+    CELL_MAX_CHARS, Cell, ColumnSummary, DEFAULT_SCHEMA, MetaUnavailable, ROW_COLUMN_LIMIT,
+    ROW_PAGE_SIZE, RowOrder, RowPage, SchemaListing, TableDetail, TableListing, TableSummary,
 };
 use uuid::Uuid;
 
@@ -19,8 +22,24 @@ use crate::{
     components::page::{StatePanel, StateTone},
     error::AppError,
     pages::project::project_path,
-    server_fns::{get_table, list_schemas, list_tables},
+    server_fns::{get_table, get_table_rows, list_schemas, list_tables},
 };
+
+/// What the main area shows for a chosen table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TableView {
+    Data,
+    Definition,
+}
+
+impl TableView {
+    fn parse(raw: Option<&str>) -> Self {
+        match raw {
+            Some("definition") => Self::Definition,
+            _ => Self::Data,
+        }
+    }
+}
 
 fn editor_path(project: Uuid) -> String {
     format!("{}/editor", project_path(project))
@@ -35,6 +54,28 @@ fn schema_query(schema: &str) -> String {
         String::new()
     } else {
         format!("?schema={}", encode(schema))
+    }
+}
+
+/// The address of one table's view. Defaults are left out so the usual
+/// address stays short.
+fn table_href(project: Uuid, table: u32, schema: &str, view: TableView, page: u32) -> String {
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    if schema != DEFAULT_SCHEMA {
+        query.append_pair("schema", schema);
+    }
+    if view == TableView::Definition {
+        query.append_pair("view", "definition");
+    }
+    if page > 1 {
+        query.append_pair("page", &page.to_string());
+    }
+    let query = query.finish();
+    let base = format!("{}/{table}", editor_path(project));
+    if query.is_empty() {
+        base
+    } else {
+        format!("{base}?{query}")
     }
 }
 
@@ -78,6 +119,15 @@ pub fn TableEditorPage() -> impl IntoView {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| DEFAULT_SCHEMA.to_owned())
     });
+    let view = Memo::new(move |_| TableView::parse(query.read().get("view").as_deref()));
+    // Anything that is not a number asks for page 0, which the server
+    // refuses with a readable message.
+    let page = Memo::new(move |_| {
+        query
+            .read()
+            .get("page")
+            .map_or(1, |raw| raw.parse::<u32>().unwrap_or(0))
+    });
 
     let schemas = Resource::new(
         move || project_id.get(),
@@ -97,11 +147,24 @@ pub fn TableEditorPage() -> impl IntoView {
             }
         },
     );
+    // Only the resource for the current view reads the stack.
     let detail = Resource::new(
-        move || (project_id.get(), table_param.get()),
-        |(id, table)| async move {
+        move || (project_id.get(), table_param.get(), view.get()),
+        |(id, table, view)| async move {
             match (id, table) {
+                (Some(_), _) if view != TableView::Definition => Ok(None),
                 (Some(id), Some(Some(table))) => get_table(id, table).await.map(Some),
+                (Some(_), None) => Ok(None),
+                _ => Err(AppError::NotFound),
+            }
+        },
+    );
+    let rows = Resource::new(
+        move || (project_id.get(), table_param.get(), view.get(), page.get()),
+        |(id, table, view, page)| async move {
+            match (id, table) {
+                (Some(_), _) if view != TableView::Data => Ok(None),
+                (Some(id), Some(Some(table))) => get_table_rows(id, table, page).await.map(Some),
                 (Some(_), None) => Ok(None),
                 _ => Err(AppError::NotFound),
             }
@@ -124,7 +187,7 @@ pub fn TableEditorPage() -> impl IntoView {
                 <Transition fallback=|| view! { <p class="loading" role="status">"Loading tables…"</p> }>
                     {move || tables.get().map(|result| match (result, project_id.get()) {
                         (Ok(Ok(listing)), Some(project)) => {
-                            table_list(listing, project, table_param.get().flatten()).into_any()
+                            table_list(listing, project, table_param.get().flatten(), view.get()).into_any()
                         }
                         (Ok(Err(_)), _) => view! {
                             <p class="field-hint">"Tables unavailable."</p>
@@ -147,30 +210,229 @@ pub fn TableEditorPage() -> impl IntoView {
                         if let Some(Ok(Err(state))) = schemas.get() {
                             return Some(unavailable_panel(state, project).into_any());
                         }
-                        detail.get().map(|result| match result {
-                            Ok(Some(Ok(detail))) => table_view(detail).into_any(),
-                            Ok(Some(Err(state))) => unavailable_panel(state, project).into_any(),
-                            Ok(None) => view! {
-                                <StatePanel
-                                    tone=StateTone::Empty
-                                    title="Select a table".to_string()
-                                    detail="Choose a table from the list to see its columns.".to_string()
-                                />
-                            }
-                            .into_any(),
-                            Err(err) => view! {
-                                <StatePanel
-                                    tone=StateTone::Error
-                                    title="Table unavailable".to_string()
-                                    detail=err.to_string()
-                                />
-                            }
-                            .into_any(),
-                        })
+                        let Some(Some(table)) = table_param.get() else {
+                            let missing = table_param.get().is_some();
+                            return Some(no_table(missing).into_any());
+                        };
+                        let current = view.get();
+                        let tabs = view_tabs(project, table, schema.get(), current);
+                        let content = match current {
+                            TableView::Definition => detail.get().map(|result| match result {
+                                Ok(Some(Ok(detail))) => table_view(detail).into_any(),
+                                Ok(Some(Err(state))) => unavailable_panel(state, project).into_any(),
+                                Ok(None) => ().into_any(),
+                                Err(err) => table_error(err).into_any(),
+                            }),
+                            TableView::Data => rows.get().map(|result| match result {
+                                Ok(Some(Ok(page))) => {
+                                    rows_view(page, project, schema.get()).into_any()
+                                }
+                                Ok(Some(Err(state))) => unavailable_panel(state, project).into_any(),
+                                Ok(None) => ().into_any(),
+                                Err(err) => table_error(err).into_any(),
+                            }),
+                        }?;
+                        Some(view! { {tabs} {content} }.into_any())
                     }}
                 </Transition>
             </div>
         </div>
+    }
+}
+
+fn no_table(missing: bool) -> impl IntoView {
+    if missing {
+        table_error(AppError::NotFound).into_any()
+    } else {
+        view! {
+            <StatePanel
+                tone=StateTone::Empty
+                title="Select a table".to_string()
+                detail="Choose a table from the list to see its rows and columns.".to_string()
+            />
+        }
+        .into_any()
+    }
+}
+
+fn table_error(err: AppError) -> impl IntoView {
+    view! {
+        <StatePanel tone=StateTone::Error title="Table unavailable".to_string() detail=err.to_string()/>
+    }
+}
+
+fn view_tabs(project: Uuid, table: u32, schema: String, current: TableView) -> impl IntoView {
+    let tab = move |view: TableView, label: &'static str| {
+        let current = (view == current).then_some("page");
+        view! {
+            // A plain link: the router's `A` marks every link to the same
+            // path as current, and the two views differ only in the query.
+            <a href=table_href(project, table, &schema, view, 1) class="tab" aria-current=current>
+                {label}
+            </a>
+        }
+    };
+    view! {
+        <nav class="tabs editor-tabs" aria-label="Table view">
+            {tab(TableView::Data, "Data")}
+            {tab(TableView::Definition, "Definition")}
+        </nav>
+    }
+}
+
+/// The table's name and row-level security state, shared by both views.
+fn table_heading(table: &TableSummary) -> impl IntoView + use<> {
+    let rls = if table.rls_enabled {
+        view! { <span class="badge badge-ok">"RLS enabled"</span> }.into_any()
+    } else {
+        view! { <span class="badge badge-error">"RLS disabled"</span> }.into_any()
+    };
+    let forced = table
+        .rls_forced
+        .then(|| view! { <span class="badge badge-muted">"RLS forced"</span> });
+    view! {
+        <div class="section-header">
+            <h2 class="section-title" id="table-title">
+                <span class="url-text">{format!("{}.{}", table.schema, table.name)}</span>
+            </h2>
+            <div class="row-actions">{rls} {forced}</div>
+        </div>
+    }
+}
+
+fn rows_view(page: RowPage, project: Uuid, schema: String) -> impl IntoView {
+    let number = page.page.get();
+    let first_row = page.page.offset() + 1;
+    let shown = u32::try_from(page.rows.len()).unwrap_or(ROW_PAGE_SIZE);
+    let link = |target: u32| table_href(project, page.table.id, &schema, TableView::Data, target);
+    let previous = page.page.previous().map(|p| link(p.get()));
+    let next = page
+        .has_more
+        .then(|| page.page.next().map(|p| link(p.get())))
+        .flatten();
+    let status = if page.rows.is_empty() {
+        format!("Page {number}")
+    } else {
+        format!("Rows {first_row}–{}", first_row + shown.saturating_sub(1))
+    };
+    // PostgreSQL's estimate is 0 until the table is first analyzed, and can
+    // lag behind; it is left out when the rows on screen already prove it
+    // wrong.
+    let seen = i64::from(page.page.offset()) + i64::from(shown);
+    let estimate = (page.table.live_rows_estimate >= seen).then(|| {
+        format!(
+            "About {} in total (estimate)",
+            page.table.live_rows_estimate
+        )
+    });
+    let pager = view! {
+        <nav class="pager" aria-label="Pages">
+            <span class="pager-status" role="status">{status}</span>
+            {estimate.map(|text| view! { <span class="field-hint">{text}</span> })}
+            <span class="pager-links">
+                {previous.map(|href| view! { <A href=href attr:class="button">"Previous"</A> })}
+                {next.map(|href| view! { <A href=href attr:class="button">"Next"</A> })}
+            </span>
+        </nav>
+    };
+    let body = if page.columns.is_empty() {
+        view! { <StatePanel tone=StateTone::Empty title="This table has no columns".to_string()/> }
+            .into_any()
+    } else if page.rows.is_empty() && number == 1 {
+        view! { <StatePanel tone=StateTone::Empty title="This table has no rows".to_string()/> }
+            .into_any()
+    } else if page.rows.is_empty() {
+        view! {
+            <StatePanel
+                tone=StateTone::Empty
+                title="No rows on this page".to_string()
+                detail="The table has fewer rows than this page starts at.".to_string()
+            />
+            <p><A href=link(1)>"Go to the first page"</A></p>
+        }
+        .into_any()
+    } else {
+        rows_table(&page, first_row).into_any()
+    };
+    let hidden = (page.hidden_columns > 0).then(|| {
+        view! {
+            <p class="field-hint">
+                {format!(
+                    "Only the first {ROW_COLUMN_LIMIT} columns are shown; {} more are left out. The Definition tab lists all of them.",
+                    page.hidden_columns
+                )}
+            </p>
+        }
+    });
+    let unordered = (page.order == RowOrder::Unordered).then(|| {
+        view! {
+            <p class="field-hint">
+                "This table has no primary key, so its rows have no fixed order and pages can overlap or skip rows while the table changes."
+            </p>
+        }
+    });
+    view! {
+        <div class="editor-heading">{table_heading(&page.table)}</div>
+        {pager}
+        {body}
+        {hidden}
+        {unordered}
+        <p class="field-hint">
+            {format!(
+                "Read-only. Values longer than {CELL_MAX_CHARS} characters are cut. Rows are read with postgres-meta's database role, which usually bypasses row-level security."
+            )}
+        </p>
+    }
+}
+
+fn rows_table(page: &RowPage, first_row: u32) -> impl IntoView + use<> {
+    let last_row = first_row
+        + u32::try_from(page.rows.len())
+            .unwrap_or(1)
+            .saturating_sub(1);
+    let headers = page
+        .columns
+        .iter()
+        .map(|column| {
+            view! {
+                <th scope="col">
+                    <span class="col-name">{column.name.clone()}</span>
+                    <span class="col-type">{column.type_label.clone()}</span>
+                </th>
+            }
+        })
+        .collect_view();
+    let rows = page
+        .rows
+        .iter()
+        .map(|row| {
+            let cells = row.iter().map(cell_view).collect_view();
+            view! { <tr>{cells}</tr> }
+        })
+        .collect_view();
+    view! {
+        <div class="table-wrap">
+            <table class="data-table rows-table">
+                <caption class="visually-hidden">{format!("Rows {first_row} to {last_row}")}</caption>
+                <thead><tr>{headers}</tr></thead>
+                <tbody>{rows}</tbody>
+            </table>
+        </div>
+    }
+}
+
+fn cell_view(cell: &Option<Cell>) -> impl IntoView + use<> {
+    match cell {
+        None => view! { <td><span class="cell-null">"NULL"</span></td> }.into_any(),
+        Some(cell) => {
+            let text = if cell.truncated {
+                format!("{}…", cell.text)
+            } else {
+                cell.text.clone()
+            };
+            let note = cell.truncated.then_some("Value cut for display");
+            view! { <td title=note>{text}</td> }.into_any()
+        }
     }
 }
 
@@ -222,21 +484,24 @@ fn schema_picker(listing: SchemaListing, current: String, project: Uuid) -> impl
     }
 }
 
-fn table_list(listing: TableListing, project: Uuid, selected: Option<u32>) -> impl IntoView {
+fn table_list(
+    listing: TableListing,
+    project: Uuid,
+    selected: Option<u32>,
+    view: TableView,
+) -> impl IntoView {
     if listing.tables.is_empty() {
         return view! {
             <p class="field-hint">{format!("No tables in {}.", listing.schema)}</p>
         }
         .into_any();
     }
-    let query = schema_query(&listing.schema);
-    let base = editor_path(project);
     let count = listing.tables.len();
     let items = listing
         .tables
         .into_iter()
         .map(|table| {
-            let href = format!("{base}/{}{query}", table.id);
+            let href = table_href(project, table.id, &listing.schema, view, 1);
             let current = (selected == Some(table.id)).then_some("page");
             view! {
                 <li>
@@ -264,14 +529,6 @@ fn table_list(listing: TableListing, project: Uuid, selected: Option<u32>) -> im
 
 fn table_view(detail: TableDetail) -> impl IntoView {
     let table = detail.table;
-    let rls = if table.rls_enabled {
-        view! { <span class="badge badge-ok">"RLS enabled"</span> }.into_any()
-    } else {
-        view! { <span class="badge badge-error">"RLS disabled"</span> }.into_any()
-    };
-    let forced = table
-        .rls_forced
-        .then(|| view! { <span class="badge badge-muted">"RLS forced"</span> });
     let primary_key = if detail.primary_key.is_empty() {
         "None".to_owned()
     } else {
@@ -289,12 +546,7 @@ fn table_view(detail: TableDetail) -> impl IntoView {
     });
     view! {
         <section class="panel" aria-labelledby="table-title">
-            <div class="section-header">
-                <h2 class="section-title" id="table-title">
-                    <span class="url-text">{format!("{}.{}", table.schema, table.name)}</span>
-                </h2>
-                <div class="row-actions">{rls} {forced}</div>
-            </div>
+            {table_heading(&table)}
             {table.comment.map(|comment| view! { <p class="section-text">{comment}</p> })}
             <dl class="detail-list detail-inline">
                 <div><dt>"Primary key"</dt><dd>{primary_key}</dd></div>
@@ -321,17 +573,13 @@ fn table_view(detail: TableDetail) -> impl IntoView {
             </div>
         })}
         <p class="field-hint">
-            "Row estimates come from PostgreSQL's statistics and can lag behind the table. Viewing and editing rows is not available yet."
+            "Row estimates come from PostgreSQL's statistics and can lag behind the table."
         </p>
     }
 }
 
 fn column_row(column: &ColumnSummary, primary_key: &[String]) -> impl IntoView + use<> {
-    let type_name = if column.data_type == "USER-DEFINED" || column.data_type == "ARRAY" {
-        column.format.clone()
-    } else {
-        column.data_type.clone()
-    };
+    let type_name = column.type_label().to_owned();
     let mut constraints = Vec::new();
     if primary_key.contains(&column.name) {
         constraints.push("Primary key".to_owned());

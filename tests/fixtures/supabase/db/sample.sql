@@ -20,3 +20,14 @@ CREATE TABLE public.tags (
 );
 
 INSERT INTO public.todos (title, slug) VALUES ('first', 'first'), ('second', 'second');
+
+-- No primary key, a name that needs quoting, more rows than one page, and
+-- values longer than the dashboard keeps.
+CREATE TABLE public."Event ""Log""" (
+  "Kind" text NOT NULL,
+  payload jsonb,
+  body text
+);
+INSERT INTO public."Event ""Log""" ("Kind", payload, body)
+SELECT 'tick', jsonb_build_object('n', n), CASE WHEN n = 1 THEN repeat('z', 300) END
+FROM generate_series(1, 120) AS n;

@@ -31,6 +31,19 @@ pub const COMMENT_MAX_CHARS: usize = 1000;
 pub const EXPRESSION_MAX_CHARS: usize = 500;
 pub const TYPE_NAME_MAX_CHARS: usize = 128;
 
+/// Rows on one page of table data.
+pub const ROW_PAGE_SIZE: u32 = 50;
+/// Highest page number accepted. Deep offsets make PostgreSQL read and
+/// discard every earlier row, so paging stops well before that gets slow.
+pub const ROW_PAGE_LIMIT: u32 = 2000;
+/// Most columns shown in the data view. Together with the cell bound this
+/// keeps a page under a few megabytes whatever the table looks like.
+pub const ROW_COLUMN_LIMIT: usize = 50;
+/// Characters kept from each value. Longer values are cut on the server.
+pub const CELL_MAX_CHARS: usize = 200;
+/// How long the database may spend on one page, in milliseconds.
+pub const ROW_QUERY_TIMEOUT_MS: u32 = 5000;
+
 /// A schema name typed into a URL or form, checked before it is sent to the
 /// stack.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -160,6 +173,18 @@ pub struct ColumnSummary {
     pub enum_labels: Vec<String>,
 }
 
+impl ColumnSummary {
+    /// The type as the table editor shows it: the SQL name, or for enums,
+    /// composite types, and arrays the underlying type name.
+    pub fn type_label(&self) -> &str {
+        if self.data_type == "USER-DEFINED" || self.data_type == "ARRAY" {
+            &self.format
+        } else {
+            &self.data_type
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableDetail {
     pub table: TableSummary,
@@ -167,6 +192,101 @@ pub struct TableDetail {
     pub primary_key: Vec<String>,
     /// Sorted by position.
     pub columns: Vec<ColumnSummary>,
+}
+
+/// A page number for table data, from 1 to [`ROW_PAGE_LIMIT`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "u32", into = "u32")]
+pub struct RowPageNumber(u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("page numbers go from 1 to {ROW_PAGE_LIMIT}")]
+pub struct RowPageOutOfRange;
+
+impl RowPageNumber {
+    pub const FIRST: Self = Self(1);
+
+    pub fn new(page: u32) -> Result<Self, RowPageOutOfRange> {
+        if (1..=ROW_PAGE_LIMIT).contains(&page) {
+            Ok(Self(page))
+        } else {
+            Err(RowPageOutOfRange)
+        }
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+
+    /// Rows skipped before this page. Cannot overflow: the largest page
+    /// times the page size fits easily in a `u32`.
+    pub const fn offset(self) -> u32 {
+        (self.0 - 1) * ROW_PAGE_SIZE
+    }
+
+    pub fn next(self) -> Option<Self> {
+        Self::new(self.0.checked_add(1)?).ok()
+    }
+
+    pub fn previous(self) -> Option<Self> {
+        Self::new(self.0.checked_sub(1)?).ok()
+    }
+}
+
+impl TryFrom<u32> for RowPageNumber {
+    type Error = RowPageOutOfRange;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<RowPageNumber> for u32 {
+    fn from(value: RowPageNumber) -> Self {
+        value.0
+    }
+}
+
+/// A column shown in the data view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RowColumn {
+    pub name: String,
+    pub type_label: String,
+}
+
+/// One value as PostgreSQL prints it, cut to [`CELL_MAX_CHARS`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cell {
+    pub text: String,
+    /// The value was longer than what is kept.
+    pub truncated: bool,
+}
+
+/// How the rows on a page are ordered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "columns", rename_all = "snake_case")]
+pub enum RowOrder {
+    /// By the primary key, so pages do not overlap.
+    PrimaryKey(Vec<String>),
+    /// The table has no primary key. PostgreSQL returns rows in whatever
+    /// order is cheapest, so pages can overlap or skip rows.
+    Unordered,
+}
+
+/// One page of a table's rows. Read-only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RowPage {
+    pub table: TableSummary,
+    /// The first [`ROW_COLUMN_LIMIT`] columns by position.
+    pub columns: Vec<RowColumn>,
+    /// Columns left out because of [`ROW_COLUMN_LIMIT`].
+    pub hidden_columns: usize,
+    /// Each row has one entry per column; `None` is SQL `NULL`.
+    pub rows: Vec<Vec<Option<Cell>>>,
+    pub page: RowPageNumber,
+    /// At least one more row exists after this page.
+    pub has_more: bool,
+    pub order: RowOrder,
 }
 
 /// Why the structure of a project's database could not be read.
@@ -191,6 +311,8 @@ pub enum MetaUnavailable {
     Unreachable {
         reason: UnreachableReason,
     },
+    /// The database stopped the read after [`ROW_QUERY_TIMEOUT_MS`].
+    QueryTimeout,
 }
 
 impl MetaUnavailable {
@@ -201,6 +323,7 @@ impl MetaUnavailable {
             Self::NotExposed => "postgres-meta is not available through the gateway",
             Self::ServiceError { .. } => "postgres-meta reported an error",
             Self::Unreachable { .. } => "The stack could not be reached",
+            Self::QueryTimeout => "The database took too long",
         }
     }
 
@@ -230,6 +353,11 @@ impl MetaUnavailable {
                  details."
             ),
             Self::Unreachable { reason } => reason.message().to_owned(),
+            Self::QueryTimeout => format!(
+                "PostgreSQL stopped reading this page after {} seconds. Later pages of a large \
+                 table take longer, because the database reads every earlier row first.",
+                ROW_QUERY_TIMEOUT_MS / 1000
+            ),
         }
     }
 }
@@ -286,6 +414,20 @@ mod tests {
         assert_eq!(bounded("abcdefghijk", 10), "abcdefghi…");
         assert_eq!(bounded("ééééé", 3), "éé…");
         assert_eq!(bounded("", 0), "");
+    }
+
+    #[test]
+    fn row_pages_are_bounded() {
+        assert!(RowPageNumber::new(0).is_err());
+        assert!(RowPageNumber::new(ROW_PAGE_LIMIT + 1).is_err());
+        assert_eq!(RowPageNumber::FIRST.offset(), 0);
+        let last = RowPageNumber::new(ROW_PAGE_LIMIT).unwrap();
+        assert_eq!(last.offset(), (ROW_PAGE_LIMIT - 1) * ROW_PAGE_SIZE);
+        assert_eq!(last.next(), None);
+        assert_eq!(RowPageNumber::FIRST.previous(), None);
+        assert_eq!(RowPageNumber::FIRST.next().map(RowPageNumber::get), Some(2));
+        assert!(serde_json::from_str::<RowPageNumber>("0").is_err());
+        assert!(serde_json::from_str::<RowPageNumber>("3").is_ok());
     }
 
     #[test]

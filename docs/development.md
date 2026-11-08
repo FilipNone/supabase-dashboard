@@ -99,6 +99,17 @@ The project overview's "Check now" button asks the stack's API gateway for `/aut
 
 The project's Table editor tab reads schemas, tables, and columns from postgres-meta through the same gateway, at `/pg/schemas`, `/pg/tables`, and `/pg/tables/{id}`, with the stored service role key and the same address policy, timeouts, and redirect rule. Responses are size-limited (8 MiB for lists, 4 MiB for one table). At most 16 of these requests run at once across the server. Nothing is cached and nothing is written to the stack.
 
+The Data tab shows a table's rows 50 at a time. The server reads the table from `/pg/tables/{id}` again and then sends one statement it builds itself to `POST /pg/query`:
+
+```sql
+SET TRANSACTION READ ONLY; SET LOCAL statement_timeout = 5000;
+SELECT left(("col")::text, 201) AS c0, ... FROM "schema"."table" ORDER BY "pk" LIMIT 51 OFFSET n
+```
+
+Names come from postgres-meta and are always double-quoted, with embedded quotes doubled; a name longer than 63 bytes or containing a NUL byte is refused instead of sent. The only other inputs are integers. Both settings stay inside the statement's implicit transaction, so nothing changes on postgres-meta's pooled connection. postgres-meta's own `statementTimeoutSecs` option is not used because it sets the timeout for the whole session.
+
+Limits: the first 50 columns, 200 characters per value (cut on the server), pages 1 to 2000, and a 4 MiB response. Tables without a primary key are read in no particular order and the page says so. A statement timeout (SQLSTATE 57014) is reported as its own state; other database errors only as "postgres-meta answered HTTP 400", because their text can contain data. Rows are read as postgres-meta's database role, which in a standard stack bypasses row-level security; every member role, viewers included, can read them.
+
 ## Endpoints
 
 - `GET /healthz`: liveness. Does not touch the database.

@@ -1,12 +1,18 @@
 //! Database structure from postgres-meta, which the standard self-hosted
 //! gateway exposes at `/pg/` for the service role only.
 //!
-//! Only three fixed GET paths are requested. No `x-connection-encrypted`
-//! header is ever sent, so postgres-meta uses its own configured database
-//! connection; the dashboard holds no database password for this. Error
-//! bodies can contain database messages, so only the status is kept.
+//! Structure comes from three fixed GET paths. Table rows come from
+//! `POST /query` with a statement this module builds itself: a single
+//! `SELECT` in a read-only transaction with a statement timeout, whose only
+//! inputs are identifiers read from postgres-meta just before (always
+//! quoted) and integers. Nothing a dashboard user types reaches the SQL.
+//!
+//! No `x-connection-encrypted` header is ever sent, so postgres-meta uses
+//! its own configured database connection; the dashboard holds no database
+//! password for this. Error bodies can contain database messages, so only
+//! the status, and for queries the SQLSTATE code, is kept.
 
-use reqwest::StatusCode;
+use reqwest::{Method, StatusCode, header::CONTENT_TYPE};
 use secrecy::SecretString;
 use serde::Deserialize;
 use supabase_dashboard_application::schema::{MetaFuture, SchemaSource};
@@ -14,10 +20,12 @@ use supabase_dashboard_domain::{
     connection::UnreachableReason,
     project::ProjectUrl,
     schema::{
-        COMMENT_MAX_CHARS, ColumnSummary, ENUM_LABEL_LIMIT, EXPRESSION_MAX_CHARS,
-        IdentityGeneration, MetaUnavailable, SCHEMA_LIST_LIMIT, SchemaListing, SchemaName,
-        SchemaSummary, TABLE_COLUMN_LIMIT, TABLE_LIST_LIMIT, TYPE_NAME_MAX_CHARS, TableDetail,
-        TableListing, TableSummary, bounded,
+        CELL_MAX_CHARS, COMMENT_MAX_CHARS, Cell, ColumnSummary, ENUM_LABEL_LIMIT,
+        EXPRESSION_MAX_CHARS, IDENTIFIER_MAX_BYTES, IdentityGeneration, MetaUnavailable,
+        ROW_COLUMN_LIMIT, ROW_PAGE_SIZE, ROW_QUERY_TIMEOUT_MS, RowColumn, RowOrder, RowPage,
+        RowPageNumber, SCHEMA_LIST_LIMIT, SchemaListing, SchemaName, SchemaSummary,
+        TABLE_COLUMN_LIMIT, TABLE_LIST_LIMIT, TYPE_NAME_MAX_CHARS, TableDetail, TableListing,
+        TableSummary, bounded,
     },
 };
 
@@ -28,6 +36,14 @@ use crate::gateway::{GatewayProbe, classify, read_bounded};
 const MAX_LIST_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// Largest response read for one table with its columns.
 const MAX_TABLE_BODY_BYTES: usize = 4 * 1024 * 1024;
+/// Largest response read for one page of rows. A full page is 51 rows of
+/// up to 50 cells of 201 characters, so even with every character escaped
+/// it stays below this.
+const MAX_ROWS_BODY_BYTES: usize = 4 * 1024 * 1024;
+/// Largest error body read; only its shape and SQLSTATE code are used.
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+/// SQLSTATE `query_canceled`, which a statement timeout raises.
+const QUERY_CANCELED: &str = "57014";
 
 /// What a request came back with, before it is decoded.
 enum Answer {
@@ -47,15 +63,34 @@ impl GatewayProbe {
         query: &[(&str, &str)],
         limit: usize,
     ) -> Result<Answer, MetaUnavailable> {
+        self.meta_send(Method::GET, api_url, key, path, query, None, limit)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn meta_send(
+        &self,
+        method: Method,
+        api_url: &ProjectUrl,
+        key: &SecretString,
+        path: &str,
+        query: &[(&str, &str)],
+        body: Option<Vec<u8>>,
+        limit: usize,
+    ) -> Result<Answer, MetaUnavailable> {
         let unreachable = |reason| MetaUnavailable::Unreachable { reason };
         let mut url = reqwest::Url::parse(&format!("{}/pg{path}", api_url.as_str()))
             .map_err(|_| unreachable(UnreachableReason::InvalidResponse))?;
         if !query.is_empty() {
             url.query_pairs_mut().extend_pairs(query);
         }
-        let response = self
-            .request(url, key, "application/json")
-            .map_err(unreachable)?
+        let mut request = self
+            .request(method, url, key, "application/json")
+            .map_err(unreachable)?;
+        if let Some(body) = body {
+            request = request.header(CONTENT_TYPE, "application/json").body(body);
+        }
+        let response = request
             .send()
             .await
             .map_err(|err| unreachable(classify(&err)))?;
@@ -71,13 +106,24 @@ impl GatewayProbe {
                 http_status: status.as_u16(),
             }),
             StatusCode::NOT_FOUND => {
-                // Small bound: only the shape matters, and the text is
-                // never kept.
-                let body = read_bounded(response, 64 * 1024).await.unwrap_or_default();
+                // Only the shape matters, and the text is never kept.
+                let body = read_bounded(response, MAX_ERROR_BODY_BYTES)
+                    .await
+                    .unwrap_or_default();
                 if is_meta_error(&body) {
                     Ok(Answer::MetaNotFound)
                 } else {
                     Err(MetaUnavailable::NotExposed)
+                }
+            }
+            StatusCode::BAD_REQUEST => {
+                let body = read_bounded(response, MAX_ERROR_BODY_BYTES)
+                    .await
+                    .unwrap_or_default();
+                if sqlstate(&body).as_deref() == Some(QUERY_CANCELED) {
+                    Err(MetaUnavailable::QueryTimeout)
+                } else {
+                    Err(MetaUnavailable::ServiceError { http_status: 400 })
                 }
             }
             _ => Err(MetaUnavailable::ServiceError {
@@ -142,6 +188,39 @@ impl GatewayProbe {
             Answer::Body(body) => decode_table(&body).map(Some),
         }
     }
+
+    async fn read_rows(
+        &self,
+        api_url: &ProjectUrl,
+        key: &SecretString,
+        table: &TableDetail,
+        page: RowPageNumber,
+    ) -> Result<RowPage, MetaUnavailable> {
+        let plan = RowQuery::new(table, page)?;
+        let body =
+            serde_json::to_vec(&serde_json::json!({ "query": plan.sql })).map_err(|_| invalid())?;
+        let answer = self
+            .meta_send(
+                Method::POST,
+                api_url,
+                key,
+                "/query",
+                &[],
+                Some(body),
+                MAX_ROWS_BODY_BYTES,
+            )
+            .await?;
+        let (rows, has_more) = decode_rows(&body_of(answer)?, plan.columns.len())?;
+        Ok(RowPage {
+            table: table.table.clone(),
+            columns: plan.columns,
+            hidden_columns: plan.hidden_columns,
+            rows,
+            page,
+            has_more,
+            order: plan.order,
+        })
+    }
 }
 
 impl SchemaSource for GatewayProbe {
@@ -170,6 +249,144 @@ impl SchemaSource for GatewayProbe {
     ) -> MetaFuture<'a, Option<TableDetail>> {
         Box::pin(self.get_table(api_url, key, table_id))
     }
+
+    fn rows<'a>(
+        &'a self,
+        api_url: &'a ProjectUrl,
+        key: &'a SecretString,
+        table: &'a TableDetail,
+        page: RowPageNumber,
+    ) -> MetaFuture<'a, RowPage> {
+        Box::pin(self.read_rows(api_url, key, table, page))
+    }
+}
+
+/// Quotes an identifier as PostgreSQL's `quote_ident` does for names that
+/// need it: in double quotes, with embedded double quotes doubled. Every
+/// name is quoted, so case and reserved words survive. Names PostgreSQL
+/// could not have produced are refused rather than sent, since the server
+/// would silently shorten an overlong one to a different name.
+fn quote_ident(name: &str) -> Result<String, MetaUnavailable> {
+    if name.is_empty() || name.len() > IDENTIFIER_MAX_BYTES || name.contains('\0') {
+        return Err(invalid());
+    }
+    Ok(format!("\"{}\"", name.replace('"', "\"\"")))
+}
+
+/// The statement for one page of rows, and what its result columns are.
+struct RowQuery {
+    sql: String,
+    columns: Vec<RowColumn>,
+    hidden_columns: usize,
+    order: RowOrder,
+}
+
+impl RowQuery {
+    fn new(table: &TableDetail, page: RowPageNumber) -> Result<Self, MetaUnavailable> {
+        let visible = &table.columns[..table.columns.len().min(ROW_COLUMN_LIMIT)];
+        // Each value is printed as text and cut one character past the
+        // bound, so the server can tell a cut value from one that fits.
+        let select = visible
+            .iter()
+            .enumerate()
+            .map(|(i, column)| {
+                Ok(format!(
+                    "left(({})::text, {}) AS c{i}",
+                    quote_ident(&column.name)?,
+                    CELL_MAX_CHARS + 1
+                ))
+            })
+            .collect::<Result<Vec<_>, MetaUnavailable>>()?
+            .join(", ");
+        let relation = format!(
+            "{}.{}",
+            quote_ident(&table.table.schema)?,
+            quote_ident(&table.table.name)?
+        );
+        let (order_by, order) = if table.primary_key.is_empty() {
+            (String::new(), RowOrder::Unordered)
+        } else {
+            let keys = table
+                .primary_key
+                .iter()
+                .map(|name| quote_ident(name))
+                .collect::<Result<Vec<_>, _>>()?;
+            (
+                format!(" ORDER BY {}", keys.join(", ")),
+                RowOrder::PrimaryKey(table.primary_key.clone()),
+            )
+        };
+        // The implicit transaction of a multi-statement query keeps both
+        // settings local to it, so nothing outlives the read on
+        // postgres-meta's pooled connection.
+        let sql = format!(
+            "SET TRANSACTION READ ONLY; SET LOCAL statement_timeout = {ROW_QUERY_TIMEOUT_MS}; \
+             SELECT {select} FROM {relation}{order_by} LIMIT {} OFFSET {}",
+            ROW_PAGE_SIZE + 1,
+            page.offset()
+        );
+        Ok(Self {
+            sql,
+            columns: visible
+                .iter()
+                .map(|column| RowColumn {
+                    name: column.name.clone(),
+                    type_label: column.type_label().to_owned(),
+                })
+                .collect(),
+            hidden_columns: table.columns.len().saturating_sub(visible.len()),
+            order,
+        })
+    }
+}
+
+fn cell(text: String) -> Cell {
+    match text.char_indices().nth(CELL_MAX_CHARS) {
+        None => Cell {
+            text,
+            truncated: false,
+        },
+        Some((end, _)) => Cell {
+            text: text[..end].to_owned(),
+            truncated: true,
+        },
+    }
+}
+
+type Rows = Vec<Vec<Option<Cell>>>;
+
+/// Rows come back as objects keyed `c0`, `c1`, ..., one string or null per
+/// column. The page holds one extra row, which only says more exist.
+fn decode_rows(body: &[u8], column_count: usize) -> Result<(Rows, bool), MetaUnavailable> {
+    let raw: Vec<serde_json::Map<String, serde_json::Value>> =
+        serde_json::from_slice(body).map_err(|_| invalid())?;
+    let page_size = ROW_PAGE_SIZE as usize;
+    if raw.len() > page_size + 1 {
+        return Err(invalid());
+    }
+    let has_more = raw.len() > page_size;
+    let rows = raw
+        .into_iter()
+        .take(page_size)
+        .map(|mut row| {
+            (0..column_count)
+                .map(|i| match row.remove(&format!("c{i}")) {
+                    Some(serde_json::Value::Null) => Ok(None),
+                    Some(serde_json::Value::String(text)) => Ok(Some(cell(text))),
+                    _ => Err(invalid()),
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((rows, has_more))
+}
+
+/// The SQLSTATE code of a postgres-meta query error, if it has one of the
+/// right shape. The message next to it is never read.
+fn sqlstate(body: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let code = value.get("code")?.as_str()?;
+    (code.len() == 5 && code.bytes().all(|b| b.is_ascii_alphanumeric())).then(|| code.to_owned())
 }
 
 /// A list endpoint never answers "not found" for an existing route, so a
@@ -463,6 +680,130 @@ mod tests {
             detail.table.comment.unwrap().chars().count(),
             COMMENT_MAX_CHARS
         );
+    }
+
+    fn column(position: u16, name: &str) -> ColumnSummary {
+        ColumnSummary {
+            position,
+            name: name.into(),
+            data_type: "text".into(),
+            format: "text".into(),
+            nullable: true,
+            unique: false,
+            identity: None,
+            generated: false,
+            default_value: None,
+            comment: None,
+            enum_labels: Vec::new(),
+        }
+    }
+
+    fn detail(schema: &str, name: &str, columns: Vec<ColumnSummary>, pk: &[&str]) -> TableDetail {
+        TableDetail {
+            table: TableSummary {
+                id: 1,
+                schema: schema.into(),
+                name: name.into(),
+                rls_enabled: false,
+                rls_forced: false,
+                live_rows_estimate: 0,
+                size: String::new(),
+                comment: None,
+            },
+            primary_key: pk.iter().map(|&k| k.to_owned()).collect(),
+            columns,
+        }
+    }
+
+    #[test]
+    fn identifiers_are_always_quoted() {
+        assert_eq!(quote_ident("todos").unwrap(), r#""todos""#);
+        assert_eq!(quote_ident("Mixed Case").unwrap(), r#""Mixed Case""#);
+        assert_eq!(
+            quote_ident(r#"a"; drop table x; --"#).unwrap(),
+            r#""a""; drop table x; --""#
+        );
+        assert_eq!(quote_ident(&"a".repeat(63)).unwrap().len(), 65);
+        assert!(quote_ident("").is_err());
+        assert!(quote_ident(&"a".repeat(64)).is_err());
+        assert!(quote_ident("a\0b").is_err());
+        // Shortened names from `bounded` never reach a query.
+        assert!(quote_ident(&bounded(&"é".repeat(40), 32)).is_err());
+    }
+
+    #[test]
+    fn row_query_is_read_only_ordered_and_bounded() {
+        let table = detail(
+            "my schema",
+            r#"we"ird"#,
+            vec![column(1, "id"), column(2, "Note")],
+            &["id"],
+        );
+        let plan = RowQuery::new(&table, RowPageNumber::new(3).unwrap()).unwrap();
+        assert_eq!(
+            plan.sql,
+            "SET TRANSACTION READ ONLY; SET LOCAL statement_timeout = 5000; \
+             SELECT left((\"id\")::text, 201) AS c0, left((\"Note\")::text, 201) AS c1 \
+             FROM \"my schema\".\"we\"\"ird\" ORDER BY \"id\" LIMIT 51 OFFSET 100"
+        );
+        assert_eq!(plan.order, RowOrder::PrimaryKey(vec!["id".into()]));
+        assert_eq!(plan.columns[1].name, "Note");
+        assert_eq!(plan.hidden_columns, 0);
+    }
+
+    #[test]
+    fn tables_without_a_key_are_unordered_and_wide_tables_cut() {
+        let columns = (1..=60).map(|i| column(i, &format!("c{i}"))).collect();
+        let plan = RowQuery::new(
+            &detail("public", "wide", columns, &[]),
+            RowPageNumber::FIRST,
+        )
+        .unwrap();
+        assert_eq!(plan.order, RowOrder::Unordered);
+        assert!(!plan.sql.contains("ORDER BY"));
+        assert!(plan.sql.ends_with("LIMIT 51 OFFSET 0"));
+        assert_eq!(plan.columns.len(), ROW_COLUMN_LIMIT);
+        assert_eq!(plan.hidden_columns, 10);
+        assert!(!plan.sql.contains("\"c51\""));
+    }
+
+    #[test]
+    fn rows_are_decoded_and_cells_cut() {
+        let long = "y".repeat(CELL_MAX_CHARS + 1);
+        let body = format!(r#"[{{"c0":"1","c1":null}},{{"c0":"2","c1":"{long}"}}]"#);
+        let (rows, more) = decode_rows(body.as_bytes(), 2).unwrap();
+        assert!(!more);
+        assert_eq!(rows[0][0].as_ref().unwrap().text, "1");
+        assert_eq!(rows[0][1], None);
+        let cut = rows[1][1].as_ref().unwrap();
+        assert!(cut.truncated);
+        assert_eq!(cut.text.chars().count(), CELL_MAX_CHARS);
+    }
+
+    #[test]
+    fn the_extra_row_only_means_more() {
+        let one = r#"{"c0":"x"}"#;
+        let full = vec![one; ROW_PAGE_SIZE as usize + 1].join(",");
+        let (rows, more) = decode_rows(format!("[{full}]").as_bytes(), 1).unwrap();
+        assert!(more);
+        assert_eq!(rows.len(), ROW_PAGE_SIZE as usize);
+        let over = vec![one; ROW_PAGE_SIZE as usize + 2].join(",");
+        assert!(decode_rows(format!("[{over}]").as_bytes(), 1).is_err());
+        // A missing or non-text cell means the answer is not what was asked.
+        assert!(decode_rows(br#"[{"c0":1}]"#, 1).is_err());
+        assert!(decode_rows(br#"[{}]"#, 1).is_err());
+        assert_eq!(decode_rows(br#"[{}]"#, 0).unwrap().0, vec![Vec::new()]);
+    }
+
+    #[test]
+    fn only_well_formed_sqlstates_are_read() {
+        assert_eq!(
+            sqlstate(br#"{"error":"ERROR: 57014: canceling","code":"57014"}"#).as_deref(),
+            Some("57014")
+        );
+        assert_eq!(sqlstate(br#"{"code":"<script>"}"#), None);
+        assert_eq!(sqlstate(br#"{"code":57014}"#), None);
+        assert_eq!(sqlstate(b"oops"), None);
     }
 
     #[test]

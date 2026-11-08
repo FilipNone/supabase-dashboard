@@ -16,7 +16,7 @@ use supabase_dashboard_domain::{
     invitation::{InvitationCode, InvitationPreview, InvitationSummary, IssuedInvitation},
     organization::{MemberSummary, OrganizationSummary},
     project::ProjectSummary,
-    schema::{MetaUnavailable, SchemaListing, TableDetail, TableListing},
+    schema::{MetaUnavailable, RowPage, SchemaListing, TableDetail, TableListing},
 };
 use uuid::Uuid;
 
@@ -287,6 +287,21 @@ pub async fn get_table(
 ) -> Result<Result<TableDetail, MetaUnavailable>, AppError> {
     let session = org_context::session()?;
     Ok(org_context::schema()?.table(&session, id, table_id).await?)
+}
+
+/// One page of a table's rows, read-only. Pages start at 1.
+#[server]
+pub async fn get_table_rows(
+    id: Uuid,
+    table_id: u32,
+    page: u32,
+) -> Result<Result<RowPage, MetaUnavailable>, AppError> {
+    let session = org_context::session()?;
+    let page = supabase_dashboard_domain::schema::RowPageNumber::new(page)
+        .map_err(|err| AppError::Rejected(format!("{}.", capitalize(&err.to_string()))))?;
+    Ok(org_context::schema()?
+        .rows(&session, id, table_id, page)
+        .await?)
 }
 
 #[cfg(feature = "ssr")]

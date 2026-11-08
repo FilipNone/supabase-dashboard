@@ -99,7 +99,7 @@ impl GatewayProbe {
         let Ok(url) = reqwest::Url::parse(&format!("{}{}", api_url.as_str(), path(service))) else {
             return unreachable(UnreachableReason::InvalidResponse);
         };
-        let request = match self.request(url, key, accept(service)) {
+        let request = match self.request(reqwest::Method::GET, url, key, accept(service)) {
             Ok(request) => request,
             Err(reason) => return unreachable(reason),
         };
@@ -138,6 +138,7 @@ impl GatewayProbe {
     /// checks every address a host name resolves to.
     pub(crate) fn request(
         &self,
+        method: reqwest::Method,
         url: reqwest::Url,
         key: &SecretString,
         accept: &'static str,
@@ -158,7 +159,7 @@ impl GatewayProbe {
         apikey.set_sensitive(true);
         headers.insert("apikey", apikey);
         headers.insert(ACCEPT, HeaderValue::from_static(accept));
-        Ok(self.client.get(url).headers(headers))
+        Ok(self.client.request(method, url).headers(headers))
     }
 }
 

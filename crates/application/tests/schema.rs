@@ -21,8 +21,8 @@ use supabase_dashboard_domain::{
     connection::{CredentialKind, SkipReason},
     project::ProjectUrl,
     schema::{
-        MetaUnavailable, SchemaListing, SchemaName, SchemaSummary, TableDetail, TableListing,
-        TableSummary,
+        MetaUnavailable, RowOrder, RowPage, RowPageNumber, SchemaListing, SchemaName,
+        SchemaSummary, TableDetail, TableListing, TableSummary,
     },
 };
 use supabase_dashboard_persistence::{Database, accounts::AccountRecord};
@@ -125,6 +125,27 @@ impl SchemaSource for FakeSource {
                 primary_key: vec!["id".into()],
                 columns: Vec::new(),
             }))
+        })
+    }
+
+    fn rows<'a>(
+        &'a self,
+        _api_url: &'a ProjectUrl,
+        key: &'a SecretString,
+        table: &'a TableDetail,
+        page: RowPageNumber,
+    ) -> MetaFuture<'a, RowPage> {
+        self.record(key);
+        Box::pin(async move {
+            Ok(RowPage {
+                table: table.table.clone(),
+                columns: Vec::new(),
+                hidden_columns: 0,
+                rows: Vec::new(),
+                page,
+                has_more: false,
+                order: RowOrder::PrimaryKey(table.primary_key.clone()),
+            })
         })
     }
 }
@@ -257,11 +278,22 @@ async fn every_member_can_browse_with_the_service_role_key() {
         assert_eq!(tables.tables[0].id, 7);
         let detail = schema.table(who, id, 7).await.unwrap().unwrap();
         assert_eq!(detail.primary_key, ["id"]);
+        let page = RowPageNumber::new(3).unwrap();
+        let rows = schema.rows(who, id, 7, page).await.unwrap().unwrap();
+        assert_eq!(rows.page, page);
+        assert_eq!(rows.order, RowOrder::PrimaryKey(vec!["id".into()]));
     }
     assert!(matches!(
         schema.table(&viewer, id, 8).await,
         Err(SchemaError::TableNotFound)
     ));
+    // Rows of a table that does not exist are not requested at all.
+    let calls = f.source.keys.lock().unwrap().len();
+    assert!(matches!(
+        schema.rows(&viewer, id, 8, RowPageNumber::FIRST).await,
+        Err(SchemaError::TableNotFound)
+    ));
+    assert_eq!(f.source.keys.lock().unwrap().len(), calls + 1);
     // Only the service role key is used, never the anon key.
     assert!(f.source.keys.lock().unwrap().iter().all(|k| k == SERVICE));
 
@@ -274,6 +306,10 @@ async fn every_member_can_browse_with_the_service_role_key() {
     ));
     assert!(matches!(
         schema.table(&outsider, id, 7).await,
+        Err(SchemaError::NotFound)
+    ));
+    assert!(matches!(
+        schema.rows(&outsider, id, 7, RowPageNumber::FIRST).await,
         Err(SchemaError::NotFound)
     ));
     assert!(matches!(
@@ -305,6 +341,13 @@ async fn missing_or_unreadable_keys_are_reported_without_contacting_the_stack() 
         Err(missing)
     );
     assert_eq!(schema.table(&owner, id, 7).await.unwrap(), Err(missing));
+    assert_eq!(
+        schema
+            .rows(&owner, id, 7, RowPageNumber::FIRST)
+            .await
+            .unwrap(),
+        Err(missing)
+    );
 
     // A key sealed under another server key, or no server key at all.
     store(&f, &owner, id, CredentialKind::ServiceRoleKey, SERVICE).await;

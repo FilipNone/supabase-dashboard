@@ -458,6 +458,20 @@ td { vertical-align: middle; }
 .columns-table { min-width: 44rem; }
 .columns-table .cell-type .url-text { white-space: nowrap; }
 .columns-table .cell-type .status-detail { display: block; }
+.editor-tabs { margin-bottom: 0; }
+.editor-heading .section-header { margin-bottom: 0; }
+/* Row data: one line per row, long values ellipsized; the wrapper scrolls
+   sideways when the table is wider than the screen. */
+.rows-table th, .rows-table td { white-space: nowrap; padding: var(--space-1) var(--space-3); }
+.rows-table td {
+  max-width: 20rem; overflow: hidden; text-overflow: ellipsis;
+  font-family: var(--font-mono); font-size: var(--text-xs);
+}
+.rows-table .col-name { display: block; color: var(--color-text); }
+.rows-table .col-type { display: block; font-weight: 400; font-size: var(--text-xs); }
+.cell-null { color: var(--color-text-muted); font-style: italic; }
+.pager { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2) var(--space-4); font-size: var(--text-sm); }
+.pager-links { display: flex; gap: var(--space-2); margin-left: auto; }
 
 @media (max-width: 640px) {
   .editor { grid-template-columns: minmax(0, 1fr); gap: var(--space-4); }

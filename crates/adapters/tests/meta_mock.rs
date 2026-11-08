@@ -10,7 +10,7 @@ use axum::{
     extract::RawQuery,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Redirect},
-    routing::get,
+    routing::{get, post},
 };
 use secrecy::SecretString;
 use supabase_dashboard_adapters::{
@@ -21,8 +21,39 @@ use supabase_dashboard_application::schema::SchemaSource;
 use supabase_dashboard_domain::{
     connection::UnreachableReason,
     project::ProjectUrl,
-    schema::{MetaUnavailable, SchemaName},
+    schema::{
+        ColumnSummary, MetaUnavailable, RowPageNumber, SchemaName, TableDetail, TableSummary,
+    },
 };
+
+fn todos() -> TableDetail {
+    TableDetail {
+        table: TableSummary {
+            id: 7,
+            schema: "public".into(),
+            name: "todos".into(),
+            rls_enabled: true,
+            rls_forced: false,
+            live_rows_estimate: 2,
+            size: "16 kB".into(),
+            comment: None,
+        },
+        primary_key: vec!["id".into()],
+        columns: vec![ColumnSummary {
+            position: 1,
+            name: "id".into(),
+            data_type: "bigint".into(),
+            format: "int8".into(),
+            nullable: false,
+            unique: false,
+            identity: None,
+            generated: false,
+            default_value: None,
+            comment: None,
+            enum_labels: Vec::new(),
+        }],
+    }
+}
 
 async fn serve(router: Router) -> ProjectUrl {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -158,4 +189,69 @@ async fn loopback_is_refused_by_default() {
             reason: UnreachableReason::DestinationNotAllowed
         }
     );
+}
+
+#[tokio::test]
+async fn rows_are_read_with_one_generated_read_only_statement() {
+    let url = serve(Router::new().route(
+        "/pg/query",
+        post(
+            |headers: HeaderMap, RawQuery(query): RawQuery, body: String| async move {
+                assert_eq!(headers.get("apikey").unwrap(), "service-key");
+                assert_eq!(headers.get("content-type").unwrap(), "application/json");
+                // No postgres-meta timeout options: they change the pooled
+                // session for good.
+                assert!(query.is_none(), "{query:?}");
+                let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+                let sql = body["query"].as_str().unwrap();
+                assert!(sql.starts_with("SET TRANSACTION READ ONLY; SET LOCAL statement_timeout"));
+                assert!(sql.contains(r#"FROM "public"."todos" ORDER BY "id" LIMIT 51 OFFSET 50"#));
+                assert!(body.get("parameters").is_none());
+                r#"[{"c0":"51"},{"c0":"52"}]"#
+            },
+        ),
+    ))
+    .await;
+    let page = RowPageNumber::new(2).unwrap();
+    let rows = loopback().rows(&url, &key(), &todos(), page).await.unwrap();
+    assert_eq!(rows.rows.len(), 2);
+    assert_eq!(rows.rows[1][0].as_ref().unwrap().text, "52");
+    assert_eq!(rows.page, page);
+}
+
+#[tokio::test]
+async fn query_errors_keep_only_the_timeout_code() {
+    let timeout = serve(Router::new().route(
+        "/pg/query",
+        post(|| async {
+            (
+                StatusCode::BAD_REQUEST,
+                r#"{"error":"ERROR:  57014: canceling statement due to statement timeout","code":"57014"}"#,
+            )
+        }),
+    ))
+    .await;
+    assert_eq!(
+        loopback()
+            .rows(&timeout, &key(), &todos(), RowPageNumber::FIRST)
+            .await
+            .unwrap_err(),
+        MetaUnavailable::QueryTimeout
+    );
+    let other = serve(Router::new().route(
+        "/pg/query",
+        post(|| async {
+            (
+                StatusCode::BAD_REQUEST,
+                r#"{"error":"column \"secret_value\" does not exist","code":"42703"}"#,
+            )
+        }),
+    ))
+    .await;
+    let err = loopback()
+        .rows(&other, &key(), &todos(), RowPageNumber::FIRST)
+        .await
+        .unwrap_err();
+    assert_eq!(err, MetaUnavailable::ServiceError { http_status: 400 });
+    assert!(!err.detail().contains("secret_value"));
 }

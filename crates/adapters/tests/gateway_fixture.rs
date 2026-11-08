@@ -71,7 +71,10 @@ async fn fixture_gateway_reports_auth_and_rest() {
 #[tokio::test]
 async fn fixture_meta_lists_structure() {
     use supabase_dashboard_application::schema::SchemaSource;
-    use supabase_dashboard_domain::schema::{IdentityGeneration, MetaUnavailable, SchemaName};
+    use supabase_dashboard_domain::schema::{
+        CELL_MAX_CHARS, IdentityGeneration, MetaUnavailable, ROW_PAGE_SIZE, RowOrder,
+        RowPageNumber, SchemaName,
+    };
 
     let Ok(raw) = std::env::var(ENV) else {
         eprintln!("skipping: {ENV} is not set");
@@ -106,8 +109,8 @@ async fn fixture_meta_lists_structure() {
     let public = SchemaName::parse("public").unwrap();
     let tables = probe.tables(&url, &service, &public).await.unwrap();
     let names: Vec<_> = tables.tables.iter().map(|t| t.name.as_str()).collect();
-    assert_eq!(names, ["tags", "todos"]);
-    let todos = &tables.tables[1];
+    assert_eq!(names, [r#"Event "Log""#, "tags", "todos"]);
+    let todos = &tables.tables[2];
     assert!(todos.rls_enabled);
     assert_eq!(todos.comment.as_deref(), Some("Synthetic fixture table"));
 
@@ -131,9 +134,58 @@ async fn fixture_meta_lists_structure() {
     assert!(detail.columns[3].unique);
     assert!(detail.columns[4].nullable);
 
-    let tags = &tables.tables[0];
+    let rows = probe
+        .rows(&url, &service, &detail, RowPageNumber::FIRST)
+        .await
+        .unwrap();
+    assert_eq!(rows.order, RowOrder::PrimaryKey(vec!["id".into()]));
+    assert!(!rows.has_more);
+    let text = |row: usize, col: usize| rows.rows[row][col].as_ref().map(|cell| cell.text.as_str());
+    assert_eq!(rows.rows.len(), 2);
+    assert_eq!(
+        (text(0, 0), text(0, 1), text(0, 2)),
+        (Some("1"), Some("first"), Some("open"))
+    );
+    assert_eq!(text(1, 1), Some("second"));
+    assert_eq!(text(0, 4), None);
+
+    let tags = &tables.tables[1];
     let detail = probe.table(&url, &service, tags.id).await.unwrap().unwrap();
     assert_eq!(detail.primary_key, ["todo_id", "label"]);
+    let rows = probe
+        .rows(&url, &service, &detail, RowPageNumber::FIRST)
+        .await
+        .unwrap();
+    assert!(rows.rows.is_empty() && !rows.has_more);
+
+    // Quoted names, no primary key, several pages, and long values.
+    let log = &tables.tables[0];
+    let detail = probe.table(&url, &service, log.id).await.unwrap().unwrap();
+    assert!(detail.primary_key.is_empty());
+    let first = probe
+        .rows(&url, &service, &detail, RowPageNumber::FIRST)
+        .await
+        .unwrap();
+    assert_eq!(first.order, RowOrder::Unordered);
+    assert_eq!(first.rows.len(), ROW_PAGE_SIZE as usize);
+    assert!(first.has_more);
+    let columns: Vec<_> = first.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(columns, ["Kind", "payload", "body"]);
+    assert_eq!(first.columns[1].type_label, "jsonb");
+    let long = first.rows.iter().find_map(|row| row[2].as_ref()).unwrap();
+    assert!(long.truncated);
+    assert_eq!(long.text.chars().count(), CELL_MAX_CHARS);
+    let third = probe
+        .rows(&url, &service, &detail, RowPageNumber::new(3).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(third.rows.len(), 20);
+    assert!(!third.has_more);
+    let past = probe
+        .rows(&url, &service, &detail, RowPageNumber::new(9).unwrap())
+        .await
+        .unwrap();
+    assert!(past.rows.is_empty());
 
     // postgres-meta's own 404 means no such table.
     assert_eq!(probe.table(&url, &service, u32::MAX).await.unwrap(), None);
