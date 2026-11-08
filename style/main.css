@@ -487,6 +487,23 @@ td { vertical-align: middle; }
 .cell-null { color: var(--color-text-muted); font-style: italic; }
 .pager { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2) var(--space-4); font-size: var(--text-sm); }
 .pager-links { display: flex; gap: var(--space-2); margin-left: auto; }
+/* Filters: applied ones as removable chips, then the add form. */
+.filter-bar { display: grid; gap: var(--space-2); margin-bottom: var(--space-3); }
+.filter-list { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.filter-chip {
+  display: inline-flex; align-items: center; gap: var(--space-1); min-width: 0; max-width: 100%;
+  padding: 2px var(--space-1) 2px var(--space-2); font-size: var(--text-sm);
+  border: 1px solid var(--color-border-strong); border-radius: var(--radius-md); background: var(--color-surface-raised);
+}
+.filter-remove {
+  display: inline-grid; place-items: center; min-width: 1.5rem; min-height: 1.5rem;
+  border-radius: var(--radius-sm); color: var(--color-text-muted); text-decoration: none;
+}
+.filter-remove:hover { color: var(--color-text); background: var(--color-muted-bg); }
+.filter-clear { font-size: var(--text-sm); justify-self: start; }
+.filter-form { display: flex; flex-wrap: wrap; align-items: flex-end; gap: var(--space-2); }
+.filter-form .field { min-width: 0; }
+.filter-form .filter-value { flex: 1 1 12rem; }
 
 @media (max-width: 640px) {
   .editor { grid-template-columns: minmax(0, 1fr); gap: var(--space-4); }

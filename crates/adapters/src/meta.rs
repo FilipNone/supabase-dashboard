@@ -29,10 +29,10 @@ use supabase_dashboard_domain::{
     project::ProjectUrl,
     schema::{
         CELL_MAX_CHARS, COMMENT_MAX_CHARS, Cell, ColumnSummary, ENUM_LABEL_LIMIT,
-        EXPRESSION_MAX_CHARS, FOREIGN_KEY_COLUMN_LIMIT, FOREIGN_KEY_LIST_LIMIT, ForeignKey,
-        ForeignKeyAction, IDENTIFIER_MAX_BYTES, IdentityGeneration, MetaUnavailable,
-        ROW_COLUMN_LIMIT, ROW_PAGE_SIZE, ROW_QUERY_TIMEOUT_MS, RelationKind, RowColumn, RowOrder,
-        RowPage, RowPageNumber, RowSort, SCHEMA_LIST_LIMIT, SchemaListing, SchemaName,
+        EXPRESSION_MAX_CHARS, FOREIGN_KEY_COLUMN_LIMIT, FOREIGN_KEY_LIST_LIMIT, FilterOp,
+        ForeignKey, ForeignKeyAction, IDENTIFIER_MAX_BYTES, IdentityGeneration, MetaUnavailable,
+        ROW_COLUMN_LIMIT, ROW_PAGE_SIZE, ROW_QUERY_TIMEOUT_MS, RelationKind, RowColumn, RowFilter,
+        RowOrder, RowPage, RowPageNumber, RowSort, SCHEMA_LIST_LIMIT, SchemaListing, SchemaName,
         SchemaSummary, TABLE_COLUMN_LIMIT, TABLE_LIST_LIMIT, TYPE_NAME_MAX_CHARS, TableDetail,
         TableListing, TableRelations, TableSummary, bounded,
     },
@@ -57,6 +57,13 @@ const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 /// SQLSTATE `query_canceled`, which a statement timeout raises.
 const QUERY_CANCELED: &str = "57014";
 const UNDEFINED_FUNCTION: &str = "42883";
+/// SQLSTATE class 22, data exceptions, such as `invalid input syntax for
+/// type integer` (22P02) or a date out of range (22008).
+const DATA_EXCEPTION_CLASS: &str = "22";
+
+/// Largest answer to the query that quotes filter values. Quoting at most
+/// doubles a value, so ten values of 1000 bytes stay well below this.
+const MAX_LITERALS_BODY_BYTES: usize = 64 * 1024;
 
 /// What a request came back with, before it is decoded.
 enum Answer {
@@ -139,6 +146,9 @@ impl GatewayProbe {
                     // such as json: "could not identify an ordering
                     // operator".
                     Some(UNDEFINED_FUNCTION) => Err(MetaUnavailable::NotSortable),
+                    Some(code) if code.starts_with(DATA_EXCEPTION_CLASS) => {
+                        Err(MetaUnavailable::FilterValueRejected)
+                    }
                     _ => Err(MetaUnavailable::ServiceError { http_status: 400 }),
                 }
             }
@@ -232,6 +242,7 @@ impl GatewayProbe {
         table: &TableDetail,
         page: RowPageNumber,
         sort: Option<&RowSort>,
+        filters: &[RowFilter],
     ) -> Result<RowPage, MetaUnavailable> {
         match table.table.kind {
             RelationKind::MaterializedView { populated: false } => {
@@ -240,7 +251,8 @@ impl GatewayProbe {
             RelationKind::ForeignTable => return Err(MetaUnavailable::ForeignRows),
             _ => {}
         }
-        let plan = RowQuery::new(table, page, sort)?;
+        let literals = self.quote_filter_values(api_url, key, filters).await?;
+        let plan = RowQuery::new(table, page, sort, filters, &literals)?;
         let body =
             serde_json::to_vec(&serde_json::json!({ "query": plan.sql })).map_err(|_| invalid())?;
         let answer = self
@@ -255,9 +267,14 @@ impl GatewayProbe {
             )
             .await
             .map_err(|state| match state {
-                // Only an ORDER BY can make the generated query look for a
-                // missing operator.
+                // Only a filter or an ORDER BY can make the generated query
+                // look for a missing operator, and only a filter value can
+                // fail to convert to a column's type.
+                MetaUnavailable::NotSortable if !filters.is_empty() => MetaUnavailable::NoOperator,
                 MetaUnavailable::NotSortable if sort.is_none() => {
+                    MetaUnavailable::ServiceError { http_status: 400 }
+                }
+                MetaUnavailable::FilterValueRejected if filters.is_empty() => {
                     MetaUnavailable::ServiceError { http_status: 400 }
                 }
                 state => state,
@@ -271,7 +288,56 @@ impl GatewayProbe {
             page,
             has_more,
             order: plan.order,
+            filters: filters.to_vec(),
         })
+    }
+
+    /// PostgreSQL's own quoting of each filter value that has one, in
+    /// order, from a parameterized `quote_literal` query. The values cannot
+    /// be parameters of the row query itself: PostgreSQL refuses
+    /// parameters in a statement list, and the read-only transaction and
+    /// timeout need one.
+    async fn quote_filter_values(
+        &self,
+        api_url: &ProjectUrl,
+        key: &SecretString,
+        filters: &[RowFilter],
+    ) -> Result<Vec<String>, MetaUnavailable> {
+        let values: Vec<&str> = filters
+            .iter()
+            .filter(|filter| filter.op.takes_value())
+            .map(|filter| filter.value.as_str())
+            .collect();
+        if values.is_empty() {
+            return Ok(Vec::new());
+        }
+        let select = (0..values.len())
+            .map(|i| format!("quote_literal(${}::text) AS l{i}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let body = serde_json::to_vec(&serde_json::json!({
+            "query": format!("SELECT {select}"),
+            "parameters": values,
+        }))
+        .map_err(|_| invalid())?;
+        let answer = self
+            .meta_send(
+                Method::POST,
+                api_url,
+                key,
+                "/query",
+                &[],
+                Some(body),
+                MAX_LITERALS_BODY_BYTES,
+            )
+            .await
+            .map_err(|state| match state {
+                MetaUnavailable::NotSortable | MetaUnavailable::FilterValueRejected => {
+                    MetaUnavailable::ServiceError { http_status: 400 }
+                }
+                state => state,
+            })?;
+        decode_literals(&body_of(answer)?, values.len())
     }
 
     async fn read_relations(
@@ -331,8 +397,9 @@ impl SchemaSource for GatewayProbe {
         table: &'a TableDetail,
         page: RowPageNumber,
         sort: Option<&'a RowSort>,
+        filters: &'a [RowFilter],
     ) -> MetaFuture<'a, RowPage> {
-        Box::pin(self.read_rows(api_url, key, table, page, sort))
+        Box::pin(self.read_rows(api_url, key, table, page, sort, filters))
     }
 
     fn relations<'a>(
@@ -366,10 +433,14 @@ struct RowQuery {
 }
 
 impl RowQuery {
+    /// `literals` are the quoted values of the filters that take one, in
+    /// order, as [`GatewayProbe::quote_filter_values`] returns them.
     fn new(
         table: &TableDetail,
         page: RowPageNumber,
         sort: Option<&RowSort>,
+        filters: &[RowFilter],
+        literals: &[String],
     ) -> Result<Self, MetaUnavailable> {
         let visible = &table.columns[..table.columns.len().min(ROW_COLUMN_LIMIT)];
         // Each value is printed as text and cut one character past the
@@ -411,6 +482,38 @@ impl RowQuery {
             None if table.primary_key.is_empty() => RowOrder::Unordered,
             None => RowOrder::PrimaryKey(table.primary_key.clone()),
         };
+        let mut literals = literals.iter();
+        let conditions = filters
+            .iter()
+            .map(|filter| {
+                let column = quote_ident(&filter.column)?;
+                if !filter.op.takes_value() {
+                    let test = if filter.op == FilterOp::IsNull {
+                        ""
+                    } else {
+                        " NOT"
+                    };
+                    return Ok(format!("{column} IS{test} NULL"));
+                }
+                let literal = literals.next().ok_or_else(invalid)?;
+                Ok(match filter.op {
+                    // Compared as text, so a pattern works on any type.
+                    FilterOp::Like => format!("({column})::text LIKE {literal}"),
+                    FilterOp::Ilike => format!("({column})::text ILIKE {literal}"),
+                    // The literal has no type, so PostgreSQL reads it as
+                    // the column's type.
+                    op => format!("{column} {} {literal}", op.label()),
+                })
+            })
+            .collect::<Result<Vec<_>, MetaUnavailable>>()?;
+        if literals.next().is_some() {
+            return Err(invalid());
+        }
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", conditions.join(" AND "))
+        };
         let order_by = if keys.is_empty() {
             String::new()
         } else {
@@ -421,7 +524,7 @@ impl RowQuery {
         // postgres-meta's pooled connection.
         let sql = format!(
             "SET TRANSACTION READ ONLY; SET LOCAL statement_timeout = {ROW_QUERY_TIMEOUT_MS}; \
-             SELECT {select} FROM {relation}{order_by} LIMIT {} OFFSET {}",
+             SELECT {select} FROM {relation}{where_clause}{order_by} LIMIT {} OFFSET {}",
             ROW_PAGE_SIZE + 1,
             page.offset()
         );
@@ -575,6 +678,51 @@ fn decode_rows(body: &[u8], column_count: usize) -> Result<(Rows, bool), MetaUna
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok((rows, has_more))
+}
+
+/// The quoted literals from [`GatewayProbe::quote_filter_values`]: one row
+/// with `count` text columns. Each is put into SQL, so each must be exactly
+/// what `quote_literal` writes, checked by [`is_quoted_literal`].
+fn decode_literals(body: &[u8], count: usize) -> Result<Vec<String>, MetaUnavailable> {
+    let rows: Vec<serde_json::Map<String, serde_json::Value>> =
+        serde_json::from_slice(body).map_err(|_| invalid())?;
+    let [row] = rows.as_slice() else {
+        return Err(invalid());
+    };
+    (0..count)
+        .map(|i| {
+            row.get(&format!("l{i}"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|literal| is_quoted_literal(literal))
+                .map(str::to_owned)
+                .ok_or_else(invalid)
+        })
+        .collect()
+}
+
+/// `quote_literal` writes `'...'` with every `'` doubled, or, when the
+/// value has a backslash, `E'...'` with every `\` doubled as well. Nothing
+/// else is accepted, so no answer can end the literal early.
+fn is_quoted_literal(literal: &str) -> bool {
+    let (escaped, rest) = match literal.strip_prefix('E') {
+        Some(rest) => (true, rest),
+        None => (false, literal),
+    };
+    let Some(inner) = rest
+        .strip_prefix('\'')
+        .and_then(|rest| rest.strip_suffix('\''))
+    else {
+        return false;
+    };
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' if chars.next() != Some('\'') => return false,
+            '\\' if !escaped || chars.next() != Some('\\') => return false,
+            _ => {}
+        }
+    }
+    true
 }
 
 /// The SQLSTATE code of a postgres-meta query error, if it has one of the
@@ -1012,7 +1160,7 @@ mod tests {
             vec![column(1, "id"), column(2, "Note")],
             &["id"],
         );
-        let plan = RowQuery::new(&table, RowPageNumber::new(3).unwrap(), None).unwrap();
+        let plan = RowQuery::new(&table, RowPageNumber::new(3).unwrap(), None, &[], &[]).unwrap();
         assert_eq!(
             plan.sql,
             "SET TRANSACTION READ ONLY; SET LOCAL statement_timeout = 5000; \
@@ -1031,6 +1179,8 @@ mod tests {
             &detail("public", "wide", columns, &[]),
             RowPageNumber::FIRST,
             None,
+            &[],
+            &[],
         )
         .unwrap();
         assert_eq!(plan.order, RowOrder::Unordered);
@@ -1051,7 +1201,7 @@ mod tests {
             &["a", "b"],
         );
         let sort = RowSort::new(odd, true).unwrap();
-        let plan = RowQuery::new(&table, RowPageNumber::FIRST, Some(&sort)).unwrap();
+        let plan = RowQuery::new(&table, RowPageNumber::FIRST, Some(&sort), &[], &[]).unwrap();
         let expected = r##"ORDER BY "Odd ""name""" DESC, "a", "b" LIMIT 51 OFFSET 0"##;
         assert!(plan.sql.ends_with(expected), "{}", plan.sql);
         assert_eq!(
@@ -1065,9 +1215,72 @@ mod tests {
 
         let keyless = detail("public", "t", vec![column(1, "n")], &[]);
         let sort = RowSort::new("n", false).unwrap();
-        let plan = RowQuery::new(&keyless, RowPageNumber::FIRST, Some(&sort)).unwrap();
+        let plan = RowQuery::new(&keyless, RowPageNumber::FIRST, Some(&sort), &[], &[]).unwrap();
         assert!(plan.sql.ends_with(r#"ORDER BY "n" LIMIT 51 OFFSET 0"#));
         assert!(plan.order.is_unstable());
+    }
+
+    #[test]
+    fn filters_become_a_where_clause_of_quoted_literals() {
+        let table = detail(
+            "public",
+            "t",
+            vec![column(1, "id"), column(2, "a:b"), column(3, "n")],
+            &["id"],
+        );
+        let filters = [
+            RowFilter::new("a:b", FilterOp::Ilike, "%x%").unwrap(),
+            RowFilter::new("n", FilterOp::IsNotNull, "").unwrap(),
+            RowFilter::new("n", FilterOp::Gte, "5").unwrap(),
+            RowFilter::new("id", FilterOp::IsNull, "").unwrap(),
+        ];
+        let literals = ["'%x%'".to_owned(), "'5'".to_owned()];
+        let plan = RowQuery::new(&table, RowPageNumber::FIRST, None, &filters, &literals).unwrap();
+        let expected = r#"FROM "public"."t" WHERE ("a:b")::text ILIKE '%x%' AND "n" IS NOT NULL AND "n" >= '5' AND "id" IS NULL ORDER BY "id" LIMIT 51"#;
+        assert!(plan.sql.contains(expected), "{}", plan.sql);
+        // Every value needs its literal, and every literal its value.
+        assert!(
+            RowQuery::new(&table, RowPageNumber::FIRST, None, &filters, &literals[..1]).is_err()
+        );
+        let extra = ["'a'".to_owned(), "'b'".to_owned(), "'c'".to_owned()];
+        assert!(RowQuery::new(&table, RowPageNumber::FIRST, None, &filters, &extra).is_err());
+        for (op, sql) in [
+            (FilterOp::Eq, "="),
+            (FilterOp::Neq, "<>"),
+            (FilterOp::Gt, ">"),
+            (FilterOp::Lt, "<"),
+            (FilterOp::Lte, "<="),
+        ] {
+            let filter = [RowFilter::new("n", op, "1").unwrap()];
+            let plan = RowQuery::new(
+                &table,
+                RowPageNumber::FIRST,
+                None,
+                &filter,
+                &["'1'".to_owned()],
+            )
+            .unwrap();
+            assert!(plan.sql.contains(&format!(r#"WHERE "n" {sql} '1' ORDER"#)));
+        }
+    }
+
+    #[test]
+    fn quoted_literals_must_look_like_literals() {
+        let body = br#"[{"l0":"'it''s'","l1":"E'a\\\\b'"}]"#;
+        assert_eq!(decode_literals(body, 2).unwrap(), ["'it''s'", r"E'a\\b'"]);
+        for bad in [
+            &br#"[{"l0":"1; DROP TABLE t"}]"#[..],
+            br#"[{"l0":"'"}]"#,
+            br#"[{"l0":null}]"#,
+            br#"[]"#,
+            br#"[{"l0":"'a'"},{"l0":"'b'"}]"#,
+            br#"[{"l0":"'' OR ''"}]"#,
+            br#"[{"l0":"'a\\'"}]"#,
+            br#"[{"l0":"E'a\\' OR '1'"}]"#,
+        ] {
+            assert!(decode_literals(bad, 1).is_err());
+        }
+        assert!(decode_literals(br#"[{"l0":"'a'"}]"#, 2).is_err());
     }
 
     #[test]

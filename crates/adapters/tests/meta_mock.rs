@@ -22,8 +22,8 @@ use supabase_dashboard_domain::{
     connection::UnreachableReason,
     project::ProjectUrl,
     schema::{
-        ColumnSummary, MetaUnavailable, RelationKind, RowPageNumber, RowSort, SchemaName,
-        TableDetail, TableSummary,
+        ColumnSummary, FilterOp, MetaUnavailable, RelationKind, RowFilter, RowPageNumber, RowSort,
+        SchemaName, TableDetail, TableSummary,
     },
 };
 
@@ -192,7 +192,7 @@ async fn ids_are_looked_up_across_kinds_and_rows_are_guarded() {
     assert_eq!(found.columns[0].name, "n");
     assert_eq!(
         probe
-            .rows(&url, &key(), &found, RowPageNumber::FIRST, None)
+            .rows(&url, &key(), &found, RowPageNumber::FIRST, None, &[])
             .await
             .unwrap_err(),
         MetaUnavailable::NotPopulated
@@ -201,7 +201,7 @@ async fn ids_are_looked_up_across_kinds_and_rows_are_guarded() {
     foreign.table.kind = RelationKind::ForeignTable;
     assert_eq!(
         probe
-            .rows(&url, &key(), &foreign, RowPageNumber::FIRST, None)
+            .rows(&url, &key(), &foreign, RowPageNumber::FIRST, None, &[])
             .await
             .unwrap_err(),
         MetaUnavailable::ForeignRows
@@ -338,7 +338,7 @@ async fn rows_are_read_with_one_generated_read_only_statement() {
     .await;
     let page = RowPageNumber::new(2).unwrap();
     let rows = loopback()
-        .rows(&url, &key(), &todos(), page, None)
+        .rows(&url, &key(), &todos(), page, None, &[])
         .await
         .unwrap();
     assert_eq!(rows.rows.len(), 2);
@@ -360,7 +360,7 @@ async fn query_errors_keep_only_the_timeout_code() {
     .await;
     assert_eq!(
         loopback()
-            .rows(&timeout, &key(), &todos(), RowPageNumber::FIRST, None)
+            .rows(&timeout, &key(), &todos(), RowPageNumber::FIRST, None, &[])
             .await
             .unwrap_err(),
         MetaUnavailable::QueryTimeout
@@ -376,7 +376,7 @@ async fn query_errors_keep_only_the_timeout_code() {
     ))
     .await;
     let err = loopback()
-        .rows(&other, &key(), &todos(), RowPageNumber::FIRST, None)
+        .rows(&other, &key(), &todos(), RowPageNumber::FIRST, None, &[])
         .await
         .unwrap_err();
     assert_eq!(err, MetaUnavailable::ServiceError { http_status: 400 });
@@ -402,7 +402,8 @@ async fn query_errors_keep_only_the_timeout_code() {
                 &key(),
                 &todos(),
                 RowPageNumber::FIRST,
-                Some(&sort)
+                Some(&sort),
+                &[]
             )
             .await
             .unwrap_err(),
@@ -410,9 +411,135 @@ async fn query_errors_keep_only_the_timeout_code() {
     );
     assert_eq!(
         loopback()
-            .rows(&unsortable, &key(), &todos(), RowPageNumber::FIRST, None)
+            .rows(
+                &unsortable,
+                &key(),
+                &todos(),
+                RowPageNumber::FIRST,
+                None,
+                &[]
+            )
             .await
             .unwrap_err(),
         MetaUnavailable::ServiceError { http_status: 400 }
+    );
+}
+
+#[tokio::test]
+async fn filter_values_are_quoted_by_postgres_before_the_read() {
+    let url = serve(Router::new().route(
+        "/pg/query",
+        post(|body: String| async move {
+            let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let sql = body["query"].as_str().unwrap();
+            if let Some(parameters) = body.get("parameters") {
+                // Values travel only as parameters of a one-statement query.
+                assert_eq!(sql, "SELECT quote_literal($1::text) AS l0");
+                assert_eq!(parameters, &serde_json::json!(["it's"]));
+                return r#"[{"l0":"'it''s'"}]"#;
+            }
+            assert!(sql.starts_with("SET TRANSACTION READ ONLY;"));
+            assert!(
+                sql.contains(r#"WHERE "title" = 'it''s' AND "id" IS NOT NULL ORDER BY"#),
+                "{sql}"
+            );
+            assert!(!sql.contains("it's"));
+            r#"[{"c0":"1"}]"#
+        }),
+    ))
+    .await;
+    let filters = [
+        RowFilter::new("title", FilterOp::Eq, "it's").unwrap(),
+        RowFilter::new("id", FilterOp::IsNotNull, "").unwrap(),
+    ];
+    let rows = loopback()
+        .rows(&url, &key(), &todos(), RowPageNumber::FIRST, None, &filters)
+        .await
+        .unwrap();
+    assert_eq!(rows.rows.len(), 1);
+    assert_eq!(rows.filters, filters);
+}
+
+#[tokio::test]
+async fn filter_errors_map_to_their_own_states() {
+    async fn failing(code: &'static str) -> ProjectUrl {
+        serve(Router::new().route(
+            "/pg/query",
+            post(move |body: String| async move {
+                if body.contains("parameters") {
+                    (StatusCode::OK, r#"[{"l0":"'x'"}]"#.to_owned())
+                } else {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!(r#"{{"error":"ERROR: {code}: value \"x\"","code":"{code}"}}"#),
+                    )
+                }
+            }),
+        ))
+        .await
+    }
+    let on_title = [RowFilter::new("title", FilterOp::Gt, "x").unwrap()];
+    let sort = RowSort::new("title", false).unwrap();
+    let cases = [
+        (
+            "22P02",
+            &on_title[..],
+            None,
+            MetaUnavailable::FilterValueRejected,
+        ),
+        (
+            "22008",
+            &on_title[..],
+            None,
+            MetaUnavailable::FilterValueRejected,
+        ),
+        (
+            "22P02",
+            &[][..],
+            None,
+            MetaUnavailable::ServiceError { http_status: 400 },
+        ),
+        ("42883", &on_title[..], None, MetaUnavailable::NoOperator),
+        (
+            "42883",
+            &on_title[..],
+            Some(&sort),
+            MetaUnavailable::NoOperator,
+        ),
+        ("42883", &[][..], Some(&sort), MetaUnavailable::NotSortable),
+    ];
+    for (code, filters, sort, expected) in cases {
+        let url = failing(code).await;
+        let err = loopback()
+            .rows(&url, &key(), &todos(), RowPageNumber::FIRST, sort, filters)
+            .await
+            .unwrap_err();
+        assert_eq!(err, expected, "{code}");
+    }
+    // An answer that is not a quoted literal is never put into SQL.
+    let tampered = serve(Router::new().route(
+        "/pg/query",
+        post(|body: String| async move {
+            assert!(body.contains("parameters"), "the row query was sent");
+            r#"[{"l0":"'' OR true"}]"#
+        }),
+    ))
+    .await;
+    let err = loopback()
+        .rows(
+            &tampered,
+            &key(),
+            &todos(),
+            RowPageNumber::FIRST,
+            None,
+            &on_title,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        MetaUnavailable::Unreachable {
+            reason: UnreachableReason::InvalidResponse
+        }
     );
 }

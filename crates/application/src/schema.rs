@@ -13,8 +13,9 @@ use supabase_dashboard_domain::{
     connection::CredentialKind,
     project::ProjectUrl,
     schema::{
-        MetaUnavailable, ROW_COLUMN_LIMIT, RowPage, RowPageNumber, RowSort, SchemaListing,
-        SchemaName, TableDefinition, TableDetail, TableListing, TableRelations,
+        MetaUnavailable, ROW_COLUMN_LIMIT, ROW_FILTER_LIMIT, RowFilter, RowPage, RowPageNumber,
+        RowSort, SchemaListing, SchemaName, TableDefinition, TableDetail, TableListing,
+        TableRelations,
     },
 };
 use supabase_dashboard_persistence::{Database, PersistenceError, projects::ProjectAccess};
@@ -65,6 +66,7 @@ pub trait SchemaSource: Send + Sync {
         table: &'a TableDetail,
         page: RowPageNumber,
         sort: Option<&'a RowSort>,
+        filters: &'a [RowFilter],
     ) -> MetaFuture<'a, RowPage>;
 
     /// The foreign keys on the table with this ID and those pointing at it,
@@ -84,6 +86,8 @@ pub enum SchemaError {
     NotFound,
     #[error("table not found")]
     TableNotFound,
+    #[error("at most {ROW_FILTER_LIMIT} filters can be applied")]
+    TooManyFilters,
     #[error("your role in this organization does not allow this action")]
     Forbidden,
     /// The request limiter was shut down; only possible while the server
@@ -189,7 +193,10 @@ impl SchemaService {
     /// One page of a table's rows. The table is looked up again first, so
     /// the query uses the names the database has now. A sort by a column
     /// the table does not have among its shown columns, as after a rename,
-    /// is dropped; the page's `order` says how the rows were ordered.
+    /// is dropped; the page's `order` says how the rows were ordered. A
+    /// filter on a column the table does not have is reported instead,
+    /// since reading without it would show rows the reader did not ask for.
+    /// Filters may name any column, shown or not.
     pub async fn rows(
         &self,
         current: &CurrentSession,
@@ -197,7 +204,11 @@ impl SchemaService {
         table_id: u32,
         page: RowPageNumber,
         sort: Option<RowSort>,
+        filters: Vec<RowFilter>,
     ) -> Result<Browse<RowPage>, SchemaError> {
+        if filters.len() > ROW_FILTER_LIMIT {
+            return Err(SchemaError::TooManyFilters);
+        }
         let access = self.access(current, project_id).await?;
         let key = match self.service_key(&access).await? {
             Ok(key) => key,
@@ -217,9 +228,13 @@ impl SchemaService {
                 .take(ROW_COLUMN_LIMIT)
                 .any(|column| column.name == sort.column)
         });
+        let known = |name: &str| detail.columns.iter().any(|column| column.name == name);
+        if !filters.iter().all(|filter| known(&filter.column)) {
+            return Ok(Err(MetaUnavailable::FilterColumnMissing));
+        }
         Ok(self
             .source
-            .rows(api_url, &key, &detail, page, sort.as_ref())
+            .rows(api_url, &key, &detail, page, sort.as_ref(), &filters)
             .await)
     }
 

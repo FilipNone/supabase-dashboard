@@ -446,6 +446,193 @@ impl RowSort {
     }
 }
 
+/// Most filters applied to one read of table data.
+pub const ROW_FILTER_LIMIT: usize = 10;
+
+/// Longest filter value, in bytes.
+pub const FILTER_VALUE_MAX_BYTES: usize = 1000;
+
+/// How a filter compares a column with its value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FilterOp {
+    Eq,
+    Neq,
+    Gt,
+    Gte,
+    Lt,
+    Lte,
+    /// SQL `LIKE` on the value as text.
+    Like,
+    /// SQL `ILIKE` on the value as text.
+    Ilike,
+    IsNull,
+    IsNotNull,
+}
+
+impl FilterOp {
+    pub const ALL: [Self; 10] = [
+        Self::Eq,
+        Self::Neq,
+        Self::Gt,
+        Self::Gte,
+        Self::Lt,
+        Self::Lte,
+        Self::Like,
+        Self::Ilike,
+        Self::IsNull,
+        Self::IsNotNull,
+    ];
+
+    /// The name used in addresses.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Eq => "eq",
+            Self::Neq => "neq",
+            Self::Gt => "gt",
+            Self::Gte => "gte",
+            Self::Lt => "lt",
+            Self::Lte => "lte",
+            Self::Like => "like",
+            Self::Ilike => "ilike",
+            Self::IsNull => "is_null",
+            Self::IsNotNull => "not_null",
+        }
+    }
+
+    pub fn from_code(code: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|op| op.code() == code)
+    }
+
+    /// The SQL spelling, which is also what the editor shows.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Eq => "=",
+            Self::Neq => "<>",
+            Self::Gt => ">",
+            Self::Gte => ">=",
+            Self::Lt => "<",
+            Self::Lte => "<=",
+            Self::Like => "like",
+            Self::Ilike => "ilike",
+            Self::IsNull => "is null",
+            Self::IsNotNull => "is not null",
+        }
+    }
+
+    pub const fn takes_value(self) -> bool {
+        !matches!(self, Self::IsNull | Self::IsNotNull)
+    }
+}
+
+/// One condition on table data. Filters on a read are combined with AND.
+/// Only the shape is checked here; whether the table has the column is
+/// checked against the table as it is read for the query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RowFilter {
+    pub column: String,
+    pub op: FilterOp,
+    /// Empty when the operator takes no value.
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RowFilterError {
+    #[error("column names are 1 to {IDENTIFIER_MAX_BYTES} bytes")]
+    Column,
+    #[error("filter values are at most {FILTER_VALUE_MAX_BYTES} bytes")]
+    ValueTooLong,
+    /// PostgreSQL text cannot hold the NUL character.
+    #[error("filter values cannot contain the NUL character")]
+    Nul,
+    #[error("a filter is not of the form column:operator:value")]
+    Malformed,
+    #[error("at most {ROW_FILTER_LIMIT} filters can be applied")]
+    TooMany,
+}
+
+impl RowFilter {
+    pub fn new(column: &str, op: FilterOp, value: &str) -> Result<Self, RowFilterError> {
+        if column.is_empty() || column.len() > IDENTIFIER_MAX_BYTES {
+            return Err(RowFilterError::Column);
+        }
+        let value = if op.takes_value() { value } else { "" };
+        if value.len() > FILTER_VALUE_MAX_BYTES {
+            return Err(RowFilterError::ValueTooLong);
+        }
+        if value.contains('\0') {
+            return Err(RowFilterError::Nul);
+        }
+        Ok(Self {
+            column: column.to_owned(),
+            op,
+            value: value.to_owned(),
+        })
+    }
+
+    /// The filter as one query-string value, `column:op:value`. A `:` or
+    /// `\` in the column name is escaped with `\`; the value is the rest of
+    /// the text, so it needs no escaping.
+    pub fn to_param(&self) -> String {
+        let mut out = String::with_capacity(self.column.len() + self.value.len() + 12);
+        for c in self.column.chars() {
+            if c == ':' || c == '\\' {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+        out.push(':');
+        out.push_str(self.op.code());
+        if self.op.takes_value() {
+            out.push(':');
+            out.push_str(&self.value);
+        }
+        out
+    }
+
+    /// Reads what [`RowFilter::to_param`] writes.
+    pub fn parse_param(raw: &str) -> Result<Self, RowFilterError> {
+        let mut column = String::new();
+        let mut chars = raw.char_indices();
+        let mut rest = None;
+        while let Some((i, c)) = chars.next() {
+            match c {
+                '\\' => match chars.next() {
+                    Some((_, escaped @ (':' | '\\'))) => column.push(escaped),
+                    _ => return Err(RowFilterError::Malformed),
+                },
+                ':' => {
+                    rest = Some(&raw[i + 1..]);
+                    break;
+                }
+                c => column.push(c),
+            }
+        }
+        let rest = rest.ok_or(RowFilterError::Malformed)?;
+        let (code, value) = match rest.split_once(':') {
+            Some((code, value)) => (code, Some(value)),
+            None => (rest, None),
+        };
+        let op = FilterOp::from_code(code).ok_or(RowFilterError::Malformed)?;
+        let value = match (op.takes_value(), value) {
+            (true, Some(value)) => value,
+            (false, None) => "",
+            _ => return Err(RowFilterError::Malformed),
+        };
+        Self::new(&column, op, value)
+    }
+}
+
+/// Reads the `filter` values of an address, in order.
+pub fn parse_filters<S: AsRef<str>>(raw: &[S]) -> Result<Vec<RowFilter>, RowFilterError> {
+    if raw.len() > ROW_FILTER_LIMIT {
+        return Err(RowFilterError::TooMany);
+    }
+    raw.iter()
+        .map(|raw| RowFilter::parse_param(raw.as_ref()))
+        .collect()
+}
+
 /// One page of a table's rows. Read-only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RowPage {
@@ -460,6 +647,8 @@ pub struct RowPage {
     /// At least one more row exists after this page.
     pub has_more: bool,
     pub order: RowOrder,
+    /// The filters the rows matched, in the order they were given.
+    pub filters: Vec<RowFilter>,
 }
 
 /// Why the structure of a project's database could not be read.
@@ -495,6 +684,15 @@ pub enum MetaUnavailable {
     /// PostgreSQL has no ordering for the type of the column the rows were
     /// to be sorted by, such as `json` or `point`.
     NotSortable,
+    /// A filter names a column the table no longer has, as after a rename.
+    /// The rows are not read, since dropping the filter would show rows
+    /// the reader did not ask for.
+    FilterColumnMissing,
+    /// PostgreSQL could not read a filter value as its column's type.
+    FilterValueRejected,
+    /// PostgreSQL has no operator for a filter or the sort on a column's
+    /// type, such as `=` on `json`.
+    NoOperator,
 }
 
 impl MetaUnavailable {
@@ -509,6 +707,9 @@ impl MetaUnavailable {
             Self::NotPopulated => "This materialized view has no data yet",
             Self::ForeignRows => "Rows of foreign tables are not shown",
             Self::NotSortable => "This column cannot be sorted",
+            Self::FilterColumnMissing => "A filtered column is no longer in the table",
+            Self::FilterValueRejected => "A filter value does not fit its column",
+            Self::NoOperator => "A filter or the sort does not work on a column's type",
         }
     }
 
@@ -553,6 +754,20 @@ impl MetaUnavailable {
                 .to_owned(),
             Self::NotSortable => "PostgreSQL has no ordering for this column's type, as with \
                                   json or point. Sort by another column, or clear the sort."
+                .to_owned(),
+            Self::FilterColumnMissing => "The table changed after the filter was set, for \
+                                          example by a column rename. Remove the filter to \
+                                          read the rows."
+                .to_owned(),
+            Self::FilterValueRejected => "PostgreSQL could not read a filter value as the \
+                                          column's type, such as a word compared with a \
+                                          number column or a date in a format it does not \
+                                          know. Change or remove the filter."
+                .to_owned(),
+            Self::NoOperator => "PostgreSQL has no comparison for a filtered or sorted \
+                                 column's type, as with = on json. The like and ilike \
+                                 filters compare any column as text. Change or remove the \
+                                 filter, or clear the sort."
                 .to_owned(),
         }
     }
@@ -685,5 +900,53 @@ mod tests {
         assert!(loose.is_unstable());
         assert!(RowOrder::Unordered.is_unstable());
         assert_eq!(RowOrder::PrimaryKey(vec!["id".into()]).sort(), None);
+    }
+
+    #[test]
+    fn filters_round_trip_through_addresses() {
+        let cases = [
+            RowFilter::new("title", FilterOp::Eq, "a:b:c").unwrap(),
+            RowFilter::new(r"odd:na\me", FilterOp::Ilike, "%x%").unwrap(),
+            RowFilter::new("done", FilterOp::IsNull, "ignored").unwrap(),
+            RowFilter::new("n", FilterOp::Gte, "").unwrap(),
+        ];
+        assert_eq!(cases[1].to_param(), r"odd\:na\\me:ilike:%x%");
+        assert_eq!(cases[2].to_param(), "done:is_null");
+        assert_eq!(cases[2].value, "");
+        for filter in cases {
+            assert_eq!(RowFilter::parse_param(&filter.to_param()), Ok(filter));
+        }
+        for op in FilterOp::ALL {
+            assert_eq!(FilterOp::from_code(op.code()), Some(op));
+        }
+    }
+
+    #[test]
+    fn malformed_filters_are_refused() {
+        for raw in [
+            "",
+            "title",
+            "title:",
+            "title:near:x",
+            "title:eq",
+            "done:is_null:x",
+            r"bad\escape:eq:x",
+            r"trailing\",
+            ":eq:x",
+        ] {
+            assert!(RowFilter::parse_param(raw).is_err(), "{raw:?}");
+        }
+        let long = format!("t:eq:{}", "x".repeat(FILTER_VALUE_MAX_BYTES + 1));
+        assert_eq!(
+            RowFilter::parse_param(&long),
+            Err(RowFilterError::ValueTooLong)
+        );
+        assert_eq!(
+            RowFilter::parse_param("t:eq:a\0b"),
+            Err(RowFilterError::Nul)
+        );
+        let many = vec!["t:is_null"; ROW_FILTER_LIMIT + 1];
+        assert_eq!(parse_filters(&many), Err(RowFilterError::TooMany));
+        assert_eq!(parse_filters(&many[1..]).unwrap().len(), ROW_FILTER_LIMIT);
     }
 }

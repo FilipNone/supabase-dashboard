@@ -21,9 +21,9 @@ use supabase_dashboard_domain::{
     connection::{CredentialKind, SkipReason},
     project::ProjectUrl,
     schema::{
-        ColumnSummary, MetaUnavailable, RelationKind, RowOrder, RowPage, RowPageNumber, RowSort,
-        SchemaListing, SchemaName, SchemaSummary, TableDetail, TableListing, TableRelations,
-        TableSummary,
+        ColumnSummary, FilterOp, MetaUnavailable, ROW_FILTER_LIMIT, RelationKind, RowFilter,
+        RowOrder, RowPage, RowPageNumber, RowSort, SchemaListing, SchemaName, SchemaSummary,
+        TableDetail, TableListing, TableRelations, TableSummary,
     },
 };
 use supabase_dashboard_persistence::{Database, accounts::AccountRecord};
@@ -162,6 +162,7 @@ impl SchemaSource for FakeSource {
         table: &'a TableDetail,
         page: RowPageNumber,
         sort: Option<&'a RowSort>,
+        filters: &'a [RowFilter],
     ) -> MetaFuture<'a, RowPage> {
         self.record(key);
         // Echoes the sort it was given, so tests see what reached it.
@@ -182,6 +183,7 @@ impl SchemaSource for FakeSource {
                 page,
                 has_more: false,
                 order,
+                filters: filters.to_vec(),
             })
         })
     }
@@ -327,25 +329,75 @@ async fn every_member_can_browse_with_the_service_role_key() {
         assert_eq!(definition.detail.primary_key, ["id"]);
         assert_eq!(definition.relations, Err(MetaUnavailable::QueryTimeout));
         let page = RowPageNumber::new(3).unwrap();
-        let rows = schema.rows(who, id, 7, page, None).await.unwrap().unwrap();
+        let rows = schema
+            .rows(who, id, 7, page, None, vec![])
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(rows.page, page);
         assert_eq!(rows.order, RowOrder::PrimaryKey(vec!["id".into()]));
     }
     // A sort reaches the source only for a column the table has.
     let by_title = RowSort::new("title", true).unwrap();
     let sorted = schema
-        .rows(&viewer, id, 7, RowPageNumber::FIRST, Some(by_title.clone()))
+        .rows(
+            &viewer,
+            id,
+            7,
+            RowPageNumber::FIRST,
+            Some(by_title.clone()),
+            vec![],
+        )
         .await
         .unwrap()
         .unwrap();
     assert_eq!(sorted.order.sort(), Some(by_title));
     let renamed = RowSort::new("gone", false).unwrap();
     let fallback = schema
-        .rows(&viewer, id, 7, RowPageNumber::FIRST, Some(renamed))
+        .rows(&viewer, id, 7, RowPageNumber::FIRST, Some(renamed), vec![])
         .await
         .unwrap()
         .unwrap();
     assert_eq!(fallback.order, RowOrder::PrimaryKey(vec!["id".into()]));
+    // Filters reach the source when every column exists, and are never
+    // dropped: an unknown column is reported without reading rows.
+    let on_title = RowFilter::new("title", FilterOp::Ilike, "%a%").unwrap();
+    let filtered = schema
+        .rows(
+            &viewer,
+            id,
+            7,
+            RowPageNumber::FIRST,
+            None,
+            vec![on_title.clone()],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(filtered.filters, std::slice::from_ref(&on_title));
+    let calls = f.source.keys.lock().unwrap().len();
+    let gone = RowFilter::new("gone", FilterOp::Eq, "x").unwrap();
+    let missing = schema
+        .rows(
+            &viewer,
+            id,
+            7,
+            RowPageNumber::FIRST,
+            None,
+            vec![on_title.clone(), gone],
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing, Err(MetaUnavailable::FilterColumnMissing));
+    // Only the table was looked up.
+    assert_eq!(f.source.keys.lock().unwrap().len(), calls + 1);
+    let many = vec![on_title; ROW_FILTER_LIMIT + 1];
+    assert!(matches!(
+        schema
+            .rows(&viewer, id, 7, RowPageNumber::FIRST, None, many)
+            .await,
+        Err(SchemaError::TooManyFilters)
+    ));
     assert!(matches!(
         schema.table(&viewer, id, 8).await,
         Err(SchemaError::TableNotFound)
@@ -360,7 +412,7 @@ async fn every_member_can_browse_with_the_service_role_key() {
     let calls = f.source.keys.lock().unwrap().len();
     assert!(matches!(
         schema
-            .rows(&viewer, id, 8, RowPageNumber::FIRST, None)
+            .rows(&viewer, id, 8, RowPageNumber::FIRST, None, vec![])
             .await,
         Err(SchemaError::TableNotFound)
     ));
@@ -381,7 +433,7 @@ async fn every_member_can_browse_with_the_service_role_key() {
     ));
     assert!(matches!(
         schema
-            .rows(&outsider, id, 7, RowPageNumber::FIRST, None)
+            .rows(&outsider, id, 7, RowPageNumber::FIRST, None, vec![])
             .await,
         Err(SchemaError::NotFound)
     ));
@@ -416,7 +468,7 @@ async fn missing_or_unreadable_keys_are_reported_without_contacting_the_stack() 
     assert_eq!(schema.table(&owner, id, 7).await.unwrap(), Err(missing));
     assert_eq!(
         schema
-            .rows(&owner, id, 7, RowPageNumber::FIRST, None)
+            .rows(&owner, id, 7, RowPageNumber::FIRST, None, vec![])
             .await
             .unwrap(),
         Err(missing)

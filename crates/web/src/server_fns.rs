@@ -291,6 +291,8 @@ pub async fn get_table(
 
 /// One page of a table's rows, read-only. Pages start at 1. `sort` names
 /// a column to order by; one the table does not have is ignored.
+/// `filters` are the editor address's `filter` values (`column:op:value`),
+/// combined with AND.
 #[server]
 pub async fn get_table_rows(
     id: Uuid,
@@ -298,8 +300,10 @@ pub async fn get_table_rows(
     page: u32,
     sort: Option<String>,
     descending: bool,
+    // An empty list is sent as nothing at all.
+    #[server(default)] filters: Vec<String>,
 ) -> Result<Result<RowPage, MetaUnavailable>, AppError> {
-    use supabase_dashboard_domain::schema::{RowPageNumber, RowSort};
+    use supabase_dashboard_domain::schema::{RowPageNumber, RowSort, parse_filters};
 
     let session = org_context::session()?;
     let rejected = |err: &dyn std::fmt::Display| {
@@ -310,8 +314,9 @@ pub async fn get_table_rows(
         .map(|column| RowSort::new(&column, descending))
         .transpose()
         .map_err(|err| rejected(&err))?;
+    let filters = parse_filters(&filters).map_err(|err| rejected(&err))?;
     Ok(org_context::schema()?
-        .rows(&session, id, table_id, page, sort)
+        .rows(&session, id, table_id, page, sort, filters)
         .await?)
 }
 

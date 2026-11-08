@@ -72,8 +72,8 @@ async fn fixture_gateway_reports_auth_and_rest() {
 async fn fixture_meta_lists_structure() {
     use supabase_dashboard_application::schema::SchemaSource;
     use supabase_dashboard_domain::schema::{
-        CELL_MAX_CHARS, ForeignKeyAction, IdentityGeneration, MetaUnavailable, ROW_PAGE_SIZE,
-        RelationKind, RowOrder, RowPageNumber, RowSort, SchemaName,
+        CELL_MAX_CHARS, FilterOp, ForeignKeyAction, IdentityGeneration, MetaUnavailable,
+        ROW_PAGE_SIZE, RelationKind, RowFilter, RowOrder, RowPageNumber, RowSort, SchemaName,
     };
 
     let Ok(raw) = std::env::var(ENV) else {
@@ -147,7 +147,7 @@ async fn fixture_meta_lists_structure() {
     assert!(detail.columns[4].nullable);
 
     let rows = probe
-        .rows(&url, &service, &detail, RowPageNumber::FIRST, None)
+        .rows(&url, &service, &detail, RowPageNumber::FIRST, None, &[])
         .await
         .unwrap();
     assert_eq!(rows.order, RowOrder::PrimaryKey(vec!["id".into()]));
@@ -169,6 +169,7 @@ async fn fixture_meta_lists_structure() {
             &detail,
             RowPageNumber::FIRST,
             Some(&by_title),
+            &[],
         )
         .await
         .unwrap();
@@ -181,11 +182,60 @@ async fn fixture_meta_lists_structure() {
         .collect();
     assert_eq!(titles, [Some("second"), Some("first")]);
 
+    // Filters: values reach PostgreSQL only through quote_literal, so a
+    // quote or a backslash is matched as itself.
+    let filter = |column: &str, op, value: &str| RowFilter::new(column, op, value).unwrap();
+    let matching = |filters: Vec<RowFilter>| {
+        let probe = &probe;
+        let (url, service, detail) = (&url, &service, &detail);
+        async move {
+            probe
+                .rows(url, service, detail, RowPageNumber::FIRST, None, &filters)
+                .await
+                .map(|page| {
+                    page.rows
+                        .iter()
+                        .map(|row| row[1].as_ref().map_or(String::new(), |c| c.text.clone()))
+                        .collect::<Vec<_>>()
+                })
+        }
+    };
+    assert_eq!(
+        matching(vec![filter("title", FilterOp::Ilike, "%ECO%")]).await,
+        Ok(vec!["second".to_owned()])
+    );
+    assert_eq!(
+        matching(vec![
+            filter("note", FilterOp::IsNull, ""),
+            filter("status", FilterOp::Eq, "open"),
+            filter("id", FilterOp::Lte, "1"),
+        ])
+        .await,
+        Ok(vec!["first".to_owned()])
+    );
+    for value in ["it's", r"a\b", "'; SELECT 1; --"] {
+        assert_eq!(
+            matching(vec![filter("title", FilterOp::Eq, value)]).await,
+            Ok(vec![])
+        );
+    }
+    for (column, value) in [
+        ("id", "abc"),
+        ("created_at", "not a date"),
+        ("status", "bogus"),
+    ] {
+        assert_eq!(
+            matching(vec![filter(column, FilterOp::Gt, value)]).await,
+            Err(MetaUnavailable::FilterValueRejected),
+            "{column}"
+        );
+    }
+
     let tags = by_name("tags");
     let detail = probe.table(&url, &service, tags.id).await.unwrap().unwrap();
     assert_eq!(detail.primary_key, ["todo_id", "label"]);
     let rows = probe
-        .rows(&url, &service, &detail, RowPageNumber::FIRST, None)
+        .rows(&url, &service, &detail, RowPageNumber::FIRST, None, &[])
         .await
         .unwrap();
     assert!(rows.rows.is_empty() && !rows.has_more);
@@ -195,7 +245,7 @@ async fn fixture_meta_lists_structure() {
     let detail = probe.table(&url, &service, log.id).await.unwrap().unwrap();
     assert!(detail.primary_key.is_empty());
     let first = probe
-        .rows(&url, &service, &detail, RowPageNumber::FIRST, None)
+        .rows(&url, &service, &detail, RowPageNumber::FIRST, None, &[])
         .await
         .unwrap();
     assert_eq!(first.order, RowOrder::Unordered);
@@ -214,6 +264,7 @@ async fn fixture_meta_lists_structure() {
             &detail,
             RowPageNumber::new(3).unwrap(),
             None,
+            &[],
         )
         .await
         .unwrap();
@@ -226,6 +277,7 @@ async fn fixture_meta_lists_structure() {
             &detail,
             RowPageNumber::new(9).unwrap(),
             None,
+            &[],
         )
         .await
         .unwrap();
@@ -301,7 +353,7 @@ async fn fixture_meta_lists_structure() {
     let columns: Vec<_> = detail.columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(columns, ["id", "title"]);
     let rows = probe
-        .rows(&url, &service, &detail, RowPageNumber::FIRST, None)
+        .rows(&url, &service, &detail, RowPageNumber::FIRST, None, &[])
         .await
         .unwrap();
     assert_eq!(rows.order, RowOrder::Unordered);
@@ -322,7 +374,7 @@ async fn fixture_meta_lists_structure() {
     assert_eq!(detail.columns.len(), 2);
     assert_eq!(
         probe
-            .rows(&url, &service, &detail, RowPageNumber::FIRST, None)
+            .rows(&url, &service, &detail, RowPageNumber::FIRST, None, &[])
             .await
             .unwrap_err(),
         MetaUnavailable::NotPopulated
@@ -337,7 +389,7 @@ async fn fixture_meta_lists_structure() {
     assert_eq!(detail.columns.len(), 2);
     assert_eq!(
         probe
-            .rows(&url, &service, &detail, RowPageNumber::FIRST, None)
+            .rows(&url, &service, &detail, RowPageNumber::FIRST, None, &[])
             .await
             .unwrap_err(),
         MetaUnavailable::ForeignRows

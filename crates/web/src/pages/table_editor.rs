@@ -13,9 +13,10 @@ use leptos_router::{
     hooks::{use_navigate, use_params_map, use_query_map},
 };
 use supabase_dashboard_domain::schema::{
-    CELL_MAX_CHARS, Cell, ColumnSummary, DEFAULT_SCHEMA, FOREIGN_KEY_LIST_LIMIT, ForeignKey,
-    MetaUnavailable, ROW_COLUMN_LIMIT, ROW_PAGE_SIZE, RelationKind, RowPage, RowSort,
-    SchemaListing, TableDefinition, TableListing, TableRelations, TableSummary,
+    CELL_MAX_CHARS, Cell, ColumnSummary, DEFAULT_SCHEMA, FILTER_VALUE_MAX_BYTES,
+    FOREIGN_KEY_LIST_LIMIT, FilterOp, ForeignKey, MetaUnavailable, ROW_COLUMN_LIMIT,
+    ROW_FILTER_LIMIT, ROW_PAGE_SIZE, RelationKind, RowColumn, RowFilter, RowPage, RowSort,
+    SchemaListing, TableDefinition, TableListing, TableRelations, TableSummary, bounded,
 };
 use uuid::Uuid;
 
@@ -61,12 +62,20 @@ fn schema_query(schema: &str) -> String {
 /// The address of one table's view. Defaults are left out so the usual
 /// address stays short.
 fn table_href(project: Uuid, table: u32, schema: &str, view: TableView, page: u32) -> String {
-    editor_href(project, table, schema, view, page, None)
+    editor_href(project, table, schema, view, page, None, &[])
 }
 
-/// A page of the Data tab, keeping `sort`.
-fn rows_href(project: Uuid, table: u32, schema: &str, page: u32, sort: Option<&RowSort>) -> String {
-    editor_href(project, table, schema, TableView::Data, page, sort)
+/// A page of the Data tab, keeping `sort` and `filters` (address values,
+/// as [`RowFilter::to_param`] writes them).
+fn rows_href(
+    project: Uuid,
+    table: u32,
+    schema: &str,
+    page: u32,
+    sort: Option<&RowSort>,
+    filters: &[String],
+) -> String {
+    editor_href(project, table, schema, TableView::Data, page, sort, filters)
 }
 
 fn editor_href(
@@ -76,6 +85,7 @@ fn editor_href(
     view: TableView,
     page: u32,
     sort: Option<&RowSort>,
+    filters: &[String],
 ) -> String {
     let mut query = url::form_urlencoded::Serializer::new(String::new());
     if schema != DEFAULT_SCHEMA {
@@ -89,6 +99,9 @@ fn editor_href(
         if sort.descending {
             query.append_pair("desc", "1");
         }
+    }
+    for filter in filters {
+        query.append_pair("filter", filter);
     }
     if page > 1 {
         query.append_pair("page", &page.to_string());
@@ -159,6 +172,29 @@ pub fn TableEditorPage() -> impl IntoView {
 
     let sort = Memo::new(move |_| query.read().get("sort").filter(|s| !s.is_empty()));
     let descending = Memo::new(move |_| query.read().get("desc").as_deref() == Some("1"));
+    // The `filter` values as given; the server checks them. Without
+    // JavaScript the add-filter form submits the new filter as `fc`, `fo`,
+    // and `fv`, which are added here, and links on the page then carry it
+    // as a `filter` value.
+    let filters = Memo::new(move |_| {
+        let query = query.read();
+        let mut filters: Vec<String> = query
+            .get_all("filter")
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|raw| !raw.is_empty())
+            .collect();
+        if let Some(column) = query.get("fc").filter(|c| !c.is_empty()) {
+            let code = query.get("fo").unwrap_or_default();
+            let value = query.get("fv").unwrap_or_default();
+            filters.push(match FilterOp::from_code(&code) {
+                // Not checked here, so the server reports what is wrong.
+                Some(op) => RowFilter { column, op, value }.to_param(),
+                None => format!("{column}:{code}:{value}"),
+            });
+        }
+        filters
+    });
 
     let schemas = Resource::new(
         move || project_id.get(),
@@ -199,14 +235,17 @@ pub fn TableEditorPage() -> impl IntoView {
                 page.get(),
                 sort.get(),
                 descending.get(),
+                filters.get(),
             )
         },
-        |(id, table, view, page, sort, descending)| async move {
+        |(id, table, view, page, sort, descending, filters)| async move {
             match (id, table) {
                 (Some(_), _) if view != TableView::Data => Ok(None),
-                (Some(id), Some(Some(table))) => get_table_rows(id, table, page, sort, descending)
-                    .await
-                    .map(Some),
+                (Some(id), Some(Some(table))) => {
+                    get_table_rows(id, table, page, sort, descending, filters)
+                        .await
+                        .map(Some)
+                }
                 (Some(_), None) => Ok(None),
                 _ => Err(AppError::NotFound),
             }
@@ -265,13 +304,34 @@ pub fn TableEditorPage() -> impl IntoView {
                                 Ok(None) => ().into_any(),
                                 Err(err) => table_error(err).into_any(),
                             }),
-                            TableView::Data => rows.get().map(|result| match result {
-                                Ok(Some(Ok(page))) => {
-                                    rows_view(page, project, schema.get()).into_any()
-                                }
-                                Ok(Some(Err(state))) => unavailable_panel(state, project).into_any(),
-                                Ok(None) => ().into_any(),
-                                Err(err) => table_error(err).into_any(),
+                            TableView::Data => rows.get().map(|result| {
+                                let columns = match &result {
+                                    Ok(Some(Ok(page))) => Some(page.columns.clone()),
+                                    Ok(None) => return ().into_any(),
+                                    _ => None,
+                                };
+                                let current_sort = sort
+                                    .get()
+                                    .and_then(|column| RowSort::new(&column, descending.get()).ok());
+                                let bar = filter_bar(FilterBar {
+                                    project,
+                                    table,
+                                    schema: schema.get(),
+                                    sort: current_sort,
+                                    filters: filters.get(),
+                                    columns,
+                                });
+                                let content = match result {
+                                    Ok(Some(Ok(page))) => {
+                                        rows_view(page, project, schema.get()).into_any()
+                                    }
+                                    Ok(Some(Err(state))) => {
+                                        unavailable_panel(state, project).into_any()
+                                    }
+                                    Ok(None) => ().into_any(),
+                                    Err(err) => table_error(err).into_any(),
+                                };
+                                view! { {bar} {content} }.into_any()
                             }),
                         }?;
                         Some(view! { {tabs} {content} }.into_any())
@@ -323,6 +383,195 @@ fn view_tabs(project: Uuid, table: u32, schema: String, current: TableView) -> i
 }
 
 /// The table's name and row-level security state, shared by both views.
+/// What the filter bar above the Data tab needs.
+struct FilterBar {
+    project: Uuid,
+    table: u32,
+    schema: String,
+    sort: Option<RowSort>,
+    /// The address's `filter` values, as given.
+    filters: Vec<String>,
+    /// The page's columns when the rows were read. Without them only the
+    /// applied filters are listed, so a filter that broke the read can be
+    /// removed.
+    columns: Option<Vec<RowColumn>>,
+}
+
+/// Longest filter value shown in the list of applied filters.
+const FILTER_LABEL_MAX_CHARS: usize = 60;
+
+fn filter_bar(bar: FilterBar) -> impl IntoView {
+    let FilterBar {
+        project,
+        table,
+        schema,
+        sort,
+        filters,
+        columns,
+    } = bar;
+    let href = |filters: &[String]| rows_href(project, table, &schema, 1, sort.as_ref(), filters);
+    let applied = filters
+        .iter()
+        .enumerate()
+        .map(|(i, raw)| {
+            let label = match RowFilter::parse_param(raw) {
+                Ok(filter) if filter.op.takes_value() => format!(
+                    "{} {} \"{}\"",
+                    filter.column,
+                    filter.op.label(),
+                    bounded(&filter.value, FILTER_LABEL_MAX_CHARS)
+                ),
+                Ok(filter) => format!("{} {}", filter.column, filter.op.label()),
+                Err(_) => bounded(raw, FILTER_LABEL_MAX_CHARS),
+            };
+            let mut rest = filters.clone();
+            rest.remove(i);
+            let remove = href(&rest);
+            let action = format!("Remove filter {label}");
+            view! {
+                <li class="filter-chip">
+                    <span class="url-text">{label}</span>
+                    <A href=remove attr:class="filter-remove" attr:aria-label=action>"×"</A>
+                </li>
+            }
+        })
+        .collect_view();
+    let clear = (filters.len() > 1).then(|| {
+        let none = href(&[]);
+        view! { <A href=none attr:class="filter-clear">"Clear filters"</A> }
+    });
+    let list = (!filters.is_empty()).then(|| {
+        view! {
+            <ul class="filter-list" aria-label="Applied filters">{applied}</ul>
+            {clear}
+        }
+    });
+    let form = match columns {
+        Some(columns) if !columns.is_empty() && filters.len() < ROW_FILTER_LIMIT => Some(
+            add_filter_form(
+                project,
+                table,
+                schema.clone(),
+                sort.clone(),
+                filters.clone(),
+                columns,
+            )
+            .into_any(),
+        ),
+        Some(_) if filters.len() >= ROW_FILTER_LIMIT => Some(
+            view! {
+                <p class="field-hint">
+                    {format!("At most {ROW_FILTER_LIMIT} filters can be applied.")}
+                </p>
+            }
+            .into_any(),
+        ),
+        _ => None,
+    };
+    view! {
+        <section class="filter-bar" aria-label="Filters">
+            {list}
+            {form}
+        </section>
+    }
+}
+
+/// Adds a filter and goes to the first page. Without JavaScript the form
+/// submits as a GET with the new filter in `fc`, `fo`, and `fv`; once the
+/// page is interactive it goes straight to the address with every filter
+/// as a `filter` value.
+fn add_filter_form(
+    project: Uuid,
+    table: u32,
+    schema: String,
+    sort: Option<RowSort>,
+    filters: Vec<String>,
+    columns: Vec<RowColumn>,
+) -> impl IntoView {
+    let navigate = use_navigate();
+    let column_ref = NodeRef::<leptos::html::Select>::new();
+    let op_ref = NodeRef::<leptos::html::Select>::new();
+    let value_ref = NodeRef::<leptos::html::Input>::new();
+    let action = format!("{}/{table}", editor_path(project));
+    let hidden_schema = (schema != DEFAULT_SCHEMA)
+        .then(|| view! { <input type="hidden" name="schema" value=schema.clone()/> });
+    let hidden_sort = sort.as_ref().map(|sort| {
+        view! {
+            <input type="hidden" name="sort" value=sort.column.clone()/>
+            {sort.descending.then(|| view! { <input type="hidden" name="desc" value="1"/> })}
+        }
+    });
+    let hidden_filters = filters
+        .iter()
+        .map(|raw| view! { <input type="hidden" name="filter" value=raw.clone()/> })
+        .collect_view();
+    let column_options = columns
+        .into_iter()
+        .map(|column| {
+            let label = column.name.clone();
+            view! { <option value=column.name>{label}</option> }
+        })
+        .collect_view();
+    let op_options = FilterOp::ALL
+        .into_iter()
+        .map(|op| view! { <option value=op.code()>{op.label()}</option> })
+        .collect_view();
+    let on_submit = move |ev: leptos::ev::SubmitEvent| {
+        let (Some(column), Some(op), Some(value)) =
+            (column_ref.get(), op_ref.get(), value_ref.get())
+        else {
+            return;
+        };
+        let Some(op) = FilterOp::from_code(&op.value()) else {
+            return;
+        };
+        ev.prevent_default();
+        let mut next = filters.clone();
+        // Checked by the server, which explains what is wrong.
+        next.push(
+            RowFilter {
+                column: column.value(),
+                op,
+                value: value.value(),
+            }
+            .to_param(),
+        );
+        navigate(
+            &rows_href(project, table, &schema, 1, sort.as_ref(), &next),
+            Default::default(),
+        );
+    };
+    view! {
+        <form method="get" action=action class="filter-form" on:submit=on_submit>
+            {hidden_schema}
+            {hidden_sort}
+            {hidden_filters}
+            <label class="field">
+                <span class="field-label">"Column"</span>
+                <select class="input" name="fc" node_ref=column_ref>{column_options}</select>
+            </label>
+            <label class="field">
+                <span class="field-label">"Operator"</span>
+                <select class="input" name="fo" node_ref=op_ref>{op_options}</select>
+            </label>
+            <label class="field filter-value">
+                <span class="field-label">"Value"</span>
+                <input
+                    class="input"
+                    name="fv"
+                    maxlength=FILTER_VALUE_MAX_BYTES.to_string()
+                    autocomplete="off"
+                    node_ref=value_ref
+                />
+            </label>
+            <button type="submit" class="button">"Add filter"</button>
+        </form>
+        <p class="field-hint">
+            "Filters combine with AND. like and ilike compare the value as text, where % matches any run of characters. is null and is not null take no value."
+        </p>
+    }
+}
+
 fn table_heading(table: &TableSummary) -> impl IntoView + use<> {
     let rls = if !table.kind.is_table() {
         view! { <span class="badge badge-muted">{table.kind.label()}</span> }.into_any()
@@ -349,7 +598,17 @@ fn rows_view(page: RowPage, project: Uuid, schema: String) -> impl IntoView {
     let first_row = page.page.offset() + 1;
     let shown = u32::try_from(page.rows.len()).unwrap_or(ROW_PAGE_SIZE);
     let sort = page.order.sort();
-    let link = |target: u32| rows_href(project, page.table.id, &schema, target, sort.as_ref());
+    let filters: Vec<String> = page.filters.iter().map(RowFilter::to_param).collect();
+    let link = |target: u32| {
+        rows_href(
+            project,
+            page.table.id,
+            &schema,
+            target,
+            sort.as_ref(),
+            &filters,
+        )
+    };
     let previous = page.page.previous().map(|p| link(p.get()));
     let next = page
         .has_more
@@ -372,7 +631,7 @@ fn rows_view(page: RowPage, project: Uuid, schema: String) -> impl IntoView {
     });
     let sorted = sort.as_ref().map(|sort| {
         let direction = if sort.descending { "descending" } else { "ascending" };
-        let clear = rows_href(project, page.table.id, &schema, 1, None);
+        let clear = rows_href(project, page.table.id, &schema, 1, None, &filters);
         view! {
             <span class="field-hint">
                 "Sorted by " <span class="url-text">{sort.column.clone()}</span> {format!(", {direction}. ")}
@@ -394,6 +653,15 @@ fn rows_view(page: RowPage, project: Uuid, schema: String) -> impl IntoView {
     let body = if page.columns.is_empty() {
         view! { <StatePanel tone=StateTone::Empty title="This table has no columns".to_string()/> }
             .into_any()
+    } else if page.rows.is_empty() && number == 1 && !filters.is_empty() {
+        view! {
+            <StatePanel
+                tone=StateTone::Empty
+                title="No rows match the filters".to_string()
+                detail="Change or remove a filter above.".to_string()
+            />
+        }
+        .into_any()
     } else if page.rows.is_empty() && number == 1 {
         view! { <StatePanel tone=StateTone::Empty title="This table has no rows".to_string()/> }
             .into_any()
@@ -413,7 +681,7 @@ fn rows_view(page: RowPage, project: Uuid, schema: String) -> impl IntoView {
                 column: column.to_owned(),
                 descending,
             });
-            rows_href(project, page.table.id, &schema, 1, sort.as_ref())
+            rows_href(project, page.table.id, &schema, 1, sort.as_ref(), &filters)
         })
         .into_any()
     };

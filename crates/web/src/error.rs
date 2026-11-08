@@ -144,6 +144,7 @@ mod server {
             match err {
                 SchemaError::NotFound | SchemaError::TableNotFound => Self::NotFound,
                 SchemaError::Forbidden => Self::Forbidden,
+                SchemaError::TooManyFilters => Self::Rejected(sentence(&err.to_string())),
                 SchemaError::Unavailable => Self::Unavailable,
                 SchemaError::Internal(err) => {
                     tracing::error!(error = %err, "schema read failed");
