@@ -20,6 +20,7 @@ leptos_router.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 time.workspace = true
+url.workspace = true
 uuid = { version = "1", default-features = false, features = ["std", "serde"] }
 wasm-bindgen = { workspace = true, optional = true }
 web-sys = { version = "0.3", optional = true, features = ["HtmlDocument", "History", "Location"] }

@@ -8,3 +8,4 @@ pub mod project;
 pub mod project_connection;
 pub mod sign_in;
 pub mod status;
+pub mod table_editor;

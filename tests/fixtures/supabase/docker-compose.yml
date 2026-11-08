@@ -26,6 +26,7 @@ services:
     volumes:
       - ./db/roles.sql:/docker-entrypoint-initdb.d/init-scripts/99-roles.sql:ro
       - ./db/jwt.sql:/docker-entrypoint-initdb.d/init-scripts/99-jwt.sql:ro
+      - ./db/sample.sql:/docker-entrypoint-initdb.d/migrations/99-sample.sql:ro
     ports:
       - "127.0.0.1:54322:5432"
     healthcheck:
@@ -101,7 +102,7 @@ services:
       # Administrative API: loopback only, never exposed beyond the host.
       - "127.0.0.1:54380:8080"
 
-  # API gateway in front of auth and rest, as in a standard self-hosted
+  # API gateway in front of auth, rest, and meta, as in a standard self-hosted
   # stack. Upstream defaults to Envoy and ships Kong as an override; the
   # fixture uses Kong because its route config is much smaller.
   gateway:
@@ -111,6 +112,8 @@ services:
         condition: service_healthy
       rest:
         condition: service_healthy
+      meta:
+        condition: service_started
     entrypoint: ["/bin/sh", "/home/kong/kong-entrypoint.sh"]
     environment:
       KONG_DATABASE: "off"

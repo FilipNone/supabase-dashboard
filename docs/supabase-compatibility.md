@@ -14,13 +14,13 @@ Versions match the upstream `docker/docker-compose.yml` in supabase/supabase on 
 | postgres-meta | `supabase/postgres-meta:v0.100.0` | `meta` | 54380 |
 | API gateway (Kong) | `kong/kong:3.9.3` | `gateway` | 54321 |
 
-Upstream now defaults to an Envoy gateway and keeps Kong as an alternative. The fixture uses Kong with a reduced `api/kong.yml` (Auth and REST routes only, legacy JWT API keys) because its configuration is much smaller; the routes and key checks match upstream's. An Envoy fixture is still to do.
+Upstream now defaults to an Envoy gateway and keeps Kong as an alternative. The fixture uses Kong with a reduced `api/kong.yml` (Auth, REST, and postgres-meta routes only, legacy JWT API keys) because its configuration is much smaller; the routes and key checks match upstream's. As upstream does, `/pg/` reaches postgres-meta only with the service role key. An Envoy fixture is still to do.
 
 Not in the fixture yet: Studio, Realtime, Storage, imgproxy, Edge Functions, Supavisor, analytics. They will be added when the milestone that uses them starts (Storage, Realtime, and Functions are M5).
 
 ## Fixture
 
-`tests/fixtures/supabase/` holds a reduced compose file adapted from upstream (Apache-2.0) with synthetic, test-only credentials in `fixture.env`. Every port binds to `127.0.0.1` and no volume persists data.
+`tests/fixtures/supabase/` holds a reduced compose file adapted from upstream (Apache-2.0) with synthetic, test-only credentials in `fixture.env`. Every port binds to `127.0.0.1` and no volume persists data. `db/sample.sql` adds a small synthetic schema (an enum, a `todos` table with RLS enabled, and a `tags` table with a composite primary key) for the schema browsing tests.
 
 ```sh
 docker compose -f tests/fixtures/supabase/docker-compose.yml \
@@ -37,6 +37,7 @@ docker compose -p sd-fixture down -v
 | PostgREST reachability through the gateway (service role key; the gateway refuses the anon key on the root path with 403) | Verified against PostgREST v14.18 via Kong 3.9.3 | same test |
 | Wrong key reported as rejected (401) | Verified | same test |
 | Envoy gateway, new-style `sb_publishable_`/`sb_secret_` keys | Not tested | No fixture yet |
-| Schema browsing, SQL, Auth users, Storage | Not implemented | Later M2 and M3 work |
+| Schema, table, and column listing through postgres-meta at `/pg/` (service role key; the gateway refuses the anon key with 403) | Verified against postgres-meta v0.100.0 via Kong 3.9.3 | `fixture_meta_lists_structure` in `crates/adapters/tests/gateway_fixture.rs` |
+| Table rows, SQL, Auth users, Storage | Not implemented | Later M2 and M3 work |
 
 Update the baseline only together with a fixture change and a passing CI run.

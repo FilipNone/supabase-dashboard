@@ -4,7 +4,7 @@ use axum::extract::FromRef;
 use leptos::config::LeptosOptions;
 use supabase_dashboard_application::{
     auth::AuthService, connections::ConnectionService, organizations::OrganizationService,
-    projects::ProjectService,
+    projects::ProjectService, schema::SchemaService,
 };
 use supabase_dashboard_persistence::Database;
 
@@ -19,6 +19,7 @@ pub struct AppState {
     pub organizations: Arc<OrganizationService>,
     pub projects: Arc<ProjectService>,
     pub connections: Arc<ConnectionService>,
+    pub schema: Arc<SchemaService>,
     pub cookie: CookieSettings,
     /// `scheme://host[:port]` of the public URL. `None` only in development
     /// without a public URL, where the Host header is compared instead.

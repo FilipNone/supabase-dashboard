@@ -291,7 +291,12 @@ impl ConnectionService {
         let stored = self.db.list_credentials(project.id).await?;
         let mut checks = Vec::with_capacity(StackService::ALL.len());
         for service in StackService::ALL {
-            let check = match self.pick_key(project.id, service, &stored) {
+            let check = match open_key(
+                self.cipher.as_ref(),
+                project.id,
+                &key_preference(service),
+                &stored,
+            ) {
                 Ok(key) => self.probe.check(&project.api_url, service, &key).await,
                 Err(reason) => ServiceCheck {
                     service,
@@ -309,41 +314,6 @@ impl ConnectionService {
             .replace_nanosecond(now.nanosecond() / 1_000 * 1_000)
             .unwrap_or(now);
         Ok(HealthReport { checked_at, checks })
-    }
-
-    /// The preferred readable key for a service, or why there is none.
-    fn pick_key(
-        &self,
-        project_id: Uuid,
-        service: StackService,
-        stored: &[StoredCredential],
-    ) -> Result<SecretString, SkipReason> {
-        let mut unreadable = false;
-        for kind in key_preference(service) {
-            let Some(credential) = stored.iter().find(|c| c.kind == kind) else {
-                continue;
-            };
-            let opened = self.cipher.as_ref().map(|cipher| {
-                cipher.open(
-                    project_id,
-                    kind,
-                    &Sealed {
-                        key_id: credential.key_id.clone(),
-                        nonce: credential.nonce.clone(),
-                        ciphertext: credential.ciphertext.clone(),
-                    },
-                )
-            });
-            match opened {
-                Some(Ok(key)) => return Ok(key),
-                Some(Err(_)) | None => unreadable = true,
-            }
-        }
-        Err(if unreadable {
-            SkipReason::UnreadableKey
-        } else {
-            SkipReason::MissingKey
-        })
     }
 
     async fn access(
@@ -392,6 +362,41 @@ impl ConnectionService {
             other => other,
         }
     }
+}
+
+/// The first readable key of `preference`, or why there is none.
+pub(crate) fn open_key(
+    cipher: Option<&CredentialCipher>,
+    project_id: Uuid,
+    preference: &[CredentialKind],
+    stored: &[StoredCredential],
+) -> Result<SecretString, SkipReason> {
+    let mut unreadable = false;
+    for &kind in preference {
+        let Some(credential) = stored.iter().find(|c| c.kind == kind) else {
+            continue;
+        };
+        let opened = cipher.map(|cipher| {
+            cipher.open(
+                project_id,
+                kind,
+                &Sealed {
+                    key_id: credential.key_id.clone(),
+                    nonce: credential.nonce.clone(),
+                    ciphertext: credential.ciphertext.clone(),
+                },
+            )
+        });
+        match opened {
+            Some(Ok(key)) => return Ok(key),
+            Some(Err(_)) | None => unreadable = true,
+        }
+    }
+    Err(if unreadable {
+        SkipReason::UnreadableKey
+    } else {
+        SkipReason::MissingKey
+    })
 }
 
 /// Audit target for a key change: the project and the kind, never the value.

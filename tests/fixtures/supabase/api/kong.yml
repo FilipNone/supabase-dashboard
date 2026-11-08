@@ -2,9 +2,10 @@
 #
 # Adapted from supabase/supabase docker/volumes/api/kong.yml (Apache-2.0,
 # see LICENSE-APACHE); this file stays under Apache-2.0. It keeps only the
-# Auth and PostgREST routes, in upstream's legacy API key mode, and the
-# same key-auth and ACL rules: the PostgREST root (OpenAPI) is limited to
-# the service role, other routes accept the anon key too.
+# Auth, PostgREST, and postgres-meta routes, in upstream's legacy API key
+# mode, and the same key-auth and ACL rules: the PostgREST root (OpenAPI)
+# and postgres-meta (/pg/) are limited to the service role, other routes
+# accept the anon key too.
 # kong-entrypoint.sh substitutes $SUPABASE_ANON_KEY and $SUPABASE_SERVICE_KEY.
 _format_version: '2.1'
 _transform: true
@@ -99,3 +100,20 @@ services:
           allow:
             - admin
             - anon
+
+  - name: meta
+    url: http://meta:8080/
+    routes:
+      - name: meta-all
+        strip_path: true
+        paths:
+          - /pg/
+    plugins:
+      - name: key-auth
+        config:
+          hide_credentials: false
+      - name: acl
+        config:
+          hide_groups_header: true
+          allow:
+            - admin

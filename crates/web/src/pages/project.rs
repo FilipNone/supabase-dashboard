@@ -1,8 +1,8 @@
 //! Project registration and the pages of one registered project.
 //!
 //! Registering a project only records where an existing stack is. The
-//! dashboard contacts the stack only when a member runs a service check,
-//! using the API keys stored on the settings page.
+//! dashboard contacts the stack only when a member runs a service check or
+//! opens the table editor, using the API keys stored on the settings page.
 
 use leptos::{form::ActionForm, prelude::*};
 use leptos_meta::Title;
@@ -230,6 +230,7 @@ pub fn ProjectLayout() -> impl IntoView {
                             </header>
                             <nav class="tabs" aria-label="Project">
                                 <A href=base.clone() exact=true attr:class="tab">"Overview"</A>
+                                <A href=format!("{base}/editor") attr:class="tab">"Table editor"</A>
                                 <A href=format!("{base}/settings") attr:class="tab">"Settings"</A>
                             </nav>
                             <Outlet/>

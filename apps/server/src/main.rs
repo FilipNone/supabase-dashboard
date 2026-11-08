@@ -23,6 +23,7 @@ use supabase_dashboard_application::{
     connections::ConnectionService,
     organizations::OrganizationService,
     projects::ProjectService,
+    schema::SchemaService,
     secrets::{CredentialCipher, KeyError},
 };
 use supabase_dashboard_persistence::{Database, PersistenceError};
@@ -197,12 +198,14 @@ async fn run() -> Result<(), StartupError> {
     if config.allow_loopback_targets {
         tracing::warn!("project checks may connect to loopback addresses");
     }
-    let probe = GatewayProbe::shared(GatewaySettings {
+    // One client for service checks and structure reads, so both share the
+    // same address policy, TLS settings, and connection pool.
+    let gateway = Arc::new(GatewayProbe::new(GatewaySettings {
         policy: TargetPolicy {
             allow_loopback: config.allow_loopback_targets,
         },
         ..GatewaySettings::default()
-    })?;
+    })?);
 
     let secure_cookie = config
         .public_url
@@ -215,7 +218,12 @@ async fn run() -> Result<(), StartupError> {
         auth,
         organizations: Arc::new(OrganizationService::new(db.clone())),
         projects: Arc::new(ProjectService::new(db.clone())),
-        connections: Arc::new(ConnectionService::new(db.clone(), cipher, probe)),
+        connections: Arc::new(ConnectionService::new(
+            db.clone(),
+            cipher.clone(),
+            gateway.clone(),
+        )),
+        schema: Arc::new(SchemaService::new(db.clone(), cipher, gateway)),
         cookie: CookieSettings::new(secure_cookie, config.session_lifetime.as_secs()),
         expected_origin: config
             .public_url

@@ -47,6 +47,7 @@ mod server {
         connections::ConnectionError,
         organizations::OrganizationError,
         projects::ProjectError,
+        schema::SchemaError,
     };
 
     use super::AppError;
@@ -132,6 +133,20 @@ mod server {
                 }
                 ConnectionError::Internal(err) => {
                     tracing::error!(error = %err, "project connection operation failed");
+                    Self::Unavailable
+                }
+            }
+        }
+    }
+
+    impl From<SchemaError> for AppError {
+        fn from(err: SchemaError) -> Self {
+            match err {
+                SchemaError::NotFound | SchemaError::TableNotFound => Self::NotFound,
+                SchemaError::Forbidden => Self::Forbidden,
+                SchemaError::Unavailable => Self::Unavailable,
+                SchemaError::Internal(err) => {
+                    tracing::error!(error = %err, "schema read failed");
                     Self::Unavailable
                 }
             }

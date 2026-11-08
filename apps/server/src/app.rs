@@ -42,6 +42,7 @@ pub fn router(state: AppState, limits: &HttpLimits) -> Router {
     let organizations = state.organizations.clone();
     let projects = state.projects.clone();
     let connections = state.connections.clone();
+    let schema = state.schema.clone();
     let auth = state.auth.clone();
     let leptos_options = state.leptos_options.clone();
     let x_request_id = HeaderName::from_static("x-request-id");
@@ -62,6 +63,7 @@ pub fn router(state: AppState, limits: &HttpLimits) -> Router {
                 provide_context(organizations.clone());
                 provide_context(projects.clone());
                 provide_context(connections.clone());
+                provide_context(schema.clone());
                 provide_context(auth.clone());
             },
             move || shell(leptos_options.clone()),
@@ -146,6 +148,7 @@ mod tests {
         connections::ConnectionService,
         organizations::OrganizationService,
         projects::ProjectService,
+        schema::SchemaService,
     };
     use supabase_dashboard_persistence::{Database, DatabaseSettings};
     use supabase_dashboard_web::{
@@ -153,10 +156,11 @@ mod tests {
         server_fns::{
             AdminListAccounts, AdminSetAccountDisabled, ChangePassword, CheckProjectHealth,
             CreateInvitation, CreateOrganization, GetCurrentAccount, GetInstallationHealth,
-            GetOrganization, GetProject, GetProjectCredentials, GetProjectHealth,
-            ListOrganizations, ListProjects, ListSessions, PreviewInvitation, RegisterProject,
-            RemoveProjectCredential, RenameOrganization, ReplaceProjectCredential, RevokeSession,
-            SignUpWithInvitation, UnregisterProject, UpdateProfile,
+            GetOrganization, GetProject, GetProjectCredentials, GetProjectHealth, GetTable,
+            ListOrganizations, ListProjects, ListSchemas, ListSessions, ListTables,
+            PreviewInvitation, RegisterProject, RemoveProjectCredential, RenameOrganization,
+            ReplaceProjectCredential, RevokeSession, SignUpWithInvitation, UnregisterProject,
+            UpdateProfile,
         },
     };
     use tower::ServiceExt;
@@ -178,6 +182,9 @@ mod tests {
         let auth = AuthService::new(db.clone(), AuthConfig::default())
             .await
             .unwrap();
+        let gateway = Arc::new(
+            supabase_dashboard_adapters::gateway::GatewayProbe::new(Default::default()).unwrap(),
+        );
         let state = AppState {
             leptos_options: LeptosOptions::builder()
                 .output_name("supabase-dashboard")
@@ -187,10 +194,10 @@ mod tests {
             projects: Arc::new(ProjectService::new(db.clone())),
             connections: Arc::new(ConnectionService::new(
                 db.clone(),
-                cipher,
-                supabase_dashboard_adapters::gateway::GatewayProbe::shared(Default::default())
-                    .unwrap(),
+                cipher.clone(),
+                gateway.clone(),
             )),
+            schema: Arc::new(SchemaService::new(db.clone(), cipher, gateway)),
             db,
             readiness_timeout: Duration::from_secs(1),
             auth: Arc::new(auth),
@@ -798,6 +805,45 @@ mod tests {
         .await;
         assert!(body.contains("NotFound"), "{body}");
 
+        const SERVICE_MARKER: &str = "sb_secret_redaction-marker-9c1d";
+        let (parts, body) = call(
+            ReplaceProjectCredential::PATH,
+            format!("id={project_id}&kind=service_role_key&value={SERVICE_MARKER}"),
+            &alice,
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+
+        // Structure reads use the service role key on the server only. The
+        // loopback target is refused before anything is sent.
+        let (_, body) = call(ListSchemas::PATH, format!("id={project_id}"), &bob).await;
+        assert!(body.contains("NotFound"), "{body}");
+        let (_, body) = call(
+            ListTables::PATH,
+            format!("id={project_id}&schema=a%2Cb"),
+            &alice,
+        )
+        .await;
+        assert!(body.contains("commas"), "{body}");
+        let mut bodies = Vec::new();
+        for (path, args) in [
+            (ListSchemas::PATH, String::new()),
+            (ListTables::PATH, "&schema=public".to_owned()),
+            (GetTable::PATH, "&table_id=1".to_owned()),
+        ] {
+            let (parts, body) = call(path, format!("id={project_id}{args}"), &alice).await;
+            assert_eq!(parts.status, StatusCode::OK, "{path}: {body}");
+            assert!(body.contains("destination_not_allowed"), "{path}: {body}");
+            bodies.push(body);
+        }
+        let page = format!("/dashboard/project/{project_id}/editor/1");
+        let (parts, body) = send(&router, get_with_cookie(&page, &alice)).await;
+        assert_eq!(parts.status, StatusCode::OK);
+        bodies.push(body);
+        for body in &bodies {
+            assert!(!body.contains("redaction-marker"), "{body}");
+        }
+
         let mut bodies = Vec::new();
         for path in [
             GetProjectCredentials::PATH,
@@ -821,11 +867,14 @@ mod tests {
         for body in &bodies {
             assert!(!body.contains("redaction-marker"), "{body}");
         }
-        let stored: Vec<u8> = sqlx::query_scalar("SELECT ciphertext FROM project_credentials")
-            .fetch_one(db.pool())
+        let stored: Vec<Vec<u8>> = sqlx::query_scalar("SELECT ciphertext FROM project_credentials")
+            .fetch_all(db.pool())
             .await
             .unwrap();
-        assert!(!String::from_utf8_lossy(&stored).contains("redaction-marker"));
+        assert_eq!(stored.len(), 2);
+        for value in &stored {
+            assert!(!String::from_utf8_lossy(value).contains("redaction-marker"));
+        }
 
         let (parts, body) = call(
             RemoveProjectCredential::PATH,
@@ -840,7 +889,10 @@ mod tests {
             &alice,
         )
         .await;
-        assert!(!body.contains(r#""state":"set""#), "{body}");
+        assert!(
+            body.contains(r#"{"kind":"anon_key","state":{"state":"not_set"}}"#),
+            "{body}"
+        );
 
         db.close().await;
         scratch.drop().await;

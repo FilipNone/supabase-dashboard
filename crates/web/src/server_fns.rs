@@ -16,6 +16,7 @@ use supabase_dashboard_domain::{
     invitation::{InvitationCode, InvitationPreview, InvitationSummary, IssuedInvitation},
     organization::{MemberSummary, OrganizationSummary},
     project::ProjectSummary,
+    schema::{MetaUnavailable, SchemaListing, TableDetail, TableListing},
 };
 use uuid::Uuid;
 
@@ -82,6 +83,7 @@ mod org_context {
         connections::ConnectionService,
         organizations::OrganizationService,
         projects::ProjectService,
+        schema::SchemaService,
     };
 
     use crate::error::AppError;
@@ -121,6 +123,13 @@ mod org_context {
     pub fn connections() -> Result<Arc<ConnectionService>, AppError> {
         use_context::<Arc<ConnectionService>>().ok_or_else(|| {
             tracing::error!("connection service is not configured");
+            AppError::Unavailable
+        })
+    }
+
+    pub fn schema() -> Result<Arc<SchemaService>, AppError> {
+        use_context::<Arc<SchemaService>>().ok_or_else(|| {
+            tracing::error!("schema service is not configured");
             AppError::Unavailable
         })
     }
@@ -247,6 +256,46 @@ pub async fn get_project_health(id: Uuid) -> Result<Option<HealthReport>, AppErr
 pub async fn check_project_health(id: Uuid) -> Result<HealthReport, AppError> {
     let session = org_context::session()?;
     Ok(org_context::connections()?.check_now(&session, id).await?)
+}
+
+/// The schemas of a project's database, or why the stack could not list
+/// them.
+#[server]
+pub async fn list_schemas(id: Uuid) -> Result<Result<SchemaListing, MetaUnavailable>, AppError> {
+    let session = org_context::session()?;
+    Ok(org_context::schema()?.schemas(&session, id).await?)
+}
+
+/// The tables of one schema. The name is checked here so a bad value gets
+/// a readable message instead of a transport error.
+#[server]
+pub async fn list_tables(
+    id: Uuid,
+    schema: String,
+) -> Result<Result<TableListing, MetaUnavailable>, AppError> {
+    let session = org_context::session()?;
+    let schema = supabase_dashboard_domain::schema::SchemaName::parse(&schema)
+        .map_err(|err| AppError::Rejected(format!("{}.", capitalize(&err.to_string()))))?;
+    Ok(org_context::schema()?.tables(&session, id, &schema).await?)
+}
+
+/// One table with its columns.
+#[server]
+pub async fn get_table(
+    id: Uuid,
+    table_id: u32,
+) -> Result<Result<TableDetail, MetaUnavailable>, AppError> {
+    let session = org_context::session()?;
+    Ok(org_context::schema()?.table(&session, id, table_id).await?)
+}
+
+#[cfg(feature = "ssr")]
+fn capitalize(message: &str) -> String {
+    let mut chars = message.chars();
+    chars
+        .next()
+        .map(|c| c.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
 }
 
 /// Projects registered in an organization.

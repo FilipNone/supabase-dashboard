@@ -5,4 +5,5 @@
 //! dependency of the browser build.
 
 pub mod gateway;
+pub mod meta;
 pub mod net;

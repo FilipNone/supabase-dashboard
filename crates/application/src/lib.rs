@@ -9,6 +9,7 @@ pub mod connections;
 pub mod organizations;
 pub mod password;
 pub mod projects;
+pub mod schema;
 pub mod secrets;
 pub mod throttle;
 pub mod token;

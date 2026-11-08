@@ -434,3 +434,32 @@ td { vertical-align: middle; }
 .key-item .subsection-title { margin: 0; color: var(--color-text); }
 .key-item .field-hint { margin: 0; }
 .status-detail { display: block; margin-top: var(--space-1); }
+
+/* Table editor: schema and table list beside the selected table. */
+.editor { display: grid; grid-template-columns: 15rem minmax(0, 1fr); gap: var(--space-6); align-items: start; }
+.editor-sidebar { display: grid; gap: var(--space-4); min-width: 0; }
+.editor-main { display: grid; gap: var(--space-4); min-width: 0; }
+.schema-picker { display: flex; align-items: flex-end; gap: var(--space-2); }
+.schema-picker .field { flex: 1; min-width: 0; }
+.table-nav { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; max-height: 60vh; overflow-y: auto; }
+.table-link {
+  display: flex; align-items: center; justify-content: space-between; gap: var(--space-2);
+  padding: var(--space-1) var(--space-2); border-radius: var(--radius-md);
+  color: var(--color-text); text-decoration: none; font-size: var(--text-sm);
+}
+.table-link:hover { background: var(--color-surface-raised); }
+.table-link[aria-current="page"] { background: var(--color-muted-bg); font-weight: 500; }
+.table-link-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.detail-inline { grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr)); }
+.data-table th.cell-name { color: var(--color-text); background: none; white-space: nowrap; }
+.data-table code { font-size: var(--text-xs); }
+/* Wide enough that identifiers do not break mid-word; the wrapper scrolls on
+   narrow screens. */
+.columns-table { min-width: 44rem; }
+.columns-table .cell-type .url-text { white-space: nowrap; }
+.columns-table .cell-type .status-detail { display: block; }
+
+@media (max-width: 640px) {
+  .editor { grid-template-columns: minmax(0, 1fr); gap: var(--space-4); }
+  .table-nav { max-height: 14rem; }
+}

@@ -95,6 +95,10 @@ The server logs a short key ID at startup, never the key. Each stored API key is
 
 The project overview's "Check now" button asks the stack's API gateway for `/auth/v1/health` (with the anon key) and `/rest/v1/` (with the service role key). Only those two paths under the registered API URL are requested. The client refuses loopback (unless allowed above), link-local, multicast, and cloud metadata addresses, checks every address a host name resolves to, does not follow redirects, ignores proxy environment variables, and gives up after 5 seconds to connect or 10 seconds in total. HTTPS uses the Mozilla root store bundled with the binary; stacks behind a private certificate authority are not supported yet. A project can be checked once every 10 seconds.
 
+### Table editor
+
+The project's Table editor tab reads schemas, tables, and columns from postgres-meta through the same gateway, at `/pg/schemas`, `/pg/tables`, and `/pg/tables/{id}`, with the stored service role key and the same address policy, timeouts, and redirect rule. Responses are size-limited (8 MiB for lists, 4 MiB for one table). At most 16 of these requests run at once across the server. Nothing is cached and nothing is written to the stack.
+
 ## Endpoints
 
 - `GET /healthz`: liveness. Does not touch the database.
