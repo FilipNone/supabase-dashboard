@@ -73,7 +73,7 @@ async fn fixture_meta_lists_structure() {
     use supabase_dashboard_application::schema::SchemaSource;
     use supabase_dashboard_domain::schema::{
         CELL_MAX_CHARS, ForeignKeyAction, IdentityGeneration, MetaUnavailable, ROW_PAGE_SIZE,
-        RowOrder, RowPageNumber, SchemaName,
+        RelationKind, RowOrder, RowPageNumber, SchemaName,
     };
 
     let Ok(raw) = std::env::var(ENV) else {
@@ -109,7 +109,18 @@ async fn fixture_meta_lists_structure() {
     let public = SchemaName::parse("public").unwrap();
     let tables = probe.tables(&url, &service, &public).await.unwrap();
     let names: Vec<_> = tables.tables.iter().map(|t| t.name.as_str()).collect();
-    assert_eq!(names, [r#"Event "Log""#, "tag_notes", "tags", "todos"]);
+    assert_eq!(
+        names,
+        [
+            r#"Event "Log""#,
+            "open_todos",
+            "remote_items",
+            "tag_notes",
+            "tags",
+            "todo_counts",
+            "todos"
+        ]
+    );
     let by_name = |name: &str| tables.tables.iter().find(|t| t.name == name).unwrap();
     let todos = by_name("todos");
     assert!(todos.rls_enabled);
@@ -247,4 +258,56 @@ async fn fixture_meta_lists_structure() {
 
     let none = probe.relations(&url, &service, u32::MAX).await.unwrap();
     assert!(none.outgoing.is_empty() && none.incoming.is_empty());
+
+    // A view is found by its ID and read unordered, without row-level
+    // security or statistics.
+    let view = by_name("open_todos");
+    assert_eq!(view.kind, RelationKind::View);
+    assert!(!view.rls_enabled && view.size.is_empty());
+    let detail = probe.table(&url, &service, view.id).await.unwrap().unwrap();
+    assert_eq!(detail.table.kind, RelationKind::View);
+    let columns: Vec<_> = detail.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(columns, ["id", "title"]);
+    let rows = probe
+        .rows(&url, &service, &detail, RowPageNumber::FIRST)
+        .await
+        .unwrap();
+    assert_eq!(rows.order, RowOrder::Unordered);
+    assert_eq!(rows.rows.len(), 2);
+
+    // A materialized view created WITH NO DATA, and a foreign table: both
+    // have columns, and neither has its rows read.
+    let counts = by_name("todo_counts");
+    assert_eq!(
+        counts.kind,
+        RelationKind::MaterializedView { populated: false }
+    );
+    let detail = probe
+        .table(&url, &service, counts.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(detail.columns.len(), 2);
+    assert_eq!(
+        probe
+            .rows(&url, &service, &detail, RowPageNumber::FIRST)
+            .await
+            .unwrap_err(),
+        MetaUnavailable::NotPopulated
+    );
+    let remote = by_name("remote_items");
+    assert_eq!(remote.kind, RelationKind::ForeignTable);
+    let detail = probe
+        .table(&url, &service, remote.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(detail.columns.len(), 2);
+    assert_eq!(
+        probe
+            .rows(&url, &service, &detail, RowPageNumber::FIRST)
+            .await
+            .unwrap_err(),
+        MetaUnavailable::ForeignRows
+    );
 }

@@ -150,9 +150,9 @@ impl SchemaService {
             .await)
     }
 
-    /// A table's columns and foreign keys. The keys are read after the
-    /// table, so a table that does not exist is reported as such, and a
-    /// failure reading the keys still returns the columns.
+    /// A relation's columns and, for tables, foreign keys. The keys are
+    /// read after the table, so a table that does not exist is reported as
+    /// such, and a failure reading the keys still returns the columns.
     pub async fn table(
         &self,
         current: &CurrentSession,
@@ -171,7 +171,17 @@ impl SchemaService {
             Ok(None) => return Err(SchemaError::TableNotFound),
             Err(state) => return Ok(Err(state)),
         };
-        let relations = self.source.relations(api_url, &key, table_id).await;
+        // PostgreSQL only allows foreign keys on tables and pointing at
+        // tables, so other kinds are not asked.
+        let relations = if detail.table.kind.is_table() {
+            self.source.relations(api_url, &key, table_id).await
+        } else {
+            Ok(TableRelations {
+                outgoing: Vec::new(),
+                incoming: Vec::new(),
+                truncated: false,
+            })
+        };
         Ok(Ok(TableDefinition { detail, relations }))
     }
 

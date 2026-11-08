@@ -14,8 +14,8 @@ use leptos_router::{
 };
 use supabase_dashboard_domain::schema::{
     CELL_MAX_CHARS, Cell, ColumnSummary, DEFAULT_SCHEMA, FOREIGN_KEY_LIST_LIMIT, ForeignKey,
-    MetaUnavailable, ROW_COLUMN_LIMIT, ROW_PAGE_SIZE, RowOrder, RowPage, SchemaListing,
-    TableDefinition, TableListing, TableRelations, TableSummary,
+    MetaUnavailable, ROW_COLUMN_LIMIT, ROW_PAGE_SIZE, RelationKind, RowOrder, RowPage,
+    SchemaListing, TableDefinition, TableListing, TableRelations, TableSummary,
 };
 use uuid::Uuid;
 
@@ -90,8 +90,13 @@ fn unavailable_panel(state: MetaUnavailable, project: Uuid) -> impl IntoView {
             <p><a href=format!("{}/settings", project_path(project))>"Open project settings"</a></p>
         }
     });
+    // These two are how the relation is, not something that went wrong.
+    let tone = match state {
+        MetaUnavailable::NotPopulated | MetaUnavailable::ForeignRows => StateTone::Empty,
+        _ => StateTone::Error,
+    };
     view! {
-        <StatePanel tone=StateTone::Error title=state.title().to_owned() detail=state.detail()/>
+        <StatePanel tone=tone title=state.title().to_owned() detail=state.detail()/>
         {settings}
     }
 }
@@ -283,7 +288,9 @@ fn view_tabs(project: Uuid, table: u32, schema: String, current: TableView) -> i
 
 /// The table's name and row-level security state, shared by both views.
 fn table_heading(table: &TableSummary) -> impl IntoView + use<> {
-    let rls = if table.rls_enabled {
+    let rls = if !table.kind.is_table() {
+        view! { <span class="badge badge-muted">{table.kind.label()}</span> }.into_any()
+    } else if table.rls_enabled {
         view! { <span class="badge badge-ok">"RLS enabled"</span> }.into_any()
     } else {
         view! { <span class="badge badge-error">"RLS disabled"</span> }.into_any()
@@ -366,9 +373,14 @@ fn rows_view(page: RowPage, project: Uuid, schema: String) -> impl IntoView {
         }
     });
     let unordered = (page.order == RowOrder::Unordered).then(|| {
+        let reason = if page.table.kind.is_table() {
+            "This table has no primary key"
+        } else {
+            "Views have no primary key"
+        };
         view! {
             <p class="field-hint">
-                "This table has no primary key, so its rows have no fixed order and pages can overlap or skip rows while the table changes."
+                {format!("{reason}, so the rows have no fixed order and pages can overlap or skip rows while the data changes.")}
             </p>
         }
     });
@@ -508,6 +520,7 @@ fn table_list(
                 <li>
                     <A href=href attr:class="table-link" attr:aria-current=current>
                         <span class="table-link-name">{table.name}</span>
+                        {kind_badge(table.kind)}
                         {table.rls_enabled.then(|| view! {
                             <span class="badge badge-muted" title="Row-level security is enabled">"RLS"</span>
                         })}
@@ -528,9 +541,24 @@ fn table_list(
     .into_any()
 }
 
+/// A short marker for entries that are not plain tables. The full kind is
+/// in the title and in the accessible name.
+fn kind_badge(kind: RelationKind) -> Option<impl IntoView + use<>> {
+    let short = match kind {
+        RelationKind::Table => return None,
+        RelationKind::View => "View",
+        RelationKind::MaterializedView { .. } => "Mat. view",
+        RelationKind::ForeignTable => "Foreign",
+    };
+    Some(view! {
+        <span class="badge badge-muted" title=kind.label() aria-label=kind.label()>{short}</span>
+    })
+}
+
 fn table_view(definition: TableDefinition) -> impl IntoView {
     let detail = definition.detail;
     let table = detail.table;
+    let is_table = table.kind.is_table();
     let primary_key = if detail.primary_key.is_empty() {
         "None".to_owned()
     } else {
@@ -551,9 +579,26 @@ fn table_view(definition: TableDefinition) -> impl IntoView {
             {table_heading(&table)}
             {table.comment.map(|comment| view! { <p class="section-text">{comment}</p> })}
             <dl class="detail-list detail-inline">
-                <div><dt>"Primary key"</dt><dd>{primary_key}</dd></div>
-                <div><dt>"Estimated rows"</dt><dd>{table.live_rows_estimate.to_string()}</dd></div>
-                <div><dt>"Size"</dt><dd>{table.size}</dd></div>
+                {if table.kind.is_table() {
+                    view! {
+                        <div><dt>"Primary key"</dt><dd>{primary_key}</dd></div>
+                        <div><dt>"Estimated rows"</dt><dd>{table.live_rows_estimate.to_string()}</dd></div>
+                        <div><dt>"Size"</dt><dd>{table.size}</dd></div>
+                    }
+                    .into_any()
+                } else {
+                    let populated = match table.kind {
+                        RelationKind::MaterializedView { populated } => {
+                            Some(if populated { "Yes" } else { "No, never refreshed" })
+                        }
+                        _ => None,
+                    };
+                    view! {
+                        <div><dt>"Kind"</dt><dd>{table.kind.label()}</dd></div>
+                        {populated.map(|p| view! { <div><dt>"Populated"</dt><dd>{p}</dd></div> })}
+                    }
+                    .into_any()
+                }}
             </dl>
         </section>
         {empty}
@@ -574,10 +619,12 @@ fn table_view(definition: TableDefinition) -> impl IntoView {
                 </table>
             </div>
         })}
-        <p class="field-hint">
-            "Row estimates come from PostgreSQL's statistics and can lag behind the table."
-        </p>
-        {relations_view(definition.relations)}
+        {is_table.then(|| view! {
+            <p class="field-hint">
+                "Row estimates come from PostgreSQL's statistics and can lag behind the table."
+            </p>
+        })}
+        {is_table.then(|| relations_view(definition.relations))}
     }
 }
 

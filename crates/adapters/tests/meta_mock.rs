@@ -22,7 +22,8 @@ use supabase_dashboard_domain::{
     connection::UnreachableReason,
     project::ProjectUrl,
     schema::{
-        ColumnSummary, MetaUnavailable, RowPageNumber, SchemaName, TableDetail, TableSummary,
+        ColumnSummary, MetaUnavailable, RelationKind, RowPageNumber, SchemaName, TableDetail,
+        TableSummary,
     },
 };
 
@@ -32,6 +33,7 @@ fn todos() -> TableDetail {
             id: 7,
             schema: "public".into(),
             name: "todos".into(),
+            kind: RelationKind::Table,
             rls_enabled: true,
             rls_forced: false,
             live_rows_estimate: 2,
@@ -81,24 +83,146 @@ fn key() -> SecretString {
     SecretString::from("service-key")
 }
 
-#[tokio::test]
-async fn schema_filter_is_url_encoded_and_key_sent_as_header() {
-    let url = serve(Router::new().route(
-        "/pg/tables",
-        get(|headers: HeaderMap, RawQuery(query): RawQuery| async move {
+/// Answers a list request for one kind after checking the filter and key.
+fn list_handler(body: &'static str) -> axum::routing::MethodRouter {
+    get(
+        move |headers: HeaderMap, RawQuery(query): RawQuery| async move {
             assert_eq!(headers.get("apikey").unwrap(), "service-key");
             assert!(headers.get("x-connection-encrypted").is_none());
             let query = query.unwrap_or_default();
             assert!(query.contains("included_schemas=my+schema%26x"), "{query}");
             assert!(query.contains("include_columns=false"), "{query}");
             assert!(!query.contains("service-key"));
-            r#"[{"id":1,"schema":"my schema&x","name":"t","rls_enabled":false,"comment":null}]"#
-        }),
-    ))
+            body
+        },
+    )
+}
+
+#[tokio::test]
+async fn schema_filter_is_url_encoded_and_every_kind_is_listed() {
+    let url = serve(
+        Router::new()
+            .route(
+                "/pg/tables",
+                list_handler(
+                    r#"[{"id":1,"schema":"my schema&x","name":"t","rls_enabled":true,"comment":null}]"#,
+                ),
+            )
+            .route(
+                "/pg/views",
+                list_handler(
+                    r#"[{"id":2,"schema":"my schema&x","name":"a_view","is_updatable":true,"comment":null}]"#,
+                ),
+            )
+            .route(
+                "/pg/materialized-views",
+                list_handler(
+                    r#"[{"id":3,"schema":"my schema&x","name":"m","is_populated":false,"comment":null}]"#,
+                ),
+            )
+            .route(
+                "/pg/foreign-tables",
+                list_handler(r#"[{"id":4,"schema":"my schema&x","name":"f","comment":null}]"#),
+            ),
+    )
     .await;
     let schema = SchemaName::parse("my schema&x").unwrap();
     let listing = loopback().tables(&url, &key(), &schema).await.unwrap();
-    assert_eq!(listing.tables.len(), 1);
+    let entries: Vec<_> = listing
+        .tables
+        .iter()
+        .map(|t| (t.name.as_str(), t.kind, t.rls_enabled))
+        .collect();
+    assert_eq!(
+        entries,
+        [
+            ("a_view", RelationKind::View, false),
+            ("f", RelationKind::ForeignTable, false),
+            (
+                "m",
+                RelationKind::MaterializedView { populated: false },
+                false
+            ),
+            ("t", RelationKind::Table, true),
+        ]
+    );
+    assert!(!listing.truncated);
+}
+
+#[tokio::test]
+async fn ids_are_looked_up_across_kinds_and_rows_are_guarded() {
+    let missing = || async {
+        (
+            StatusCode::NOT_FOUND,
+            r#"{"error":"Cannot find a relation with ID 3"}"#,
+        )
+    };
+    let detail = |name: &'static str, extra: &'static str| {
+        get(move || async move {
+            format!(
+                r#"{{"id":3,"schema":"public","name":"{name}",{extra}"comment":null,
+                     "columns":[{{"ordinal_position":1,"name":"n","data_type":"integer",
+                     "format":"int4","is_nullable":true,"is_identity":false,
+                     "identity_generation":null,"default_value":null,"comment":null}}]}}"#
+            )
+        })
+    };
+    let url = serve(
+        Router::new()
+            .route("/pg/tables/{id}", get(missing))
+            .route("/pg/views/{id}", get(missing))
+            .route(
+                "/pg/materialized-views/{id}",
+                detail("m", r#""is_populated":false,"#),
+            )
+            // Reaching this would mean rows were read anyway.
+            .route(
+                "/pg/query",
+                post(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+            ),
+    )
+    .await;
+    let probe = loopback();
+    let found = probe.table(&url, &key(), 3).await.unwrap().unwrap();
+    assert_eq!(
+        found.table.kind,
+        RelationKind::MaterializedView { populated: false }
+    );
+    assert!(found.primary_key.is_empty());
+    assert_eq!(found.columns[0].name, "n");
+    assert_eq!(
+        probe
+            .rows(&url, &key(), &found, RowPageNumber::FIRST)
+            .await
+            .unwrap_err(),
+        MetaUnavailable::NotPopulated
+    );
+    let mut foreign = found.clone();
+    foreign.table.kind = RelationKind::ForeignTable;
+    assert_eq!(
+        probe
+            .rows(&url, &key(), &foreign, RowPageNumber::FIRST)
+            .await
+            .unwrap_err(),
+        MetaUnavailable::ForeignRows
+    );
+
+    // Not found at any of the four paths.
+    let url = serve(Router::new().fallback(missing)).await;
+    assert_eq!(probe.table(&url, &key(), 3).await.unwrap(), None);
+
+    // An answer about a different relation does not count: postgres-meta
+    // v0.100 does this for unknown foreign table IDs.
+    let url = serve(
+        Router::new()
+            .route("/pg/tables/{id}", get(missing))
+            .route("/pg/views/{id}", get(missing))
+            .route("/pg/materialized-views/{id}", get(missing))
+            .route("/pg/foreign-tables/{id}", detail("f", "")),
+    )
+    .await;
+    assert_eq!(probe.table(&url, &key(), 99).await.unwrap(), None);
+    assert!(probe.table(&url, &key(), 3).await.unwrap().is_some());
 }
 
 #[tokio::test]

@@ -15,9 +15,11 @@ pub const IDENTIFIER_MAX_BYTES: usize = 63;
 /// Most schemas listed for one project.
 pub const SCHEMA_LIST_LIMIT: usize = 500;
 
-/// Most tables listed for one schema. postgres-meta does not sort its
-/// results, so offset pages could skip or repeat tables; the dashboard reads
-/// up to this many, sorts them, and says when the list was cut off.
+/// Most relations listed for one schema, counting tables, views,
+/// materialized views, and foreign tables together. postgres-meta does not
+/// sort its results, so offset pages could skip or repeat entries; the
+/// dashboard reads up to this many of each kind, sorts them, keeps this
+/// many, and says when the list was cut off.
 pub const TABLE_LIST_LIMIT: usize = 1000;
 
 /// PostgreSQL's own limit on columns per table.
@@ -115,12 +117,49 @@ pub struct SchemaListing {
     pub truncated: bool,
 }
 
+/// What kind of relation a table editor entry is. postgres-meta lists each
+/// kind at its own path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RelationKind {
+    /// An ordinary or partitioned table.
+    Table,
+    View,
+    MaterializedView {
+        /// False until the first `REFRESH`; reading it fails until then.
+        populated: bool,
+    },
+    /// A table whose rows live elsewhere and are fetched through a foreign
+    /// data wrapper on every read.
+    ForeignTable,
+}
+
+impl RelationKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Table => "Table",
+            Self::View => "View",
+            Self::MaterializedView { .. } => "Materialized view",
+            Self::ForeignTable => "Foreign table",
+        }
+    }
+
+    /// Only tables have row-level security, statistics, and a size of
+    /// their own in postgres-meta's answers.
+    pub const fn is_table(self) -> bool {
+        matches!(self, Self::Table)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableSummary {
-    /// The table's OID, which identifies it in postgres-meta.
+    /// The relation's OID, which identifies it in postgres-meta.
     pub id: u32,
     pub schema: String,
     pub name: String,
+    pub kind: RelationKind,
+    /// The next four are only meaningful for [`RelationKind::Table`];
+    /// other kinds have `false`, `0`, and an empty size.
     pub rls_enabled: bool,
     pub rls_forced: bool,
     /// PostgreSQL's statistics estimate, not a count.
@@ -133,9 +172,10 @@ pub struct TableSummary {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableListing {
     pub schema: String,
-    /// Sorted by name.
+    /// Tables, views, materialized views, and foreign tables, sorted by
+    /// name.
     pub tables: Vec<TableSummary>,
-    /// More tables exist than [`TABLE_LIST_LIMIT`].
+    /// More relations exist than [`TABLE_LIST_LIMIT`].
     pub truncated: bool,
 }
 
@@ -389,6 +429,12 @@ pub enum MetaUnavailable {
     },
     /// The database stopped the read after [`ROW_QUERY_TIMEOUT_MS`].
     QueryTimeout,
+    /// A materialized view that has never been refreshed has no rows to
+    /// read; PostgreSQL refuses the query.
+    NotPopulated,
+    /// Rows of a foreign table are not read: each read goes to the remote
+    /// source, which may be slow, rate limited, or billed per request.
+    ForeignRows,
 }
 
 impl MetaUnavailable {
@@ -400,6 +446,8 @@ impl MetaUnavailable {
             Self::ServiceError { .. } => "postgres-meta reported an error",
             Self::Unreachable { .. } => "The stack could not be reached",
             Self::QueryTimeout => "The database took too long",
+            Self::NotPopulated => "This materialized view has no data yet",
+            Self::ForeignRows => "Rows of foreign tables are not shown",
         }
     }
 
@@ -434,6 +482,14 @@ impl MetaUnavailable {
                  large table take longer, because the database reads every earlier row first.",
                 ROW_QUERY_TIMEOUT_MS / 1000
             ),
+            Self::NotPopulated => "It was created WITH NO DATA and has not been refreshed. \
+                                   Run REFRESH MATERIALIZED VIEW on the database to fill it."
+                .to_owned(),
+            Self::ForeignRows => "Each read of a foreign table goes to its remote source \
+                                  through a foreign data wrapper, which can be slow, rate \
+                                  limited, or billed per request. The Definition tab lists its \
+                                  columns."
+                .to_owned(),
         }
     }
 }
@@ -504,6 +560,15 @@ mod tests {
         assert_eq!(RowPageNumber::FIRST.next().map(RowPageNumber::get), Some(2));
         assert!(serde_json::from_str::<RowPageNumber>("0").is_err());
         assert!(serde_json::from_str::<RowPageNumber>("3").is_ok());
+    }
+
+    #[test]
+    fn relation_kinds_serialize_with_a_tag() {
+        let json =
+            serde_json::to_string(&RelationKind::MaterializedView { populated: false }).unwrap();
+        assert_eq!(json, r#"{"kind":"materialized_view","populated":false}"#);
+        assert!(RelationKind::Table.is_table());
+        assert!(!RelationKind::View.is_table());
     }
 
     #[test]

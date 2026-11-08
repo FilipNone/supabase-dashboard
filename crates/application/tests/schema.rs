@@ -21,7 +21,7 @@ use supabase_dashboard_domain::{
     connection::{CredentialKind, SkipReason},
     project::ProjectUrl,
     schema::{
-        MetaUnavailable, RowOrder, RowPage, RowPageNumber, SchemaListing, SchemaName,
+        MetaUnavailable, RelationKind, RowOrder, RowPage, RowPageNumber, SchemaListing, SchemaName,
         SchemaSummary, TableDetail, TableListing, TableRelations, TableSummary,
     },
 };
@@ -54,6 +54,7 @@ fn table(id: u32, name: &str) -> TableSummary {
         id,
         schema: "public".into(),
         name: name.into(),
+        kind: RelationKind::Table,
         rls_enabled: false,
         rls_forced: false,
         live_rows_estimate: 0,
@@ -62,7 +63,8 @@ fn table(id: u32, name: &str) -> TableSummary {
     }
 }
 
-/// Records the key each call used. Table 7 exists; others do not. Reading
+/// Records the key each call used. Table 7 and view 9 exist; others do
+/// not. Reading
 /// foreign keys always times out, to show that the columns survive it.
 #[derive(Default)]
 struct FakeSource {
@@ -121,11 +123,22 @@ impl SchemaSource for FakeSource {
     ) -> MetaFuture<'a, Option<TableDetail>> {
         self.record(key);
         Box::pin(async move {
-            Ok((table_id == 7).then(|| TableDetail {
-                table: table(7, "todos"),
-                primary_key: vec!["id".into()],
-                columns: Vec::new(),
-            }))
+            Ok(match table_id {
+                7 => Some(TableDetail {
+                    table: table(7, "todos"),
+                    primary_key: vec!["id".into()],
+                    columns: Vec::new(),
+                }),
+                9 => Some(TableDetail {
+                    table: TableSummary {
+                        kind: RelationKind::View,
+                        ..table(9, "open_todos")
+                    },
+                    primary_key: Vec::new(),
+                    columns: Vec::new(),
+                }),
+                _ => None,
+            })
         })
     }
 
@@ -299,6 +312,12 @@ async fn every_member_can_browse_with_the_service_role_key() {
         schema.table(&viewer, id, 8).await,
         Err(SchemaError::TableNotFound)
     ));
+    // A view cannot have foreign keys, so they are not asked for.
+    let calls = f.source.keys.lock().unwrap().len();
+    let view = schema.table(&viewer, id, 9).await.unwrap().unwrap();
+    let relations = view.relations.unwrap();
+    assert!(relations.outgoing.is_empty() && relations.incoming.is_empty());
+    assert_eq!(f.source.keys.lock().unwrap().len(), calls + 1);
     // Rows of a table that does not exist are not requested at all.
     let calls = f.source.keys.lock().unwrap().len();
     assert!(matches!(

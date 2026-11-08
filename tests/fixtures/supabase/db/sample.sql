@@ -41,3 +41,16 @@ CREATE TABLE public.tag_notes (
   parent_id bigint REFERENCES public.tag_notes (id) ON DELETE SET NULL,
   FOREIGN KEY (tag_todo, tag_label) REFERENCES public.tags (todo_id, label) ON UPDATE CASCADE
 );
+
+-- Other relation kinds: a view, a materialized view that was never
+-- refreshed, and a foreign table whose server is never contacted.
+CREATE VIEW public.open_todos AS
+  SELECT id, title FROM public.todos WHERE status = 'open';
+CREATE MATERIALIZED VIEW public.todo_counts AS
+  SELECT status, count(*) AS n FROM public.todos GROUP BY status
+  WITH NO DATA;
+CREATE EXTENSION IF NOT EXISTS postgres_fdw;
+CREATE SERVER sample_remote FOREIGN DATA WRAPPER postgres_fdw
+  OPTIONS (host '127.0.0.1', dbname 'unused');
+CREATE FOREIGN TABLE public.remote_items (id integer, label text)
+  SERVER sample_remote;

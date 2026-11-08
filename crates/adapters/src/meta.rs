@@ -1,7 +1,9 @@
 //! Database structure from postgres-meta, which the standard self-hosted
 //! gateway exposes at `/pg/` for the service role only.
 //!
-//! Structure comes from three fixed GET paths. Table rows and foreign keys
+//! Structure comes from fixed GET paths: `/schemas`, and for tables,
+//! views, materialized views, and foreign tables each their own list and
+//! by-ID path. Table rows and foreign keys
 //! come from `POST /query` with statements this module builds itself: a
 //! single `SELECT` in a read-only transaction with a statement timeout,
 //! whose only inputs are identifiers read from postgres-meta just before
@@ -29,8 +31,8 @@ use supabase_dashboard_domain::{
         CELL_MAX_CHARS, COMMENT_MAX_CHARS, Cell, ColumnSummary, ENUM_LABEL_LIMIT,
         EXPRESSION_MAX_CHARS, FOREIGN_KEY_COLUMN_LIMIT, FOREIGN_KEY_LIST_LIMIT, ForeignKey,
         ForeignKeyAction, IDENTIFIER_MAX_BYTES, IdentityGeneration, MetaUnavailable,
-        ROW_COLUMN_LIMIT, ROW_PAGE_SIZE, ROW_QUERY_TIMEOUT_MS, RowColumn, RowOrder, RowPage,
-        RowPageNumber, SCHEMA_LIST_LIMIT, SchemaListing, SchemaName, SchemaSummary,
+        ROW_COLUMN_LIMIT, ROW_PAGE_SIZE, ROW_QUERY_TIMEOUT_MS, RelationKind, RowColumn, RowOrder,
+        RowPage, RowPageNumber, SCHEMA_LIST_LIMIT, SchemaListing, SchemaName, SchemaSummary,
         TABLE_COLUMN_LIMIT, TABLE_LIST_LIMIT, TYPE_NAME_MAX_CHARS, TableDetail, TableListing,
         TableRelations, TableSummary, bounded,
     },
@@ -167,20 +169,26 @@ impl GatewayProbe {
         schema: &SchemaName,
     ) -> Result<TableListing, MetaUnavailable> {
         let limit = (TABLE_LIST_LIMIT + 1).to_string();
-        let answer = self
-            .meta_get(
-                api_url,
-                key,
-                "/tables",
-                &[
-                    ("included_schemas", schema.as_str()),
-                    ("include_columns", "false"),
-                    ("limit", limit.as_str()),
-                ],
-                MAX_LIST_BODY_BYTES,
-            )
-            .await?;
-        decode_tables(schema, &body_of(answer)?)
+        let mut parts = Vec::with_capacity(RelationPath::ALL.len());
+        // One after another rather than at once, so a listing holds one
+        // connection on the stack like every other request.
+        for path in RelationPath::ALL {
+            let answer = self
+                .meta_get(
+                    api_url,
+                    key,
+                    path.list(),
+                    &[
+                        ("included_schemas", schema.as_str()),
+                        ("include_columns", "false"),
+                        ("limit", limit.as_str()),
+                    ],
+                    MAX_LIST_BODY_BYTES,
+                )
+                .await?;
+            parts.push(decode_tables(schema, path, &body_of(answer)?)?);
+        }
+        Ok(merge_listings(schema, parts))
     }
 
     async fn get_table(
@@ -189,14 +197,28 @@ impl GatewayProbe {
         key: &SecretString,
         table_id: u32,
     ) -> Result<Option<TableDetail>, MetaUnavailable> {
-        let path = format!("/tables/{table_id}");
-        match self
-            .meta_get(api_url, key, &path, &[], MAX_TABLE_BODY_BYTES)
-            .await?
-        {
-            Answer::MetaNotFound => Ok(None),
-            Answer::Body(body) => decode_table(&body).map(Some),
+        // An ID names one relation, but postgres-meta looks each kind up
+        // at its own path, so the kinds are tried in order of how common
+        // they are.
+        for path in RelationPath::ALL {
+            let by_id = format!("{}/{table_id}", path.list());
+            match self
+                .meta_get(api_url, key, &by_id, &[], MAX_TABLE_BODY_BYTES)
+                .await?
+            {
+                Answer::MetaNotFound => continue,
+                Answer::Body(body) => {
+                    let detail = decode_table(path, &body)?;
+                    // postgres-meta v0.100 answers `/foreign-tables/{id}`
+                    // for an unknown ID with some other foreign table, so
+                    // only an answer for this exact ID counts.
+                    if detail.table.id == table_id {
+                        return Ok(Some(detail));
+                    }
+                }
+            }
         }
+        Ok(None)
     }
 
     async fn read_rows(
@@ -206,6 +228,13 @@ impl GatewayProbe {
         table: &TableDetail,
         page: RowPageNumber,
     ) -> Result<RowPage, MetaUnavailable> {
+        match table.table.kind {
+            RelationKind::MaterializedView { populated: false } => {
+                return Err(MetaUnavailable::NotPopulated);
+            }
+            RelationKind::ForeignTable => return Err(MetaUnavailable::ForeignRows),
+            _ => {}
+        }
         let plan = RowQuery::new(table, page)?;
         let body =
             serde_json::to_vec(&serde_json::json!({ "query": plan.sql })).map_err(|_| invalid())?;
@@ -552,11 +581,41 @@ struct RawSchema {
     owner: String,
 }
 
+/// The postgres-meta path for each kind of relation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelationPath {
+    Tables,
+    Views,
+    MaterializedViews,
+    ForeignTables,
+}
+
+impl RelationPath {
+    const ALL: [Self; 4] = [
+        Self::Tables,
+        Self::Views,
+        Self::MaterializedViews,
+        Self::ForeignTables,
+    ];
+
+    const fn list(self) -> &'static str {
+        match self {
+            Self::Tables => "/tables",
+            Self::Views => "/views",
+            Self::MaterializedViews => "/materialized-views",
+            Self::ForeignTables => "/foreign-tables",
+        }
+    }
+}
+
+/// One relation of any kind. Only tables carry the security, statistics,
+/// and size fields, and only materialized views `is_populated`.
 #[derive(Deserialize)]
 struct RawTable {
     id: i64,
     schema: String,
     name: String,
+    #[serde(default)]
     rls_enabled: bool,
     #[serde(default)]
     rls_forced: bool,
@@ -565,6 +624,7 @@ struct RawTable {
     #[serde(default)]
     size: String,
     comment: Option<String>,
+    is_populated: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -628,20 +688,44 @@ fn decode_schemas(body: &[u8]) -> Result<SchemaListing, MetaUnavailable> {
     Ok(SchemaListing { schemas, truncated })
 }
 
-fn table_summary(raw: RawTable) -> Result<TableSummary, MetaUnavailable> {
+fn table_summary(path: RelationPath, raw: RawTable) -> Result<TableSummary, MetaUnavailable> {
+    let kind = match path {
+        RelationPath::Tables => RelationKind::Table,
+        RelationPath::Views => RelationKind::View,
+        RelationPath::MaterializedViews => RelationKind::MaterializedView {
+            populated: raw.is_populated.ok_or_else(invalid)?,
+        },
+        RelationPath::ForeignTables => RelationKind::ForeignTable,
+    };
+    let table = kind.is_table();
     Ok(TableSummary {
         id: u32::try_from(raw.id).map_err(|_| invalid())?,
         schema: name(&raw.schema),
         name: name(&raw.name),
-        rls_enabled: raw.rls_enabled,
-        rls_forced: raw.rls_forced,
-        live_rows_estimate: raw.live_rows_estimate.max(0),
-        size: bounded(&raw.size, 32),
+        kind,
+        rls_enabled: table && raw.rls_enabled,
+        rls_forced: table && raw.rls_forced,
+        live_rows_estimate: if table {
+            raw.live_rows_estimate.max(0)
+        } else {
+            0
+        },
+        size: if table {
+            bounded(&raw.size, 32)
+        } else {
+            String::new()
+        },
         comment: optional_text(raw.comment, COMMENT_MAX_CHARS),
     })
 }
 
-fn decode_tables(schema: &SchemaName, body: &[u8]) -> Result<TableListing, MetaUnavailable> {
+/// One kind's list. `truncated` means that kind alone had more than
+/// [`TABLE_LIST_LIMIT`] entries.
+fn decode_tables(
+    schema: &SchemaName,
+    path: RelationPath,
+    body: &[u8],
+) -> Result<TableListing, MetaUnavailable> {
     let raw: Vec<RawTable> = serde_json::from_slice(body).map_err(|_| invalid())?;
     let truncated = raw.len() > TABLE_LIST_LIMIT;
     let mut tables = raw
@@ -650,7 +734,7 @@ fn decode_tables(schema: &SchemaName, body: &[u8]) -> Result<TableListing, MetaU
         // The filter is applied by postgres-meta; this keeps a service that
         // ignored it from mixing in other schemas.
         .filter(|t| t.schema == schema.as_str())
-        .map(table_summary)
+        .map(|raw| table_summary(path, raw))
         .collect::<Result<Vec<_>, _>>()?;
     tables.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(TableListing {
@@ -658,6 +742,24 @@ fn decode_tables(schema: &SchemaName, body: &[u8]) -> Result<TableListing, MetaU
         tables,
         truncated,
     })
+}
+
+/// All kinds in one list sorted by name, cut to [`TABLE_LIST_LIMIT`]. A
+/// kind that was cut on its own may be missing names that sort early, so
+/// the result is flagged then too.
+fn merge_listings(schema: &SchemaName, parts: Vec<TableListing>) -> TableListing {
+    let mut truncated = parts.iter().any(|part| part.truncated);
+    let mut tables: Vec<TableSummary> = parts.into_iter().flat_map(|part| part.tables).collect();
+    tables.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+    if tables.len() > TABLE_LIST_LIMIT {
+        tables.truncate(TABLE_LIST_LIMIT);
+        truncated = true;
+    }
+    TableListing {
+        schema: schema.as_str().to_owned(),
+        tables,
+        truncated,
+    }
 }
 
 fn decode_column(raw: RawColumn) -> Result<ColumnSummary, MetaUnavailable> {
@@ -691,7 +793,7 @@ fn decode_column(raw: RawColumn) -> Result<ColumnSummary, MetaUnavailable> {
     })
 }
 
-fn decode_table(body: &[u8]) -> Result<TableDetail, MetaUnavailable> {
+fn decode_table(path: RelationPath, body: &[u8]) -> Result<TableDetail, MetaUnavailable> {
     let raw: RawTableDetail = serde_json::from_slice(body).map_err(|_| invalid())?;
     if raw.columns.len() > TABLE_COLUMN_LIMIT {
         return Err(invalid());
@@ -703,7 +805,7 @@ fn decode_table(body: &[u8]) -> Result<TableDetail, MetaUnavailable> {
         .collect::<Result<Vec<_>, _>>()?;
     columns.sort_by_key(|c| c.position);
     Ok(TableDetail {
-        table: table_summary(raw.table)?,
+        table: table_summary(path, raw.table)?,
         primary_key: raw
             .primary_keys
             .iter()
@@ -749,6 +851,7 @@ mod tests {
         let schema = SchemaName::parse("public").unwrap();
         let listing = decode_tables(
             &schema,
+            RelationPath::Tables,
             br#"[{"id":20,"schema":"public","name":"todos","rls_enabled":true,
                   "live_rows_estimate":3,"size":"16 kB","comment":null},
                  {"id":10,"schema":"auth","name":"users","rls_enabled":false,
@@ -769,6 +872,7 @@ mod tests {
         let schema = SchemaName::parse("public").unwrap();
         let result = decode_tables(
             &schema,
+            RelationPath::Tables,
             br#"[{"id":-5,"schema":"public","name":"t","rls_enabled":false,"comment":null}]"#,
         );
         assert_eq!(result.unwrap_err(), invalid());
@@ -778,6 +882,7 @@ mod tests {
     #[test]
     fn table_detail_is_decoded() {
         let detail = decode_table(
+            RelationPath::Tables,
             br#"{"id":20,"schema":"public","name":"todos","rls_enabled":true,"rls_forced":false,
                  "live_rows_estimate":0,"size":"24 kB","comment":null,
                  "primary_keys":[{"schema":"public","table_name":"todos","name":"id","table_id":20}],
@@ -812,7 +917,7 @@ mod tests {
         let body = format!(
             r#"{{"id":1,"schema":"public","name":"t","rls_enabled":false,"comment":"{long}","columns":[]}}"#
         );
-        let detail = decode_table(body.as_bytes()).unwrap();
+        let detail = decode_table(RelationPath::Tables, body.as_bytes()).unwrap();
         assert_eq!(
             detail.table.comment.unwrap().chars().count(),
             COMMENT_MAX_CHARS
@@ -841,6 +946,7 @@ mod tests {
                 id: 1,
                 schema: schema.into(),
                 name: name.into(),
+                kind: RelationKind::Table,
                 rls_enabled: false,
                 rls_forced: false,
                 live_rows_estimate: 0,
