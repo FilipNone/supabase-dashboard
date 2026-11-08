@@ -205,7 +205,7 @@ Release checks include a fresh installation, migration from the previous support
 
 ## Revision history
 
-- 2026-11-08: M2 schema browsing: a read-only table editor for schemas, tables, and columns through postgres-meta behind the gateway, and the fixture now routes `/pg/` and loads a synthetic sample schema. Updated the second and fourth M2 items.
+- 2026-11-08: M2 schema browsing: a read-only table editor for schemas, tables, and columns through postgres-meta behind the gateway, and the fixture now routes `/pg/` and loads a synthetic sample schema. Updated the second and fourth M2 items. Released as `v0.1.0-dev.3`.
 - 2026-11-08: planned the Dokploy integration as the first M4 provider: detecting the dashboard's own Dokploy project and environment, creating stacks there by default, adopting existing Supabase services, and separate remove and destroy actions. The M6 Dokploy item now covers only the integrations page.
 
 - 2026-11-08: M2 API keys and health checks: encrypted anon and service role key storage, a gateway health check for Auth and REST with an SSRF address policy, the Kong gateway in the fixture, and release `v0.1.0-dev.2`. Updated the first, second, third, and last M2 items.
