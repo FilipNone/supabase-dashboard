@@ -72,8 +72,8 @@ async fn fixture_gateway_reports_auth_and_rest() {
 async fn fixture_meta_lists_structure() {
     use supabase_dashboard_application::schema::SchemaSource;
     use supabase_dashboard_domain::schema::{
-        CELL_MAX_CHARS, IdentityGeneration, MetaUnavailable, ROW_PAGE_SIZE, RowOrder,
-        RowPageNumber, SchemaName,
+        CELL_MAX_CHARS, ForeignKeyAction, IdentityGeneration, MetaUnavailable, ROW_PAGE_SIZE,
+        RowOrder, RowPageNumber, SchemaName,
     };
 
     let Ok(raw) = std::env::var(ENV) else {
@@ -109,8 +109,9 @@ async fn fixture_meta_lists_structure() {
     let public = SchemaName::parse("public").unwrap();
     let tables = probe.tables(&url, &service, &public).await.unwrap();
     let names: Vec<_> = tables.tables.iter().map(|t| t.name.as_str()).collect();
-    assert_eq!(names, [r#"Event "Log""#, "tags", "todos"]);
-    let todos = &tables.tables[2];
+    assert_eq!(names, [r#"Event "Log""#, "tag_notes", "tags", "todos"]);
+    let by_name = |name: &str| tables.tables.iter().find(|t| t.name == name).unwrap();
+    let todos = by_name("todos");
     assert!(todos.rls_enabled);
     assert_eq!(todos.comment.as_deref(), Some("Synthetic fixture table"));
 
@@ -149,7 +150,7 @@ async fn fixture_meta_lists_structure() {
     assert_eq!(text(1, 1), Some("second"));
     assert_eq!(text(0, 4), None);
 
-    let tags = &tables.tables[1];
+    let tags = by_name("tags");
     let detail = probe.table(&url, &service, tags.id).await.unwrap().unwrap();
     assert_eq!(detail.primary_key, ["todo_id", "label"]);
     let rows = probe
@@ -159,7 +160,7 @@ async fn fixture_meta_lists_structure() {
     assert!(rows.rows.is_empty() && !rows.has_more);
 
     // Quoted names, no primary key, several pages, and long values.
-    let log = &tables.tables[0];
+    let log = by_name(r#"Event "Log""#);
     let detail = probe.table(&url, &service, log.id).await.unwrap().unwrap();
     assert!(detail.primary_key.is_empty());
     let first = probe
@@ -189,4 +190,61 @@ async fn fixture_meta_lists_structure() {
 
     // postgres-meta's own 404 means no such table.
     assert_eq!(probe.table(&url, &service, u32::MAX).await.unwrap(), None);
+
+    // Foreign keys keep their column pairs in key order, whatever the
+    // order the columns were declared in, and a key from a table to
+    // itself shows in both directions.
+    let notes = by_name("tag_notes");
+    let relations = probe.relations(&url, &service, notes.id).await.unwrap();
+    assert!(!relations.truncated);
+    let outgoing: Vec<_> = relations
+        .outgoing
+        .iter()
+        .map(|k| {
+            (
+                k.referenced_table.as_str(),
+                k.columns.clone(),
+                k.referenced_columns.clone(),
+                k.on_update,
+                k.on_delete,
+            )
+        })
+        .collect();
+    assert_eq!(
+        outgoing,
+        [
+            (
+                "tag_notes",
+                vec!["parent_id".to_owned()],
+                vec!["id".to_owned()],
+                ForeignKeyAction::NoAction,
+                ForeignKeyAction::SetNull,
+            ),
+            (
+                "tags",
+                vec!["tag_todo".to_owned(), "tag_label".to_owned()],
+                vec!["todo_id".to_owned(), "label".to_owned()],
+                ForeignKeyAction::Cascade,
+                ForeignKeyAction::NoAction,
+            ),
+        ]
+    );
+    let incoming: Vec<_> = relations
+        .incoming
+        .iter()
+        .map(|k| k.table.as_str())
+        .collect();
+    assert_eq!(incoming, ["tag_notes"]);
+
+    let relations = probe.relations(&url, &service, todos.id).await.unwrap();
+    assert!(relations.outgoing.is_empty());
+    let incoming: Vec<_> = relations
+        .incoming
+        .iter()
+        .map(|k| (k.table.as_str(), k.on_delete))
+        .collect();
+    assert_eq!(incoming, [("tags", ForeignKeyAction::Cascade)]);
+
+    let none = probe.relations(&url, &service, u32::MAX).await.unwrap();
+    assert!(none.outgoing.is_empty() && none.incoming.is_empty());
 }

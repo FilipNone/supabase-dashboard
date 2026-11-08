@@ -22,7 +22,7 @@ use supabase_dashboard_domain::{
     project::ProjectUrl,
     schema::{
         MetaUnavailable, RowOrder, RowPage, RowPageNumber, SchemaListing, SchemaName,
-        SchemaSummary, TableDetail, TableListing, TableSummary,
+        SchemaSummary, TableDetail, TableListing, TableRelations, TableSummary,
     },
 };
 use supabase_dashboard_persistence::{Database, accounts::AccountRecord};
@@ -62,7 +62,8 @@ fn table(id: u32, name: &str) -> TableSummary {
     }
 }
 
-/// Records the key each call used. Table 7 exists; others do not.
+/// Records the key each call used. Table 7 exists; others do not. Reading
+/// foreign keys always times out, to show that the columns survive it.
 #[derive(Default)]
 struct FakeSource {
     keys: Mutex<Vec<String>>,
@@ -147,6 +148,16 @@ impl SchemaSource for FakeSource {
                 order: RowOrder::PrimaryKey(table.primary_key.clone()),
             })
         })
+    }
+
+    fn relations<'a>(
+        &'a self,
+        _api_url: &'a ProjectUrl,
+        key: &'a SecretString,
+        _table_id: u32,
+    ) -> MetaFuture<'a, TableRelations> {
+        self.record(key);
+        Box::pin(async { Err(MetaUnavailable::QueryTimeout) })
     }
 }
 
@@ -276,8 +287,9 @@ async fn every_member_can_browse_with_the_service_role_key() {
         assert_eq!(listing.schemas[0].name, "public");
         let tables = schema.tables(who, id, &public).await.unwrap().unwrap();
         assert_eq!(tables.tables[0].id, 7);
-        let detail = schema.table(who, id, 7).await.unwrap().unwrap();
-        assert_eq!(detail.primary_key, ["id"]);
+        let definition = schema.table(who, id, 7).await.unwrap().unwrap();
+        assert_eq!(definition.detail.primary_key, ["id"]);
+        assert_eq!(definition.relations, Err(MetaUnavailable::QueryTimeout));
         let page = RowPageNumber::new(3).unwrap();
         let rows = schema.rows(who, id, 7, page).await.unwrap().unwrap();
         assert_eq!(rows.page, page);

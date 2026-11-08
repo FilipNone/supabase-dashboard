@@ -108,6 +108,8 @@ SELECT left(("col")::text, 201) AS c0, ... FROM "schema"."table" ORDER BY "pk" L
 
 Names come from postgres-meta and are always double-quoted, with embedded quotes doubled; a name longer than 63 bytes or containing a NUL byte is refused instead of sent. The only other inputs are integers. Both settings stay inside the statement's implicit transaction, so nothing changes on postgres-meta's pooled connection. postgres-meta's own `statementTimeoutSecs` option is not used because it sets the timeout for the whole session.
 
+The Definition tab also lists foreign keys: the ones on the table, and the ones on other tables that point at it. They come from a second generated statement to `POST /pg/query` that reads `pg_catalog.pg_constraint` in the same kind of read-only transaction with the same 5 second timeout. Its only input is the table's OID, an integer. postgres-meta's own `relationships` field is not used, because it matches key columns with `= any(...)` and so cannot say which column pairs with which in a key of more than one column. At most 200 keys are listed. If this read fails, the columns are still shown, with the failure in the foreign key section.
+
 Limits: the first 50 columns, 200 characters per value (cut on the server), pages 1 to 2000, and a 4 MiB response. Tables without a primary key are read in no particular order and the page says so. A statement timeout (SQLSTATE 57014) is reported as its own state; other database errors only as "postgres-meta answered HTTP 400", because their text can contain data. Rows are read as postgres-meta's database role, which in a standard stack bypasses row-level security; every member role, viewers included, can read them.
 
 ## Endpoints

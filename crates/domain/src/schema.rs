@@ -1,5 +1,5 @@
 //! Database structure read from a stack's postgres-meta service: schemas,
-//! tables, and columns. Read-only.
+//! tables, columns, and foreign keys. Read-only.
 //!
 //! Everything here comes from a remote service, so every list and string is
 //! bounded before it reaches the browser, and failures are fixed states
@@ -194,6 +194,82 @@ pub struct TableDetail {
     pub columns: Vec<ColumnSummary>,
 }
 
+/// Most foreign keys read for one table, counting both directions.
+pub const FOREIGN_KEY_LIST_LIMIT: usize = 200;
+/// PostgreSQL's limit on columns in one key (`INDEX_MAX_KEYS`).
+pub const FOREIGN_KEY_COLUMN_LIMIT: usize = 32;
+
+/// What a foreign key does when the row it points to is updated or deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForeignKeyAction {
+    NoAction,
+    Restrict,
+    Cascade,
+    SetNull,
+    SetDefault,
+}
+
+impl ForeignKeyAction {
+    /// The one-letter code PostgreSQL stores in `pg_constraint`.
+    pub fn from_code(code: &str) -> Option<Self> {
+        match code {
+            "a" => Some(Self::NoAction),
+            "r" => Some(Self::Restrict),
+            "c" => Some(Self::Cascade),
+            "n" => Some(Self::SetNull),
+            "d" => Some(Self::SetDefault),
+            _ => None,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::NoAction => "No action",
+            Self::Restrict => "Restrict",
+            Self::Cascade => "Cascade",
+            Self::SetNull => "Set null",
+            Self::SetDefault => "Set default",
+        }
+    }
+}
+
+/// A foreign key constraint. `columns[i]` points at
+/// `referenced_columns[i]`; both are in key order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForeignKey {
+    pub name: String,
+    pub schema: String,
+    pub table: String,
+    pub columns: Vec<String>,
+    pub referenced_schema: String,
+    pub referenced_table: String,
+    pub referenced_columns: Vec<String>,
+    pub on_update: ForeignKeyAction,
+    pub on_delete: ForeignKeyAction,
+}
+
+/// The foreign keys that touch one table. A key from the table to itself
+/// is in both lists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableRelations {
+    /// Keys on this table, sorted by name.
+    pub outgoing: Vec<ForeignKey>,
+    /// Keys on other tables that point at this one, sorted by table and
+    /// name.
+    pub incoming: Vec<ForeignKey>,
+    /// More keys exist than [`FOREIGN_KEY_LIST_LIMIT`].
+    pub truncated: bool,
+}
+
+/// What the Definition tab shows. The keys are read separately, so a
+/// failure there still leaves the columns visible.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableDefinition {
+    pub detail: TableDetail,
+    pub relations: Result<TableRelations, MetaUnavailable>,
+}
+
 /// A page number for table data, from 1 to [`ROW_PAGE_LIMIT`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "u32", into = "u32")]
@@ -354,8 +430,8 @@ impl MetaUnavailable {
             ),
             Self::Unreachable { reason } => reason.message().to_owned(),
             Self::QueryTimeout => format!(
-                "PostgreSQL stopped reading this page after {} seconds. Later pages of a large \
-                 table take longer, because the database reads every earlier row first.",
+                "PostgreSQL stopped the read after {} seconds. For table data, later pages of a \
+                 large table take longer, because the database reads every earlier row first.",
                 ROW_QUERY_TIMEOUT_MS / 1000
             ),
         }
@@ -428,6 +504,24 @@ mod tests {
         assert_eq!(RowPageNumber::FIRST.next().map(RowPageNumber::get), Some(2));
         assert!(serde_json::from_str::<RowPageNumber>("0").is_err());
         assert!(serde_json::from_str::<RowPageNumber>("3").is_ok());
+    }
+
+    #[test]
+    fn foreign_key_actions_are_read_from_catalog_codes() {
+        assert_eq!(
+            ForeignKeyAction::from_code("a"),
+            Some(ForeignKeyAction::NoAction)
+        );
+        assert_eq!(
+            ForeignKeyAction::from_code("c"),
+            Some(ForeignKeyAction::Cascade)
+        );
+        assert_eq!(
+            ForeignKeyAction::from_code("d"),
+            Some(ForeignKeyAction::SetDefault)
+        );
+        assert_eq!(ForeignKeyAction::from_code("x"), None);
+        assert_eq!(ForeignKeyAction::from_code("cc"), None);
     }
 
     #[test]

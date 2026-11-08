@@ -1,11 +1,17 @@
 //! Database structure from postgres-meta, which the standard self-hosted
 //! gateway exposes at `/pg/` for the service role only.
 //!
-//! Structure comes from three fixed GET paths. Table rows come from
-//! `POST /query` with a statement this module builds itself: a single
-//! `SELECT` in a read-only transaction with a statement timeout, whose only
-//! inputs are identifiers read from postgres-meta just before (always
-//! quoted) and integers. Nothing a dashboard user types reaches the SQL.
+//! Structure comes from three fixed GET paths. Table rows and foreign keys
+//! come from `POST /query` with statements this module builds itself: a
+//! single `SELECT` in a read-only transaction with a statement timeout,
+//! whose only inputs are identifiers read from postgres-meta just before
+//! (always quoted) and integers. Nothing a dashboard user types reaches the
+//! SQL.
+//!
+//! Foreign keys are read from `pg_constraint` rather than from the
+//! `relationships` field of postgres-meta's table detail, which joins key
+//! columns with `= any(...)` and so loses which column pairs with which in
+//! a key of more than one column.
 //!
 //! No `x-connection-encrypted` header is ever sent, so postgres-meta uses
 //! its own configured database connection; the dashboard holds no database
@@ -21,11 +27,12 @@ use supabase_dashboard_domain::{
     project::ProjectUrl,
     schema::{
         CELL_MAX_CHARS, COMMENT_MAX_CHARS, Cell, ColumnSummary, ENUM_LABEL_LIMIT,
-        EXPRESSION_MAX_CHARS, IDENTIFIER_MAX_BYTES, IdentityGeneration, MetaUnavailable,
+        EXPRESSION_MAX_CHARS, FOREIGN_KEY_COLUMN_LIMIT, FOREIGN_KEY_LIST_LIMIT, ForeignKey,
+        ForeignKeyAction, IDENTIFIER_MAX_BYTES, IdentityGeneration, MetaUnavailable,
         ROW_COLUMN_LIMIT, ROW_PAGE_SIZE, ROW_QUERY_TIMEOUT_MS, RowColumn, RowOrder, RowPage,
         RowPageNumber, SCHEMA_LIST_LIMIT, SchemaListing, SchemaName, SchemaSummary,
         TABLE_COLUMN_LIMIT, TABLE_LIST_LIMIT, TYPE_NAME_MAX_CHARS, TableDetail, TableListing,
-        TableSummary, bounded,
+        TableRelations, TableSummary, bounded,
     },
 };
 
@@ -40,6 +47,9 @@ const MAX_TABLE_BODY_BYTES: usize = 4 * 1024 * 1024;
 /// up to 50 cells of 201 characters, so even with every character escaped
 /// it stays below this.
 const MAX_ROWS_BODY_BYTES: usize = 4 * 1024 * 1024;
+/// Largest response read for a table's foreign keys: at most 201 keys of
+/// up to 32 column pairs, with names of at most 63 bytes.
+const MAX_RELATIONS_BODY_BYTES: usize = 4 * 1024 * 1024;
 /// Largest error body read; only its shape and SQLSTATE code are used.
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 /// SQLSTATE `query_canceled`, which a statement timeout raises.
@@ -221,6 +231,28 @@ impl GatewayProbe {
             order: plan.order,
         })
     }
+
+    async fn read_relations(
+        &self,
+        api_url: &ProjectUrl,
+        key: &SecretString,
+        table_id: u32,
+    ) -> Result<TableRelations, MetaUnavailable> {
+        let body = serde_json::to_vec(&serde_json::json!({ "query": relations_sql(table_id) }))
+            .map_err(|_| invalid())?;
+        let answer = self
+            .meta_send(
+                Method::POST,
+                api_url,
+                key,
+                "/query",
+                &[],
+                Some(body),
+                MAX_RELATIONS_BODY_BYTES,
+            )
+            .await?;
+        decode_relations(&body_of(answer)?)
+    }
 }
 
 impl SchemaSource for GatewayProbe {
@@ -258,6 +290,15 @@ impl SchemaSource for GatewayProbe {
         page: RowPageNumber,
     ) -> MetaFuture<'a, RowPage> {
         Box::pin(self.read_rows(api_url, key, table, page))
+    }
+
+    fn relations<'a>(
+        &'a self,
+        api_url: &'a ProjectUrl,
+        key: &'a SecretString,
+        table_id: u32,
+    ) -> MetaFuture<'a, TableRelations> {
+        Box::pin(self.read_relations(api_url, key, table_id))
     }
 }
 
@@ -338,6 +379,102 @@ impl RowQuery {
             order,
         })
     }
+}
+
+/// The statement for the foreign keys on or pointing at one table. Its
+/// only input is the table's OID. Key columns are listed in key order by
+/// walking `conkey` and `confkey` with their ordinals, so the two lists pair
+/// up. Keys on the table itself come first, then keys on other tables.
+fn relations_sql(table_id: u32) -> String {
+    format!(
+        "SET TRANSACTION READ ONLY; SET LOCAL statement_timeout = {ROW_QUERY_TIMEOUT_MS}; \
+         SELECT c.conname::text AS name, \
+         sn.nspname::text AS schema, sc.relname::text AS \"table\", \
+         tn.nspname::text AS referenced_schema, tc.relname::text AS referenced_table, \
+         array(SELECT a.attname::text FROM unnest(c.conkey) WITH ORDINALITY AS k(num, ord) \
+         JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.num \
+         ORDER BY k.ord) AS columns, \
+         array(SELECT a.attname::text FROM unnest(c.confkey) WITH ORDINALITY AS k(num, ord) \
+         JOIN pg_catalog.pg_attribute a ON a.attrelid = c.confrelid AND a.attnum = k.num \
+         ORDER BY k.ord) AS referenced_columns, \
+         c.confupdtype::text AS on_update, c.confdeltype::text AS on_delete, \
+         c.conrelid = {table_id} AS outgoing, c.confrelid = {table_id} AS incoming \
+         FROM pg_catalog.pg_constraint c \
+         JOIN pg_catalog.pg_class sc ON sc.oid = c.conrelid \
+         JOIN pg_catalog.pg_namespace sn ON sn.oid = sc.relnamespace \
+         JOIN pg_catalog.pg_class tc ON tc.oid = c.confrelid \
+         JOIN pg_catalog.pg_namespace tn ON tn.oid = tc.relnamespace \
+         WHERE c.contype = 'f' AND (c.conrelid = {table_id} OR c.confrelid = {table_id}) \
+         ORDER BY c.conrelid = {table_id} DESC, sn.nspname, sc.relname, c.conname \
+         LIMIT {}",
+        FOREIGN_KEY_LIST_LIMIT + 1
+    )
+}
+
+#[derive(Deserialize)]
+struct RawForeignKey {
+    name: String,
+    schema: String,
+    table: String,
+    referenced_schema: String,
+    referenced_table: String,
+    columns: Vec<String>,
+    referenced_columns: Vec<String>,
+    on_update: String,
+    on_delete: String,
+    outgoing: bool,
+    incoming: bool,
+}
+
+fn decode_foreign_key(raw: &RawForeignKey) -> Result<ForeignKey, MetaUnavailable> {
+    if raw.columns.is_empty()
+        || raw.columns.len() > FOREIGN_KEY_COLUMN_LIMIT
+        || raw.columns.len() != raw.referenced_columns.len()
+    {
+        return Err(invalid());
+    }
+    let action = |code: &str| ForeignKeyAction::from_code(code).ok_or_else(invalid);
+    Ok(ForeignKey {
+        name: name(&raw.name),
+        schema: name(&raw.schema),
+        table: name(&raw.table),
+        columns: raw.columns.iter().map(|c| name(c)).collect(),
+        referenced_schema: name(&raw.referenced_schema),
+        referenced_table: name(&raw.referenced_table),
+        referenced_columns: raw.referenced_columns.iter().map(|c| name(c)).collect(),
+        on_update: action(&raw.on_update)?,
+        on_delete: action(&raw.on_delete)?,
+    })
+}
+
+fn decode_relations(body: &[u8]) -> Result<TableRelations, MetaUnavailable> {
+    let raw: Vec<RawForeignKey> = serde_json::from_slice(body).map_err(|_| invalid())?;
+    if raw.len() > FOREIGN_KEY_LIST_LIMIT + 1 {
+        return Err(invalid());
+    }
+    let truncated = raw.len() > FOREIGN_KEY_LIST_LIMIT;
+    let mut relations = TableRelations {
+        outgoing: Vec::new(),
+        incoming: Vec::new(),
+        truncated,
+    };
+    for raw in raw.iter().take(FOREIGN_KEY_LIST_LIMIT) {
+        let key = decode_foreign_key(raw)?;
+        match (raw.outgoing, raw.incoming) {
+            (true, true) => {
+                relations.incoming.push(key.clone());
+                relations.outgoing.push(key);
+            }
+            (true, false) => relations.outgoing.push(key),
+            (false, true) => relations.incoming.push(key),
+            (false, false) => return Err(invalid()),
+        }
+    }
+    relations.outgoing.sort_by(|a, b| a.name.cmp(&b.name));
+    relations
+        .incoming
+        .sort_by(|a, b| (&a.schema, &a.table, &a.name).cmp(&(&b.schema, &b.table, &b.name)));
+    Ok(relations)
 }
 
 fn cell(text: String) -> Cell {
@@ -815,5 +952,73 @@ mod tests {
             br#"{"message":"no Route matched with those values"}"#
         ));
         assert!(!is_meta_error(b"Not Found"));
+    }
+
+    fn raw_key(name: &str, outgoing: bool, incoming: bool) -> serde_json::Value {
+        serde_json::json!({
+            "name": name, "schema": "public", "table": "tags",
+            "referenced_schema": "public", "referenced_table": "todos",
+            "columns": ["todo_id", "owner"], "referenced_columns": ["id", "owner"],
+            "on_update": "a", "on_delete": "c",
+            "outgoing": outgoing, "incoming": incoming,
+        })
+    }
+
+    #[test]
+    fn relation_query_takes_only_the_table_id() {
+        let sql = relations_sql(16_384);
+        assert!(sql.starts_with("SET TRANSACTION READ ONLY; SET LOCAL statement_timeout = "));
+        assert!(sql.contains("c.conrelid = 16384 OR c.confrelid = 16384"));
+        assert!(sql.contains("WITH ORDINALITY"));
+        assert!(sql.ends_with(&format!("LIMIT {}", FOREIGN_KEY_LIST_LIMIT + 1)));
+        assert_eq!(sql.matches(';').count(), 2, "one SELECT after the settings");
+    }
+
+    #[test]
+    fn relations_are_split_by_direction_and_keep_column_pairs() {
+        let body = serde_json::to_vec(&serde_json::json!([
+            raw_key("z_out", true, false),
+            raw_key("a_out", true, false),
+            raw_key("self", true, true),
+            raw_key("in", false, true),
+        ]))
+        .unwrap();
+        let relations = decode_relations(&body).unwrap();
+        let names = |keys: &[ForeignKey]| keys.iter().map(|k| k.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&relations.outgoing), ["a_out", "self", "z_out"]);
+        assert_eq!(names(&relations.incoming), ["in", "self"]);
+        assert!(!relations.truncated);
+        let key = &relations.outgoing[0];
+        assert_eq!(key.columns, ["todo_id", "owner"]);
+        assert_eq!(key.referenced_columns, ["id", "owner"]);
+        assert_eq!(key.on_update, ForeignKeyAction::NoAction);
+        assert_eq!(key.on_delete, ForeignKeyAction::Cascade);
+    }
+
+    #[test]
+    fn malformed_relations_are_invalid() {
+        let decode =
+            |value: serde_json::Value| decode_relations(&serde_json::to_vec(&value).unwrap());
+        let mut uneven = raw_key("k", true, false);
+        uneven["referenced_columns"] = serde_json::json!(["id"]);
+        assert!(decode(serde_json::json!([uneven])).is_err());
+        let mut action = raw_key("k", true, false);
+        action["on_delete"] = serde_json::json!("x");
+        assert!(decode(serde_json::json!([action])).is_err());
+        assert!(decode(serde_json::json!([raw_key("k", false, false)])).is_err());
+        let mut empty = raw_key("k", true, false);
+        empty["columns"] = serde_json::json!([]);
+        empty["referenced_columns"] = serde_json::json!([]);
+        assert!(decode(serde_json::json!([empty])).is_err());
+    }
+
+    #[test]
+    fn too_many_relations_are_cut_off() {
+        let keys: Vec<_> = (0..=FOREIGN_KEY_LIST_LIMIT)
+            .map(|i| raw_key(&format!("k{i:03}"), true, false))
+            .collect();
+        let relations = decode_relations(&serde_json::to_vec(&keys).unwrap()).unwrap();
+        assert!(relations.truncated);
+        assert_eq!(relations.outgoing.len(), FOREIGN_KEY_LIST_LIMIT);
     }
 }

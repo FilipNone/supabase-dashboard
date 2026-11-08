@@ -16,7 +16,7 @@ use supabase_dashboard_domain::{
     invitation::{InvitationCode, InvitationPreview, InvitationSummary, IssuedInvitation},
     organization::{MemberSummary, OrganizationSummary},
     project::ProjectSummary,
-    schema::{MetaUnavailable, RowPage, SchemaListing, TableDetail, TableListing},
+    schema::{MetaUnavailable, RowPage, SchemaListing, TableDefinition, TableListing},
 };
 use uuid::Uuid;
 
@@ -279,12 +279,12 @@ pub async fn list_tables(
     Ok(org_context::schema()?.tables(&session, id, &schema).await?)
 }
 
-/// One table with its columns.
+/// One table with its columns and foreign keys.
 #[server]
 pub async fn get_table(
     id: Uuid,
     table_id: u32,
-) -> Result<Result<TableDetail, MetaUnavailable>, AppError> {
+) -> Result<Result<TableDefinition, MetaUnavailable>, AppError> {
     let session = org_context::session()?;
     Ok(org_context::schema()?.table(&session, id, table_id).await?)
 }

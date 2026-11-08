@@ -13,8 +13,8 @@ use supabase_dashboard_domain::{
     connection::CredentialKind,
     project::ProjectUrl,
     schema::{
-        MetaUnavailable, RowPage, RowPageNumber, SchemaListing, SchemaName, TableDetail,
-        TableListing,
+        MetaUnavailable, RowPage, RowPageNumber, SchemaListing, SchemaName, TableDefinition,
+        TableDetail, TableListing, TableRelations,
     },
 };
 use supabase_dashboard_persistence::{Database, PersistenceError, projects::ProjectAccess};
@@ -65,6 +65,16 @@ pub trait SchemaSource: Send + Sync {
         table: &'a TableDetail,
         page: RowPageNumber,
     ) -> MetaFuture<'a, RowPage>;
+
+    /// The foreign keys on the table with this ID and those pointing at it,
+    /// read in a read-only transaction with a statement timeout. An unknown
+    /// ID gives empty lists.
+    fn relations<'a>(
+        &'a self,
+        api_url: &'a ProjectUrl,
+        key: &'a SecretString,
+        table_id: u32,
+    ) -> MetaFuture<'a, TableRelations>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -140,27 +150,29 @@ impl SchemaService {
             .await)
     }
 
+    /// A table's columns and foreign keys. The keys are read after the
+    /// table, so a table that does not exist is reported as such, and a
+    /// failure reading the keys still returns the columns.
     pub async fn table(
         &self,
         current: &CurrentSession,
         project_id: Uuid,
         table_id: u32,
-    ) -> Result<Browse<TableDetail>, SchemaError> {
+    ) -> Result<Browse<TableDefinition>, SchemaError> {
         let access = self.access(current, project_id).await?;
         let key = match self.service_key(&access).await? {
             Ok(key) => key,
             Err(state) => return Ok(Err(state)),
         };
         let _permit = self.permit().await?;
-        match self
-            .source
-            .table(&access.project.api_url, &key, table_id)
-            .await
-        {
-            Ok(Some(detail)) => Ok(Ok(detail)),
-            Ok(None) => Err(SchemaError::TableNotFound),
-            Err(state) => Ok(Err(state)),
-        }
+        let api_url = &access.project.api_url;
+        let detail: TableDetail = match self.source.table(api_url, &key, table_id).await {
+            Ok(Some(detail)) => detail,
+            Ok(None) => return Err(SchemaError::TableNotFound),
+            Err(state) => return Ok(Err(state)),
+        };
+        let relations = self.source.relations(api_url, &key, table_id).await;
+        Ok(Ok(TableDefinition { detail, relations }))
     }
 
     /// One page of a table's rows. The table is looked up again first, so

@@ -1,7 +1,7 @@
 //! `/dashboard/project/:project_id/editor[/:table_id]`: the project's
 //! schemas and tables, and for the chosen table either a page of its rows
-//! (`Data`, the default) or its columns (`?view=definition`), read through
-//! the stack's postgres-meta.
+//! (`Data`, the default) or its columns and foreign keys
+//! (`?view=definition`), read through the stack's postgres-meta.
 //!
 //! Read-only for now. Each view reads the stack when it opens; nothing is
 //! cached, so what is shown is current as of the page load.
@@ -13,8 +13,9 @@ use leptos_router::{
     hooks::{use_navigate, use_params_map, use_query_map},
 };
 use supabase_dashboard_domain::schema::{
-    CELL_MAX_CHARS, Cell, ColumnSummary, DEFAULT_SCHEMA, MetaUnavailable, ROW_COLUMN_LIMIT,
-    ROW_PAGE_SIZE, RowOrder, RowPage, SchemaListing, TableDetail, TableListing, TableSummary,
+    CELL_MAX_CHARS, Cell, ColumnSummary, DEFAULT_SCHEMA, FOREIGN_KEY_LIST_LIMIT, ForeignKey,
+    MetaUnavailable, ROW_COLUMN_LIMIT, ROW_PAGE_SIZE, RowOrder, RowPage, SchemaListing,
+    TableDefinition, TableListing, TableRelations, TableSummary,
 };
 use uuid::Uuid;
 
@@ -218,7 +219,7 @@ pub fn TableEditorPage() -> impl IntoView {
                         let tabs = view_tabs(project, table, schema.get(), current);
                         let content = match current {
                             TableView::Definition => detail.get().map(|result| match result {
-                                Ok(Some(Ok(detail))) => table_view(detail).into_any(),
+                                Ok(Some(Ok(definition))) => table_view(definition).into_any(),
                                 Ok(Some(Err(state))) => unavailable_panel(state, project).into_any(),
                                 Ok(None) => ().into_any(),
                                 Err(err) => table_error(err).into_any(),
@@ -527,7 +528,8 @@ fn table_list(
     .into_any()
 }
 
-fn table_view(detail: TableDetail) -> impl IntoView {
+fn table_view(definition: TableDefinition) -> impl IntoView {
+    let detail = definition.detail;
     let table = detail.table;
     let primary_key = if detail.primary_key.is_empty() {
         "None".to_owned()
@@ -575,7 +577,118 @@ fn table_view(detail: TableDetail) -> impl IntoView {
         <p class="field-hint">
             "Row estimates come from PostgreSQL's statistics and can lag behind the table."
         </p>
+        {relations_view(definition.relations)}
     }
+}
+
+fn relations_view(relations: Result<TableRelations, MetaUnavailable>) -> impl IntoView {
+    let body = match relations {
+        Err(state) => view! {
+            <p class="form-error" role="alert">
+                {format!("Foreign keys unavailable: {}. ", state.title())}
+                {state.detail()}
+            </p>
+        }
+        .into_any(),
+        Ok(relations) => view! {
+            {key_table(
+                "outgoing-keys",
+                "References",
+                "This table has no foreign keys.",
+                relations.outgoing,
+                false,
+            )}
+            {key_table(
+                "incoming-keys",
+                "Referenced by",
+                "No foreign keys point at this table.",
+                relations.incoming,
+                true,
+            )}
+            {relations.truncated.then(|| view! {
+                <p class="field-hint">
+                    {format!("Only the first {FOREIGN_KEY_LIST_LIMIT} foreign keys are listed.")}
+                </p>
+            })}
+        }
+        .into_any(),
+    };
+    view! {
+        <section class="keys-section" aria-labelledby="keys-title">
+            <h2 class="section-title" id="keys-title">"Foreign keys"</h2>
+            {body}
+        </section>
+    }
+}
+
+/// One direction of foreign keys. `incoming` lists the table each key is
+/// on; otherwise the table each key points at.
+fn key_table(
+    id: &'static str,
+    title: &'static str,
+    empty: &'static str,
+    keys: Vec<ForeignKey>,
+    incoming: bool,
+) -> impl IntoView {
+    let heading = view! { <h3 class="subsection-title" id=id>{title}</h3> };
+    if keys.is_empty() {
+        return view! { {heading} <p class="field-hint">{empty}</p> }.into_any();
+    }
+    let rows = keys
+        .into_iter()
+        .map(|key| {
+            let (table, other) = if incoming {
+                (
+                    format!("{}.{}", key.schema, key.table),
+                    key.columns.join(", "),
+                )
+            } else {
+                (
+                    format!("{}.{}", key.referenced_schema, key.referenced_table),
+                    key.referenced_columns.join(", "),
+                )
+            };
+            let own = if incoming {
+                key.referenced_columns.join(", ")
+            } else {
+                key.columns.join(", ")
+            };
+            view! {
+                <tr>
+                    <th scope="row" class="cell-name"><span class="url-text">{key.name}</span></th>
+                    <td><span class="url-text">{own}</span></td>
+                    <td><span class="url-text">{table}</span></td>
+                    <td><span class="url-text">{other}</span></td>
+                    <td>{key.on_update.label()}</td>
+                    <td>{key.on_delete.label()}</td>
+                </tr>
+            }
+        })
+        .collect_view();
+    let (own_label, table_label, other_label) = if incoming {
+        ("Columns here", "From table", "Its columns")
+    } else {
+        ("Columns", "Points to", "Target columns")
+    };
+    view! {
+        {heading}
+        <div class="table-wrap">
+            <table class="data-table keys-table" aria-labelledby=id>
+                <thead>
+                    <tr>
+                        <th scope="col">"Constraint"</th>
+                        <th scope="col">{own_label}</th>
+                        <th scope="col">{table_label}</th>
+                        <th scope="col">{other_label}</th>
+                        <th scope="col">"On update"</th>
+                        <th scope="col">"On delete"</th>
+                    </tr>
+                </thead>
+                <tbody>{rows}</tbody>
+            </table>
+        </div>
+    }
+    .into_any()
 }
 
 fn column_row(column: &ColumnSummary, primary_key: &[String]) -> impl IntoView + use<> {

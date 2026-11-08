@@ -31,3 +31,13 @@ CREATE TABLE public."Event ""Log""" (
 INSERT INTO public."Event ""Log""" ("Kind", payload, body)
 SELECT 'tick', jsonb_build_object('n', n), CASE WHEN n = 1 THEN repeat('z', 300) END
 FROM generate_series(1, 120) AS n;
+
+-- Foreign keys: one of two columns, declared in a different order from the
+-- key, and one from a table to itself.
+CREATE TABLE public.tag_notes (
+  id bigint PRIMARY KEY,
+  tag_label text NOT NULL,
+  tag_todo bigint NOT NULL,
+  parent_id bigint REFERENCES public.tag_notes (id) ON DELETE SET NULL,
+  FOREIGN KEY (tag_todo, tag_label) REFERENCES public.tags (todo_id, label) ON UPDATE CASCADE
+);

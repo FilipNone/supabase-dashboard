@@ -458,6 +458,10 @@ td { vertical-align: middle; }
 .columns-table { min-width: 44rem; }
 .columns-table .cell-type .url-text { white-space: nowrap; }
 .columns-table .cell-type .status-detail { display: block; }
+/* Foreign keys: names stay on one line; the wrapper scrolls sideways. */
+.keys-section { display: grid; gap: var(--space-3); margin-top: var(--space-6); }
+.keys-table { min-width: 48rem; }
+.keys-table .url-text { white-space: nowrap; }
 .editor-tabs { margin-bottom: 0; }
 .editor-heading .section-header { margin-bottom: 0; }
 /* Row data: one line per row, long values ellipsized; the wrapper scrolls
