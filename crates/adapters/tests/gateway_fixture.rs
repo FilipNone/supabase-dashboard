@@ -73,7 +73,7 @@ async fn fixture_meta_lists_structure() {
     use supabase_dashboard_application::schema::SchemaSource;
     use supabase_dashboard_domain::schema::{
         CELL_MAX_CHARS, ForeignKeyAction, IdentityGeneration, MetaUnavailable, ROW_PAGE_SIZE,
-        RelationKind, RowOrder, RowPageNumber, SchemaName,
+        RelationKind, RowOrder, RowPageNumber, RowSort, SchemaName,
     };
 
     let Ok(raw) = std::env::var(ENV) else {
@@ -147,7 +147,7 @@ async fn fixture_meta_lists_structure() {
     assert!(detail.columns[4].nullable);
 
     let rows = probe
-        .rows(&url, &service, &detail, RowPageNumber::FIRST)
+        .rows(&url, &service, &detail, RowPageNumber::FIRST, None)
         .await
         .unwrap();
     assert_eq!(rows.order, RowOrder::PrimaryKey(vec!["id".into()]));
@@ -161,11 +161,31 @@ async fn fixture_meta_lists_structure() {
     assert_eq!(text(1, 1), Some("second"));
     assert_eq!(text(0, 4), None);
 
+    let by_title = RowSort::new("title", true).unwrap();
+    let sorted = probe
+        .rows(
+            &url,
+            &service,
+            &detail,
+            RowPageNumber::FIRST,
+            Some(&by_title),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sorted.order.sort(), Some(by_title));
+    assert!(!sorted.order.is_unstable());
+    let titles: Vec<_> = sorted
+        .rows
+        .iter()
+        .map(|row| row[1].as_ref().map(|cell| cell.text.as_str()))
+        .collect();
+    assert_eq!(titles, [Some("second"), Some("first")]);
+
     let tags = by_name("tags");
     let detail = probe.table(&url, &service, tags.id).await.unwrap().unwrap();
     assert_eq!(detail.primary_key, ["todo_id", "label"]);
     let rows = probe
-        .rows(&url, &service, &detail, RowPageNumber::FIRST)
+        .rows(&url, &service, &detail, RowPageNumber::FIRST, None)
         .await
         .unwrap();
     assert!(rows.rows.is_empty() && !rows.has_more);
@@ -175,7 +195,7 @@ async fn fixture_meta_lists_structure() {
     let detail = probe.table(&url, &service, log.id).await.unwrap().unwrap();
     assert!(detail.primary_key.is_empty());
     let first = probe
-        .rows(&url, &service, &detail, RowPageNumber::FIRST)
+        .rows(&url, &service, &detail, RowPageNumber::FIRST, None)
         .await
         .unwrap();
     assert_eq!(first.order, RowOrder::Unordered);
@@ -188,13 +208,25 @@ async fn fixture_meta_lists_structure() {
     assert!(long.truncated);
     assert_eq!(long.text.chars().count(), CELL_MAX_CHARS);
     let third = probe
-        .rows(&url, &service, &detail, RowPageNumber::new(3).unwrap())
+        .rows(
+            &url,
+            &service,
+            &detail,
+            RowPageNumber::new(3).unwrap(),
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(third.rows.len(), 20);
     assert!(!third.has_more);
     let past = probe
-        .rows(&url, &service, &detail, RowPageNumber::new(9).unwrap())
+        .rows(
+            &url,
+            &service,
+            &detail,
+            RowPageNumber::new(9).unwrap(),
+            None,
+        )
         .await
         .unwrap();
     assert!(past.rows.is_empty());
@@ -269,7 +301,7 @@ async fn fixture_meta_lists_structure() {
     let columns: Vec<_> = detail.columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(columns, ["id", "title"]);
     let rows = probe
-        .rows(&url, &service, &detail, RowPageNumber::FIRST)
+        .rows(&url, &service, &detail, RowPageNumber::FIRST, None)
         .await
         .unwrap();
     assert_eq!(rows.order, RowOrder::Unordered);
@@ -290,7 +322,7 @@ async fn fixture_meta_lists_structure() {
     assert_eq!(detail.columns.len(), 2);
     assert_eq!(
         probe
-            .rows(&url, &service, &detail, RowPageNumber::FIRST)
+            .rows(&url, &service, &detail, RowPageNumber::FIRST, None)
             .await
             .unwrap_err(),
         MetaUnavailable::NotPopulated
@@ -305,7 +337,7 @@ async fn fixture_meta_lists_structure() {
     assert_eq!(detail.columns.len(), 2);
     assert_eq!(
         probe
-            .rows(&url, &service, &detail, RowPageNumber::FIRST)
+            .rows(&url, &service, &detail, RowPageNumber::FIRST, None)
             .await
             .unwrap_err(),
         MetaUnavailable::ForeignRows

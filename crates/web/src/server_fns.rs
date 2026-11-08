@@ -289,18 +289,29 @@ pub async fn get_table(
     Ok(org_context::schema()?.table(&session, id, table_id).await?)
 }
 
-/// One page of a table's rows, read-only. Pages start at 1.
+/// One page of a table's rows, read-only. Pages start at 1. `sort` names
+/// a column to order by; one the table does not have is ignored.
 #[server]
 pub async fn get_table_rows(
     id: Uuid,
     table_id: u32,
     page: u32,
+    sort: Option<String>,
+    descending: bool,
 ) -> Result<Result<RowPage, MetaUnavailable>, AppError> {
+    use supabase_dashboard_domain::schema::{RowPageNumber, RowSort};
+
     let session = org_context::session()?;
-    let page = supabase_dashboard_domain::schema::RowPageNumber::new(page)
-        .map_err(|err| AppError::Rejected(format!("{}.", capitalize(&err.to_string()))))?;
+    let rejected = |err: &dyn std::fmt::Display| {
+        AppError::Rejected(format!("{}.", capitalize(&err.to_string())))
+    };
+    let page = RowPageNumber::new(page).map_err(|err| rejected(&err))?;
+    let sort = sort
+        .map(|column| RowSort::new(&column, descending))
+        .transpose()
+        .map_err(|err| rejected(&err))?;
     Ok(org_context::schema()?
-        .rows(&session, id, table_id, page)
+        .rows(&session, id, table_id, page, sort)
         .await?)
 }
 

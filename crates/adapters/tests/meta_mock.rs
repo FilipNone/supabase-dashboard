@@ -22,8 +22,8 @@ use supabase_dashboard_domain::{
     connection::UnreachableReason,
     project::ProjectUrl,
     schema::{
-        ColumnSummary, MetaUnavailable, RelationKind, RowPageNumber, SchemaName, TableDetail,
-        TableSummary,
+        ColumnSummary, MetaUnavailable, RelationKind, RowPageNumber, RowSort, SchemaName,
+        TableDetail, TableSummary,
     },
 };
 
@@ -192,7 +192,7 @@ async fn ids_are_looked_up_across_kinds_and_rows_are_guarded() {
     assert_eq!(found.columns[0].name, "n");
     assert_eq!(
         probe
-            .rows(&url, &key(), &found, RowPageNumber::FIRST)
+            .rows(&url, &key(), &found, RowPageNumber::FIRST, None)
             .await
             .unwrap_err(),
         MetaUnavailable::NotPopulated
@@ -201,7 +201,7 @@ async fn ids_are_looked_up_across_kinds_and_rows_are_guarded() {
     foreign.table.kind = RelationKind::ForeignTable;
     assert_eq!(
         probe
-            .rows(&url, &key(), &foreign, RowPageNumber::FIRST)
+            .rows(&url, &key(), &foreign, RowPageNumber::FIRST, None)
             .await
             .unwrap_err(),
         MetaUnavailable::ForeignRows
@@ -337,7 +337,10 @@ async fn rows_are_read_with_one_generated_read_only_statement() {
     ))
     .await;
     let page = RowPageNumber::new(2).unwrap();
-    let rows = loopback().rows(&url, &key(), &todos(), page).await.unwrap();
+    let rows = loopback()
+        .rows(&url, &key(), &todos(), page, None)
+        .await
+        .unwrap();
     assert_eq!(rows.rows.len(), 2);
     assert_eq!(rows.rows[1][0].as_ref().unwrap().text, "52");
     assert_eq!(rows.page, page);
@@ -357,7 +360,7 @@ async fn query_errors_keep_only_the_timeout_code() {
     .await;
     assert_eq!(
         loopback()
-            .rows(&timeout, &key(), &todos(), RowPageNumber::FIRST)
+            .rows(&timeout, &key(), &todos(), RowPageNumber::FIRST, None)
             .await
             .unwrap_err(),
         MetaUnavailable::QueryTimeout
@@ -373,9 +376,43 @@ async fn query_errors_keep_only_the_timeout_code() {
     ))
     .await;
     let err = loopback()
-        .rows(&other, &key(), &todos(), RowPageNumber::FIRST)
+        .rows(&other, &key(), &todos(), RowPageNumber::FIRST, None)
         .await
         .unwrap_err();
     assert_eq!(err, MetaUnavailable::ServiceError { http_status: 400 });
     assert!(!err.detail().contains("secret_value"));
+
+    // A missing ordering operator means the sort column's type has none,
+    // but only when a sort was asked for.
+    let unsortable = serve(Router::new().route(
+        "/pg/query",
+        post(|| async {
+            (
+                StatusCode::BAD_REQUEST,
+                r#"{"error":"could not identify an ordering operator for type json","code":"42883"}"#,
+            )
+        }),
+    ))
+    .await;
+    let sort = RowSort::new("title", false).unwrap();
+    assert_eq!(
+        loopback()
+            .rows(
+                &unsortable,
+                &key(),
+                &todos(),
+                RowPageNumber::FIRST,
+                Some(&sort)
+            )
+            .await
+            .unwrap_err(),
+        MetaUnavailable::NotSortable
+    );
+    assert_eq!(
+        loopback()
+            .rows(&unsortable, &key(), &todos(), RowPageNumber::FIRST, None)
+            .await
+            .unwrap_err(),
+        MetaUnavailable::ServiceError { http_status: 400 }
+    );
 }

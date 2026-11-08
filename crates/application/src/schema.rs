@@ -13,8 +13,8 @@ use supabase_dashboard_domain::{
     connection::CredentialKind,
     project::ProjectUrl,
     schema::{
-        MetaUnavailable, RowPage, RowPageNumber, SchemaListing, SchemaName, TableDefinition,
-        TableDetail, TableListing, TableRelations,
+        MetaUnavailable, ROW_COLUMN_LIMIT, RowPage, RowPageNumber, RowSort, SchemaListing,
+        SchemaName, TableDefinition, TableDetail, TableListing, TableRelations,
     },
 };
 use supabase_dashboard_persistence::{Database, PersistenceError, projects::ProjectAccess};
@@ -64,6 +64,7 @@ pub trait SchemaSource: Send + Sync {
         key: &'a SecretString,
         table: &'a TableDetail,
         page: RowPageNumber,
+        sort: Option<&'a RowSort>,
     ) -> MetaFuture<'a, RowPage>;
 
     /// The foreign keys on the table with this ID and those pointing at it,
@@ -186,13 +187,16 @@ impl SchemaService {
     }
 
     /// One page of a table's rows. The table is looked up again first, so
-    /// the query uses the names the database has now.
+    /// the query uses the names the database has now. A sort by a column
+    /// the table does not have among its shown columns, as after a rename,
+    /// is dropped; the page's `order` says how the rows were ordered.
     pub async fn rows(
         &self,
         current: &CurrentSession,
         project_id: Uuid,
         table_id: u32,
         page: RowPageNumber,
+        sort: Option<RowSort>,
     ) -> Result<Browse<RowPage>, SchemaError> {
         let access = self.access(current, project_id).await?;
         let key = match self.service_key(&access).await? {
@@ -206,7 +210,17 @@ impl SchemaService {
             Ok(None) => return Err(SchemaError::TableNotFound),
             Err(state) => return Ok(Err(state)),
         };
-        Ok(self.source.rows(api_url, &key, &detail, page).await)
+        let sort = sort.filter(|sort| {
+            detail
+                .columns
+                .iter()
+                .take(ROW_COLUMN_LIMIT)
+                .any(|column| column.name == sort.column)
+        });
+        Ok(self
+            .source
+            .rows(api_url, &key, &detail, page, sort.as_ref())
+            .await)
     }
 
     /// postgres-meta is limited to the service role in the standard gateway

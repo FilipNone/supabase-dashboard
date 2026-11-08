@@ -14,7 +14,7 @@ use leptos_router::{
 };
 use supabase_dashboard_domain::schema::{
     CELL_MAX_CHARS, Cell, ColumnSummary, DEFAULT_SCHEMA, FOREIGN_KEY_LIST_LIMIT, ForeignKey,
-    MetaUnavailable, ROW_COLUMN_LIMIT, ROW_PAGE_SIZE, RelationKind, RowOrder, RowPage,
+    MetaUnavailable, ROW_COLUMN_LIMIT, ROW_PAGE_SIZE, RelationKind, RowPage, RowSort,
     SchemaListing, TableDefinition, TableListing, TableRelations, TableSummary,
 };
 use uuid::Uuid;
@@ -61,12 +61,34 @@ fn schema_query(schema: &str) -> String {
 /// The address of one table's view. Defaults are left out so the usual
 /// address stays short.
 fn table_href(project: Uuid, table: u32, schema: &str, view: TableView, page: u32) -> String {
+    editor_href(project, table, schema, view, page, None)
+}
+
+/// A page of the Data tab, keeping `sort`.
+fn rows_href(project: Uuid, table: u32, schema: &str, page: u32, sort: Option<&RowSort>) -> String {
+    editor_href(project, table, schema, TableView::Data, page, sort)
+}
+
+fn editor_href(
+    project: Uuid,
+    table: u32,
+    schema: &str,
+    view: TableView,
+    page: u32,
+    sort: Option<&RowSort>,
+) -> String {
     let mut query = url::form_urlencoded::Serializer::new(String::new());
     if schema != DEFAULT_SCHEMA {
         query.append_pair("schema", schema);
     }
     if view == TableView::Definition {
         query.append_pair("view", "definition");
+    }
+    if let Some(sort) = sort {
+        query.append_pair("sort", &sort.column);
+        if sort.descending {
+            query.append_pair("desc", "1");
+        }
     }
     if page > 1 {
         query.append_pair("page", &page.to_string());
@@ -135,6 +157,9 @@ pub fn TableEditorPage() -> impl IntoView {
             .map_or(1, |raw| raw.parse::<u32>().unwrap_or(0))
     });
 
+    let sort = Memo::new(move |_| query.read().get("sort").filter(|s| !s.is_empty()));
+    let descending = Memo::new(move |_| query.read().get("desc").as_deref() == Some("1"));
+
     let schemas = Resource::new(
         move || project_id.get(),
         |id| async move {
@@ -166,11 +191,22 @@ pub fn TableEditorPage() -> impl IntoView {
         },
     );
     let rows = Resource::new(
-        move || (project_id.get(), table_param.get(), view.get(), page.get()),
-        |(id, table, view, page)| async move {
+        move || {
+            (
+                project_id.get(),
+                table_param.get(),
+                view.get(),
+                page.get(),
+                sort.get(),
+                descending.get(),
+            )
+        },
+        |(id, table, view, page, sort, descending)| async move {
             match (id, table) {
                 (Some(_), _) if view != TableView::Data => Ok(None),
-                (Some(id), Some(Some(table))) => get_table_rows(id, table, page).await.map(Some),
+                (Some(id), Some(Some(table))) => get_table_rows(id, table, page, sort, descending)
+                    .await
+                    .map(Some),
                 (Some(_), None) => Ok(None),
                 _ => Err(AppError::NotFound),
             }
@@ -312,7 +348,8 @@ fn rows_view(page: RowPage, project: Uuid, schema: String) -> impl IntoView {
     let number = page.page.get();
     let first_row = page.page.offset() + 1;
     let shown = u32::try_from(page.rows.len()).unwrap_or(ROW_PAGE_SIZE);
-    let link = |target: u32| table_href(project, page.table.id, &schema, TableView::Data, target);
+    let sort = page.order.sort();
+    let link = |target: u32| rows_href(project, page.table.id, &schema, target, sort.as_ref());
     let previous = page.page.previous().map(|p| link(p.get()));
     let next = page
         .has_more
@@ -333,10 +370,21 @@ fn rows_view(page: RowPage, project: Uuid, schema: String) -> impl IntoView {
             page.table.live_rows_estimate
         )
     });
+    let sorted = sort.as_ref().map(|sort| {
+        let direction = if sort.descending { "descending" } else { "ascending" };
+        let clear = rows_href(project, page.table.id, &schema, 1, None);
+        view! {
+            <span class="field-hint">
+                "Sorted by " <span class="url-text">{sort.column.clone()}</span> {format!(", {direction}. ")}
+                <A href=clear>"Clear sort"</A>
+            </span>
+        }
+    });
     let pager = view! {
         <nav class="pager" aria-label="Pages">
             <span class="pager-status" role="status">{status}</span>
             {estimate.map(|text| view! { <span class="field-hint">{text}</span> })}
+            {sorted}
             <span class="pager-links">
                 {previous.map(|href| view! { <A href=href attr:class="button">"Previous"</A> })}
                 {next.map(|href| view! { <A href=href attr:class="button">"Next"</A> })}
@@ -360,7 +408,14 @@ fn rows_view(page: RowPage, project: Uuid, schema: String) -> impl IntoView {
         }
         .into_any()
     } else {
-        rows_table(&page, first_row).into_any()
+        rows_table(&page, first_row, |column, descending| {
+            let sort = column.map(|column| RowSort {
+                column: column.to_owned(),
+                descending,
+            });
+            rows_href(project, page.table.id, &schema, 1, sort.as_ref())
+        })
+        .into_any()
     };
     let hidden = (page.hidden_columns > 0).then(|| {
         view! {
@@ -372,15 +427,20 @@ fn rows_view(page: RowPage, project: Uuid, schema: String) -> impl IntoView {
             </p>
         }
     });
-    let unordered = (page.order == RowOrder::Unordered).then(|| {
+    let unordered = page.order.is_unstable().then(|| {
         let reason = if page.table.kind.is_table() {
             "This table has no primary key"
         } else {
             "Views have no primary key"
         };
+        let rows = if sort.is_some() {
+            "rows with equal values in the sorted column"
+        } else {
+            "the rows"
+        };
         view! {
             <p class="field-hint">
-                {format!("{reason}, so the rows have no fixed order and pages can overlap or skip rows while the data changes.")}
+                {format!("{reason}, so {rows} have no fixed order and pages can overlap or skip rows while the data changes.")}
             </p>
         }
     });
@@ -398,19 +458,51 @@ fn rows_view(page: RowPage, project: Uuid, schema: String) -> impl IntoView {
     }
 }
 
-fn rows_table(page: &RowPage, first_row: u32) -> impl IntoView + use<> {
+/// `href(column, descending)` links to the first page sorted that way, or
+/// unsorted for `None`. Each header cycles through ascending, descending,
+/// and back to the default order.
+fn rows_table<F: Fn(Option<&str>, bool) -> String>(
+    page: &RowPage,
+    first_row: u32,
+    href: F,
+) -> impl IntoView + use<F> {
     let last_row = first_row
         + u32::try_from(page.rows.len())
             .unwrap_or(1)
             .saturating_sub(1);
+    let current = page.order.sort();
     let headers = page
         .columns
         .iter()
         .map(|column| {
+            let state = current
+                .as_ref()
+                .filter(|sort| sort.column == column.name)
+                .map(|sort| sort.descending);
+            let (aria, mark, action, target) = match state {
+                None => (None, "", "sort ascending", href(Some(&column.name), false)),
+                Some(false) => (
+                    Some("ascending"),
+                    "↑",
+                    "sort descending",
+                    href(Some(&column.name), true),
+                ),
+                Some(true) => (Some("descending"), "↓", "clear sort", href(None, false)),
+            };
+            // The link's children are built later, so they own their text.
+            let name = column.name.clone();
+            let type_label = column.type_label.clone();
+            let action = format!(", {action}");
             view! {
-                <th scope="col">
-                    <span class="col-name">{column.name.clone()}</span>
-                    <span class="col-type">{column.type_label.clone()}</span>
+                <th scope="col" aria-sort=aria>
+                    <A href=target attr:class="sort-link">
+                        <span class="col-name">
+                            {name}
+                            <span class="sort-mark" aria-hidden="true">{mark}</span>
+                        </span>
+                        <span class="col-type">{type_label}</span>
+                        <span class="visually-hidden">{action}</span>
+                    </A>
                 </th>
             }
         })

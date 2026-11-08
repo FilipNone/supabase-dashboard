@@ -21,8 +21,9 @@ use supabase_dashboard_domain::{
     connection::{CredentialKind, SkipReason},
     project::ProjectUrl,
     schema::{
-        MetaUnavailable, RelationKind, RowOrder, RowPage, RowPageNumber, SchemaListing, SchemaName,
-        SchemaSummary, TableDetail, TableListing, TableRelations, TableSummary,
+        ColumnSummary, MetaUnavailable, RelationKind, RowOrder, RowPage, RowPageNumber, RowSort,
+        SchemaListing, SchemaName, SchemaSummary, TableDetail, TableListing, TableRelations,
+        TableSummary,
     },
 };
 use supabase_dashboard_persistence::{Database, accounts::AccountRecord};
@@ -127,7 +128,19 @@ impl SchemaSource for FakeSource {
                 7 => Some(TableDetail {
                     table: table(7, "todos"),
                     primary_key: vec!["id".into()],
-                    columns: Vec::new(),
+                    columns: vec![ColumnSummary {
+                        position: 1,
+                        name: "title".into(),
+                        data_type: "text".into(),
+                        format: "text".into(),
+                        nullable: false,
+                        unique: false,
+                        identity: None,
+                        generated: false,
+                        default_value: None,
+                        comment: None,
+                        enum_labels: Vec::new(),
+                    }],
                 }),
                 9 => Some(TableDetail {
                     table: TableSummary {
@@ -148,8 +161,18 @@ impl SchemaSource for FakeSource {
         key: &'a SecretString,
         table: &'a TableDetail,
         page: RowPageNumber,
+        sort: Option<&'a RowSort>,
     ) -> MetaFuture<'a, RowPage> {
         self.record(key);
+        // Echoes the sort it was given, so tests see what reached it.
+        let order = match sort {
+            Some(sort) => RowOrder::Sorted {
+                column: sort.column.clone(),
+                descending: sort.descending,
+                tiebreak: table.primary_key.clone(),
+            },
+            None => RowOrder::PrimaryKey(table.primary_key.clone()),
+        };
         Box::pin(async move {
             Ok(RowPage {
                 table: table.table.clone(),
@@ -158,7 +181,7 @@ impl SchemaSource for FakeSource {
                 rows: Vec::new(),
                 page,
                 has_more: false,
-                order: RowOrder::PrimaryKey(table.primary_key.clone()),
+                order,
             })
         })
     }
@@ -304,10 +327,25 @@ async fn every_member_can_browse_with_the_service_role_key() {
         assert_eq!(definition.detail.primary_key, ["id"]);
         assert_eq!(definition.relations, Err(MetaUnavailable::QueryTimeout));
         let page = RowPageNumber::new(3).unwrap();
-        let rows = schema.rows(who, id, 7, page).await.unwrap().unwrap();
+        let rows = schema.rows(who, id, 7, page, None).await.unwrap().unwrap();
         assert_eq!(rows.page, page);
         assert_eq!(rows.order, RowOrder::PrimaryKey(vec!["id".into()]));
     }
+    // A sort reaches the source only for a column the table has.
+    let by_title = RowSort::new("title", true).unwrap();
+    let sorted = schema
+        .rows(&viewer, id, 7, RowPageNumber::FIRST, Some(by_title.clone()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(sorted.order.sort(), Some(by_title));
+    let renamed = RowSort::new("gone", false).unwrap();
+    let fallback = schema
+        .rows(&viewer, id, 7, RowPageNumber::FIRST, Some(renamed))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fallback.order, RowOrder::PrimaryKey(vec!["id".into()]));
     assert!(matches!(
         schema.table(&viewer, id, 8).await,
         Err(SchemaError::TableNotFound)
@@ -321,7 +359,9 @@ async fn every_member_can_browse_with_the_service_role_key() {
     // Rows of a table that does not exist are not requested at all.
     let calls = f.source.keys.lock().unwrap().len();
     assert!(matches!(
-        schema.rows(&viewer, id, 8, RowPageNumber::FIRST).await,
+        schema
+            .rows(&viewer, id, 8, RowPageNumber::FIRST, None)
+            .await,
         Err(SchemaError::TableNotFound)
     ));
     assert_eq!(f.source.keys.lock().unwrap().len(), calls + 1);
@@ -340,7 +380,9 @@ async fn every_member_can_browse_with_the_service_role_key() {
         Err(SchemaError::NotFound)
     ));
     assert!(matches!(
-        schema.rows(&outsider, id, 7, RowPageNumber::FIRST).await,
+        schema
+            .rows(&outsider, id, 7, RowPageNumber::FIRST, None)
+            .await,
         Err(SchemaError::NotFound)
     ));
     assert!(matches!(
@@ -374,7 +416,7 @@ async fn missing_or_unreadable_keys_are_reported_without_contacting_the_stack() 
     assert_eq!(schema.table(&owner, id, 7).await.unwrap(), Err(missing));
     assert_eq!(
         schema
-            .rows(&owner, id, 7, RowPageNumber::FIRST)
+            .rows(&owner, id, 7, RowPageNumber::FIRST, None)
             .await
             .unwrap(),
         Err(missing)

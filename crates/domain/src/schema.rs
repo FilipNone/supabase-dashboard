@@ -387,6 +387,63 @@ pub enum RowOrder {
     /// The table has no primary key. PostgreSQL returns rows in whatever
     /// order is cheapest, so pages can overlap or skip rows.
     Unordered,
+    /// By the column the reader chose, then by the primary key so rows with
+    /// equal values keep their place between pages. Without a primary key
+    /// (`tiebreak` is empty), such rows can still overlap or skip pages.
+    Sorted {
+        column: String,
+        descending: bool,
+        tiebreak: Vec<String>,
+    },
+}
+
+impl RowOrder {
+    /// The column the rows are sorted by, if the reader chose one.
+    pub fn sort(&self) -> Option<RowSort> {
+        match self {
+            Self::Sorted {
+                column, descending, ..
+            } => Some(RowSort {
+                column: column.clone(),
+                descending: *descending,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Pages can overlap or skip rows while the data changes.
+    pub fn is_unstable(&self) -> bool {
+        match self {
+            Self::PrimaryKey(_) => false,
+            Self::Unordered => true,
+            Self::Sorted { tiebreak, .. } => tiebreak.is_empty(),
+        }
+    }
+}
+
+/// A request to sort table data by one column. Only the name is checked
+/// here; whether the table has that column is checked against the table as
+/// it is read for the query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RowSort {
+    pub column: String,
+    pub descending: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("column names are 1 to {IDENTIFIER_MAX_BYTES} bytes")]
+pub struct RowSortError;
+
+impl RowSort {
+    pub fn new(column: &str, descending: bool) -> Result<Self, RowSortError> {
+        if column.is_empty() || column.len() > IDENTIFIER_MAX_BYTES {
+            return Err(RowSortError);
+        }
+        Ok(Self {
+            column: column.to_owned(),
+            descending,
+        })
+    }
 }
 
 /// One page of a table's rows. Read-only.
@@ -435,6 +492,9 @@ pub enum MetaUnavailable {
     /// Rows of a foreign table are not read: each read goes to the remote
     /// source, which may be slow, rate limited, or billed per request.
     ForeignRows,
+    /// PostgreSQL has no ordering for the type of the column the rows were
+    /// to be sorted by, such as `json` or `point`.
+    NotSortable,
 }
 
 impl MetaUnavailable {
@@ -448,6 +508,7 @@ impl MetaUnavailable {
             Self::QueryTimeout => "The database took too long",
             Self::NotPopulated => "This materialized view has no data yet",
             Self::ForeignRows => "Rows of foreign tables are not shown",
+            Self::NotSortable => "This column cannot be sorted",
         }
     }
 
@@ -489,6 +550,9 @@ impl MetaUnavailable {
                                   through a foreign data wrapper, which can be slow, rate \
                                   limited, or billed per request. The Definition tab lists its \
                                   columns."
+                .to_owned(),
+            Self::NotSortable => "PostgreSQL has no ordering for this column's type, as with \
+                                  json or point. Sort by another column, or clear the sort."
                 .to_owned(),
         }
     }
@@ -599,5 +663,27 @@ mod tests {
         })
         .unwrap();
         assert_eq!(json, r#"{"state":"no_key","reason":"missing_key"}"#);
+    }
+
+    #[test]
+    fn sorts_are_checked_and_report_stability() {
+        assert!(RowSort::new("", false).is_err());
+        assert!(RowSort::new(&"a".repeat(64), false).is_err());
+        let sort = RowSort::new("Name \"x\"", true).unwrap();
+        let order = RowOrder::Sorted {
+            column: sort.column.clone(),
+            descending: true,
+            tiebreak: vec!["id".into()],
+        };
+        assert_eq!(order.sort(), Some(sort));
+        assert!(!order.is_unstable());
+        let loose = RowOrder::Sorted {
+            column: "n".into(),
+            descending: false,
+            tiebreak: vec![],
+        };
+        assert!(loose.is_unstable());
+        assert!(RowOrder::Unordered.is_unstable());
+        assert_eq!(RowOrder::PrimaryKey(vec!["id".into()]).sort(), None);
     }
 }

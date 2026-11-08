@@ -481,6 +481,9 @@ td { vertical-align: middle; }
 }
 .rows-table .col-name { display: block; color: var(--color-text); }
 .rows-table .col-type { display: block; font-weight: 400; font-size: var(--text-xs); }
+.sort-link { display: block; color: inherit; text-decoration: none; }
+.sort-link:hover .col-name { text-decoration: underline; }
+.sort-mark { margin-left: var(--space-1); }
 .cell-null { color: var(--color-text-muted); font-style: italic; }
 .pager { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2) var(--space-4); font-size: var(--text-sm); }
 .pager-links { display: flex; gap: var(--space-2); margin-left: auto; }

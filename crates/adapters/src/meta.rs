@@ -32,9 +32,9 @@ use supabase_dashboard_domain::{
         EXPRESSION_MAX_CHARS, FOREIGN_KEY_COLUMN_LIMIT, FOREIGN_KEY_LIST_LIMIT, ForeignKey,
         ForeignKeyAction, IDENTIFIER_MAX_BYTES, IdentityGeneration, MetaUnavailable,
         ROW_COLUMN_LIMIT, ROW_PAGE_SIZE, ROW_QUERY_TIMEOUT_MS, RelationKind, RowColumn, RowOrder,
-        RowPage, RowPageNumber, SCHEMA_LIST_LIMIT, SchemaListing, SchemaName, SchemaSummary,
-        TABLE_COLUMN_LIMIT, TABLE_LIST_LIMIT, TYPE_NAME_MAX_CHARS, TableDetail, TableListing,
-        TableRelations, TableSummary, bounded,
+        RowPage, RowPageNumber, RowSort, SCHEMA_LIST_LIMIT, SchemaListing, SchemaName,
+        SchemaSummary, TABLE_COLUMN_LIMIT, TABLE_LIST_LIMIT, TYPE_NAME_MAX_CHARS, TableDetail,
+        TableListing, TableRelations, TableSummary, bounded,
     },
 };
 
@@ -56,6 +56,7 @@ const MAX_RELATIONS_BODY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 /// SQLSTATE `query_canceled`, which a statement timeout raises.
 const QUERY_CANCELED: &str = "57014";
+const UNDEFINED_FUNCTION: &str = "42883";
 
 /// What a request came back with, before it is decoded.
 enum Answer {
@@ -132,10 +133,13 @@ impl GatewayProbe {
                 let body = read_bounded(response, MAX_ERROR_BODY_BYTES)
                     .await
                     .unwrap_or_default();
-                if sqlstate(&body).as_deref() == Some(QUERY_CANCELED) {
-                    Err(MetaUnavailable::QueryTimeout)
-                } else {
-                    Err(MetaUnavailable::ServiceError { http_status: 400 })
+                match sqlstate(&body).as_deref() {
+                    Some(QUERY_CANCELED) => Err(MetaUnavailable::QueryTimeout),
+                    // `ORDER BY` on a type without a btree operator class,
+                    // such as json: "could not identify an ordering
+                    // operator".
+                    Some(UNDEFINED_FUNCTION) => Err(MetaUnavailable::NotSortable),
+                    _ => Err(MetaUnavailable::ServiceError { http_status: 400 }),
                 }
             }
             _ => Err(MetaUnavailable::ServiceError {
@@ -227,6 +231,7 @@ impl GatewayProbe {
         key: &SecretString,
         table: &TableDetail,
         page: RowPageNumber,
+        sort: Option<&RowSort>,
     ) -> Result<RowPage, MetaUnavailable> {
         match table.table.kind {
             RelationKind::MaterializedView { populated: false } => {
@@ -235,7 +240,7 @@ impl GatewayProbe {
             RelationKind::ForeignTable => return Err(MetaUnavailable::ForeignRows),
             _ => {}
         }
-        let plan = RowQuery::new(table, page)?;
+        let plan = RowQuery::new(table, page, sort)?;
         let body =
             serde_json::to_vec(&serde_json::json!({ "query": plan.sql })).map_err(|_| invalid())?;
         let answer = self
@@ -248,7 +253,15 @@ impl GatewayProbe {
                 Some(body),
                 MAX_ROWS_BODY_BYTES,
             )
-            .await?;
+            .await
+            .map_err(|state| match state {
+                // Only an ORDER BY can make the generated query look for a
+                // missing operator.
+                MetaUnavailable::NotSortable if sort.is_none() => {
+                    MetaUnavailable::ServiceError { http_status: 400 }
+                }
+                state => state,
+            })?;
         let (rows, has_more) = decode_rows(&body_of(answer)?, plan.columns.len())?;
         Ok(RowPage {
             table: table.table.clone(),
@@ -317,8 +330,9 @@ impl SchemaSource for GatewayProbe {
         key: &'a SecretString,
         table: &'a TableDetail,
         page: RowPageNumber,
+        sort: Option<&'a RowSort>,
     ) -> MetaFuture<'a, RowPage> {
-        Box::pin(self.read_rows(api_url, key, table, page))
+        Box::pin(self.read_rows(api_url, key, table, page, sort))
     }
 
     fn relations<'a>(
@@ -352,7 +366,11 @@ struct RowQuery {
 }
 
 impl RowQuery {
-    fn new(table: &TableDetail, page: RowPageNumber) -> Result<Self, MetaUnavailable> {
+    fn new(
+        table: &TableDetail,
+        page: RowPageNumber,
+        sort: Option<&RowSort>,
+    ) -> Result<Self, MetaUnavailable> {
         let visible = &table.columns[..table.columns.len().min(ROW_COLUMN_LIMIT)];
         // Each value is printed as text and cut one character past the
         // bound, so the server can tell a cut value from one that fits.
@@ -373,18 +391,30 @@ impl RowQuery {
             quote_ident(&table.table.schema)?,
             quote_ident(&table.table.name)?
         );
-        let (order_by, order) = if table.primary_key.is_empty() {
-            (String::new(), RowOrder::Unordered)
+        let mut keys = table
+            .primary_key
+            .iter()
+            .map(|name| quote_ident(name))
+            .collect::<Result<Vec<_>, _>>()?;
+        let order = match sort {
+            Some(sort) => {
+                // PostgreSQL's defaults put NULLs last going up and first
+                // going down, so the two directions mirror each other.
+                let direction = if sort.descending { " DESC" } else { "" };
+                keys.insert(0, format!("{}{direction}", quote_ident(&sort.column)?));
+                RowOrder::Sorted {
+                    column: sort.column.clone(),
+                    descending: sort.descending,
+                    tiebreak: table.primary_key.clone(),
+                }
+            }
+            None if table.primary_key.is_empty() => RowOrder::Unordered,
+            None => RowOrder::PrimaryKey(table.primary_key.clone()),
+        };
+        let order_by = if keys.is_empty() {
+            String::new()
         } else {
-            let keys = table
-                .primary_key
-                .iter()
-                .map(|name| quote_ident(name))
-                .collect::<Result<Vec<_>, _>>()?;
-            (
-                format!(" ORDER BY {}", keys.join(", ")),
-                RowOrder::PrimaryKey(table.primary_key.clone()),
-            )
+            format!(" ORDER BY {}", keys.join(", "))
         };
         // The implicit transaction of a multi-statement query keeps both
         // settings local to it, so nothing outlives the read on
@@ -982,7 +1012,7 @@ mod tests {
             vec![column(1, "id"), column(2, "Note")],
             &["id"],
         );
-        let plan = RowQuery::new(&table, RowPageNumber::new(3).unwrap()).unwrap();
+        let plan = RowQuery::new(&table, RowPageNumber::new(3).unwrap(), None).unwrap();
         assert_eq!(
             plan.sql,
             "SET TRANSACTION READ ONLY; SET LOCAL statement_timeout = 5000; \
@@ -1000,6 +1030,7 @@ mod tests {
         let plan = RowQuery::new(
             &detail("public", "wide", columns, &[]),
             RowPageNumber::FIRST,
+            None,
         )
         .unwrap();
         assert_eq!(plan.order, RowOrder::Unordered);
@@ -1008,6 +1039,35 @@ mod tests {
         assert_eq!(plan.columns.len(), ROW_COLUMN_LIMIT);
         assert_eq!(plan.hidden_columns, 10);
         assert!(!plan.sql.contains("\"c51\""));
+    }
+
+    #[test]
+    fn sorted_rows_fall_back_to_the_primary_key_for_ties() {
+        let odd = r#"Odd "name""#;
+        let table = detail(
+            "public",
+            "t",
+            vec![column(1, "a"), column(2, "b"), column(3, odd)],
+            &["a", "b"],
+        );
+        let sort = RowSort::new(odd, true).unwrap();
+        let plan = RowQuery::new(&table, RowPageNumber::FIRST, Some(&sort)).unwrap();
+        let expected = r##"ORDER BY "Odd ""name""" DESC, "a", "b" LIMIT 51 OFFSET 0"##;
+        assert!(plan.sql.ends_with(expected), "{}", plan.sql);
+        assert_eq!(
+            plan.order,
+            RowOrder::Sorted {
+                column: odd.into(),
+                descending: true,
+                tiebreak: vec!["a".into(), "b".into()],
+            }
+        );
+
+        let keyless = detail("public", "t", vec![column(1, "n")], &[]);
+        let sort = RowSort::new("n", false).unwrap();
+        let plan = RowQuery::new(&keyless, RowPageNumber::FIRST, Some(&sort)).unwrap();
+        assert!(plan.sql.ends_with(r#"ORDER BY "n" LIMIT 51 OFFSET 0"#));
+        assert!(plan.order.is_unstable());
     }
 
     #[test]
