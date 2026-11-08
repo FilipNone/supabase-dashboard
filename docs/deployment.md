@@ -25,9 +25,9 @@ The metadata database belongs to the dashboard. It is separate from the database
 1. Download and unpack the bundle from the release page:
 
    ```sh
-   curl -fLO https://github.com/FilipNone/supabase-dashboard/releases/download/v0.1.0-dev.3/supabase-dashboard-0.1.0-dev.3-docker.tar.gz
-   tar -xzf supabase-dashboard-0.1.0-dev.3-docker.tar.gz
-   cd supabase-dashboard-0.1.0-dev.3-docker
+   curl -fLO https://github.com/FilipNone/supabase-dashboard/releases/download/v0.1.0-dev.4/supabase-dashboard-0.1.0-dev.4-docker.tar.gz
+   tar -xzf supabase-dashboard-0.1.0-dev.4-docker.tar.gz
+   cd supabase-dashboard-0.1.0-dev.4-docker
    ```
 
    `SHA256SUMS` on the release page lists the checksum of each file.
