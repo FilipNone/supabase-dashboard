@@ -61,6 +61,18 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-leptos@0.3.11
+      # cargo-leptos uses wasm-opt from PATH and only downloads Binaryen
+      # itself when it is missing; that download has failed CI before.
+      # Keep the version and checksum in step with the Dockerfile.
+      - name: Install wasm-opt (Binaryen 123)
+        run: |
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$RUNNER_TEMP/binaryen.tar.gz" \
+            https://github.com/WebAssembly/binaryen/releases/download/version_123/binaryen-version_123-x86_64-linux.tar.gz
+          echo "e959f2170af4c20c552e9de3a0253704d6a9d2766e8fdb88e4d6ac4bae9388fe  $RUNNER_TEMP/binaryen.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/binaryen"
+          tar -xzf "$RUNNER_TEMP/binaryen.tar.gz" -C "$RUNNER_TEMP/binaryen" --strip-components=1
+          echo "$RUNNER_TEMP/binaryen/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/binaryen/bin/wasm-opt" --version
       - name: Build server and WASM bundle
         run: cargo leptos build --release
 
