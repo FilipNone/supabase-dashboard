@@ -318,7 +318,7 @@ fn SessionTable(
 }
 
 /// `2026-11-07 14:05`, in UTC.
-fn utc_minutes(at: OffsetDateTime) -> String {
+pub fn utc_minutes(at: OffsetDateTime) -> String {
     let at = at.to_offset(time::UtcOffset::UTC);
     format!("{} {:02}:{:02}", at.date(), at.hour(), at.minute())
 }

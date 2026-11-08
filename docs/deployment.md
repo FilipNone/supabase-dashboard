@@ -2,7 +2,7 @@
 
 This guide runs a released build on one Linux server from the prebuilt container image `ghcr.io/filipnone/supabase-dashboard`. Nothing is compiled on the server. To build from source, see [docs/development.md](https://github.com/FilipNone/supabase-dashboard/blob/main/docs/development.md).
 
-Development releases (`0.1.0-dev.N`) are previews. The dashboard can manage operator accounts, organizations, members, invitations, and a registry of self-hosted stacks. It does not connect to registered stacks yet. Expect breaking changes between dev releases.
+Development releases (`0.1.0-dev.N`) are previews. The dashboard can manage operator accounts, organizations, members, invitations, and a registry of self-hosted stacks. It can store a stack's API keys and check whether its Auth and REST services answer; it does not browse or change anything in a stack yet. Expect breaking changes between dev releases.
 
 ## What you need
 
@@ -25,9 +25,9 @@ The metadata database belongs to the dashboard. It is separate from the database
 1. Download and unpack the bundle from the release page:
 
    ```sh
-   curl -fLO https://github.com/FilipNone/supabase-dashboard/releases/download/v0.1.0-dev.1/supabase-dashboard-0.1.0-dev.1-docker.tar.gz
-   tar -xzf supabase-dashboard-0.1.0-dev.1-docker.tar.gz
-   cd supabase-dashboard-0.1.0-dev.1-docker
+   curl -fLO https://github.com/FilipNone/supabase-dashboard/releases/download/v0.1.0-dev.2/supabase-dashboard-0.1.0-dev.2-docker.tar.gz
+   tar -xzf supabase-dashboard-0.1.0-dev.2-docker.tar.gz
+   cd supabase-dashboard-0.1.0-dev.2-docker
    ```
 
    `SHA256SUMS` on the release page lists the checksum of each file.
@@ -42,7 +42,17 @@ The metadata database belongs to the dashboard. It is separate from the database
 
    Then edit `.env` and set `SUPABASE_DASHBOARD_PUBLIC_URL` (and `SUPABASE_DASHBOARD_DOMAIN` if you use Caddy) to your DNS name.
 
-3. Start it. With the bundled Caddy, which gets a Let's Encrypt certificate and needs ports 80 and 443 open:
+3. Create the key that encrypts the API keys of the stacks you register. The container runs as user 10001, so that user has to be able to read the file:
+
+   ```sh
+   openssl rand -base64 32 > secret.key
+   sudo chown 10001:10001 secret.key
+   sudo chmod 400 secret.key
+   ```
+
+   Copy `secret.key` somewhere safe, away from the database backups. Anyone with both can decrypt the stored keys, and without the file nobody can: if it is lost, every stack's keys have to be entered again. The dashboard logs a short key ID at startup so you can tell which key is in use.
+
+4. Start it. With the bundled Caddy, which gets a Let's Encrypt certificate and needs ports 80 and 443 open:
 
    ```sh
    docker compose --profile caddy up -d
@@ -56,7 +66,7 @@ The metadata database belongs to the dashboard. It is separate from the database
 
    The dashboard listens on `127.0.0.1:3000` on the host. Point the proxy there and keep the original `Host` header. The server checks the `Origin` of every form submission against `SUPABASE_DASHBOARD_PUBLIC_URL`, so the URL in the browser must match it exactly.
 
-4. Check that it is up:
+5. Check that it is up:
 
    ```sh
    docker compose ps                     # dashboard shows "healthy"
@@ -65,7 +75,7 @@ The metadata database belongs to the dashboard. It is separate from the database
 
    The server applies database migrations at startup. If it keeps restarting, `docker compose logs dashboard` names the setting or problem.
 
-5. Create the first operator. There is no default account and no public sign-up:
+6. Create the first operator. There is no default account and no public sign-up:
 
    ```sh
    docker compose exec dashboard supabase-dashboard-server create-owner --email you@example.com --name "Your Name"
@@ -81,6 +91,10 @@ On a private network only, you can skip HTTPS: in `.env`, set `SUPABASE_DASHBOAR
 
 Everything is set in `.env`. `compose.yaml` passes it to the dashboard container and builds `SUPABASE_DASHBOARD_DATABASE_URL` from `POSTGRES_PASSWORD`. Only use letters and digits in that password, because it goes into the URL unescaped. Session lifetime, request limits, and logging are documented under Configuration in [docs/development.md](https://github.com/FilipNone/supabase-dashboard/blob/main/docs/development.md#configuration). Restart after a change with `docker compose up -d`.
 
+The encryption key is not in `.env`. `compose.yaml` mounts `secret.key` as a Compose secret at `/run/secrets/secret_key` and points `SUPABASE_DASHBOARD_SECRET_KEY_FILE` at it, so the key does not appear in `docker inspect`.
+
+To check a stack that runs on the same server, register it by an address the container can reach, such as the host's private network address. Loopback addresses are refused unless `SUPABASE_DASHBOARD_ALLOW_LOOPBACK_TARGETS=true`, and inside the container `127.0.0.1` is the container itself.
+
 ## Operations
 
 | Task | Command |
@@ -90,7 +104,7 @@ Everything is set in `.env`. `compose.yaml` passes it to the dashboard container
 | Reset a forgotten password | `docker compose exec dashboard supabase-dashboard-server reset-password --email you@example.com` |
 | Back up the metadata database | `docker compose exec -T db pg_dump -U dashboard -Fc dashboard > dashboard-$(date +%F).dump` |
 
-`reset-password` signs the account out everywhere. Keep backups outside the server and treat them as secrets: they contain session hashes, password hashes, and audit records.
+`reset-password` signs the account out everywhere. Keep backups outside the server and treat them as secrets: they contain session hashes, password hashes, audit records, and the encrypted API keys of registered stacks. Keep `secret.key` in a different place from the dumps.
 
 To restore a backup into an empty database:
 
@@ -106,7 +120,7 @@ These steps were checked once with 0.1.0-dev.1 (backup, wipe the volume, start f
 
 1. Read the release notes.
 2. Back up the metadata database (see above).
-3. Set `SUPABASE_DASHBOARD_VERSION` in `.env` to the new version, and replace `compose.yaml` and `Caddyfile` with the files from the new bundle if they changed.
+3. Set `SUPABASE_DASHBOARD_VERSION` in `.env` to the new version, and replace `compose.yaml` and `Caddyfile` with the files from the new bundle if they changed. Upgrading from 0.1.0-dev.1: the new `compose.yaml` expects `secret.key`, so create it first (Install, step 3).
 4. `docker compose pull && docker compose up -d`
 
 Migrations only move forward. To go back to an older version, restore the backup taken before the upgrade.
@@ -124,6 +138,7 @@ export LEPTOS_OUTPUT_NAME=supabase-dashboard LEPTOS_SITE_ROOT=site LEPTOS_SITE_P
   LEPTOS_SITE_ADDR=127.0.0.1:3000 LEPTOS_ENV=PROD
 export SUPABASE_DASHBOARD_PUBLIC_URL=https://dashboard.example.com
 export SUPABASE_DASHBOARD_DATABASE_URL=postgres://dashboard:<password>@127.0.0.1:5432/dashboard
+export SUPABASE_DASHBOARD_SECRET_KEY_FILE=/etc/supabase-dashboard/secret.key
 ./supabase-dashboard-server
 ```
 

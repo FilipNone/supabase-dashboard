@@ -12,8 +12,11 @@ Versions match the upstream `docker/docker-compose.yml` in supabase/supabase on 
 | Auth (GoTrue) | `supabase/gotrue:v2.197.0` | `auth` | 54399 |
 | PostgREST | `postgrest/postgrest:v14.18` | `rest` | 54330 |
 | postgres-meta | `supabase/postgres-meta:v0.100.0` | `meta` | 54380 |
+| API gateway (Kong) | `kong/kong:3.9.3` | `gateway` | 54321 |
 
-Not in the fixture yet: Studio, the API gateway, Realtime, Storage, imgproxy, Edge Functions, Supavisor, analytics. They will be added when the milestone that uses them starts (Storage, Realtime, and Functions are M5).
+Upstream now defaults to an Envoy gateway and keeps Kong as an alternative. The fixture uses Kong with a reduced `api/kong.yml` (Auth and REST routes only, legacy JWT API keys) because its configuration is much smaller; the routes and key checks match upstream's. An Envoy fixture is still to do.
+
+Not in the fixture yet: Studio, Realtime, Storage, imgproxy, Edge Functions, Supavisor, analytics. They will be added when the milestone that uses them starts (Storage, Realtime, and Functions are M5).
 
 ## Fixture
 
@@ -30,6 +33,10 @@ docker compose -p sd-fixture down -v
 | Capability | Status | Evidence |
 | --- | --- | --- |
 | Fixture services start and report healthy | Verified | CI job `fixture` (`up --wait`) |
-| Any dashboard adapter operation | Not implemented | Adapters start in M2 |
+| Auth health and version through the gateway (anon key) | Verified against GoTrue v2.197.0 via Kong 3.9.3 | `crates/adapters/tests/gateway_fixture.rs`, CI job `fixture` |
+| PostgREST reachability through the gateway (service role key; the gateway refuses the anon key on the root path with 403) | Verified against PostgREST v14.18 via Kong 3.9.3 | same test |
+| Wrong key reported as rejected (401) | Verified | same test |
+| Envoy gateway, new-style `sb_publishable_`/`sb_secret_` keys | Not tested | No fixture yet |
+| Schema browsing, SQL, Auth users, Storage | Not implemented | Later M2 and M3 work |
 
 Update the baseline only together with a fixture change and a passing CI run.

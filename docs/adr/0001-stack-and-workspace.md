@@ -31,26 +31,33 @@ Why these:
 ```text
 apps/server/        binary: configuration, startup, HTTP routes, graceful shutdown
 crates/domain/      framework-free types shared by server and browser
+crates/application/ authorized use cases, credential encryption, adapter traits (server only)
 crates/persistence/ control-plane PostgreSQL pool and migrations (server only)
+crates/adapters/    HTTP clients for managed stacks and the outbound address policy (server only)
 crates/web/         Leptos UI; `ssr` feature for the server, `hydrate` for WASM
 style/, assets/     CSS theme tokens and static files
 ```
 
-`crates/application` and `crates/adapters` from the AGENTS.md proposal will be added when the first authorized use case (M1) and the first Supabase adapter (M2) exist. Splitting earlier would only create empty crates.
+`crates/application` came with the first authorized use cases in M1 and `crates/adapters` with the first stack check in M2.
 
 Boundary rules:
 
 - `domain` depends on no HTTP, database, or UI crate.
-- `web` with the `hydrate` feature must not pull in `persistence`, SQLx, or Tokio's networking. CI builds the WASM target separately to catch leaks.
+- `application` defines the traits adapters implement (for example `StackProbe`) and does not depend on `adapters`; only the server binary wires the two together.
+- `web` with the `hydrate` feature must not pull in `persistence`, `application`, `adapters`, SQLx, reqwest, or Tokio's networking. CI builds the WASM target separately to catch leaks.
 - Secrets are wrapped in `secrecy::SecretString` on the server and have no `Serialize` implementation.
 
 ## Secret storage strategy
 
-No managed-project credentials are stored in M0. When M2 adds them:
+Implemented in M2 for project API keys (`crates/application/src/secrets.rs`):
 
-- Encrypt each credential with AES-256-GCM using the RustCrypto `aes-gcm` crate (or an equivalent reviewed library), with a random nonce per value.
-- The key comes from the deployment (a file or environment variable), never from the metadata database. Each ciphertext records a key ID so keys can be rotated by re-encrypting rows in a background job.
+- Each credential is encrypted with AES-256-GCM from the RustCrypto `aes-gcm` crate (0.11), with a random 96-bit nonce per value from the operating system. The associated data names the project and the key slot, so a ciphertext moved to another row fails to decrypt.
+- The key comes from the deployment (`SUPABASE_DASHBOARD_SECRET_KEY_FILE` or `SUPABASE_DASHBOARD_SECRET_KEY`), never from the metadata database. Each row records a key ID (a truncated SHA-256 of the key under a fixed label), so rows sealed under another key are reported as unreadable instead of failing as errors. Rotation by re-encrypting rows is not built yet.
 - Losing the key makes stored credentials unrecoverable; operators then re-enter them. Backups of the metadata database are useless to an attacker without the key, and the key must be backed up separately.
+
+## Outbound HTTP
+
+Stack checks use reqwest 0.13 with rustls and the `ring` provider, the same provider SQLx already pulls in, and the Mozilla roots from `webpki-roots`. This avoids building `aws-lc-rs` (reqwest's default) for the arm64 image. The cost is that the operating system's certificate store is not consulted, so stacks behind a private CA are not supported yet. A custom DNS resolver applies the address policy in `crates/adapters/src/net.rs` to every resolved address, and address literals are checked before a request is sent. Redirects and environment proxies are disabled.
 
 ## Metadata backup and recovery requirements
 

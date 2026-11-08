@@ -11,7 +11,9 @@ publish.workspace = true
 [dependencies]
 supabase-dashboard-domain.workspace = true
 supabase-dashboard-persistence.workspace = true
+aes-gcm = "0.11"
 argon2 = "0.6"
+base64 = "0.22"
 getrandom = "0.4"
 secrecy.workspace = true
 sha2 = "0.11"

@@ -2,6 +2,7 @@
 # Setup is in README.md in this bundle (docs/deployment.md in the repository).
 #
 #   cp .env.example .env    # then edit .env
+#   create secret.key        # see "Install" in README.md
 #   docker compose up -d                    # behind your own HTTPS proxy
 #   docker compose --profile caddy up -d    # or with the bundled Caddy for TLS
 #
@@ -37,6 +38,11 @@ services:
     env_file: .env
     environment:
       SUPABASE_DASHBOARD_DATABASE_URL: postgres://dashboard:${POSTGRES_PASSWORD}@db:5432/dashboard
+      SUPABASE_DASHBOARD_SECRET_KEY_FILE: /run/secrets/secret_key
+    secrets:
+      # Encrypts the API keys of managed stacks. Back it up separately from
+      # the database: without it, stored keys cannot be read.
+      - secret_key
     ports:
       # Loopback only by default; put an HTTPS reverse proxy in front.
       - "${SUPABASE_DASHBOARD_BIND:-127.0.0.1}:${SUPABASE_DASHBOARD_PORT:-3000}:3000"
@@ -64,6 +70,10 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
+
+secrets:
+  secret_key:
+    file: ./secret.key
 
 volumes:
   db-data:

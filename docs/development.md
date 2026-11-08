@@ -1,6 +1,6 @@
 # Local development
 
-This describes what exists today (M0 and the first part of M1). See `docs/adr/0001-stack-and-workspace.md` for why the stack was chosen.
+This describes what exists today (M0, M1, and the start of M2). See `docs/adr/0001-stack-and-workspace.md` for why the stack was chosen.
 
 ## Prerequisites
 
@@ -74,8 +74,26 @@ All settings are environment variables. Invalid values stop the server at startu
 | `SUPABASE_DASHBOARD_SESSION_LIFETIME_HOURS` | 12 | 1 to 720; absolute session lifetime from sign-in |
 | `SUPABASE_DASHBOARD_SESSION_IDLE_TIMEOUT_MINS` | 60 | 5 to 1440; must not exceed the lifetime |
 | `SUPABASE_DASHBOARD_LOG_FORMAT` | `json` (`pretty` in development) | |
+| `SUPABASE_DASHBOARD_SECRET_KEY_FILE` | unset | Path to a file holding the key that encrypts stored project API keys: 32 random bytes, base64-encoded. Without a key the server starts, but it cannot store or use API keys |
+| `SUPABASE_DASHBOARD_SECRET_KEY` | unset | The same key given directly. Set only one of the two; prefer the file, because environment variables show up in `docker inspect` and process listings |
+| `SUPABASE_DASHBOARD_ALLOW_LOOPBACK_TARGETS` | `false` | `true` lets service checks connect to `127.0.0.0/8` and `::1`, for a stack on the same machine. Logged as a warning at startup |
 | `RUST_LOG` | `info,tower_http=info,sqlx=warn` | Standard `tracing` filter |
 | `LEPTOS_SITE_ADDR` | `127.0.0.1:3000` | Listen address |
+
+### The credential encryption key
+
+Generate one and keep it outside the repository and outside the metadata database:
+
+```sh
+openssl rand -base64 32 > .secret.key && chmod 600 .secret.key
+echo "SUPABASE_DASHBOARD_SECRET_KEY_FILE=$PWD/.secret.key" >> .env
+```
+
+The server logs a short key ID at startup, never the key. Each stored API key is sealed with AES-256-GCM and tied to its project and key slot, so a ciphertext copied to another project or slot does not decrypt. If the server starts with a different key, keys saved under the old one show as unreadable on the project's settings page and have to be entered again. There is no key rotation command yet.
+
+### Service checks
+
+The project overview's "Check now" button asks the stack's API gateway for `/auth/v1/health` (with the anon key) and `/rest/v1/` (with the service role key). Only those two paths under the registered API URL are requested. The client refuses loopback (unless allowed above), link-local, multicast, and cloud metadata addresses, checks every address a host name resolves to, does not follow redirects, ignores proxy environment variables, and gives up after 5 seconds to connect or 10 seconds in total. HTTPS uses the Mozilla root store bundled with the binary; stacks behind a private certificate authority are not supported yet. A project can be checked once every 10 seconds.
 
 ## Endpoints
 
@@ -104,9 +122,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy -p supabase-dashboard-web --target wasm32-unknown-unknown --features hydrate -- -D warnings
 cargo test --workspace
 SUPABASE_DASHBOARD_TEST_DATABASE_URL=postgres://... cargo test --workspace
+SUPABASE_DASHBOARD_TEST_FIXTURE_URL=http://127.0.0.1:54321 cargo test -p supabase-dashboard-adapters
 cargo leptos build
 ```
 
-The database tests create and drop their own scratch databases, so the role in the URL needs `CREATEDB`. Without the variable they print a skip message and pass.
+The database tests create and drop their own scratch databases, so the role in the URL needs `CREATEDB`. Without the variable they print a skip message and pass. The fixture URL points the adapter tests at the gateway of the disposable Supabase stack described in `docs/supabase-compatibility.md`; without it that test is skipped too.
 
-The WASM clippy run also catches server-only crates leaking into the browser build: `cargo tree -p supabase-dashboard-web --target wasm32-unknown-unknown --features hydrate -e normal` must not list `sqlx`, `axum`, `tokio`, `argon2`, `supabase-dashboard-persistence`, or `supabase-dashboard-application`. CI checks this.
+The WASM clippy run also catches server-only crates leaking into the browser build: `cargo tree -p supabase-dashboard-web --target wasm32-unknown-unknown --features hydrate -e normal` must not list `sqlx`, `axum`, `tokio`, `argon2`, `reqwest`, `supabase-dashboard-persistence`, `supabase-dashboard-application`, or `supabase-dashboard-adapters`. CI checks this.

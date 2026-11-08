@@ -1,6 +1,6 @@
 # Supabase Dashboard roadmap
 
-Updated: 2026-11-07
+Updated: 2026-11-08
 
 ## Goal and status
 
@@ -8,7 +8,7 @@ Build a self-hosted dashboard in Rust that looks and works like <https://supabas
 
 Repository: <https://github.com/FilipNone/supabase-dashboard>.
 
-Status: M0 nearly complete; M1 started. A Cargo workspace exists with an Axum server, Leptos SSR/hydrated UI shell, control-plane PostgreSQL migrations, and CI (see `docs/development.md` and `docs/adr/0001-stack-and-workspace.md`). Operators can be bootstrapped from the command line, sign in and out, edit their profile, change their password, and sign out other sessions. Installation admins can list accounts, disable or re-enable them, and see every organization and registered project. Every page and API path requires a session, except the invitation page. Operators can create and rename organizations, switch between them, and manage member roles, removal, and leaving from the browser. Owners and admins can invite people by email; the invitee accepts with an existing account or creates one from the link. Owners and admins can register an existing stack as a project by its API URL, rename it, change its API URL, and unregister it; every member can see the organization's projects. The dashboard does not connect to registered stacks yet. Current focus: a secure vertical slice that registers an existing deployment and shows its health and schema.
+Status: M0 nearly complete; M1 started. A Cargo workspace exists with an Axum server, Leptos SSR/hydrated UI shell, control-plane PostgreSQL migrations, and CI (see `docs/development.md` and `docs/adr/0001-stack-and-workspace.md`). Operators can be bootstrapped from the command line, sign in and out, edit their profile, change their password, and sign out other sessions. Installation admins can list accounts, disable or re-enable them, and see every organization and registered project. Every page and API path requires a session, except the invitation page. Operators can create and rename organizations, switch between them, and manage member roles, removal, and leaving from the browser. Owners and admins can invite people by email; the invitee accepts with an existing account or creates one from the link. Owners and admins can register an existing stack as a project by its API URL, rename it, change its API URL, and unregister it; every member can see the organization's projects. Owners and admins can store a project's anon and service role keys, encrypted on the server, and any member can run a health check that reports whether the stack's Auth and REST services answer, with the Auth version. Current focus: a secure vertical slice that registers an existing deployment and shows its health and schema.
 
 Priority scale: P1 = required for the first usable release; P2 = next release after the foundation; P3 = later or dependent on research. Milestones indicate dependency order, not dates or delivery estimates.
 
@@ -35,7 +35,7 @@ The main technical risks are privileged credentials, isolation between organizat
 
 - [x] Record the architecture decision, Rust toolchain, selected framework versions, and application license; verify any reused upstream licenses separately. (ADR 0001, `MIT OR Apache-2.0`; the fixture compose is adapted from Apache-2.0 upstream files with attribution.)
 - [x] Create a minimal Cargo workspace with a running server, Rust UI, health endpoint, configuration validation, and graceful shutdown.
-- [x] Establish separate control-plane PostgreSQL storage, versioned migrations, secret-storage strategy, and backup/recovery requirements. (Strategy and requirements are documented in ADR 0001; encryption is implemented when M2 first stores credentials; the tested restore runbook is an M4 item.)
+- [x] Establish separate control-plane PostgreSQL storage, versioned migrations, secret-storage strategy, and backup/recovery requirements. (Strategy and requirements are documented in ADR 0001; credential encryption landed with M2 API key storage; the tested restore runbook is an M4 item.)
 - [ ] Build the reference-style shell: primary sidebar, organization/project switchers, page headers, tables, dialogs, dark/light/system themes, and responsive navigation. (Done: sidebar, top bar, page header, table, empty/error states, themes, responsive navigation, checked at 1280px and 390px in both themes. The organization switcher in the top bar lists the operator's organizations and marks the current one. Inside an organization a project switcher lists its projects; on a project page both show the project's organization and the project, and phones show only the innermost menu. Checked at 1280px dark and 390px light. Remaining: dialogs.)
 - [x] Add structured redacted logs, request IDs, typed API errors, bounded requests, and documented local development setup. (`ApiError` gives a JSON envelope with stable codes; new variants are added with the endpoints that need them.)
 - [x] Add formatting, clippy, unit/integration checks, server/UI builds, and a synthetic disposable Supabase fixture with pinned component versions. Document an explicit supported-version baseline. (`docs/supabase-compatibility.md`; the fixture covers db, auth, rest, and meta.)
@@ -55,12 +55,12 @@ Acceptance: two organizations cannot read or mutate each other's records, includ
 
 ### M2: register existing deployments (P1)
 
-- [ ] Add a project connection wizard for explicitly enrolled self-hosted targets, with TLS verification and server-side credential storage.
-- [ ] Detect reachable services, component versions, permissions, and supported capabilities; distinguish unknown health from failure.
-- [ ] Show project cards, project overview, service health, and connection diagnostics. Support metadata edits and explicit credential replacement. (Started: the organization page lists project cards, and each project has an overview and a settings page where it can be renamed or pointed at a new API URL (same checks as registration, audited, and nothing is sent to the stack). Health, diagnostics, and credentials come with the connection wizard.)
+- [ ] Add a project connection wizard for explicitly enrolled self-hosted targets, with TLS verification and server-side credential storage. (Started: the anon and service role keys are entered on the project's settings page, validated, and stored with AES-256-GCM under a key supplied by the deployment. They are never sent back to the browser; the page shows only whether each is set and when. Replacing and removing keys is limited to owners and admins and audited. HTTPS checks verify certificates against the Mozilla root store. Still missing: a guided wizard at registration, private CA support, and key rotation.)
+- [ ] Detect reachable services, component versions, permissions, and supported capabilities; distinguish unknown health from failure. (Started: a check asks the gateway for Auth health with the anon key and the PostgREST root with the service role key, and records healthy, key rejected, HTTP error, unreachable with a fixed reason, or not checked because a key is missing or unreadable. The Auth version is read from its health response. Verified against the Kong fixture. Not done: other services, permissions, a capability matrix, and periodic checks.)
+- [ ] Show project cards, project overview, service health, and connection diagnostics. Support metadata edits and explicit credential replacement. (Started: the organization page lists project cards, and each project has an overview and a settings page where it can be renamed or pointed at a new API URL (same checks as registration, audited, and nothing is sent to the stack). The overview shows the last saved health check with its time and a Check now button, rate limited to one check per project every 10 seconds. The settings page has the API key section. Diagnostics beyond the per-service reason are not done.)
 - [ ] Implement schema/table/column browsing and bounded, paginated read-only data access, with safe identifier handling.
 - [x] Add disconnect/unregister behavior that preserves the remote stack and its data. (Unregistering requires typing the project name and deletes only the registry row. Nothing is sent to the stack.)
-- [ ] Test forbidden destinations, redirects/DNS changes, expired credentials, unreachable services, permission errors, and unsupported versions.
+- [ ] Test forbidden destinations, redirects/DNS changes, expired credentials, unreachable services, permission errors, and unsupported versions. (Started: adapter tests cover refused loopback, names resolving to loopback, cloud metadata addresses, redirects not followed, timeouts, oversized bodies, closed ports, TLS failure, and rejected keys. Every resolved address is checked at connection time. Not covered yet: expired JWT keys and unsupported versions.)
 
 Acceptance: an operator registers a disposable stack, browses schema/data, and reconnects after a service outage without affecting other projects. Secrets never appear in browser responses or logs. Unregistering leaves the stack intact.
 
@@ -172,6 +172,7 @@ Release checks include a fresh installation, migration from the previous support
 
 ## Revision history
 
+- 2026-11-08: M2 API keys and health checks: encrypted anon and service role key storage, a gateway health check for Auth and REST with an SSRF address policy, the Kong gateway in the fixture, and release `v0.1.0-dev.2`. Updated the first, second, third, and last M2 items.
 - 2026-11-08: first development release `v0.1.0-dev.1`: a multi-arch container image on GHCR, a Docker Compose deploy bundle with optional Caddy TLS, and Linux tarballs, built by `.github/workflows/release.yml`. Started the M7 installation documentation item.
 - 2026-11-07: owners and admins can change a project's API URL from its settings page. The M2 project item stays open.
 - 2026-11-07: added the top-bar project switcher; the M0 shell item now only lacks dialogs.

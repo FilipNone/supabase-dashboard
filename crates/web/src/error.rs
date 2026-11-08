@@ -44,6 +44,7 @@ impl FromServerFnError for AppError {
 mod server {
     use supabase_dashboard_application::{
         auth::{AccountUpdateError, AdminError, AuthError, InvitationSignUpError},
+        connections::ConnectionError,
         organizations::OrganizationError,
         projects::ProjectError,
     };
@@ -113,6 +114,42 @@ mod server {
                 }
             }
         }
+    }
+
+    impl From<ConnectionError> for AppError {
+        fn from(err: ConnectionError) -> Self {
+            match err {
+                ConnectionError::NotFound => Self::NotFound,
+                ConnectionError::Forbidden => Self::Forbidden,
+                ConnectionError::StorageUnavailable
+                | ConnectionError::NotStored
+                | ConnectionError::CheckTooSoon { .. }
+                | ConnectionError::CheckInProgress
+                | ConnectionError::Input(_) => Self::Rejected(sentence(&err.to_string())),
+                ConnectionError::Cipher(err) => {
+                    tracing::error!(error = %err, "credential encryption failed");
+                    Self::Unavailable
+                }
+                ConnectionError::Internal(err) => {
+                    tracing::error!(error = %err, "project connection operation failed");
+                    Self::Unavailable
+                }
+            }
+        }
+    }
+
+    /// Service messages are lowercase clauses; the UI shows sentences.
+    fn sentence(message: &str) -> String {
+        let mut chars = message.chars();
+        let mut out: String = chars
+            .next()
+            .map(|c| c.to_uppercase().collect())
+            .unwrap_or_default();
+        out.push_str(chars.as_str());
+        if !out.ends_with('.') {
+            out.push('.');
+        }
+        out
     }
 
     impl From<OrganizationError> for AppError {

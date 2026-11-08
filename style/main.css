@@ -426,3 +426,11 @@ td { vertical-align: middle; }
 @media (max-width: 640px) {
   .detail-list > div { grid-template-columns: 1fr; gap: var(--space-1); }
 }
+
+/* Project API keys: one block per key, separated by a rule. */
+.key-list { display: grid; gap: var(--space-4); }
+.key-item { display: grid; gap: var(--space-3); min-width: 0; }
+.key-item + .key-item { border-top: 1px solid var(--color-border); padding-top: var(--space-4); }
+.key-item .subsection-title { margin: 0; color: var(--color-text); }
+.key-item .field-hint { margin: 0; }
+.status-detail { display: block; margin-top: var(--space-1); }

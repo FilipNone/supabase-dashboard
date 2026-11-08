@@ -14,17 +14,23 @@ mod telemetry;
 
 use std::{process::ExitCode, sync::Arc, time::Duration};
 
+use supabase_dashboard_adapters::{
+    gateway::{GatewayError, GatewayProbe, GatewaySettings},
+    net::TargetPolicy,
+};
 use supabase_dashboard_application::{
     auth::{AuthConfig, AuthError, AuthService, BootstrapError, PasswordResetError},
+    connections::ConnectionService,
     organizations::OrganizationService,
     projects::ProjectService,
+    secrets::{CredentialCipher, KeyError},
 };
 use supabase_dashboard_persistence::{Database, PersistenceError};
 use tokio::net::TcpListener;
 
 use crate::{
     app::HttpLimits,
-    config::{Config, ConfigError},
+    config::{Config, ConfigError, SecretKeySource},
     session::CookieSettings,
     state::AppState,
 };
@@ -56,6 +62,15 @@ enum StartupError {
     Auth(#[from] AuthError),
     #[error("could not reset the password: {0}")]
     PasswordReset(#[from] PasswordResetError),
+    #[error("could not read the credential encryption key file {path}: {source}")]
+    SecretKeyFile {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
+    #[error("SUPABASE_DASHBOARD_SECRET_KEY(_FILE) is invalid: {0}")]
+    SecretKey(#[from] KeyError),
+    #[error("could not set up project connections: {0}")]
+    Gateway(#[from] GatewayError),
 }
 
 #[tokio::main]
@@ -135,6 +150,21 @@ fn ensure_trailing_slash(url: &str) -> String {
     }
 }
 
+/// Loads the credential encryption key, if one is configured.
+fn credential_cipher(config: &Config) -> Result<Option<CredentialCipher>, StartupError> {
+    let encoded = match &config.secret_key {
+        None => return Ok(None),
+        Some(SecretKeySource::Inline(key)) => key.clone(),
+        Some(SecretKeySource::File(path)) => std::fs::read_to_string(path)
+            .map(secrecy::SecretString::from)
+            .map_err(|source| StartupError::SecretKeyFile {
+                path: path.clone(),
+                source,
+            })?,
+    };
+    Ok(Some(CredentialCipher::from_base64(&encoded)?))
+}
+
 async fn run() -> Result<(), StartupError> {
     let config = Config::from_env()?;
     telemetry::init(config.log_format)?;
@@ -154,6 +184,26 @@ async fn run() -> Result<(), StartupError> {
     }
     tokio::spawn(prune_sessions(Arc::clone(&auth)));
 
+    let cipher = credential_cipher(&config)?;
+    match &cipher {
+        Some(cipher) => {
+            tracing::info!(key_id = cipher.key_id(), "credential encryption key loaded")
+        }
+        None => tracing::warn!(
+            "no credential encryption key is configured; project API keys cannot be stored \
+             (set SUPABASE_DASHBOARD_SECRET_KEY_FILE)"
+        ),
+    }
+    if config.allow_loopback_targets {
+        tracing::warn!("project checks may connect to loopback addresses");
+    }
+    let probe = GatewayProbe::shared(GatewaySettings {
+        policy: TargetPolicy {
+            allow_loopback: config.allow_loopback_targets,
+        },
+        ..GatewaySettings::default()
+    })?;
+
     let secure_cookie = config
         .public_url
         .as_ref()
@@ -165,6 +215,7 @@ async fn run() -> Result<(), StartupError> {
         auth,
         organizations: Arc::new(OrganizationService::new(db.clone())),
         projects: Arc::new(ProjectService::new(db.clone())),
+        connections: Arc::new(ConnectionService::new(db.clone(), cipher, probe)),
         cookie: CookieSettings::new(secure_cookie, config.session_lifetime.as_secs()),
         expected_origin: config
             .public_url

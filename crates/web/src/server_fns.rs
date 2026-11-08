@@ -11,6 +11,7 @@ use supabase_dashboard_domain::{
     account::{AccountSummary, AdminAccountSummary, SessionSummary},
     admin::RegisteredResources,
     authz::OrgRole,
+    connection::{CredentialKind, CredentialOverview, HealthReport},
     health::InstallationHealth,
     invitation::{InvitationCode, InvitationPreview, InvitationSummary, IssuedInvitation},
     organization::{MemberSummary, OrganizationSummary},
@@ -78,6 +79,7 @@ mod org_context {
     use leptos::prelude::use_context;
     use supabase_dashboard_application::{
         auth::{AuthService, CurrentSession, RequestContext},
+        connections::ConnectionService,
         organizations::OrganizationService,
         projects::ProjectService,
     };
@@ -112,6 +114,13 @@ mod org_context {
     pub fn projects() -> Result<Arc<ProjectService>, AppError> {
         use_context::<Arc<ProjectService>>().ok_or_else(|| {
             tracing::error!("project service is not configured");
+            AppError::Unavailable
+        })
+    }
+
+    pub fn connections() -> Result<Arc<ConnectionService>, AppError> {
+        use_context::<Arc<ConnectionService>>().ok_or_else(|| {
+            tracing::error!("connection service is not configured");
             AppError::Unavailable
         })
     }
@@ -178,6 +187,66 @@ pub async fn rename_organization(id: Uuid, name: String) -> Result<OrganizationS
     Ok(org_context::organizations()?
         .rename(&session, id, &name, audit.get())
         .await?)
+}
+
+/// Which API keys are stored for a project, without their values.
+#[server]
+pub async fn get_project_credentials(id: Uuid) -> Result<CredentialOverview, AppError> {
+    let session = org_context::session()?;
+    Ok(org_context::connections()?
+        .credentials(&session, id)
+        .await?)
+}
+
+/// An API key typed into a form. Never printed, never sent back.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecretInput(String);
+
+impl fmt::Debug for SecretInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SecretInput([REDACTED])")
+    }
+}
+
+/// Stores or replaces one of a project's API keys.
+#[server]
+pub async fn replace_project_credential(
+    id: Uuid,
+    kind: CredentialKind,
+    value: SecretInput,
+) -> Result<(), AppError> {
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    let value = secrecy::SecretString::from(value.0);
+    Ok(org_context::connections()?
+        .replace_credential(&session, id, kind, &value, audit.get())
+        .await?)
+}
+
+#[server]
+pub async fn remove_project_credential(id: Uuid, kind: CredentialKind) -> Result<(), AppError> {
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    Ok(org_context::connections()?
+        .remove_credential(&session, id, kind, audit.get())
+        .await?)
+}
+
+/// The last saved service check of a project, if any.
+#[server]
+pub async fn get_project_health(id: Uuid) -> Result<Option<HealthReport>, AppError> {
+    let session = org_context::session()?;
+    Ok(org_context::connections()?
+        .last_report(&session, id)
+        .await?)
+}
+
+/// Checks the project's services now and saves the result.
+#[server]
+pub async fn check_project_health(id: Uuid) -> Result<HealthReport, AppError> {
+    let session = org_context::session()?;
+    Ok(org_context::connections()?.check_now(&session, id).await?)
 }
 
 /// Projects registered in an organization.

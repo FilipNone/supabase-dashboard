@@ -1,0 +1,32 @@
+[package]
+name = "supabase-dashboard-adapters"
+description = "Outbound connections to self-hosted Supabase services for supabase-dashboard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+supabase-dashboard-application.workspace = true
+supabase-dashboard-domain.workspace = true
+# No default features: TLS comes from the preconfigured rustls config below,
+# with the ring provider, instead of reqwest's aws-lc-rs default.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "time"] }
+tracing.workspace = true
+url.workspace = true
+webpki-roots = "1"
+
+[dev-dependencies]
+axum.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

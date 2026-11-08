@@ -41,6 +41,7 @@ pub fn router(state: AppState, limits: &HttpLimits) -> Router {
     });
     let organizations = state.organizations.clone();
     let projects = state.projects.clone();
+    let connections = state.connections.clone();
     let auth = state.auth.clone();
     let leptos_options = state.leptos_options.clone();
     let x_request_id = HeaderName::from_static("x-request-id");
@@ -60,6 +61,7 @@ pub fn router(state: AppState, limits: &HttpLimits) -> Router {
                 provide_context(probe.clone());
                 provide_context(organizations.clone());
                 provide_context(projects.clone());
+                provide_context(connections.clone());
                 provide_context(auth.clone());
             },
             move || shell(leptos_options.clone()),
@@ -141,6 +143,7 @@ mod tests {
     use secrecy::SecretString;
     use supabase_dashboard_application::{
         auth::{AuthConfig, AuthService},
+        connections::ConnectionService,
         organizations::OrganizationService,
         projects::ProjectService,
     };
@@ -148,11 +151,12 @@ mod tests {
     use supabase_dashboard_web::{
         app::SIGN_IN_PATH,
         server_fns::{
-            AdminListAccounts, AdminSetAccountDisabled, ChangePassword, CreateInvitation,
-            CreateOrganization, GetCurrentAccount, GetInstallationHealth, GetOrganization,
-            GetProject, ListOrganizations, ListProjects, ListSessions, PreviewInvitation,
-            RegisterProject, RenameOrganization, RevokeSession, SignUpWithInvitation,
-            UnregisterProject, UpdateProfile,
+            AdminListAccounts, AdminSetAccountDisabled, ChangePassword, CheckProjectHealth,
+            CreateInvitation, CreateOrganization, GetCurrentAccount, GetInstallationHealth,
+            GetOrganization, GetProject, GetProjectCredentials, GetProjectHealth,
+            ListOrganizations, ListProjects, ListSessions, PreviewInvitation, RegisterProject,
+            RemoveProjectCredential, RenameOrganization, ReplaceProjectCredential, RevokeSession,
+            SignUpWithInvitation, UnregisterProject, UpdateProfile,
         },
     };
     use tower::ServiceExt;
@@ -164,6 +168,13 @@ mod tests {
     const ORIGIN: &str = "http://dash.localhost:3000";
 
     async fn router_for(db: Database) -> Router {
+        router_with_cipher(db, None).await
+    }
+
+    async fn router_with_cipher(
+        db: Database,
+        cipher: Option<supabase_dashboard_application::secrets::CredentialCipher>,
+    ) -> Router {
         let auth = AuthService::new(db.clone(), AuthConfig::default())
             .await
             .unwrap();
@@ -174,6 +185,12 @@ mod tests {
                 .build(),
             organizations: Arc::new(OrganizationService::new(db.clone())),
             projects: Arc::new(ProjectService::new(db.clone())),
+            connections: Arc::new(ConnectionService::new(
+                db.clone(),
+                cipher,
+                supabase_dashboard_adapters::gateway::GatewayProbe::shared(Default::default())
+                    .unwrap(),
+            )),
             db,
             readiness_timeout: Duration::from_secs(1),
             auth: Arc::new(auth),
@@ -697,6 +714,133 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 2);
+
+        db.close().await;
+        scratch.drop().await;
+    }
+
+    #[tokio::test]
+    async fn api_keys_never_come_back_over_http() {
+        let Some(scratch) = ScratchDb::create("http_keys").await else {
+            return;
+        };
+        let db = Database::connect(&scratch.settings).await.unwrap();
+        db.migrate().await.unwrap();
+        // A fixed test key (32 zero bytes, base64).
+        let cipher = supabase_dashboard_application::secrets::CredentialCipher::from_base64(
+            &SecretString::from("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+        )
+        .unwrap();
+        let router = router_with_cipher(db.clone(), Some(cipher)).await;
+        AuthService::new(db.clone(), AuthConfig::default())
+            .await
+            .unwrap()
+            .bootstrap_owner(
+                "alice@example.test",
+                "Alice",
+                &SecretString::from("correct horse battery staple"),
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO accounts (id, email, display_name, password_hash) \
+             SELECT gen_random_uuid(), 'bob@example.test', 'Bob', password_hash FROM accounts",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let alice = sign_in_cookie(&router, "alice%40example.test").await;
+        let bob = sign_in_cookie(&router, "bob%40example.test").await;
+        let call = |path: &'static str, body: String, cookie: &str| {
+            send(&router, form_post(path, &body, Some(cookie)))
+        };
+        let (_, body) = call(CreateOrganization::PATH, "name=Acme".into(), &alice).await;
+        let acme: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let acme_id = acme["id"].as_str().unwrap().to_owned();
+        // Loopback is refused by the default target policy, so the check
+        // below never leaves the process.
+        let (parts, body) = call(
+            RegisterProject::PATH,
+            format!(
+                "organization_id={acme_id}&name=Lab&api_url=http%3A%2F%2F127.0.0.1%3A9\
+                 &allow_unencrypted=true"
+            ),
+            &alice,
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        let project: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let project_id = project["id"].as_str().unwrap().to_owned();
+
+        const MARKER: &str = "sb_publishable_redaction-marker-7f3a";
+        let (parts, body) = call(
+            ReplaceProjectCredential::PATH,
+            format!("id={project_id}&kind=anon_key&value={MARKER}"),
+            &alice,
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        assert!(!body.contains("redaction-marker"), "{body}");
+
+        // Bob cannot replace or read keys on Alice's project.
+        let (_, body) = call(
+            ReplaceProjectCredential::PATH,
+            format!("id={project_id}&kind=anon_key&value=sb_publishable_bob"),
+            &bob,
+        )
+        .await;
+        assert!(body.contains("NotFound"), "{body}");
+        let (_, body) = call(
+            GetProjectCredentials::PATH,
+            format!("id={project_id}"),
+            &bob,
+        )
+        .await;
+        assert!(body.contains("NotFound"), "{body}");
+
+        let mut bodies = Vec::new();
+        for path in [
+            GetProjectCredentials::PATH,
+            CheckProjectHealth::PATH,
+            GetProjectHealth::PATH,
+        ] {
+            let (parts, body) = call(path, format!("id={project_id}"), &alice).await;
+            assert_eq!(parts.status, StatusCode::OK, "{path}: {body}");
+            bodies.push(body);
+        }
+        assert!(bodies[0].contains(r#""state":"set""#), "{}", bodies[0]);
+        assert!(
+            bodies[1].contains("destination_not_allowed"),
+            "{}",
+            bodies[1]
+        );
+        let page = format!("/dashboard/project/{project_id}/settings");
+        let (parts, body) = send(&router, get_with_cookie(&page, &alice)).await;
+        assert_eq!(parts.status, StatusCode::OK);
+        bodies.push(body);
+        for body in &bodies {
+            assert!(!body.contains("redaction-marker"), "{body}");
+        }
+        let stored: Vec<u8> = sqlx::query_scalar("SELECT ciphertext FROM project_credentials")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&stored).contains("redaction-marker"));
+
+        let (parts, body) = call(
+            RemoveProjectCredential::PATH,
+            format!("id={project_id}&kind=anon_key"),
+            &alice,
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        let (_, body) = call(
+            GetProjectCredentials::PATH,
+            format!("id={project_id}"),
+            &alice,
+        )
+        .await;
+        assert!(!body.contains(r#""state":"set""#), "{body}");
 
         db.close().await;
         scratch.drop().await;

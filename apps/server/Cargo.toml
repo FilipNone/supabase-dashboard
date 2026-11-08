@@ -13,6 +13,7 @@ name = "supabase-dashboard-server"
 path = "src/main.rs"
 
 [dependencies]
+supabase-dashboard-adapters.workspace = true
 supabase-dashboard-application.workspace = true
 supabase-dashboard-domain.workspace = true
 supabase-dashboard-persistence.workspace = true

@@ -100,3 +100,33 @@ services:
     ports:
       # Administrative API: loopback only, never exposed beyond the host.
       - "127.0.0.1:54380:8080"
+
+  # API gateway in front of auth and rest, as in a standard self-hosted
+  # stack. Upstream defaults to Envoy and ships Kong as an override; the
+  # fixture uses Kong because its route config is much smaller.
+  gateway:
+    image: kong/kong:3.9.3
+    depends_on:
+      auth:
+        condition: service_healthy
+      rest:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "/home/kong/kong-entrypoint.sh"]
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /usr/local/kong/kong.yml
+      KONG_ROUTER_FLAVOR: expressions
+      KONG_DNS_ORDER: LAST,A,CNAME
+      KONG_PLUGINS: request-transformer,key-auth,acl
+      SUPABASE_ANON_KEY: ${ANON_KEY}
+      SUPABASE_SERVICE_KEY: ${SERVICE_ROLE_KEY}
+    volumes:
+      - ./api/kong.yml:/home/kong/temp.yml:ro
+      - ./api/kong-entrypoint.sh:/home/kong/kong-entrypoint.sh:ro
+    ports:
+      - "127.0.0.1:54321:8000"
+    healthcheck:
+      test: ["CMD", "kong", "health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20

@@ -1,9 +1,9 @@
 [workspace]
 resolver = "3"
-members = ["apps/server", "crates/application", "crates/domain", "crates/persistence", "crates/web"]
+members = ["apps/server", "crates/adapters", "crates/application", "crates/domain", "crates/persistence", "crates/web"]
 
 [workspace.package]
-version = "0.1.0-dev.1"
+version = "0.1.0-dev.2"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT OR Apache-2.0"
@@ -11,6 +11,7 @@ repository = "https://github.com/FilipNone/supabase-dashboard"
 publish = false
 
 [workspace.dependencies]
+supabase-dashboard-adapters = { path = "crates/adapters" }
 supabase-dashboard-application = { path = "crates/application" }
 supabase-dashboard-domain = { path = "crates/domain" }
 supabase-dashboard-persistence = { path = "crates/persistence" }

@@ -1,8 +1,8 @@
 //! Project registration and the pages of one registered project.
 //!
 //! Registering a project only records where an existing stack is. The
-//! dashboard does not contact the stack yet, so these pages say plainly that
-//! its health is unknown instead of showing a status they cannot back up.
+//! dashboard contacts the stack only when a member runs a service check,
+//! using the API keys stored on the settings page.
 
 use leptos::{form::ActionForm, prelude::*};
 use leptos_meta::Title;
@@ -22,6 +22,7 @@ use crate::{
         page::{PageHeader, StatePanel, StateTone},
     },
     error::AppError,
+    pages::project_connection::{ApiKeysPanel, HealthPanel},
     server_fns::{
         ChangeProjectUrl, RegisterProject, RenameProject, UnregisterProject, get_organization,
         get_project,
@@ -255,7 +256,7 @@ fn loaded_project(ctx: ProjectContext) -> Option<ProjectSummary> {
     ctx.project.get().and_then(Result::ok)
 }
 
-/// Registry details. Health and schema come with the connection checks.
+/// Registry details and the last service check.
 #[component]
 pub fn ProjectOverviewPage() -> impl IntoView {
     let Some(ctx) = use_context::<ProjectContext>() else {
@@ -290,18 +291,14 @@ pub fn ProjectOverviewPage() -> impl IntoView {
                         </div>
                     </dl>
                 </section>
-                <StatePanel
-                    tone=StateTone::Empty
-                    title="Service health has not been checked".to_string()
-                    detail="The dashboard does not connect to registered stacks yet. Health, version detection, and schema browsing are planned next.".to_string()
-                />
+                <HealthPanel project=project.clone()/>
             }
         })}
     }
     .into_any()
 }
 
-/// Rename and unregister.
+/// Rename, change the API URL, manage API keys, and unregister.
 #[component]
 pub fn ProjectSettingsPage() -> impl IntoView {
     let Some(ctx) = use_context::<ProjectContext>() else {
@@ -367,6 +364,7 @@ pub fn ProjectSettingsPage() -> impl IntoView {
                     {rename_feedback}
                 </section>
                 {url_zone}
+                <ApiKeysPanel project=project.clone()/>
                 {danger_zone}
             }
         })}

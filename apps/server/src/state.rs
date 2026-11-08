@@ -3,7 +3,8 @@ use std::{sync::Arc, time::Duration};
 use axum::extract::FromRef;
 use leptos::config::LeptosOptions;
 use supabase_dashboard_application::{
-    auth::AuthService, organizations::OrganizationService, projects::ProjectService,
+    auth::AuthService, connections::ConnectionService, organizations::OrganizationService,
+    projects::ProjectService,
 };
 use supabase_dashboard_persistence::Database;
 
@@ -17,6 +18,7 @@ pub struct AppState {
     pub auth: Arc<AuthService>,
     pub organizations: Arc<OrganizationService>,
     pub projects: Arc<ProjectService>,
+    pub connections: Arc<ConnectionService>,
     pub cookie: CookieSettings,
     /// `scheme://host[:port]` of the public URL. `None` only in development
     /// without a public URL, where the Host header is compared instead.

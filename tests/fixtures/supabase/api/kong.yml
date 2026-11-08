@@ -1,0 +1,101 @@
+# Reduced Kong declarative config for the fixture gateway.
+#
+# Adapted from supabase/supabase docker/volumes/api/kong.yml (Apache-2.0,
+# see LICENSE-APACHE); this file stays under Apache-2.0. It keeps only the
+# Auth and PostgREST routes, in upstream's legacy API key mode, and the
+# same key-auth and ACL rules: the PostgREST root (OpenAPI) is limited to
+# the service role, other routes accept the anon key too.
+# kong-entrypoint.sh substitutes $SUPABASE_ANON_KEY and $SUPABASE_SERVICE_KEY.
+_format_version: '2.1'
+_transform: true
+
+consumers:
+  - username: anon
+    keyauth_credentials:
+      - key: $SUPABASE_ANON_KEY
+  - username: service_role
+    keyauth_credentials:
+      - key: $SUPABASE_SERVICE_KEY
+
+acls:
+  - consumer: anon
+    group: anon
+  - consumer: service_role
+    group: admin
+
+services:
+  - name: auth-v1
+    url: http://auth:9999/
+    routes:
+      - name: auth-v1-all
+        strip_path: true
+        paths:
+          - /auth/v1/
+    plugins:
+      - name: key-auth
+        config:
+          hide_credentials: false
+      - name: request-transformer
+        config:
+          add:
+            headers:
+              - "Authorization: $((headers.authorization ~= nil and headers.authorization:sub(1, 10) ~= 'Bearer sb_' and headers.authorization) or headers.apikey)"
+          replace:
+            headers:
+              - "Authorization: $((headers.authorization ~= nil and headers.authorization:sub(1, 10) ~= 'Bearer sb_' and headers.authorization) or headers.apikey)"
+      - name: acl
+        config:
+          hide_groups_header: true
+          allow:
+            - admin
+            - anon
+
+  - name: rest-v1-openapi
+    url: http://rest:3000/
+    routes:
+      - name: rest-v1-openapi-root
+        strip_path: true
+        expression: 'http.path == "/rest/v1/"'
+    plugins:
+      - name: key-auth
+        config:
+          hide_credentials: false
+      - name: request-transformer
+        config:
+          add:
+            headers:
+              - "Authorization: $((headers.authorization ~= nil and headers.authorization:sub(1, 10) ~= 'Bearer sb_' and headers.authorization) or headers.apikey)"
+          replace:
+            headers:
+              - "Authorization: $((headers.authorization ~= nil and headers.authorization:sub(1, 10) ~= 'Bearer sb_' and headers.authorization) or headers.apikey)"
+      - name: acl
+        config:
+          hide_groups_header: true
+          allow:
+            - admin
+
+  - name: rest-v1
+    url: http://rest:3000/
+    routes:
+      - name: rest-v1-all
+        strip_path: true
+        paths:
+          - /rest/v1/
+    plugins:
+      - name: key-auth
+        config:
+          hide_credentials: false
+      - name: request-transformer
+        config:
+          add:
+            headers:
+              - "Authorization: $((headers.authorization ~= nil and headers.authorization:sub(1, 10) ~= 'Bearer sb_' and headers.authorization) or headers.apikey)"
+          replace:
+            headers:
+              - "Authorization: $((headers.authorization ~= nil and headers.authorization:sub(1, 10) ~= 'Bearer sb_' and headers.authorization) or headers.apikey)"
+      - name: acl
+        config:
+          hide_groups_header: true
+          allow:
+            - admin
+            - anon

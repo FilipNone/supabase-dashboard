@@ -36,6 +36,21 @@ pub struct Config {
     pub session_idle_timeout: Duration,
     /// Absolute session lifetime from sign-in.
     pub session_lifetime: Duration,
+    /// Where the key that encrypts stored project credentials comes from.
+    /// Without one, the dashboard cannot store or use project API keys.
+    pub secret_key: Option<SecretKeySource>,
+    /// Let project checks connect to loopback addresses. For development
+    /// against a stack on the same host only.
+    pub allow_loopback_targets: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum SecretKeySource {
+    /// A file holding the base64 key, such as a Docker secret. Read once at
+    /// startup.
+    File(std::path::PathBuf),
+    /// The base64 key itself, from the environment.
+    Inline(SecretString),
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -110,6 +125,29 @@ impl Config {
             Some(_) => return Err(invalid("LOG_FORMAT", "expected `json` or `pretty`")),
         };
 
+        let secret_key = match (get("SECRET_KEY_FILE"), get("SECRET_KEY")) {
+            (Some(_), Some(_)) => {
+                return Err(invalid(
+                    "SECRET_KEY",
+                    "set either SUPABASE_DASHBOARD_SECRET_KEY or SUPABASE_DASHBOARD_SECRET_KEY_FILE, not both",
+                ));
+            }
+            (Some(path), None) => Some(SecretKeySource::File(path.into())),
+            // Do not echo the value in any error.
+            (None, Some(key)) => Some(SecretKeySource::Inline(SecretString::from(key))),
+            (None, None) => None,
+        };
+        let allow_loopback_targets = match get("ALLOW_LOOPBACK_TARGETS").as_deref() {
+            None | Some("false") => false,
+            Some("true") => true,
+            Some(_) => {
+                return Err(invalid(
+                    "ALLOW_LOOPBACK_TARGETS",
+                    "expected `true` or `false`",
+                ));
+            }
+        };
+
         Ok(Self {
             environment,
             public_url,
@@ -121,6 +159,8 @@ impl Config {
             log_format,
             session_idle_timeout,
             session_lifetime,
+            secret_key,
+            allow_loopback_targets,
         })
     }
 }
@@ -290,6 +330,40 @@ mod tests {
         ])
         .unwrap_err();
         assert!(err.to_string().contains("must not exceed"));
+    }
+
+    #[test]
+    fn secret_key_comes_from_one_source_and_is_not_printed() {
+        let dev = ("ENV", "development");
+        assert!(load(&[DB, dev]).unwrap().secret_key.is_none());
+        let config = load(&[DB, dev, ("SECRET_KEY", "c2VjcmV0LWtleS12YWx1ZQ==")]).unwrap();
+        assert!(matches!(
+            config.secret_key,
+            Some(SecretKeySource::Inline(_))
+        ));
+        assert!(!format!("{config:?}").contains("c2VjcmV0"));
+        let config = load(&[DB, dev, ("SECRET_KEY_FILE", "/run/secrets/key")]).unwrap();
+        assert!(matches!(config.secret_key, Some(SecretKeySource::File(_))));
+        let err = load(&[
+            DB,
+            dev,
+            ("SECRET_KEY", "c2VjcmV0LWtleS12YWx1ZQ=="),
+            ("SECRET_KEY_FILE", "/run/secrets/key"),
+        ])
+        .unwrap_err();
+        assert!(!err.to_string().contains("c2VjcmV0"));
+    }
+
+    #[test]
+    fn loopback_targets_are_off_by_default() {
+        let dev = ("ENV", "development");
+        assert!(!load(&[DB, dev]).unwrap().allow_loopback_targets);
+        assert!(
+            load(&[DB, dev, ("ALLOW_LOOPBACK_TARGETS", "true")])
+                .unwrap()
+                .allow_loopback_targets
+        );
+        assert!(load(&[DB, dev, ("ALLOW_LOOPBACK_TARGETS", "yes")]).is_err());
     }
 
     #[test]

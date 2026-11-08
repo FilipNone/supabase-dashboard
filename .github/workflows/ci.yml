@@ -44,7 +44,7 @@ jobs:
       - name: No server-only crates in the browser build
         run: |
           if cargo tree -p supabase-dashboard-web --target wasm32-unknown-unknown --features hydrate -e normal \
-              | grep -E '(^|[^a-z_-])(sqlx|axum|argon2|supabase-dashboard-persistence|supabase-dashboard-application|tokio) v'; then
+              | grep -E '(^|[^a-z_-])(sqlx|axum|argon2|reqwest|supabase-dashboard-persistence|supabase-dashboard-application|supabase-dashboard-adapters|tokio) v'; then
             echo "server-only dependency found in the hydrate build" >&2
             exit 1
           fi
@@ -77,6 +77,15 @@ jobs:
           curl -fsS http://127.0.0.1:54399/health
           curl -fsS -o /dev/null http://127.0.0.1:54330/
           curl -fsS -o /dev/null http://127.0.0.1:54380/
+          # The gateway refuses requests without a key.
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:54321/auth/v1/health)" = 401
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Adapter tests against the fixture
+        env:
+          SUPABASE_DASHBOARD_TEST_FIXTURE_URL: http://127.0.0.1:54321
+        run: cargo test -p supabase-dashboard-adapters --locked
       - name: Show logs on failure
         if: failure()
         run: docker compose -p sd-fixture logs --no-color --tail 100

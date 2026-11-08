@@ -6,7 +6,7 @@ This is an independent project. It is not made, endorsed, or supported by Supaba
 
 ## Status
 
-Early development (milestones M0 and M1, M2 started). Operators can sign in, manage organizations, members, and invitations, and register existing self-hosted stacks by API URL. The dashboard does not connect to registered stacks yet. `ROADMAP.md` has the plan and current status.
+Early development (milestones M0 and M1, M2 started). Operators can sign in, manage organizations, members, and invitations, register existing self-hosted stacks by API URL, store each stack's API keys encrypted on the server, and check whether its Auth and REST services answer. `ROADMAP.md` has the plan and current status.
 
 ## Install
 
