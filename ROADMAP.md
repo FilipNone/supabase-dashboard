@@ -76,7 +76,7 @@ Acceptance: table and SQL workflows run against the supported fixture stack. Una
 
 ### M4: project lifecycle and remote servers (P2)
 
-- [ ] Define a deployment-provider interface and implement one documented provider first; evaluate Dokploy as the first provider before introducing a separate Docker/SSH executor.
+- [ ] Define a deployment-provider interface and implement one documented provider first. Dokploy is the first provider (see "Dokploy integration" below); a separate Docker/SSH executor comes after it.
 - [ ] Add enrolled remote servers with verified identity, connectivity checks, access restrictions, and resource inventory.
 - [ ] Provision a new isolated stack through a durable background job with generated secrets, health checks, progress, and reconciliation after restart.
 - [ ] Edit supported stack configuration with a preview, validation, restart requirements, and recovery instructions.
@@ -84,6 +84,37 @@ Acceptance: table and SQL workflows run against the supported fixture stack. Una
 - [ ] Document and test metadata backup/restore. Add provider-aware project backup/restore only after an isolated restore drill succeeds.
 
 Acceptance: provision, reconfigure, and remove a disposable project through the chosen provider without touching another project's services or storage. Restarting the dashboard mid-job does not duplicate resources or lose the operation's status. Unknown outcomes require reconciliation rather than blind retries.
+
+#### Dokploy integration (first M4 provider, P2)
+
+Goal: when the dashboard is installed as a service on [Dokploy](https://dokploy.com), it finds that Dokploy instance and its own place in it. Every Supabase stack it creates then appears in Dokploy as a Compose service, in the same Dokploy project and environment as the dashboard unless the operator picks another one.
+
+What the Dokploy documentation says (read through Context7 on 2026-11-08; check again against the version we pin):
+
+- The API is served at `/api/<router>.<procedure>` and authenticated with an `x-api-key` header. A key belongs to one Dokploy user and one Dokploy organization (`metadata.organizationId`), has that user's permissions, and can have an expiry.
+- Resources form a tree: organization, project, environment, service. Each project starts with a default environment, and services in different environments are isolated from each other. Members can be limited to specific projects and environments.
+- `compose.create` takes a `name` and an `environmentId`, plus optional fields that include `serverId` (deploy on a remote server) and `composeType` (`docker-compose` or `stack` for Swarm). Older API versions took a `projectId` instead, so the supported version range matters.
+- Other calls we need: `project.all`, `environment.byProjectId`, `environment.create`, `compose.one`, `compose.update`, `compose.deploy`, `compose.delete` (with a required `deleteVolumes` flag), and `domain.create` (with `composeId` and `serviceName`). `compose.deployTemplate` deploys the official templates.
+- Environment variables set on a service are written to its `.env` file and reach containers only where the compose file references them. Project and environment shared variables are referenced as `${{project.NAME}}` and `${{environment.NAME}}`.
+- "Isolated deployments" put each compose app on its own network named after its `appName` and attach Traefik to that network. Without isolation, two stacks with the same service names collide on the shared `dokploy-network`.
+- The official Supabase template routes one domain to an Envoy `api-gw` service on port 8000. Our health check has only been verified against the Kong gateway.
+- The docs describe no variable that tells a container its own Dokploy project, environment, or service. Detection has to be built (first item below).
+
+Items:
+
+- [ ] Record the supported Dokploy versions and the API calls we use, from Dokploy's OpenAPI document. Add a disposable Dokploy instance to the test fixtures. Read the version when connecting and refuse unsupported versions with a clear message.
+- [ ] Detect the dashboard's Dokploy placement. An installation admin enters the Dokploy URL and an API key, or the deployment supplies them (the key from a file). The dashboard then looks for its own service by matching the host of `SUPABASE_DASHBOARD_PUBLIC_URL` against the Dokploy domains the key can see, which gives the service, environment, and project. One match is shown for the admin to confirm; zero or several matches ask the admin to choose. Nothing is used before confirmation, and startup reports when the dashboard's service has moved or disappeared. Optional extra signal, to verify first: whether Dokploy's own API answers on `dokploy-network`, so the setup page can suggest the internal URL.
+- [ ] Treat the Dokploy key as an infrastructure credential: whoever holds it can deploy any compose file on Dokploy's servers. Encrypt it with the existing credential key, limit connecting, replacing, and removing it to installation admins, audit each change, and never send it to the browser. Recommend a dedicated Dokploy member limited to the target projects and environments, show the key's expiry, and warn before it lapses.
+- [ ] Enroll the Dokploy URL as an explicit destination in the SSRF address policy, including a private address when Dokploy is on the same host or network. A Dokploy connection does not enroll any other destination.
+- [ ] Choose where new stacks go. The create-project form defaults to the dashboard's own Dokploy project and environment. The operator can pick another project or environment the key can see, create a new environment, and pick a Dokploy server when Dokploy manages more than one. Dashboard organizations and Dokploy organizations are separate: an installation admin decides which Dokploy targets each dashboard organization may use, and by default only the dashboard's own environment is allowed.
+- [ ] Provision a stack as a durable job. Generate the Postgres password, JWT secret, and signed anon and service role keys on the server, and store the keys the dashboard needs encrypted. Create the compose service from our pinned compose file rather than the moving official template, with isolated deployment on. Set its variables through the API, add the domain, deploy, poll the deployment until it finishes, run the health check, and register the project with its Dokploy `composeId`. Give each service a name derived from the job, and look the name up before creating it, so a restart does not create a duplicate. Document that Dokploy keeps these variables in its own database, so anyone with access to the service in Dokploy can read the stack's secrets.
+- [ ] Link both sides. The Dokploy service gets a recognizable name and a description pointing to the dashboard project. The dashboard project shows the Dokploy project, environment, server, deployment status, and last deployment, with a link to the service in Dokploy. Reconciliation detects changes made in Dokploy (redeploys, variable edits, deletion) and shows them instead of overwriting them.
+- [ ] Adopt existing Supabase services already running in Dokploy, for example ones made from the official template. List compose services that look like Supabase stacks, register one as a project with its `composeId`, and take the API URL from its domain. Copy the stack's keys from the service variables only after an admin confirms. Add a health check for the Envoy gateway.
+- [ ] Keep three separate actions, each with its own permission, typed confirmation, and audit event: unregister (dashboard record only), remove from Dokploy (`compose.delete` with `deleteVolumes: false`, data volumes stay on the server), and destroy data (`deleteVolumes: true`). Add stop, start, and redeploy. Do not retry a delete without first reading the service's state.
+- [ ] Change a stack's configuration through `compose.update`, with a preview listing the changed variable names (values hidden) and the restart required. Never edit the `.env` file as text.
+- [ ] Document installing the dashboard on Dokploy (compose service, domain, metadata database, connecting the key). Then consider publishing a Dokploy template for the dashboard, and using Dokploy's volume backups for project backups once a restore drill has passed.
+
+Acceptance: on a disposable Dokploy instance, install the dashboard as a Dokploy service, connect a key, and confirm the detected project and environment. Create two Supabase projects that appear in that environment without name or network collisions, and a third in another environment. Restarting the dashboard during provisioning creates no duplicate. Remove one stack while keeping its volumes, destroy another, and check that the dashboard and Dokploy agree on what is left. The Dokploy key never reaches the browser, logs, or audit records.
 
 ### M5: project service management (P2)
 
@@ -102,7 +133,7 @@ Acceptance: each page has tested authorized success, permission-denied, service-
 - [ ] Add dashboard email delivery for invitations and chosen account-recovery flows, initially SMTP and/or Resend through a replaceable adapter. Keep this distinct from a managed project's SMTP configuration.
 - [ ] Add organization SSO enforcement only after testing owner recovery, existing sessions, and lockout prevention.
 - [ ] Add GitHub project integration with least-privilege repository access, verified webhook signatures, and explicit deployment/migration permissions. Linking this source repository does not implement this product feature.
-- [ ] Complete Dokploy integration against a recorded supported API version, including enrollment, provisioning, and interrupted-job reconciliation.
+- [ ] Show the Dokploy connection and each organization's allowed Dokploy targets on `/org/:org_id/integrations` next to the other providers. The Dokploy provider itself is M4 work.
 - [ ] Add a DNS-provider adapter for previewed record changes, ownership checks, propagation status, and safe rollback. Select the first provider before implementation.
 - [ ] Add scoped/revocable dashboard API tokens, integration settings, and account/organization audit views.
 
@@ -169,8 +200,12 @@ Release checks include a fresh installation, migration from the previous support
 - [Self-hosting overview](https://supabase.com/docs/guides/self-hosting): single-project model and differences from the hosted platform, including the unavailable Management API.
 - [Self-hosting with Docker](https://supabase.com/docs/guides/self-hosting/docker): service deployment and production security requirements.
 - [Supabase Studio](https://github.com/supabase/supabase/tree/master/apps/studio): reference implementation; verify the license and the current self-hosted feature set before reuse.
+- [Dokploy documentation](https://docs.dokploy.com) and [API reference](https://docs.dokploy.com/docs/api): the first deployment provider; its OpenAPI document is the source for the supported API surface.
+- [Dokploy templates](https://github.com/Dokploy/templates): includes the official Supabase blueprint (Envoy gateway); check its license before reusing any of it.
 
 ## Revision history
+
+- 2026-11-08: planned the Dokploy integration as the first M4 provider: detecting the dashboard's own Dokploy project and environment, creating stacks there by default, adopting existing Supabase services, and separate remove and destroy actions. The M6 Dokploy item now covers only the integrations page.
 
 - 2026-11-08: M2 API keys and health checks: encrypted anon and service role key storage, a gateway health check for Auth and REST with an SSRF address policy, the Kong gateway in the fixture, and release `v0.1.0-dev.2`. Updated the first, second, third, and last M2 items.
 - 2026-11-08: first development release `v0.1.0-dev.1`: a multi-arch container image on GHCR, a Docker Compose deploy bundle with optional Caddy TLS, and Linux tarballs, built by `.github/workflows/release.yml`. Started the M7 installation documentation item.
