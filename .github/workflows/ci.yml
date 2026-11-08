@@ -60,10 +60,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-leptos@0.3.11
-      # cargo-leptos uses wasm-opt from PATH and only downloads Binaryen
-      # itself when it is missing; that download has failed CI before.
-      # Keep the version and checksum in step with the Dockerfile.
+          # wasm-bindgen must match Cargo.lock (the Dockerfile checks this).
+          tool: cargo-leptos@0.3.11,wasm-bindgen@0.2.130
+      # cargo-leptos uses wasm-bindgen and wasm-opt from PATH and downloads
+      # them itself only when they are missing; those downloads have failed
+      # CI before. Keep the Binaryen version and checksum in step with the
+      # Dockerfile.
       - name: Install wasm-opt (Binaryen 123)
         run: |
           curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$RUNNER_TEMP/binaryen.tar.gz" \
