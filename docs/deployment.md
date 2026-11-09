@@ -103,6 +103,8 @@ Members open a project's Studio through the dashboard, which serves each project
 2. Point `*.studio.example.com` at the dashboard server (a wildcard DNS record), and give the reverse proxy a certificate for it. A wildcard certificate needs the ACME DNS challenge. The proxy must pass the original `Host` header through, because the dashboard picks the project from it.
 3. For each project, save the stack gateway's Studio login on the project's Settings page.
 
+Some Studio pages do not go through the dashboard. The Realtime inspector opens a WebSocket from the browser straight to the stack's public API URL (the stack's `SUPABASE_PUBLIC_URL`), with the service role key in the query string. Members' browsers must be able to reach that URL for those pages to work, and anyone who can open Studio can read the key from there, as they can on Studio's API settings page. Seen with Studio 2026.11.02 against the test stack; other pages may do the same.
+
 Requests on a Studio host are limited by `SUPABASE_DASHBOARD_STUDIO_MAX_BODY_BYTES` (50 MiB by default) and `SUPABASE_DASHBOARD_STUDIO_REQUEST_TIMEOUT_SECS` (300 seconds). If the reverse proxy has its own body limit or timeout, raise it to match, or Storage uploads and long SQL queries in Studio fail at the proxy.
 
 ### Closing the stack's own Studio entrance
@@ -119,7 +121,7 @@ A self-hosted stack serves Studio itself, behind HTTP basic auth on the gateway'
 3. Save the same username and password on the project's Settings page in the dashboard, then run "Check now" on the project page. The Studio row should report that the stored login is accepted.
 4. Do not keep the password anywhere else. If someone needs Studio, give them a dashboard role that allows it.
 
-Where the network allows it, also keep the gateway's Studio route away from the internet: for example, let only the dashboard server reach the stack's gateway port, or put the stack's public API behind a separate proxy that serves only the API paths (`/auth/v1/`, `/rest/v1/`, `/storage/v1/`, `/realtime/v1/`, `/functions/v1/`, and the others your apps use). These setups depend on the stack's gateway and network and have not been tested with this dashboard yet.
+Where the network allows it, also keep the gateway's Studio route away from the internet: for example, let only the dashboard server reach the stack's gateway port, or put the stack's public API behind a separate proxy that serves only the API paths (`/auth/v1/`, `/rest/v1/`, `/storage/v1/`, `/realtime/v1/`, `/functions/v1/`, and the others your apps use). Closing the API paths themselves to members' browsers breaks the Studio pages that call them directly. These setups depend on the stack's gateway and network and have not been tested with this dashboard yet.
 
 The project page warns every member until a Studio login is saved.
 

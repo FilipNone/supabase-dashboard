@@ -14,10 +14,12 @@ Versions match the upstream `docker/docker-compose.yml` in supabase/supabase on 
 | postgres-meta | `supabase/postgres-meta:v0.100.0` | `meta` | 54380 |
 | API gateway (Kong) | `kong/kong:3.9.3` | `gateway` | 54321 |
 | Studio | `supabase/studio:2026.11.02-sha-a05e7ec` (pinned 2026-11-09) | `studio` | none: only through the gateway |
+| Storage | `supabase/storage-api:v1.89.12` (pinned 2026-11-09; file backend, no image transformations) | `storage` | none: only through the gateway |
+| Realtime | `supabase/realtime:v2.148.3` (pinned 2026-11-09) | `realtime` | none: only through the gateway |
 
-Upstream now defaults to an Envoy gateway and keeps Kong as an alternative. The fixture uses Kong with a reduced `api/kong.yml` (Auth and REST routes, legacy JWT API keys, and the basic-auth catch-all route to Studio) because its configuration is much smaller; the routes, key checks, and Studio login match upstream's. The Studio login is `DASHBOARD_USERNAME` and `DASHBOARD_PASSWORD` in `fixture.env`. An Envoy fixture is still to do.
+Upstream now defaults to an Envoy gateway and keeps Kong as an alternative. The fixture uses Kong with a reduced `api/kong.yml` (Auth, REST, Storage, and Realtime routes, legacy JWT API keys, and the basic-auth catch-all route to Studio) because its configuration is much smaller; the routes, key checks, and Studio login match upstream's. The Studio login is `DASHBOARD_USERNAME` and `DASHBOARD_PASSWORD` in `fixture.env`. An Envoy fixture is still to do.
 
-Not in the fixture yet: Realtime, Storage, imgproxy, Edge Functions, Supavisor, analytics. The Studio pages that need them are added as those pages are checked through the dashboard.
+Not in the fixture yet: imgproxy, Edge Functions, Supavisor, analytics. The Studio pages that need them are added as those pages are checked through the dashboard.
 
 ## Fixture
 
@@ -43,6 +45,8 @@ docker compose -p sd-fixture down -v
 | Envoy gateway, new-style `sb_publishable_`/`sb_secret_` keys | Not tested | No fixture yet |
 | Studio through the dashboard: launcher, one-time code, Studio host cookie, Studio's redirect and project page, a same-origin SQL query through Studio's API, a cross-site write refused, a viewer refused, sign-out ending access | Verified against Studio 2026.11.02-sha-a05e7ec via Kong 3.9.3 | `studio_opens_the_fixture_studio` in `apps/server/src/app.rs`, CI job `fixture` |
 | Studio pages in a browser through the dashboard: Home, Table editor (a table and row created through the SQL API are listed), SQL editor, Auth users | Checked by hand in headless Chromium on 2026-11-09, light and dark themes, at 1280×720; no page errors | Not automated |
-| Studio pages whose services are not in the fixture: Storage, Realtime inspector, Edge Functions, logs | Not checked | The fixture has no Storage, Realtime, Functions, or analytics services |
+| Studio's Storage buckets page through the dashboard (bucket list loads through Studio's API) | Checked by hand in Chromium on 2026-11-09 | Not automated; uploads not checked |
+| Studio's Realtime inspector: joins a channel and receives presence | Checked by hand in Chromium on 2026-11-09 | Not automated. The inspector's WebSocket goes from the browser straight to the stack's public API URL with the service role key, not through the dashboard |
+| Studio pages whose services are not in the fixture: Edge Functions, logs | Not checked | The fixture has no Functions or analytics services |
 
 Update the baseline only together with a fixture change and a passing CI run.

@@ -3,7 +3,8 @@
 # Adapted from supabase/supabase docker/docker-compose.yml. This file stays
 # under Apache-2.0 (see LICENSE-APACHE), not the MIT option. It is
 # reduced to the services the dashboard talks to first, plus Studio behind
-# the gateway's basic-auth catch-all route. Image tags match the upstream
+# the gateway's basic-auth catch-all route and the Storage and Realtime
+# services behind Studio's pages. Image tags match the upstream
 # file as of 2026-11-07, except Studio, which matches it as of 2026-11-09. All ports bind to 127.0.0.1 and there is
 # no persistent volume: `down` discards everything.
 #
@@ -25,6 +26,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
       JWT_EXP: ${JWT_EXPIRY}
     volumes:
+      - ./db/realtime.sql:/docker-entrypoint-initdb.d/migrations/99-realtime.sql:ro
       - ./db/roles.sql:/docker-entrypoint-initdb.d/init-scripts/99-roles.sql:ro
       - ./db/jwt.sql:/docker-entrypoint-initdb.d/init-scripts/99-jwt.sql:ro
     ports:
@@ -102,6 +104,77 @@ services:
       # Administrative API: loopback only, never exposed beyond the host.
       - "127.0.0.1:54380:8080"
 
+  # File-backed, without image transformations (upstream's imgproxy).
+  storage:
+    image: supabase/storage-api:v1.89.12
+    depends_on:
+      db:
+        condition: service_healthy
+      rest:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:5000/status"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    environment:
+      ANON_KEY: ${ANON_KEY}
+      SERVICE_KEY: ${SERVICE_ROLE_KEY}
+      POSTGREST_URL: http://rest:3000
+      AUTH_JWT_SECRET: ${JWT_SECRET}
+      DATABASE_URL: postgres://supabase_storage_admin:${POSTGRES_PASSWORD}@db:${POSTGRES_PORT}/${POSTGRES_DB}
+      STORAGE_PUBLIC_URL: http://127.0.0.1:54321
+      REQUEST_ALLOW_X_FORWARDED_PATH: "true"
+      FILE_SIZE_LIMIT: 52428800
+      STORAGE_BACKEND: file
+      GLOBAL_S3_BUCKET: stub
+      FILE_STORAGE_BACKEND_PATH: /var/lib/storage
+      TENANT_ID: stub
+      REGION: stub
+      ENABLE_IMAGE_TRANSFORMATION: "false"
+
+  realtime:
+    image: supabase/realtime:v2.148.3
+    depends_on:
+      db:
+        condition: service_healthy
+    # Realtime takes the tenant from the first label of the host name it is
+    # called by, so the gateway reaches it by upstream's container name.
+    networks:
+      default:
+        aliases:
+          - realtime-dev.supabase-realtime
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -sSfL --head -o /dev/null -H \"Authorization: Bearer ${ANON_KEY}\" http://localhost:4000/api/tenants/realtime-dev/health"
+        ]
+      timeout: 5s
+      interval: 5s
+      retries: 30
+      start_period: 10s
+    environment:
+      PORT: 4000
+      DB_HOST: db
+      DB_PORT: ${POSTGRES_PORT}
+      DB_USER: supabase_admin
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_NAME: ${POSTGRES_DB}
+      DB_AFTER_CONNECT_QUERY: 'SET search_path TO _realtime'
+      DB_ENC_KEY: ${REALTIME_DB_ENC_KEY}
+      API_JWT_SECRET: ${JWT_SECRET}
+      SECRET_KEY_BASE: ${REALTIME_SECRET_KEY_BASE}
+      METRICS_JWT_SECRET: ${JWT_SECRET}
+      ERL_AFLAGS: -proto_dist inet_tcp
+      DNS_NODES: "''"
+      RLIMIT_NOFILE: "10000"
+      APP_NAME: realtime
+      SEED_SELF_HOST: "true"
+      RUN_JANITOR: "true"
+      DISABLE_HEALTHCHECK_LOGGING: "true"
+
   # Studio has no port of its own: it is reached only through the gateway's
   # catch-all route, which asks for DASHBOARD_USERNAME and DASHBOARD_PASSWORD.
   studio:
@@ -150,6 +223,10 @@ services:
         condition: service_healthy
       rest:
         condition: service_healthy
+      storage:
+        condition: service_healthy
+      realtime:
+        condition: service_healthy
       studio:
         condition: service_healthy
     entrypoint: ["/bin/sh", "/home/kong/kong-entrypoint.sh"]
@@ -158,7 +235,7 @@ services:
       KONG_DECLARATIVE_CONFIG: /usr/local/kong/kong.yml
       KONG_ROUTER_FLAVOR: expressions
       KONG_DNS_ORDER: LAST,A,CNAME
-      KONG_PLUGINS: request-transformer,cors,key-auth,acl,basic-auth
+      KONG_PLUGINS: request-transformer,cors,key-auth,acl,basic-auth,request-termination
       SUPABASE_ANON_KEY: ${ANON_KEY}
       SUPABASE_SERVICE_KEY: ${SERVICE_ROLE_KEY}
       DASHBOARD_USERNAME: ${DASHBOARD_USERNAME}
