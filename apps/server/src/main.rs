@@ -10,6 +10,8 @@ mod health;
 mod scratch_db;
 mod session;
 mod state;
+mod studio;
+mod studio_host;
 mod telemetry;
 
 use std::{process::ExitCode, sync::Arc, time::Duration};
@@ -17,6 +19,7 @@ use std::{process::ExitCode, sync::Arc, time::Duration};
 use supabase_dashboard_adapters::{
     gateway::{GatewayError, GatewayProbe, GatewaySettings},
     net::TargetPolicy,
+    studio_proxy::{StudioProxy, StudioProxySettings},
 };
 use supabase_dashboard_application::{
     auth::{AuthConfig, AuthError, AuthService, BootstrapError, PasswordResetError},
@@ -24,6 +27,7 @@ use supabase_dashboard_application::{
     organizations::OrganizationService,
     projects::ProjectService,
     secrets::{CredentialCipher, KeyError},
+    studio::StudioService,
 };
 use supabase_dashboard_persistence::{Database, PersistenceError};
 use tokio::net::TcpListener;
@@ -33,6 +37,7 @@ use crate::{
     config::{Config, ConfigError, SecretKeySource},
     session::CookieSettings,
     state::AppState,
+    studio::StudioGateway,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -197,12 +202,40 @@ async fn run() -> Result<(), StartupError> {
     if config.allow_loopback_targets {
         tracing::warn!("project checks may connect to loopback addresses");
     }
+    let policy = TargetPolicy {
+        allow_loopback: config.allow_loopback_targets,
+    };
     let probe = GatewayProbe::shared(GatewaySettings {
-        policy: TargetPolicy {
-            allow_loopback: config.allow_loopback_targets,
-        },
+        policy,
         ..GatewaySettings::default()
     })?;
+    let studio = match (&config.studio_hosts, &config.public_url) {
+        (Some(hosts), Some(public_url)) => {
+            let service =
+                StudioService::new(db.clone(), cipher.clone(), config.session_idle_timeout);
+            let proxy = StudioProxy::new(StudioProxySettings {
+                policy,
+                read_timeout: config.studio_request_timeout,
+                ..StudioProxySettings::default()
+            })?;
+            tracing::info!(
+                example = %hosts.origin(uuid::Uuid::nil()),
+                "Studio access is enabled"
+            );
+            Some(Arc::new(StudioGateway::new(
+                hosts.clone(),
+                Arc::new(service),
+                proxy,
+                public_url.origin().ascii_serialization(),
+            )))
+        }
+        _ => {
+            tracing::warn!(
+                "Studio access is off; set SUPABASE_DASHBOARD_STUDIO_DOMAIN to open projects in Studio"
+            );
+            None
+        }
+    };
 
     let secure_cookie = config
         .public_url
@@ -221,10 +254,13 @@ async fn run() -> Result<(), StartupError> {
             .public_url
             .as_ref()
             .map(|url| url.origin().ascii_serialization()),
+        studio,
     };
     let limits = HttpLimits {
         max_body_bytes: config.max_body_bytes,
         request_timeout: config.request_timeout,
+        studio_max_body_bytes: config.studio_max_body_bytes,
+        studio_request_timeout: config.studio_request_timeout,
     };
     let router = app::router(state, &limits);
 

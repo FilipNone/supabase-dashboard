@@ -29,6 +29,20 @@ pub struct CookieSettings {
 }
 
 impl CookieSettings {
+    /// The Studio session cookie on a project's Studio host. It has its own
+    /// name, so the dashboard never mistakes one for the other.
+    pub fn studio(secure: bool, max_age_secs: u64) -> Self {
+        Self {
+            name: if secure {
+                "__Host-sd-studio"
+            } else {
+                "sd-studio"
+            },
+            secure,
+            max_age_secs,
+        }
+    }
+
     pub fn new(secure: bool, max_age_secs: u64) -> Self {
         Self {
             name: if secure {
@@ -41,11 +55,11 @@ impl CookieSettings {
         }
     }
 
-    fn set(&self, value: &str) -> Option<HeaderValue> {
+    pub(crate) fn set(&self, value: &str) -> Option<HeaderValue> {
         self.header(value, self.max_age_secs)
     }
 
-    fn clear(&self) -> Option<HeaderValue> {
+    pub(crate) fn clear(&self) -> Option<HeaderValue> {
         self.header("", 0)
     }
 
@@ -59,7 +73,7 @@ impl CookieSettings {
     }
 
     /// The session cookie value from the request, if present.
-    fn read<'a>(&self, headers: &'a HeaderMap) -> Option<&'a str> {
+    pub(crate) fn read<'a>(&self, headers: &'a HeaderMap) -> Option<&'a str> {
         headers
             .get_all(header::COOKIE)
             .iter()
@@ -170,7 +184,7 @@ pub async fn verify_origin(
     }
 }
 
-fn is_safe_method(method: &Method) -> bool {
+pub(crate) fn is_safe_method(method: &Method) -> bool {
     matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
 }
 
@@ -264,7 +278,7 @@ fn sign_in_error(code: &str) -> Response {
     Redirect::to(&format!("{SIGN_IN_PATH}?error={code}")).into_response()
 }
 
-fn request_context(headers: &HeaderMap) -> RequestContext<'_> {
+pub(crate) fn request_context(headers: &HeaderMap) -> RequestContext<'_> {
     RequestContext {
         request_id: headers.get("x-request-id").and_then(|v| v.to_str().ok()),
         user_agent: headers

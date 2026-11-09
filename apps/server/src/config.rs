@@ -6,6 +6,8 @@ use std::{fmt, time::Duration};
 use secrecy::SecretString;
 use supabase_dashboard_persistence::DatabaseSettings;
 
+use crate::studio_host::StudioHosts;
+
 const PREFIX: &str = "SUPABASE_DASHBOARD_";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +44,15 @@ pub struct Config {
     /// Let project checks connect to loopback addresses. For development
     /// against a stack on the same host only.
     pub allow_loopback_targets: bool,
+    /// Where each project's Studio is served. Without it, Studio cannot be
+    /// opened through the dashboard.
+    pub studio_hosts: Option<StudioHosts>,
+    /// Largest request body on a Studio host. Separate from the dashboard's
+    /// limit because Studio uploads files to Storage.
+    pub studio_max_body_bytes: usize,
+    /// Longest time a Studio request may take to answer, because Studio's
+    /// SQL editor can run long queries.
+    pub studio_request_timeout: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -148,6 +159,28 @@ impl Config {
             }
         };
 
+        let studio_hosts = match (get("STUDIO_DOMAIN"), &public_url) {
+            (None, _) => None,
+            (Some(_), None) => {
+                return Err(invalid(
+                    "STUDIO_DOMAIN",
+                    "needs SUPABASE_DASHBOARD_PUBLIC_URL, whose scheme Studio hosts share",
+                ));
+            }
+            (Some(raw), Some(url)) => {
+                Some(StudioHosts::parse(&raw, url).map_err(|e| invalid("STUDIO_DOMAIN", e))?)
+            }
+        };
+        let studio_max_body_bytes = bounded(
+            &get,
+            "STUDIO_MAX_BODY_BYTES",
+            50 * 1024 * 1024,
+            1024,
+            1024 * 1024 * 1024,
+        )?;
+        let studio_request_timeout =
+            secs(bounded(&get, "STUDIO_REQUEST_TIMEOUT_SECS", 300, 10, 3600)?);
+
         Ok(Self {
             environment,
             public_url,
@@ -161,6 +194,10 @@ impl Config {
             session_lifetime,
             secret_key,
             allow_loopback_targets,
+            studio_hosts,
+            studio_max_body_bytes: usize::try_from(studio_max_body_bytes)
+                .map_err(|_| invalid("STUDIO_MAX_BODY_BYTES", "does not fit in memory size"))?,
+            studio_request_timeout,
         })
     }
 }
@@ -364,6 +401,31 @@ mod tests {
                 .allow_loopback_targets
         );
         assert!(load(&[DB, dev, ("ALLOW_LOOPBACK_TARGETS", "yes")]).is_err());
+    }
+
+    #[test]
+    fn studio_domain_needs_a_public_url_outside_it() {
+        let dev = ("ENV", "development");
+        assert!(load(&[DB, dev]).unwrap().studio_hosts.is_none());
+        let err = load(&[DB, dev, ("STUDIO_DOMAIN", "studio.localhost")]).unwrap_err();
+        assert!(err.to_string().contains("PUBLIC_URL"), "{err}");
+        let config = load(&[
+            DB,
+            ("PUBLIC_URL", "https://dash.example.test"),
+            ("STUDIO_DOMAIN", "studio.example.test"),
+        ])
+        .unwrap();
+        assert!(config.studio_hosts.unwrap().is_https());
+        assert_eq!(config.studio_max_body_bytes, 50 * 1024 * 1024);
+        assert_eq!(config.studio_request_timeout, Duration::from_secs(300));
+        let err = load(&[
+            DB,
+            ("PUBLIC_URL", "https://studio.example.test"),
+            ("STUDIO_DOMAIN", "studio.example.test"),
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("STUDIO_DOMAIN"), "{err}");
+        assert!(load(&[DB, dev, ("STUDIO_REQUEST_TIMEOUT_SECS", "1")]).is_err());
     }
 
     #[test]

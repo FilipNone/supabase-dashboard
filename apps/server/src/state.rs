@@ -8,7 +8,7 @@ use supabase_dashboard_application::{
 };
 use supabase_dashboard_persistence::Database;
 
-use crate::session::CookieSettings;
+use crate::{session::CookieSettings, studio::StudioGateway};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -23,6 +23,9 @@ pub struct AppState {
     /// `scheme://host[:port]` of the public URL. `None` only in development
     /// without a public URL, where the Host header is compared instead.
     pub expected_origin: Option<String>,
+    /// Studio hosts and the gateway behind them, when
+    /// `SUPABASE_DASHBOARD_STUDIO_DOMAIN` is set.
+    pub studio: Option<Arc<StudioGateway>>,
 }
 
 impl FromRef<AppState> for LeptosOptions {

@@ -30,7 +30,7 @@ The dashboard is the only way into a project's Studio. It authenticates the pers
 
 1. A member opens `/dashboard/project/:project_id`. The dashboard requires a signed-in session (the normal sign-in page otherwise) and checks `Permission::StudioOpen` for the member's role in the project's organization.
 2. The dashboard creates a one-time code: 256 random bits, stored only as a SHA-256 hash, bound to the account, the dashboard session, and the project, valid for 60 seconds. It answers with a 303 redirect to `https://<label>.<studio domain>/__dashboard/handoff?code=…`, with `Referrer-Policy: no-referrer`. Opening Studio is audited as `studio.open`, and a refused attempt is audited too.
-3. The Studio host redeems the code in one statement that deletes it, so it works once. It creates a Studio session (a random token, stored as a hash) that points at the dashboard session, then sets `__Host-sd_studio` (HttpOnly, Secure, `SameSite=Lax`, `Path=/`) and redirects to `/project/default`, or to the Studio path the member started from.
+3. The Studio host redeems the code in one statement that deletes it, so it works once. It creates a Studio session (a random token, stored as a hash) that points at the dashboard session, then sets `__Host-sd-studio` (HttpOnly, Secure, `SameSite=Lax`, `Path=/`; `sd-studio` without `Secure` in local HTTP development) and redirects to `/project/default`, or to the Studio path the member started from.
 4. Without a valid Studio cookie, a `GET` on a Studio host redirects to `/dashboard/project/:project_id` on the dashboard host, which signs the member in if needed and starts again at step 2. Other methods get 401.
 
 Every request on a Studio host checks again, in one indexed query, that:
@@ -50,7 +50,7 @@ Unsafe methods (`POST`, `PUT`, `PATCH`, `DELETE`) on a Studio host must come fro
 - The upstream is the project's registered API URL, which already went through the outbound address policy (`crates/adapters/src/net.rs`), and only the gateway's catch-all Studio route. No request on a Studio host can choose the destination. This is a fixed, per-project route, not a general proxy.
 - The dashboard adds `Authorization: Basic …` from the project's stored Studio credentials. It drops whatever `Authorization` header the browser sent, and removes its own cookie from the forwarded `Cookie` header. It also removes any `Set-Cookie` from Studio that uses its cookie name.
 - Hop-by-hop headers are dropped, `X-Forwarded-Host` and `X-Forwarded-Proto` describe the Studio host, and redirects from Studio are passed to the browser, never followed by the dashboard.
-- Request bodies are capped (by default the same limit as the dashboard, with a larger configurable limit for Studio's Storage uploads), and responses are streamed rather than buffered. The upstream timeout is longer than the dashboard's, because Studio's SQL editor can run long queries.
+- Request bodies are capped by their own limit, larger than the dashboard's because of Studio's Storage uploads, and responses are streamed rather than buffered. The upstream timeout is longer than the dashboard's, because Studio's SQL editor can run long queries.
 - Studio's Realtime inspector connects from the browser to the stack's public API URL, not to the Studio host, so the gateway does not need to handle WebSockets at first. This needs checking in the browser for each pinned Studio version.
 
 ### Credentials and roles

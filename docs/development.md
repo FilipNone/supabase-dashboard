@@ -76,6 +76,9 @@ All settings are environment variables. Invalid values stop the server at startu
 | `SUPABASE_DASHBOARD_LOG_FORMAT` | `json` (`pretty` in development) | |
 | `SUPABASE_DASHBOARD_SECRET_KEY_FILE` | unset | Path to a file holding the key that encrypts stored project API keys: 32 random bytes, base64-encoded. Without a key the server starts, but it cannot store or use API keys |
 | `SUPABASE_DASHBOARD_SECRET_KEY` | unset | The same key given directly. Set only one of the two; prefer the file, because environment variables show up in `docker inspect` and process listings |
+| `SUPABASE_DASHBOARD_STUDIO_DOMAIN` | unset | Base domain for project Studio hosts, as `host` or `host:port`, for example `studio.example.com`. Each project's Studio is served at `<project id in hex>.<domain>`. Needs `SUPABASE_DASHBOARD_PUBLIC_URL`, whose host must not be this domain or a name under it; Studio hosts use the public URL's scheme. Unset turns Studio access off |
+| `SUPABASE_DASHBOARD_STUDIO_MAX_BODY_BYTES` | 52428800 | 1 KiB to 1 GiB; request body limit on Studio hosts |
+| `SUPABASE_DASHBOARD_STUDIO_REQUEST_TIMEOUT_SECS` | 300 | 10 to 3600; how long a Studio request may take, including Studio's own wait for long SQL queries. Slower requests get 504 |
 | `SUPABASE_DASHBOARD_ALLOW_LOOPBACK_TARGETS` | `false` | `true` lets service checks connect to `127.0.0.0/8` and `::1`, for a stack on the same machine. Logged as a warning at startup |
 | `RUST_LOG` | `info,tower_http=info,sqlx=warn` | Standard `tracing` filter |
 | `LEPTOS_SITE_ADDR` | `127.0.0.1:3000` | Listen address |
@@ -104,6 +107,8 @@ The project overview's "Check now" button asks the stack's API gateway for `/aut
 - `POST /auth/sign-in`: form fields `email` and `password`. Redirects home with a session cookie, or back to the sign-in page with a fixed `error` code. Five failures for one email within 15 minutes block further attempts for that email until the window passes.
 - `POST /auth/sign-out`: revokes the session and clears the cookie.
 - `/dashboard/organizations` and `/dashboard/status`: the UI shell. Organizations is an empty state for now.
+- `GET /dashboard/project/:project_id[?path=/project/default/...]`: opens the project's Studio. Members whose role allows `StudioOpen` (owner, admin, developer) get a 303 redirect to the project's Studio host with a one-time code valid for 60 seconds. Others are sent to the project page with `?studio=forbidden`, `?studio=not_configured` (no Studio login saved), or `?studio=disabled` (no Studio domain configured).
+- `GET /__dashboard/handoff?code=` on a Studio host: redeems the code, sets the Studio cookie, and redirects to the requested Studio path or `/project/default`. A used or expired code shows a page with a link to start again.
 
 Everything except `/healthz`, `/readyz`, `/favicon.svg`, `/pkg/*`, the sign-in page, and the two `/auth/` form endpoints requires a session. Pages redirect to sign-in; `/api/*` and other `/auth/*` paths answer `401` with the JSON error envelope. Signed-in responses are sent with `Cache-Control: no-store`.
 
@@ -111,7 +116,20 @@ The session cookie is `__Host-sd-session` with `Secure` when the public URL is H
 
 Cross-site request protection: a POST, PUT, PATCH, or DELETE must carry `Sec-Fetch-Site: same-origin`, or, when that header is absent, an `Origin` equal to the public URL's origin (the request's `Host` in development without a public URL). Requests with neither header are refused with `403 cross_origin_request`. Scripts calling the API need to send a matching `Origin`.
 
+The Studio cookie is `__Host-sd-studio` (`sd-studio` over plain HTTP), set on one project's Studio host only. It is HttpOnly and SameSite=Lax, and it works only while the dashboard session it came from is valid and the member's role still allows `StudioOpen`; every request on a Studio host checks this again. Without it, page loads on a Studio host go back through `/dashboard/project/:project_id` and other requests get 401. Unsafe methods on a Studio host need the same-origin check above, against the Studio host's own origin.
+
 Every response carries an `x-request-id` header (a client-supplied one is kept), and request log lines include it. Logs record method and path only; query strings, headers, and bodies are not logged.
+
+### Studio hosts
+
+Opening a project's Studio needs `SUPABASE_DASHBOARD_STUDIO_DOMAIN`, a DNS name under it for every project (a wildcard record is simplest), and the project's Studio login saved on its settings page. For local development, browsers resolve every `*.localhost` name to the loopback address, so this works without DNS:
+
+```sh
+SUPABASE_DASHBOARD_PUBLIC_URL=http://dash.localhost:3000
+SUPABASE_DASHBOARD_STUDIO_DOMAIN=studio.localhost:3000
+```
+
+Requests are routed by their `Host` header before anything else runs: a project's Studio host goes to the Studio gateway, an unknown name under the Studio domain gets a plain 404, and every other host gets the dashboard. On a Studio host only `/__dashboard/handoff` belongs to the dashboard; every other path is forwarded to the project's registered gateway with the stored Studio login added on the server. The browser's `Authorization` header, its forwarding headers, and the dashboard's Studio cookie are not forwarded. Responses are streamed, redirects are passed back to the browser, and the gateway's own address in a `Location` header is turned into a path. A gateway on the loopback address is reached only when `SUPABASE_DASHBOARD_ALLOW_LOOPBACK_TARGETS` is on.
 
 ## Checks
 

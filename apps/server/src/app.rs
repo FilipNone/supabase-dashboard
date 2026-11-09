@@ -25,11 +25,13 @@ use tower_http::{
     trace::TraceLayer,
 };
 
-use crate::{error, health, session, state::AppState};
+use crate::{error, health, session, state::AppState, studio};
 
 pub struct HttpLimits {
     pub max_body_bytes: usize,
     pub request_timeout: Duration,
+    pub studio_max_body_bytes: usize,
+    pub studio_request_timeout: Duration,
 }
 
 pub fn router(state: AppState, limits: &HttpLimits) -> Router {
@@ -45,6 +47,19 @@ pub fn router(state: AppState, limits: &HttpLimits) -> Router {
     let auth = state.auth.clone();
     let leptos_options = state.leptos_options.clone();
     let x_request_id = HeaderName::from_static("x-request-id");
+    // Studio hosts get their own routes, body limit, and timeout.
+    let studio_hosts = state.studio.clone().map(|gateway| {
+        let hosts = gateway.hosts.clone();
+        let routes = studio::router(gateway).layer(
+            ServiceBuilder::new()
+                .layer(RequestBodyLimitLayer::new(limits.studio_max_body_bytes))
+                .layer(TimeoutLayer::with_status_code(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    limits.studio_request_timeout,
+                )),
+        );
+        (hosts, routes)
+    });
 
     Router::new()
         .route("/", get(home_redirect))
@@ -53,6 +68,7 @@ pub fn router(state: AppState, limits: &HttpLimits) -> Router {
         .route("/readyz", get(health::ready))
         .route("/auth/sign-in", post(session::sign_in))
         .route("/auth/sign-out", post(session::sign_out))
+        .route("/dashboard/project/{project_id}", get(studio::launch))
         .route("/api/{*rest}", any(error::api_not_found))
         .leptos_routes_with_context(
             &state,
@@ -80,6 +96,19 @@ pub fn router(state: AppState, limits: &HttpLimits) -> Router {
         .with_state(state)
         .layer(
             ServiceBuilder::new()
+                .layer(RequestBodyLimitLayer::new(limits.max_body_bytes))
+                .layer(TimeoutLayer::with_status_code(
+                    StatusCode::REQUEST_TIMEOUT,
+                    limits.request_timeout,
+                )),
+        )
+        // Outside the dashboard's own limits and middleware: requests for a
+        // Studio host never reach the dashboard's routes.
+        .layer(middleware::from_fn(move |request, next| {
+            studio::dispatch(studio_hosts.clone(), request, next)
+        }))
+        .layer(
+            ServiceBuilder::new()
                 // Outermost first: mark credentials as sensitive before anything
                 // can record them, then assign a request ID used by every log line.
                 .layer(SetSensitiveRequestHeadersLayer::new([
@@ -104,11 +133,6 @@ pub fn router(state: AppState, limits: &HttpLimits) -> Router {
                 .layer(SetResponseHeaderLayer::if_not_present(
                     header::REFERRER_POLICY,
                     HeaderValue::from_static("same-origin"),
-                ))
-                .layer(RequestBodyLimitLayer::new(limits.max_body_bytes))
-                .layer(TimeoutLayer::with_status_code(
-                    StatusCode::REQUEST_TIMEOUT,
-                    limits.request_timeout,
                 )),
         )
 }
@@ -155,8 +179,9 @@ mod tests {
             CreateInvitation, CreateOrganization, GetCurrentAccount, GetInstallationHealth,
             GetOrganization, GetProject, GetProjectCredentials, GetProjectHealth,
             ListOrganizations, ListProjects, ListSessions, PreviewInvitation, RegisterProject,
-            RemoveProjectCredential, RenameOrganization, ReplaceProjectCredential, RevokeSession,
-            SignUpWithInvitation, UnregisterProject, UpdateProfile,
+            RemoveProjectCredential, RenameOrganization, ReplaceProjectCredential,
+            ReplaceStudioLogin, RevokeSession, SignUpWithInvitation, UnregisterProject,
+            UpdateProfile,
         },
     };
     use tower::ServiceExt;
@@ -196,14 +221,18 @@ mod tests {
             auth: Arc::new(auth),
             cookie: CookieSettings::new(false, 3600),
             expected_origin: None,
+            studio: None,
         };
-        router(
-            state,
-            &HttpLimits {
-                max_body_bytes: 1024,
-                request_timeout: Duration::from_secs(5),
-            },
-        )
+        router(state, &test_limits())
+    }
+
+    fn test_limits() -> HttpLimits {
+        HttpLimits {
+            max_body_bytes: 1024,
+            request_timeout: Duration::from_secs(5),
+            studio_max_body_bytes: 4096,
+            studio_request_timeout: Duration::from_secs(5),
+        }
     }
 
     /// Router whose metadata database is unreachable: port 1 on loopback is
@@ -846,6 +875,314 @@ mod tests {
         )
         .await;
         assert!(!body.contains(r#""state":"set""#), "{body}");
+
+        db.close().await;
+        scratch.drop().await;
+    }
+
+    /// A gateway that answers Studio requests only with the right login and
+    /// echoes the Cookie header it received.
+    async fn mock_studio_gateway() -> String {
+        use axum::http::HeaderMap;
+        const EXPECTED: &str = "Basic c3VwYWJhc2U6c3R1ZGlvLXBhc3N3b3JkLWZvci10ZXN0cw==";
+        let app = Router::new().fallback(|headers: HeaderMap| async move {
+            let auth = headers
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok());
+            if auth != Some(EXPECTED) {
+                return (StatusCode::UNAUTHORIZED, String::new());
+            }
+            let cookie = headers
+                .get(header::COOKIE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("-");
+            (StatusCode::OK, format!("studio page; cookie={cookie}"))
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    fn studio_get(host: &str, path: &str, cookie: Option<&str>) -> Request<Body> {
+        let mut builder = Request::get(path)
+            .header(header::HOST, host)
+            .header("sec-fetch-mode", "navigate");
+        if let Some(cookie) = cookie {
+            builder = builder.header(header::COOKIE, cookie);
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn studio_opens_only_through_the_dashboard() {
+        use supabase_dashboard_adapters::{
+            net::TargetPolicy,
+            studio_proxy::{StudioProxy, StudioProxySettings},
+        };
+        use supabase_dashboard_application::{secrets::CredentialCipher, studio::StudioService};
+
+        use crate::{studio::StudioGateway, studio_host::StudioHosts};
+
+        let Some(scratch) = ScratchDb::create("http_studio").await else {
+            return;
+        };
+        let db = Database::connect(&scratch.settings).await.unwrap();
+        db.migrate().await.unwrap();
+        let cipher = CredentialCipher::from_base64(&SecretString::from(
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        ))
+        .unwrap();
+        let auth = AuthService::new(db.clone(), AuthConfig::default())
+            .await
+            .unwrap();
+        auth.bootstrap_owner(
+            "alice@example.test",
+            "Alice",
+            &SecretString::from("correct horse battery staple"),
+        )
+        .await
+        .unwrap();
+        let public = url::Url::parse(ORIGIN).unwrap();
+        let hosts = StudioHosts::parse("studio.localhost:3000", &public).unwrap();
+        let gateway = StudioGateway::new(
+            hosts.clone(),
+            Arc::new(StudioService::new(
+                db.clone(),
+                Some(cipher.clone()),
+                Duration::from_secs(3600),
+            )),
+            StudioProxy::new(StudioProxySettings {
+                policy: TargetPolicy {
+                    allow_loopback: true,
+                },
+                ..StudioProxySettings::default()
+            })
+            .unwrap(),
+            ORIGIN.to_owned(),
+        );
+        let state = AppState {
+            leptos_options: LeptosOptions::builder()
+                .output_name("supabase-dashboard")
+                .site_root("target/site")
+                .build(),
+            organizations: Arc::new(OrganizationService::new(db.clone())),
+            projects: Arc::new(ProjectService::new(db.clone())),
+            connections: Arc::new(ConnectionService::new(
+                db.clone(),
+                Some(cipher),
+                supabase_dashboard_adapters::gateway::GatewayProbe::shared(Default::default())
+                    .unwrap(),
+            )),
+            db: db.clone(),
+            readiness_timeout: Duration::from_secs(1),
+            auth: Arc::new(auth),
+            cookie: CookieSettings::new(false, 3600),
+            expected_origin: None,
+            studio: Some(Arc::new(gateway)),
+        };
+        let router = router(state, &test_limits());
+
+        let bob_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO accounts (id, email, display_name, password_hash) \
+             SELECT gen_random_uuid(), 'bob@example.test', 'Bob', password_hash FROM accounts \
+             RETURNING id",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let alice = sign_in_cookie(&router, "alice%40example.test").await;
+        let bob = sign_in_cookie(&router, "bob%40example.test").await;
+        let call = |path: &'static str, body: String, cookie: &str| {
+            send(&router, form_post(path, &body, Some(cookie)))
+        };
+        let (_, body) = call(CreateOrganization::PATH, "name=Acme".into(), &alice).await;
+        let acme: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let acme_id = acme["id"].as_str().unwrap().to_owned();
+        sqlx::query(
+            "INSERT INTO organization_members (organization_id, account_id, role) \
+             VALUES ($1::uuid, $2, 'viewer')",
+        )
+        .bind(&acme_id)
+        .bind(bob_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let gateway_url = mock_studio_gateway().await;
+        let mut ids = Vec::new();
+        for name in ["Main", "Other"] {
+            let (_, body) = call(
+                RegisterProject::PATH,
+                format!(
+                    "organization_id={acme_id}&name={name}&allow_unencrypted=true&api_url={}",
+                    url::form_urlencoded::byte_serialize(gateway_url.as_bytes())
+                        .collect::<String>()
+                ),
+                &alice,
+            )
+            .await;
+            let project: serde_json::Value = serde_json::from_str(&body).unwrap();
+            ids.push(
+                project["id"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<uuid::Uuid>()
+                    .unwrap(),
+            );
+        }
+        let (main, other) = (ids[0], ids[1]);
+        let launch = |id: uuid::Uuid| format!("/dashboard/project/{id}");
+
+        // Without a saved login, the member is sent to the project page.
+        let (parts, _) = send(&router, get_with_cookie(&launch(main), &alice)).await;
+        assert_eq!(
+            location(&parts),
+            format!("/dashboard/org/{acme_id}/projects/{main}?studio=not_configured")
+        );
+        for id in [main, other] {
+            let (parts, body) = call(
+                ReplaceStudioLogin::PATH,
+                format!("id={id}&username=supabase&password=studio-password-for-tests"),
+                &alice,
+            )
+            .await;
+            assert_eq!(parts.status, StatusCode::OK, "{body}");
+        }
+
+        // Signed out: the launcher asks for a session first.
+        let (parts, _) = send(&router, get(&launch(main))).await;
+        assert_eq!(location(&parts), SIGN_IN_PATH);
+        // A viewer is refused and told why.
+        let (parts, _) = send(&router, get_with_cookie(&launch(main), &bob)).await;
+        assert_eq!(
+            location(&parts),
+            format!("/dashboard/org/{acme_id}/projects/{main}?studio=forbidden")
+        );
+        let (parts, _) = send(
+            &router,
+            get_with_cookie(&launch(uuid::Uuid::now_v7()), &alice),
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::NOT_FOUND);
+
+        // The owner gets a one-time code for the project's Studio host.
+        let (parts, _) = send(
+            &router,
+            get_with_cookie(
+                &format!("{}?path=%2Fproject%2Fdefault%2Fsql", launch(main)),
+                &alice,
+            ),
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::SEE_OTHER);
+        assert_eq!(parts.headers[header::REFERRER_POLICY], "no-referrer");
+        let target = url::Url::parse(location(&parts)).unwrap();
+        let main_host = hosts.host(main);
+        assert_eq!(
+            target.host_str(),
+            Some(main_host.split(':').next().unwrap())
+        );
+        assert_eq!(target.path(), "/__dashboard/handoff");
+        let handoff = format!("{}?{}", target.path(), target.query().unwrap());
+
+        // The code does not work on another project's host.
+        let other_host = hosts.host(other);
+        let (parts, _) = send(&router, studio_get(&other_host, &handoff, None)).await;
+        assert_eq!(parts.status, StatusCode::BAD_REQUEST);
+        // It was used up by that attempt; get a fresh one.
+        let (parts, _) = send(&router, get_with_cookie(&launch(main), &alice)).await;
+        let target = url::Url::parse(location(&parts)).unwrap();
+        let handoff = format!("{}?{}", target.path(), target.query().unwrap());
+        let (parts, _) = send(&router, studio_get(&main_host, &handoff, None)).await;
+        assert_eq!(parts.status, StatusCode::SEE_OTHER);
+        assert_eq!(location(&parts), "/project/default");
+        let set_cookie = parts.headers[header::SET_COOKIE].to_str().unwrap();
+        assert!(set_cookie.starts_with("sd-studio="), "{set_cookie}");
+        assert!(set_cookie.contains("HttpOnly"), "{set_cookie}");
+        let studio_cookie = set_cookie.split(';').next().unwrap().to_owned();
+        let (parts, _) = send(&router, studio_get(&main_host, &handoff, None)).await;
+        assert_eq!(parts.status, StatusCode::BAD_REQUEST, "codes work once");
+
+        // Studio answers through the dashboard, which adds the login and
+        // keeps its own cookie to itself.
+        let cookies = format!("{studio_cookie}; theme=dark");
+        let (parts, body) = send(
+            &router,
+            studio_get(&main_host, "/project/default", Some(&cookies)),
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        assert_eq!(body, "studio page; cookie=theme=dark");
+
+        // The cookie does not open another project's Studio.
+        let (parts, _) = send(
+            &router,
+            studio_get(&other_host, "/project/default", Some(&studio_cookie)),
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::SEE_OTHER);
+        assert!(location(&parts).starts_with(&format!("{ORIGIN}{}", launch(other))));
+
+        // A write from another origin is refused, even with the cookie.
+        let forged = Request::post("/api/platform/pg-meta/default/query")
+            .header(header::HOST, &main_host)
+            .header(header::COOKIE, &studio_cookie)
+            .header("sec-fetch-site", "same-site")
+            .body(Body::from("{}"))
+            .unwrap();
+        let (parts, _) = send(&router, forged).await;
+        assert_eq!(parts.status, StatusCode::FORBIDDEN);
+
+        // Without a cookie, page loads go back to the launcher with the path
+        // and API calls get 401.
+        let (parts, _) = send(
+            &router,
+            studio_get(&main_host, "/project/default/sql?x=1", None),
+        )
+        .await;
+        assert_eq!(
+            location(&parts),
+            format!(
+                "{ORIGIN}{}?path=%2Fproject%2Fdefault%2Fsql%3Fx%3D1",
+                launch(main)
+            )
+        );
+        let api = Request::get("/api/profile")
+            .header(header::HOST, &main_host)
+            .header("sec-fetch-mode", "cors")
+            .body(Body::empty())
+            .unwrap();
+        let (parts, _) = send(&router, api).await;
+        assert_eq!(parts.status, StatusCode::UNAUTHORIZED);
+
+        // Names under the Studio domain that are not projects get 404, and
+        // the dashboard's own routes are not served there.
+        let (parts, _) = send(&router, studio_get("www.studio.localhost:3000", "/", None)).await;
+        assert_eq!(parts.status, StatusCode::NOT_FOUND);
+
+        // Signing out of the dashboard ends Studio access at once.
+        let (parts, _) = send(&router, form_post("/auth/sign-out", "", Some(&alice))).await;
+        assert_eq!(parts.status, StatusCode::SEE_OTHER);
+        let (parts, _) = send(
+            &router,
+            studio_get(&main_host, "/project/default", Some(&studio_cookie)),
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::SEE_OTHER);
+        assert!(
+            parts.headers[header::SET_COOKIE]
+                .to_str()
+                .unwrap()
+                .contains("Max-Age=0")
+        );
+
+        let opened: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_events WHERE action = 'studio.open' AND outcome = 'success'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(opened, 2);
 
         db.close().await;
         scratch.drop().await;
