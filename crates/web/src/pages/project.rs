@@ -8,7 +8,7 @@ use leptos::{form::ActionForm, prelude::*};
 use leptos_meta::Title;
 use leptos_router::{
     components::{A, Outlet},
-    hooks::{use_navigate, use_params_map},
+    hooks::{use_navigate, use_params_map, use_query_map},
 };
 use supabase_dashboard_domain::{
     authz::Permission,
@@ -28,6 +28,44 @@ use crate::{
         get_project,
     },
 };
+
+/// Opens the project's Studio. This is a server route
+/// (`apps/server/src/studio.rs`), not a page: links to it need
+/// `rel="external"` so the client-side router leaves them alone.
+pub fn studio_launch_path(id: Uuid) -> String {
+    format!("/dashboard/project/{id}")
+}
+
+/// Where a project card or the project switcher leads: the project's Studio
+/// for roles that may open it, the dashboard's project page otherwise. The
+/// flag is true for Studio, whose link must be external.
+pub fn project_entry(project: &ProjectSummary) -> (String, bool) {
+    if project.role.allows(Permission::StudioOpen) {
+        (studio_launch_path(project.id), true)
+    } else {
+        (project_path(project.organization_id, project.id), false)
+    }
+}
+
+/// Why the launcher sent the member back here instead of into Studio. The
+/// texts are fixed: the query value only selects one of them.
+fn studio_refusal(code: &str) -> Option<&'static str> {
+    match code {
+        "forbidden" => Some(
+            "Your role can't open this project's Studio. Studio gives full access to the \
+             database, so only owners, admins, and developers can open it.",
+        ),
+        "not_configured" => Some(
+            "Studio can't be opened until an owner or admin saves the gateway's Studio login \
+             under Settings.",
+        ),
+        "disabled" => Some(
+            "Studio access is turned off on this dashboard. An administrator turns it on by \
+             setting SUPABASE_DASHBOARD_STUDIO_DOMAIN.",
+        ),
+        _ => None,
+    }
+}
 
 /// The dashboard's own page for a project: status, health, and settings.
 pub fn project_path(organization_id: Uuid, id: Uuid) -> String {
@@ -190,6 +228,14 @@ pub fn ProjectLayout() -> impl IntoView {
     // Reload only after a save succeeds. A refused save keeps the form as the
     // user left it, so they can correct the value or confirm plain HTTP.
     let saved = RwSignal::new(0u32);
+    let query = use_query_map();
+    let refusal = move || {
+        query
+            .read()
+            .get("studio")
+            .and_then(|code| studio_refusal(&code))
+            .map(|text| view! { <p class="form-error page-notice" role="alert">{text}</p> })
+    };
     let project = Resource::new(
         move || (org_id.get(), id.get(), saved.get()),
         |(org_id, id, _)| async move {
@@ -232,6 +278,13 @@ pub fn ProjectLayout() -> impl IntoView {
                 project.get().map(|result| match result {
                     Ok(project) => {
                         let base = project_path(project.organization_id, project.id);
+                        let open_studio = project.role.allows(Permission::StudioOpen).then(|| view! {
+                            <div class="page-actions">
+                                <a class="button button-primary" href=studio_launch_path(project.id) rel="external">
+                                    "Open Studio"
+                                </a>
+                            </div>
+                        });
                         view! {
                             <Title text=project.name.as_str().to_owned()/>
                             <header class="page-header">
@@ -239,7 +292,9 @@ pub fn ProjectLayout() -> impl IntoView {
                                     <h1 class="page-title">{project.name.as_str().to_owned()}</h1>
                                     <p class="page-description url-text">{project.api_url.as_str().to_owned()}</p>
                                 </div>
+                                {open_studio}
                             </header>
+                            {refusal}
                             <nav class="tabs" aria-label="Project">
                                 <A href=base.clone() exact=true attr:class="tab">"Overview"</A>
                                 <A href=format!("{base}/settings") attr:class="tab">"Settings"</A>
@@ -261,6 +316,18 @@ pub fn ProjectLayout() -> impl IntoView {
                 })
             }}
         </Transition>
+    }
+}
+
+/// What opening Studio means for this member. Studio has no roles of its
+/// own, so the note says plainly what it gives access to.
+fn studio_access_note(project: &ProjectSummary) -> &'static str {
+    if project.role.allows(Permission::StudioOpen) {
+        "You can open this project's Studio. Studio gives full access to the database, \
+         including running any SQL as its owner, and shows the stack's API keys and JWT secret."
+    } else {
+        "Your role can't open Studio, because Studio gives full access to the database and \
+         shows the stack's keys. Ask an owner or admin for the developer role if you need it."
     }
 }
 
@@ -300,6 +367,10 @@ pub fn ProjectOverviewPage() -> impl IntoView {
                         <div>
                             <dt>"Your role"</dt>
                             <dd>{project.role.label()}</dd>
+                        </div>
+                        <div>
+                            <dt>"Studio"</dt>
+                            <dd>{studio_access_note(&project)}</dd>
                         </div>
                     </dl>
                 </section>
@@ -479,5 +550,20 @@ fn unregister_section(
             </ActionForm>
             {move || action_error(unregister.value().get())}
         </section>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_known_refusal_codes_show_a_message() {
+        for code in ["forbidden", "not_configured", "disabled"] {
+            assert!(studio_refusal(code).is_some(), "{code}");
+        }
+        for code in ["", "Forbidden", "<script>", "ok"] {
+            assert!(studio_refusal(code).is_none(), "{code}");
+        }
     }
 }

@@ -10,7 +10,7 @@ use supabase_dashboard_domain::{account::AccountSummary, project::ProjectSummary
 
 use super::theme_switcher::ThemeSwitcher;
 use crate::{
-    pages::project::project_path,
+    pages::project::project_entry,
     server_fns::{get_current_account, get_project, list_organizations, list_projects},
 };
 
@@ -265,9 +265,10 @@ fn ProjectMenu(
         .into_iter()
         .map(|project| {
             let selected = (current == Some(project.id)).then_some("page");
+            let (href, studio) = project_entry(&project);
             view! {
                 <li>
-                    <a href=project_path(organization, project.id) aria-current=selected>
+                    <a href=href rel=studio.then_some("external") aria-current=selected>
                         {project.name.as_str().to_owned()}
                     </a>
                 </li>

@@ -329,6 +329,7 @@ code { font-family: var(--font-mono); font-size: var(--text-sm); }
   margin: 0; padding: var(--space-3); border-radius: var(--radius-md);
   background: var(--color-ok-bg); color: var(--color-ok-text); font-size: var(--text-sm);
 }
+.page-notice { margin-bottom: var(--space-6); }
 .input[readonly] { background: var(--color-surface-raised); color: var(--color-text-muted); }
 .button:focus-visible, .card-link:focus-visible, .tab:focus-visible {
   outline: 2px solid var(--color-focus); outline-offset: 2px;
@@ -349,6 +350,14 @@ code { font-family: var(--font-mono); font-size: var(--text-sm); }
 }
 .card-link:hover { border-color: var(--color-border-strong); background: var(--color-surface-raised); }
 .card-title { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* A card whose title link covers the whole card, with one more link on top. */
+.project-card { position: relative; }
+.card-cover { color: inherit; text-decoration: none; }
+.card-cover::after { content: ""; position: absolute; inset: 0; border-radius: inherit; }
+.card-cover:focus-visible { outline: none; }
+.card-cover:focus-visible::after { outline: 2px solid var(--color-focus); outline-offset: 2px; }
+.card-aside { position: relative; z-index: 1; color: var(--color-text-muted); font-size: var(--text-sm); }
+.card-aside:hover { color: var(--color-text); }
 
 /* Tabs */
 .tabs { display: flex; gap: var(--space-4); margin-bottom: var(--space-6); border-bottom: 1px solid var(--color-border); overflow-x: auto; }

@@ -1049,6 +1049,39 @@ mod tests {
             assert_eq!(parts.status, StatusCode::OK, "{body}");
         }
 
+        // The project page offers Studio to the owner, explains a refusal
+        // with a fixed text, and offers nothing to a viewer.
+        let page = format!("/dashboard/org/{acme_id}/projects/{main}");
+        let (_, body) = send(&router, get_with_cookie(&page, &alice)).await;
+        assert!(
+            body.contains(&format!(r#"href="{}" rel="external""#, launch(main))),
+            "{body}"
+        );
+        assert!(body.contains("full access to the database"));
+        let (_, body) = send(
+            &router,
+            get_with_cookie(&format!("{page}?studio=forbidden"), &bob),
+        )
+        .await;
+        assert!(!body.contains("Open Studio"));
+        assert!(
+            body.contains("Your role can't open this project's Studio"),
+            "{body}"
+        );
+        let (_, body) = send(
+            &router,
+            get_with_cookie(&format!("{page}?studio=%3Cscript%3E"), &alice),
+        )
+        .await;
+        assert!(!body.contains("<script>"));
+        // Cards open Studio for the owner and the project page for a viewer.
+        let org_page = format!("/dashboard/org/{acme_id}");
+        let (_, body) = send(&router, get_with_cookie(&org_page, &alice)).await;
+        assert!(body.contains(&format!(r#"href="{}" rel="external""#, launch(main))));
+        let (_, body) = send(&router, get_with_cookie(&org_page, &bob)).await;
+        assert!(!body.contains(&launch(main)), "{body}");
+        assert!(body.contains(&page));
+
         // Signed out: the launcher asks for a session first.
         let (parts, _) = send(&router, get(&launch(main))).await;
         assert_eq!(location(&parts), SIGN_IN_PATH);

@@ -26,7 +26,7 @@ use crate::{
         page::{StatePanel, StateTone},
     },
     error::AppError,
-    pages::project::project_path,
+    pages::project::{project_entry, project_path},
     server_fns::{
         ChangeMemberRole, CreateInvitation, RemoveMember, RenameOrganization, RevokeInvitation,
         get_organization, list_invitations, list_members, list_projects,
@@ -186,13 +186,25 @@ fn ProjectGrid(list: Vec<ProjectSummary>) -> impl IntoView {
                 .map(|project| {
                     let insecure = (!project.api_url.is_encrypted())
                         .then(|| view! { <span class="badge badge-error">"Plain HTTP"</span> });
+                    let (href, studio) = project_entry(&project);
+                    // The card opens Studio when the member may; the
+                    // dashboard's own page stays one link away.
+                    let status = studio.then(|| view! {
+                        <a class="card-aside" href=project_path(project.organization_id, project.id)>
+                            "Status and settings"
+                        </a>
+                    });
                     view! {
                         <li>
-                            <a class="card-link card-stack" href=project_path(project.organization_id, project.id)>
-                                <span class="card-title">{project.name.as_str().to_owned()}</span>
+                            <div class="card-link card-stack project-card">
+                                <a class="card-title card-cover" href=href rel=studio.then_some("external")>
+                                    {project.name.as_str().to_owned()}
+                                    {studio.then(|| view! { <span class="visually-hidden">" (opens Studio)"</span> })}
+                                </a>
                                 <span class="card-meta url-text">{project.api_url.as_str().to_owned()}</span>
                                 {insecure}
-                            </a>
+                                {status}
+                            </div>
                         </li>
                     }
                 })
@@ -308,6 +320,11 @@ pub fn OrganizationTeamPage() -> impl IntoView {
         <Invitations ctx/>
         <section class="panel" aria-labelledby="team-title">
             <h2 class="section-title" id="team-title">"Members"</h2>
+            <p class="field-hint">
+                "Owners, administrators, and developers can open each project's Studio. Studio has \
+                 no roles of its own: it gives full access to the database and shows the stack's \
+                 API keys and JWT secret. Read-only members see project status in the dashboard only."
+            </p>
             {action_error}
             <Transition fallback=|| view! { <p class="loading" role="status">"Loading members…"</p> }>
                 {move || {

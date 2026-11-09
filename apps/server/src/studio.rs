@@ -78,7 +78,7 @@ impl StudioGateway {
 
 /// `/dashboard/project/:id` on the dashboard host.
 pub fn launch_path(project_id: Uuid) -> String {
-    format!("/dashboard/project/{project_id}")
+    supabase_dashboard_web::pages::project::studio_launch_path(project_id)
 }
 
 /// The project a Studio host request belongs to, set by [`dispatch`].
