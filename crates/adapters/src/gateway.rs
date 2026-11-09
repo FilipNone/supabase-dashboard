@@ -99,12 +99,28 @@ impl GatewayProbe {
         let Ok(url) = reqwest::Url::parse(&format!("{}{}", api_url.as_str(), path(service))) else {
             return unreachable(UnreachableReason::InvalidResponse);
         };
-        let request = match self.request(reqwest::Method::GET, url, key, accept(service)) {
-            Ok(request) => request,
-            Err(reason) => return unreachable(reason),
+        // The resolver only sees host names; address literals are checked
+        // here, before anything is sent.
+        let literal = match url.host() {
+            Some(url::Host::Ipv4(ip)) => Some(std::net::IpAddr::V4(ip)),
+            Some(url::Host::Ipv6(ip)) => Some(std::net::IpAddr::V6(ip)),
+            _ => None,
         };
+        if literal.is_some_and(|ip| !self.policy.allows(ip)) {
+            return unreachable(UnreachableReason::DestinationNotAllowed);
+        }
+        let mut headers = HeaderMap::new();
+        let Ok(mut apikey) = HeaderValue::from_str(key.expose_secret()) else {
+            // Stored keys are validated as printable ASCII, so this means
+            // the stored value is not a usable key.
+            return unreachable(UnreachableReason::InvalidResponse);
+        };
+        apikey.set_sensitive(true);
+        headers.insert("apikey", apikey);
+        headers.insert(ACCEPT, HeaderValue::from_static(accept(service)));
+
         let started = Instant::now();
-        let response = match request.send().await {
+        let response = match self.client.get(url).headers(headers).send().await {
             Ok(response) => response,
             Err(err) => return unreachable(classify(&err)),
         };
@@ -112,7 +128,7 @@ impl GatewayProbe {
         let status = response.status();
         let (status, version) = if status.is_success() {
             match service {
-                StackService::Auth => match read_bounded(response, MAX_HEALTH_BODY_BYTES).await {
+                StackService::Auth => match read_bounded(response).await {
                     Ok(body) => (ServiceStatus::Healthy, auth_version(&body)),
                     Err(reason) => (ServiceStatus::Unreachable { reason }, None),
                 },
@@ -129,37 +145,6 @@ impl GatewayProbe {
             version,
             latency_ms,
         }
-    }
-}
-
-impl GatewayProbe {
-    /// A GET request to `url` with the key in the `apikey` header. Address
-    /// literals are checked here, before anything is sent; the resolver
-    /// checks every address a host name resolves to.
-    pub(crate) fn request(
-        &self,
-        method: reqwest::Method,
-        url: reqwest::Url,
-        key: &SecretString,
-        accept: &'static str,
-    ) -> Result<reqwest::RequestBuilder, UnreachableReason> {
-        let literal = match url.host() {
-            Some(url::Host::Ipv4(ip)) => Some(std::net::IpAddr::V4(ip)),
-            Some(url::Host::Ipv6(ip)) => Some(std::net::IpAddr::V6(ip)),
-            _ => None,
-        };
-        if literal.is_some_and(|ip| !self.policy.allows(ip)) {
-            return Err(UnreachableReason::DestinationNotAllowed);
-        }
-        let mut headers = HeaderMap::new();
-        // Stored keys are validated as printable ASCII, so a failure here
-        // means the stored value is not a usable key.
-        let mut apikey = HeaderValue::from_str(key.expose_secret())
-            .map_err(|_| UnreachableReason::InvalidResponse)?;
-        apikey.set_sensitive(true);
-        headers.insert("apikey", apikey);
-        headers.insert(ACCEPT, HeaderValue::from_static(accept));
-        Ok(self.client.request(method, url).headers(headers))
     }
 }
 
@@ -199,7 +184,7 @@ fn status_failure(status: StatusCode) -> ServiceStatus {
 
 /// Maps a request error to a fixed reason. The error itself may name
 /// addresses, so it is logged at debug level only and never returned.
-pub(crate) fn classify(err: &reqwest::Error) -> UnreachableReason {
+fn classify(err: &reqwest::Error) -> UnreachableReason {
     tracing::debug!(error = %err, "service check request failed");
     if chain_has::<DestinationNotAllowed>(err) {
         UnreachableReason::DestinationNotAllowed
@@ -216,40 +201,18 @@ pub(crate) fn classify(err: &reqwest::Error) -> UnreachableReason {
     }
 }
 
-pub(crate) async fn read_bounded(
-    response: Response,
-    limit: usize,
-) -> Result<Vec<u8>, UnreachableReason> {
-    read_limited(response, limit)
-        .await
-        .map_err(|err| match err {
-            ReadError::TooLarge => UnreachableReason::InvalidResponse,
-            ReadError::Failed(reason) => reason,
-        })
-}
-
-/// Why a body was not read.
-pub(crate) enum ReadError {
-    /// The body was longer than the limit. Reading stopped there.
-    TooLarge,
-    Failed(UnreachableReason),
-}
-
-pub(crate) async fn read_limited(
-    mut response: Response,
-    limit: usize,
-) -> Result<Vec<u8>, ReadError> {
+async fn read_bounded(mut response: Response) -> Result<Vec<u8>, UnreachableReason> {
     let mut body = Vec::new();
     loop {
         match response.chunk().await {
             Ok(Some(chunk)) => {
-                if body.len().saturating_add(chunk.len()) > limit {
-                    return Err(ReadError::TooLarge);
+                if body.len().saturating_add(chunk.len()) > MAX_HEALTH_BODY_BYTES {
+                    return Err(UnreachableReason::InvalidResponse);
                 }
                 body.extend_from_slice(&chunk);
             }
             Ok(None) => return Ok(body),
-            Err(err) => return Err(ReadError::Failed(classify(&err))),
+            Err(err) => return Err(classify(&err)),
         }
     }
 }

@@ -2951,7 +2951,6 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
- "uuid",
  "webpki-roots",
 ]
 
@@ -3047,7 +3046,6 @@ dependencies = [
  "thiserror 2.0.21",
  "time",
  "tracing",
- "url",
  "uuid",
  "wasm-bindgen",
  "web-sys",

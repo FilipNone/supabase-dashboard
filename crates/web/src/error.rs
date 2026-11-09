@@ -47,9 +47,6 @@ mod server {
         connections::ConnectionError,
         organizations::OrganizationError,
         projects::ProjectError,
-        schema::SchemaError,
-        snippets::SnippetError,
-        sql::SqlError,
     };
 
     use super::AppError;
@@ -135,49 +132,6 @@ mod server {
                 }
                 ConnectionError::Internal(err) => {
                     tracing::error!(error = %err, "project connection operation failed");
-                    Self::Unavailable
-                }
-            }
-        }
-    }
-
-    impl From<SchemaError> for AppError {
-        fn from(err: SchemaError) -> Self {
-            match err {
-                SchemaError::NotFound | SchemaError::TableNotFound => Self::NotFound,
-                SchemaError::Forbidden => Self::Forbidden,
-                SchemaError::TooManyFilters => Self::Rejected(sentence(&err.to_string())),
-                SchemaError::Unavailable => Self::Unavailable,
-                SchemaError::Internal(err) => {
-                    tracing::error!(error = %err, "schema read failed");
-                    Self::Unavailable
-                }
-            }
-        }
-    }
-
-    impl From<SqlError> for AppError {
-        fn from(err: SqlError) -> Self {
-            match err {
-                SqlError::NotFound => Self::NotFound,
-                SqlError::Forbidden => Self::Forbidden,
-                SqlError::Unavailable => Self::Unavailable,
-                SqlError::Internal(err) => {
-                    tracing::error!(error = %err, "sql run failed");
-                    Self::Unavailable
-                }
-            }
-        }
-    }
-
-    impl From<SnippetError> for AppError {
-        fn from(err: SnippetError) -> Self {
-            match err {
-                SnippetError::NotFound => Self::NotFound,
-                SnippetError::Forbidden => Self::Forbidden,
-                SnippetError::LimitReached => Self::Rejected(sentence(&err.to_string())),
-                SnippetError::Internal(err) => {
-                    tracing::error!(error = %err, "snippet operation failed");
                     Self::Unavailable
                 }
             }

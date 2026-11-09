@@ -14,13 +14,13 @@ Versions match the upstream `docker/docker-compose.yml` in supabase/supabase on 
 | postgres-meta | `supabase/postgres-meta:v0.100.0` | `meta` | 54380 |
 | API gateway (Kong) | `kong/kong:3.9.3` | `gateway` | 54321 |
 
-Upstream now defaults to an Envoy gateway and keeps Kong as an alternative. The fixture uses Kong with a reduced `api/kong.yml` (Auth, REST, and postgres-meta routes only, legacy JWT API keys) because its configuration is much smaller; the routes and key checks match upstream's. As upstream does, `/pg/` reaches postgres-meta only with the service role key. An Envoy fixture is still to do.
+Upstream now defaults to an Envoy gateway and keeps Kong as an alternative. The fixture uses Kong with a reduced `api/kong.yml` (Auth and REST routes only, legacy JWT API keys) because its configuration is much smaller; the routes and key checks match upstream's. An Envoy fixture is still to do.
 
-Not in the fixture yet: Studio, Realtime, Storage, imgproxy, Edge Functions, Supavisor, analytics. They will be added when the milestone that uses them starts (Storage, Realtime, and Functions are M5).
+Not in the fixture yet: Studio, Realtime, Storage, imgproxy, Edge Functions, Supavisor, analytics. Studio and the gateway's Studio route come with M3 (Studio access); the services behind Studio's other pages are added as those pages are checked through the dashboard.
 
 ## Fixture
 
-`tests/fixtures/supabase/` holds a reduced compose file adapted from upstream (Apache-2.0) with synthetic, test-only credentials in `fixture.env`. Every port binds to `127.0.0.1` and no volume persists data. `db/sample.sql` adds a small synthetic schema (an enum, a `todos` table with RLS enabled, a `tags` table with a composite primary key, and an `Event "Log"` table with no primary key, a name that needs quoting, 120 rows, and one value longer than the dashboard keeps) for the schema browsing and row paging tests.
+`tests/fixtures/supabase/` holds a reduced compose file adapted from upstream (Apache-2.0) with synthetic, test-only credentials in `fixture.env`. Every port binds to `127.0.0.1` and no volume persists data.
 
 ```sh
 docker compose -f tests/fixtures/supabase/docker-compose.yml \
@@ -37,13 +37,6 @@ docker compose -p sd-fixture down -v
 | PostgREST reachability through the gateway (service role key; the gateway refuses the anon key on the root path with 403) | Verified against PostgREST v14.18 via Kong 3.9.3 | same test |
 | Wrong key reported as rejected (401) | Verified | same test |
 | Envoy gateway, new-style `sb_publishable_`/`sb_secret_` keys | Not tested | No fixture yet |
-| Schema, table, and column listing through postgres-meta at `/pg/` (service role key; the gateway refuses the anon key with 403) | Verified against postgres-meta v0.100.0 via Kong 3.9.3 | `fixture_meta_lists_structure` in `crates/adapters/tests/gateway_fixture.rs` |
-| Read-only table rows through postgres-meta `POST /pg/query` (generated `SELECT` in a read-only transaction with a local statement timeout; ordered by primary key, or by a chosen column with the primary key as tiebreaker; 50 rows per page). Filter values are quoted by PostgreSQL through a parameterized `quote_literal` query (`parameters` in the `/pg/query` body), since parameters cannot go into the guarded statement list | Verified against postgres-meta v0.100.0 and PostgreSQL 17.6 via Kong 3.9.3 | same test |
-| Views, materialized views, and foreign tables listed and looked up through `/pg/views`, `/pg/materialized-views`, and `/pg/foreign-tables`; view rows read like tables without a primary key. postgres-meta v0.100 answers `/pg/foreign-tables/{id}` for an unknown ID with another foreign table, so answers are checked against the requested ID | Verified against postgres-meta v0.100.0 and PostgreSQL 17.6 via Kong 3.9.3 | `fixture_meta_lists_structure`, and `ids_are_looked_up_across_kinds_and_rows_are_guarded` in `crates/adapters/tests/meta_mock.rs` |
-| A table's foreign keys in both directions, read from `pg_catalog.pg_constraint` through `POST /pg/query` (generated `SELECT` whose only input is the table's OID, in a read-only transaction with a local statement timeout) | Verified against postgres-meta v0.100.0 and PostgreSQL 17.6 via Kong 3.9.3, including a two-column key declared out of order and a key from a table to itself | same test |
-| SQL editor runs through `POST /pg/query` with `statementTimeoutSecs` and `queryTimeoutSecs`, and the `x-pg-application-name` header, which Kong passes through. postgres-meta opens a new connection per request, so session settings do not carry over between runs. Errors come back as HTTP 400 with `code` (SQLSTATE) and `error` (the text with `LINE` and caret). Cancel finds the run's backend in `pg_stat_activity` by `application_name` and calls `pg_cancel_backend` | Verified against postgres-meta v0.100.0 and PostgreSQL 17.6 via Kong 3.9.3, including cancelling a running `pg_sleep(15)` | `fixture_sql_runs_with_limits_and_can_be_cancelled` in `crates/adapters/tests/gateway_fixture.rs`, and `crates/adapters/tests/sql_mock.rs` |
-| Row editing, Auth users, Storage | Not implemented | M3 and later |
-
-Saved SQL snippets are stored by the dashboard, not by the stack, so they do not depend on any stack version. Snippets saved in self-hosted Studio are not imported.
+| Studio through the dashboard (Table editor, SQL editor, Auth, Storage, and the rest) | Not implemented | M3, see `docs/adr/0002-studio-access.md` |
 
 Update the baseline only together with a fixture change and a passing CI run.

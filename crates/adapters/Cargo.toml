@@ -22,7 +22,6 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "time"] }
 tracing.workspace = true
 url.workspace = true
-uuid.workspace = true
 webpki-roots = "1"
 
 [dev-dependencies]

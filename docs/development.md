@@ -69,7 +69,7 @@ All settings are environment variables. Invalid values stop the server at startu
 | `SUPABASE_DASHBOARD_DB_ACQUIRE_TIMEOUT_SECS` | 5 | 1 to 120 |
 | `SUPABASE_DASHBOARD_DB_STATEMENT_TIMEOUT_SECS` | 30 | 1 to 3600; set as PostgreSQL `statement_timeout` |
 | `SUPABASE_DASHBOARD_MAX_BODY_BYTES` | 1048576 | 1 KiB to 64 MiB; larger requests get 413 |
-| `SUPABASE_DASHBOARD_REQUEST_TIMEOUT_SECS` | 30 | 1 to 600; slower requests get 408. Keep it above 26 so a long SQL editor query reports the database timeout instead of a 408 |
+| `SUPABASE_DASHBOARD_REQUEST_TIMEOUT_SECS` | 30 | 1 to 600; slower requests get 408 |
 | `SUPABASE_DASHBOARD_READINESS_TIMEOUT_SECS` | 2 | 1 to 30 |
 | `SUPABASE_DASHBOARD_SESSION_LIFETIME_HOURS` | 12 | 1 to 720; absolute session lifetime from sign-in |
 | `SUPABASE_DASHBOARD_SESSION_IDLE_TIMEOUT_MINS` | 60 | 5 to 1440; must not exceed the lifetime |
@@ -94,25 +94,6 @@ The server logs a short key ID at startup, never the key. Each stored API key is
 ### Service checks
 
 The project overview's "Check now" button asks the stack's API gateway for `/auth/v1/health` (with the anon key) and `/rest/v1/` (with the service role key). Only those two paths under the registered API URL are requested. The client refuses loopback (unless allowed above), link-local, multicast, and cloud metadata addresses, checks every address a host name resolves to, does not follow redirects, ignores proxy environment variables, and gives up after 5 seconds to connect or 10 seconds in total. HTTPS uses the Mozilla root store bundled with the binary; stacks behind a private certificate authority are not supported yet. A project can be checked once every 10 seconds.
-
-### Table editor
-
-The project's Table editor tab reads schemas, tables, and columns from postgres-meta through the same gateway, at `/pg/schemas`, `/pg/tables`, and `/pg/tables/{id}`, with the stored service role key and the same address policy, timeouts, and redirect rule. Responses are size-limited (8 MiB for lists, 4 MiB for one table). At most 16 of these requests run at once across the server. Nothing is cached and nothing is written to the stack.
-
-The Data tab shows a table's rows 50 at a time. The server reads the table from `/pg/tables/{id}` again and then sends one statement it builds itself to `POST /pg/query`:
-
-```sql
-SET TRANSACTION READ ONLY; SET LOCAL statement_timeout = 5000;
-SELECT left(("col")::text, 201) AS c0, ... FROM "schema"."table" ORDER BY "pk" LIMIT 51 OFFSET n
-```
-
-Names come from postgres-meta and are always double-quoted, with embedded quotes doubled; a name longer than 63 bytes or containing a NUL byte is refused instead of sent. The only other inputs are integers. Both settings stay inside the statement's implicit transaction, so nothing changes on postgres-meta's pooled connection. postgres-meta's own `statementTimeoutSecs` option is not used because it sets the timeout for the whole session.
-
-The Definition tab also lists foreign keys: the ones on the table, and the ones on other tables that point at it. They come from a second generated statement to `POST /pg/query` that reads `pg_catalog.pg_constraint` in the same kind of read-only transaction with the same 5 second timeout. Its only input is the table's OID, an integer. postgres-meta's own `relationships` field is not used, because it matches key columns with `= any(...)` and so cannot say which column pairs with which in a key of more than one column. At most 200 keys are listed. If this read fails, the columns are still shown, with the failure in the foreign key section.
-
-Views, materialized views, and foreign tables are listed next to tables, each read from its own postgres-meta path (`/pg/views`, `/pg/materialized-views`, `/pg/foreign-tables`, one request after another). The 1000-entry limit applies to all kinds together. A relation is looked up by ID at each kind's path in turn, and an answer only counts if it carries the requested ID: postgres-meta v0.100 answers `/foreign-tables/{id}` for an unknown ID with a different foreign table. Views are read like tables without a primary key, so their pages have no fixed order. A materialized view that was never refreshed is not queried, and neither is a foreign table, because each read goes to the remote source. Both show a notice instead. Only tables show row-level security, size, row estimates, and foreign keys.
-
-Limits: the first 50 columns, 200 characters per value (cut on the server), pages 1 to 2000, and a 4 MiB response. Tables without a primary key are read in no particular order and the page says so. A column header links to the same table sorted by that column (`?sort=<column>`, plus `&desc=1` for descending); the next click reverses it and the one after that clears it. The sort column is checked against the first 50 columns of the table as it is read for the query and dropped if it is not there, and the primary key follows it in the `ORDER BY` so rows with equal values keep their pages. A type with no ordering operator, such as `json`, fails with SQLSTATE 42883, which is reported as "This column cannot be sorted" only when a sort was asked for. Filters are `filter=<column>:<op>:<value>` values, at most 10, combined with AND; `op` is one of `eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `like`, `ilike`, `is_null`, and `not_null` (the last two take no value and no third part), and a `:` or `\` in the column name is escaped with `\`. Values are at most 1000 bytes. postgres-meta passes `parameters` to PostgreSQL, but PostgreSQL refuses parameters in a statement list, which the read-only transaction and timeout need, so a filtered read first sends one parameterized `SELECT quote_literal($1::text), ...` and puts PostgreSQL's quoted literals into the row query; the adapter accepts only answers of the exact form `quote_literal` writes. The literals have no type, so PostgreSQL reads each as its column's type; `like` and `ilike` compare the column cast to text. A filter on a column the table no longer has is reported instead of being dropped. A value PostgreSQL cannot read as the column's type (SQLSTATE class 22) and a missing operator while filters are applied (42883, as for `=` on `json`) have their own states. The add-filter form submits as a GET with `fc`, `fo`, and `fv` when it is used before the page is interactive; links on the resulting page carry that filter as a `filter` value. A statement timeout (SQLSTATE 57014) is reported as its own state; other database errors only as "postgres-meta answered HTTP 400", because their text can contain data. Rows are read as postgres-meta's database role, which in a standard stack bypasses row-level security; every member role, viewers included, can read them.
 
 ## Endpoints
 

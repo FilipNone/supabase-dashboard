@@ -18,9 +18,7 @@ use crate::pages::{
     organizations::OrganizationsPage,
     project::{NewProjectPage, ProjectLayout, ProjectOverviewPage, ProjectSettingsPage},
     sign_in::SignInPage,
-    sql_editor::SqlEditorPage,
     status::StatusPage,
-    table_editor::TableEditorPage,
 };
 
 /// Server-rendered HTML document. The theme comes from a non-secret cookie
@@ -112,9 +110,6 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("new/:org_id") view=NewProjectPage/>
                     <ParentRoute path=path!("project/:project_id") view=ProjectLayout>
                         <Route path=path!("") view=ProjectOverviewPage/>
-                        <Route path=path!("editor") view=TableEditorPage/>
-                        <Route path=path!("editor/:table_id") view=TableEditorPage/>
-                        <Route path=path!("sql") view=SqlEditorPage/>
                         <Route path=path!("settings") view=ProjectSettingsPage/>
                     </ParentRoute>
                 </ParentRoute>

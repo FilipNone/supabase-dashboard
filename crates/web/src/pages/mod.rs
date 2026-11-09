@@ -7,6 +7,4 @@ pub mod organizations;
 pub mod project;
 pub mod project_connection;
 pub mod sign_in;
-pub mod sql_editor;
 pub mod status;
-pub mod table_editor;

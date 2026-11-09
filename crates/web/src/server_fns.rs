@@ -16,9 +16,6 @@ use supabase_dashboard_domain::{
     invitation::{InvitationCode, InvitationPreview, InvitationSummary, IssuedInvitation},
     organization::{MemberSummary, OrganizationSummary},
     project::ProjectSummary,
-    schema::{MetaUnavailable, RowPage, SchemaListing, TableDefinition, TableListing},
-    snippet::{Snippet, SnippetList, SnippetVisibility},
-    sql::SqlOutcome,
 };
 use uuid::Uuid;
 
@@ -85,9 +82,6 @@ mod org_context {
         connections::ConnectionService,
         organizations::OrganizationService,
         projects::ProjectService,
-        schema::SchemaService,
-        snippets::SnippetService,
-        sql::SqlService,
     };
 
     use crate::error::AppError;
@@ -127,27 +121,6 @@ mod org_context {
     pub fn connections() -> Result<Arc<ConnectionService>, AppError> {
         use_context::<Arc<ConnectionService>>().ok_or_else(|| {
             tracing::error!("connection service is not configured");
-            AppError::Unavailable
-        })
-    }
-
-    pub fn schema() -> Result<Arc<SchemaService>, AppError> {
-        use_context::<Arc<SchemaService>>().ok_or_else(|| {
-            tracing::error!("schema service is not configured");
-            AppError::Unavailable
-        })
-    }
-
-    pub fn snippets() -> Result<Arc<SnippetService>, AppError> {
-        use_context::<Arc<SnippetService>>().ok_or_else(|| {
-            tracing::error!("snippet service is not configured");
-            AppError::Unavailable
-        })
-    }
-
-    pub fn sql() -> Result<Arc<SqlService>, AppError> {
-        use_context::<Arc<SqlService>>().ok_or_else(|| {
-            tracing::error!("sql service is not configured");
             AppError::Unavailable
         })
     }
@@ -274,151 +247,6 @@ pub async fn get_project_health(id: Uuid) -> Result<Option<HealthReport>, AppErr
 pub async fn check_project_health(id: Uuid) -> Result<HealthReport, AppError> {
     let session = org_context::session()?;
     Ok(org_context::connections()?.check_now(&session, id).await?)
-}
-
-/// The schemas of a project's database, or why the stack could not list
-/// them.
-#[server]
-pub async fn list_schemas(id: Uuid) -> Result<Result<SchemaListing, MetaUnavailable>, AppError> {
-    let session = org_context::session()?;
-    Ok(org_context::schema()?.schemas(&session, id).await?)
-}
-
-/// The tables of one schema. The name is checked here so a bad value gets
-/// a readable message instead of a transport error.
-#[server]
-pub async fn list_tables(
-    id: Uuid,
-    schema: String,
-) -> Result<Result<TableListing, MetaUnavailable>, AppError> {
-    let session = org_context::session()?;
-    let schema = supabase_dashboard_domain::schema::SchemaName::parse(&schema)
-        .map_err(|err| AppError::Rejected(format!("{}.", capitalize(&err.to_string()))))?;
-    Ok(org_context::schema()?.tables(&session, id, &schema).await?)
-}
-
-/// One table with its columns and foreign keys.
-#[server]
-pub async fn get_table(
-    id: Uuid,
-    table_id: u32,
-) -> Result<Result<TableDefinition, MetaUnavailable>, AppError> {
-    let session = org_context::session()?;
-    Ok(org_context::schema()?.table(&session, id, table_id).await?)
-}
-
-/// One page of a table's rows, read-only. Pages start at 1. `sort` names
-/// a column to order by; one the table does not have is ignored.
-/// `filters` are the editor address's `filter` values (`column:op:value`),
-/// combined with AND.
-#[server]
-pub async fn get_table_rows(
-    id: Uuid,
-    table_id: u32,
-    page: u32,
-    sort: Option<String>,
-    descending: bool,
-    // An empty list is sent as nothing at all.
-    #[server(default)] filters: Vec<String>,
-) -> Result<Result<RowPage, MetaUnavailable>, AppError> {
-    use supabase_dashboard_domain::schema::{RowPageNumber, RowSort, parse_filters};
-
-    let session = org_context::session()?;
-    let rejected = |err: &dyn std::fmt::Display| {
-        AppError::Rejected(format!("{}.", capitalize(&err.to_string())))
-    };
-    let page = RowPageNumber::new(page).map_err(|err| rejected(&err))?;
-    let sort = sort
-        .map(|column| RowSort::new(&column, descending))
-        .transpose()
-        .map_err(|err| rejected(&err))?;
-    let filters = parse_filters(&filters).map_err(|err| rejected(&err))?;
-    Ok(org_context::schema()?
-        .rows(&session, id, table_id, page, sort, filters)
-        .await?)
-}
-
-/// Runs SQL on a project's database as written. Only roles that may run
-/// SQL get here; the text is never logged or audited.
-#[server]
-pub async fn run_sql(id: Uuid, sql: String) -> Result<SqlOutcome, AppError> {
-    let session = org_context::session()?;
-    let sql = supabase_dashboard_domain::sql::SqlText::parse(&sql)
-        .map_err(|err| AppError::Rejected(format!("{}.", capitalize(&err.to_string()))))?;
-    let audit = org_context::AuditContext::current();
-    Ok(org_context::sql()?
-        .run(&session, id, &sql, audit.get())
-        .await?)
-}
-
-/// Cancels the caller's running SQL on a project. Gives the number of
-/// statements the database was asked to stop; zero means none was running.
-#[server]
-pub async fn cancel_sql(id: Uuid) -> Result<Result<u32, MetaUnavailable>, AppError> {
-    let session = org_context::session()?;
-    let audit = org_context::AuditContext::current();
-    Ok(org_context::sql()?
-        .cancel(&session, id, audit.get())
-        .await?)
-}
-
-/// The caller's SQL snippets and the ones shared with the project.
-#[server]
-pub async fn list_snippets(id: Uuid) -> Result<SnippetList, AppError> {
-    let session = org_context::session()?;
-    Ok(org_context::snippets()?.list(&session, id).await?)
-}
-
-#[server]
-pub async fn get_snippet(id: Uuid, snippet_id: Uuid) -> Result<Snippet, AppError> {
-    let session = org_context::session()?;
-    Ok(org_context::snippets()?
-        .get(&session, id, snippet_id)
-        .await?)
-}
-
-/// Saves the editor's text as a snippet: a new one without `snippet_id`,
-/// otherwise the caller's own existing one. Gives the snippet's ID.
-#[server]
-pub async fn save_snippet(
-    id: Uuid,
-    snippet_id: Option<Uuid>,
-    name: String,
-    visibility: SnippetVisibility,
-    sql: String,
-) -> Result<Uuid, AppError> {
-    let session = org_context::session()?;
-    let input = supabase_dashboard_domain::snippet::SnippetInput::parse(&name, visibility, &sql)
-        .map_err(|err| AppError::Rejected(format!("{}.", capitalize(&err.to_string()))))?;
-    let audit = org_context::AuditContext::current();
-    let snippets = org_context::snippets()?;
-    match snippet_id {
-        None => Ok(snippets.create(&session, id, &input, audit.get()).await?),
-        Some(snippet_id) => {
-            snippets
-                .update(&session, id, snippet_id, &input, audit.get())
-                .await?;
-            Ok(snippet_id)
-        }
-    }
-}
-
-#[server]
-pub async fn delete_snippet(id: Uuid, snippet_id: Uuid) -> Result<(), AppError> {
-    let session = org_context::session()?;
-    let audit = org_context::AuditContext::current();
-    Ok(org_context::snippets()?
-        .delete(&session, id, snippet_id, audit.get())
-        .await?)
-}
-
-#[cfg(feature = "ssr")]
-fn capitalize(message: &str) -> String {
-    let mut chars = message.chars();
-    chars
-        .next()
-        .map(|c| c.to_uppercase().chain(chars).collect())
-        .unwrap_or_default()
 }
 
 /// Projects registered in an organization.
