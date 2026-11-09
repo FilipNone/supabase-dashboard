@@ -65,19 +65,13 @@ impl OrgRole {
                 | P::ProjectUpdate
                 | P::ProjectCredentialsReplace
                 | P::ProjectUnregister
-                | P::TableDataRead
-                | P::TableDataWrite
-                | P::SqlExecute
-                | P::SchemaChange => true,
+                | P::StudioOpen => true,
             },
             Self::Developer => match permission {
                 P::OrgRead
                 | P::MembersRead
                 | P::ProjectRead
-                | P::TableDataRead
-                | P::TableDataWrite
-                | P::SqlExecute
-                | P::SchemaChange => true,
+                | P::StudioOpen => true,
                 P::OrgUpdate
                 | P::OrgDelete
                 | P::MembersManage
@@ -88,10 +82,10 @@ impl OrgRole {
                 | P::ProjectUnregister => false,
             },
             Self::Viewer => match permission {
-                P::OrgRead | P::MembersRead | P::ProjectRead | P::TableDataRead => true,
-                // Arbitrary SQL cannot be proven read-only by inspection, so
-                // read-only members get no SQL access at all.
-                P::SqlExecute
+                P::OrgRead | P::MembersRead | P::ProjectRead => true,
+                // Studio has no roles of its own: whoever opens it can run
+                // any SQL as the database owner, so read-only members cannot.
+                P::StudioOpen
                 | P::OrgUpdate
                 | P::OrgDelete
                 | P::MembersManage
@@ -99,9 +93,7 @@ impl OrgRole {
                 | P::ProjectRegister
                 | P::ProjectUpdate
                 | P::ProjectCredentialsReplace
-                | P::ProjectUnregister
-                | P::TableDataWrite
-                | P::SchemaChange => false,
+                | P::ProjectUnregister => false,
             },
         }
     }
@@ -126,14 +118,14 @@ pub enum Permission {
     ProjectCredentialsReplace,
     /// Remove the registry entry only; never deletes the stack or its data.
     ProjectUnregister,
-    TableDataRead,
-    TableDataWrite,
-    SqlExecute,
-    SchemaChange,
+    /// Open the project's Supabase Studio through the dashboard. Studio has
+    /// no roles, so this grants full database access and shows the stack's
+    /// API keys and JWT secret.
+    StudioOpen,
 }
 
 impl Permission {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 12] = [
         Self::OrgRead,
         Self::OrgUpdate,
         Self::OrgDelete,
@@ -145,10 +137,7 @@ impl Permission {
         Self::ProjectUpdate,
         Self::ProjectCredentialsReplace,
         Self::ProjectUnregister,
-        Self::TableDataRead,
-        Self::TableDataWrite,
-        Self::SqlExecute,
-        Self::SchemaChange,
+        Self::StudioOpen,
     ];
 }
 
@@ -223,21 +212,15 @@ mod tests {
                 P::ProjectUpdate,
                 P::ProjectCredentialsReplace,
                 P::ProjectUnregister,
-                P::TableDataRead,
-                P::TableDataWrite,
-                P::SqlExecute,
-                P::SchemaChange,
+                P::StudioOpen,
             ],
             Developer => &[
                 P::OrgRead,
                 P::MembersRead,
                 P::ProjectRead,
-                P::TableDataRead,
-                P::TableDataWrite,
-                P::SqlExecute,
-                P::SchemaChange,
+                P::StudioOpen,
             ],
-            Viewer => &[P::OrgRead, P::MembersRead, P::ProjectRead, P::TableDataRead],
+            Viewer => &[P::OrgRead, P::MembersRead, P::ProjectRead],
         }
     }
 
