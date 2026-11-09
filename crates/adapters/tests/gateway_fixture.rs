@@ -149,7 +149,12 @@ async fn fixture_studio_is_reached_through_the_proxy() {
     );
     headers.insert(header::COOKIE, "sd-studio=session".parse().unwrap());
     let response = proxy
-        .forward(&url, &studio_login(), site, get("/project/default", headers))
+        .forward(
+            &url,
+            &studio_login(),
+            site,
+            get("/project/default", headers),
+        )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
