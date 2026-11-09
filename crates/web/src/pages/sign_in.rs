@@ -2,12 +2,23 @@ use leptos::prelude::*;
 use leptos_meta::Title;
 use leptos_router::hooks::use_query_map;
 
+use crate::app::sign_in_return_path;
+
 /// Operator sign-in. A plain HTML form posted to `/auth/sign-in`, so it
 /// works before the WASM bundle loads. The server redirects back here with a
-/// fixed `error` code on failure; nothing the operator typed is echoed.
+/// fixed `error` code on failure; nothing the operator typed is echoed. A
+/// safe `next` page is passed through the form, so the operator ends up where
+/// they were going, such as a project's Studio.
 #[component]
 pub fn SignInPage() -> impl IntoView {
     let query = use_query_map();
+    let return_to = move || {
+        query
+            .read()
+            .get("next")
+            .filter(|next| sign_in_return_path(next).is_some())
+            .map(|next| view! { <input type="hidden" name="next" value=next/> })
+    };
     let message = move || {
         query.read().get("error").map(|code| match code.as_str() {
             "throttled" => "Too many failed attempts for this account. Wait a few minutes and try again.",
@@ -30,6 +41,7 @@ pub fn SignInPage() -> impl IntoView {
                     <p class="form-error" role="alert" id="sign-in-error">{text}</p>
                 })}
                 <form method="post" action="/auth/sign-in" class="auth-form">
+                    {return_to}
                     <label class="field">
                         <span class="field-label">"Email"</span>
                         <input

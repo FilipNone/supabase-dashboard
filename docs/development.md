@@ -104,13 +104,13 @@ The project overview's "Check now" button asks the stack's API gateway for `/aut
 - `GET /readyz`: readiness. 200 when the metadata database answers, 503 otherwise, with a JSON body listing component status. Error details go to the server log, not the response.
 - Unknown paths under `/api/` return `404` with `{"error":{"code":"not_found","message":...}}`. API errors always use this envelope; messages never contain credentials or internal error text.
 - `GET /dashboard/sign-in`: the sign-in page. Signed-in operators are redirected to the home page.
-- `POST /auth/sign-in`: form fields `email` and `password`. Redirects home with a session cookie, or back to the sign-in page with a fixed `error` code. Five failures for one email within 15 minutes block further attempts for that email until the window passes.
+- `POST /auth/sign-in`: form fields `email`, `password`, and optionally `next`. Redirects with a session cookie to `next` when it is a dashboard page on this host (a path starting with `/dashboard/`, printable ASCII, no backslash, not the sign-in page), and home otherwise, or back to the sign-in page with a fixed `error` code. Five failures for one email within 15 minutes block further attempts for that email until the window passes.
 - `POST /auth/sign-out`: revokes the session and clears the cookie.
 - `/dashboard/organizations` and `/dashboard/status`: the UI shell. Organizations is an empty state for now.
 - `GET /dashboard/project/:project_id[?path=/project/default/...]`: opens the project's Studio. Members whose role allows `StudioOpen` (owner, admin, developer) get a 303 redirect to the project's Studio host with a one-time code valid for 60 seconds. Others are sent to the project page with `?studio=forbidden`, `?studio=not_configured` (no Studio login saved), or `?studio=disabled` (no Studio domain configured).
 - `GET /__dashboard/handoff?code=` on a Studio host: redeems the code, sets the Studio cookie, and redirects to the requested Studio path or `/project/default`. A used or expired code shows a page with a link to start again.
 
-Everything except `/healthz`, `/readyz`, `/favicon.svg`, `/pkg/*`, the sign-in page, and the two `/auth/` form endpoints requires a session. Pages redirect to sign-in; `/api/*` and other `/auth/*` paths answer `401` with the JSON error envelope. Signed-in responses are sent with `Cache-Control: no-store`.
+Everything except `/healthz`, `/readyz`, `/favicon.svg`, `/pkg/*`, the sign-in page, and the two `/auth/` form endpoints requires a session. Pages redirect to sign-in, with `?next=` naming the page when it is under `/dashboard/`, so the operator returns there afterwards; `/api/*` and other `/auth/*` paths answer `401` with the JSON error envelope. Signed-in responses are sent with `Cache-Control: no-store`.
 
 The session cookie is `__Host-sd-session` with `Secure` when the public URL is HTTPS, and `sd-session` otherwise (local HTTP development). It is HttpOnly and SameSite=Lax. The database stores only a SHA-256 hash of the token.
 

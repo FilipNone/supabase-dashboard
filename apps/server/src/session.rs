@@ -14,6 +14,7 @@ use serde::Deserialize;
 use supabase_dashboard_application::auth::{RequestContext, SignInError};
 use supabase_dashboard_web::app::{
     HOME_PATH, INVITE_PATH, INVITE_PREVIEW_PATH, INVITE_SIGN_UP_PATH, SIGN_IN_PATH,
+    sign_in_return_path,
 };
 
 use crate::{error::ApiError, state::AppState};
@@ -142,9 +143,18 @@ pub async fn guard(State(state): State<AppState>, mut request: Request, next: Ne
     };
 
     match (access, session) {
-        (Access::SignInPage, Some(_)) => Redirect::to(HOME_PATH).into_response(),
+        (Access::SignInPage, Some(_)) => {
+            let next = query_value(request.uri().query(), "next");
+            Redirect::to(after_sign_in(next.as_deref())).into_response()
+        }
         (Access::Api, None) => ApiError::Unauthenticated.into_response(),
-        (Access::Page, None) => Redirect::to(SIGN_IN_PATH).into_response(),
+        (Access::Page, None) => {
+            let target = request
+                .uri()
+                .path_and_query()
+                .map_or(request.uri().path(), |p| p.as_str());
+            Redirect::to(&sign_in_url(Some(target), None)).into_response()
+        }
         (Access::Public | Access::SignInPage, None) => next.run(request).await,
         (Access::Optional, None) => no_store(next.run(request).await),
         (_, Some(session)) => {
@@ -218,6 +228,39 @@ fn origin_allowed(state: &AppState, headers: &HeaderMap) -> bool {
 pub struct SignInForm {
     email: String,
     password: String,
+    /// The page to return to, checked again before use.
+    #[serde(default)]
+    next: Option<String>,
+}
+
+/// The first value of `name` in a query string.
+fn query_value(query: Option<&str>, name: &str) -> Option<String> {
+    url::form_urlencoded::parse(query?.as_bytes())
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.into_owned())
+}
+
+/// The page to open after signing in: `next` when it is a safe dashboard
+/// page, home otherwise.
+fn after_sign_in(next: Option<&str>) -> &str {
+    next.and_then(sign_in_return_path).unwrap_or(HOME_PATH)
+}
+
+/// The sign-in page, carrying a safe `next` page and an error code.
+fn sign_in_url(next: Option<&str>, error: Option<&str>) -> String {
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    if let Some(code) = error {
+        query.append_pair("error", code);
+    }
+    if let Some(next) = next.and_then(sign_in_return_path) {
+        query.append_pair("next", next);
+    }
+    let query = query.finish();
+    if query.is_empty() {
+        SIGN_IN_PATH.to_owned()
+    } else {
+        format!("{SIGN_IN_PATH}?{query}")
+    }
 }
 
 /// `POST /auth/sign-in`. Always answers with a redirect so the form works
@@ -229,10 +272,11 @@ pub async fn sign_in(
     Form(form): Form<SignInForm>,
 ) -> Response {
     let password = SecretString::from(form.password);
+    let next = form.next.as_deref();
     let ctx = request_context(&headers);
     match state.auth.sign_in(&form.email, &password, ctx).await {
         Ok(signed_in) => {
-            let mut response = Redirect::to(HOME_PATH).into_response();
+            let mut response = Redirect::to(after_sign_in(next)).into_response();
             if let Some(cookie) = state.cookie.set(signed_in.token.expose_cookie_value()) {
                 response.headers_mut().insert(header::SET_COOKIE, cookie);
             }
@@ -243,18 +287,18 @@ pub async fn sign_in(
                 Ok(false) => "setup",
                 _ => "invalid",
             };
-            sign_in_error(code)
+            sign_in_error(code, next)
         }
         Err(SignInError::Throttled { retry_after }) => {
             tracing::warn!(
                 retry_after_secs = retry_after.as_secs(),
                 "sign-in throttled"
             );
-            sign_in_error("throttled")
+            sign_in_error("throttled", next)
         }
         Err(SignInError::Internal(err)) => {
             tracing::error!(error = %err, "sign-in failed");
-            sign_in_error("unavailable")
+            sign_in_error("unavailable", next)
         }
     }
 }
@@ -274,8 +318,8 @@ pub async fn sign_out(State(state): State<AppState>, headers: HeaderMap) -> Resp
     response
 }
 
-fn sign_in_error(code: &str) -> Response {
-    Redirect::to(&format!("{SIGN_IN_PATH}?error={code}")).into_response()
+fn sign_in_error(code: &str, next: Option<&str>) -> Response {
+    Redirect::to(&sign_in_url(next, Some(code))).into_response()
 }
 
 pub(crate) fn request_context(headers: &HeaderMap) -> RequestContext<'_> {

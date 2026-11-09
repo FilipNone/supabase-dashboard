@@ -326,17 +326,28 @@ mod tests {
     #[tokio::test]
     async fn pages_redirect_to_sign_in_without_a_session() {
         let router = offline_router().await;
-        for path in [
-            "/",
-            "/dashboard",
-            "/dashboard/organizations",
-            "/dashboard/status",
-            "/dashboard/does-not-exist",
-            "/elsewhere",
+        // Dashboard pages come back after sign-in; other paths do not.
+        for (path, expected) in [
+            ("/", SIGN_IN_PATH),
+            ("/dashboard", SIGN_IN_PATH),
+            ("/elsewhere", SIGN_IN_PATH),
+            ("/dashboard/", "/dashboard/sign-in?next=%2Fdashboard%2F"),
+            (
+                "/dashboard/organizations",
+                "/dashboard/sign-in?next=%2Fdashboard%2Forganizations",
+            ),
+            (
+                "/dashboard/status?tab=a%20b",
+                "/dashboard/sign-in?next=%2Fdashboard%2Fstatus%3Ftab%3Da%2520b",
+            ),
+            (
+                "/dashboard//evil.test",
+                "/dashboard/sign-in?next=%2Fdashboard%2F%2Fevil.test",
+            ),
         ] {
             let (parts, _) = send(&router, get(path)).await;
             assert_eq!(parts.status, StatusCode::SEE_OTHER, "{path}");
-            assert_eq!(location(&parts), SIGN_IN_PATH, "{path}");
+            assert_eq!(location(&parts), expected, "{path}");
         }
     }
 
@@ -506,7 +517,7 @@ mod tests {
         let (parts, _) = send(&router, get_with_cookie(HOME_PATH, &cookie)).await;
         assert_eq!(
             location(&parts),
-            SIGN_IN_PATH,
+            "/dashboard/sign-in?next=%2Fdashboard%2Forganizations",
             "revoked cookie no longer works"
         );
 
@@ -1082,9 +1093,67 @@ mod tests {
         assert!(!body.contains(&launch(main)), "{body}");
         assert!(body.contains(&page));
 
-        // Signed out: the launcher asks for a session first.
-        let (parts, _) = send(&router, get(&launch(main))).await;
-        assert_eq!(location(&parts), SIGN_IN_PATH);
+        // Signed out: the launcher asks for a session first, and signing
+        // in leads back to it.
+        let launch_main = format!("{}?path=%2Fproject%2Fdefault%2Fsql", launch(main));
+        let (parts, _) = send(&router, get(&launch_main)).await;
+        let sign_in = location(&parts).to_owned();
+        assert!(sign_in.starts_with("/dashboard/sign-in?next="), "{sign_in}");
+        // The page carries the launcher in a hidden field. Leptos's query
+        // map decodes `next` once more than the server encoded it, so the
+        // nested `path` arrives unescaped; the launcher reads it either way.
+        let (_, body) = send(&router, get(&sign_in)).await;
+        assert!(
+            body.contains(&format!(r#"name="next" value="{}?path="#, launch(main))),
+            "{body}"
+        );
+        let next = url::form_urlencoded::byte_serialize(launch_main.as_bytes()).collect::<String>();
+        let (parts, _) = send(
+            &router,
+            form_post(
+                "/auth/sign-in",
+                &format!("email=alice%40example.test&password=wrong-password-here&next={next}"),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(
+            location(&parts),
+            format!("/dashboard/sign-in?error=invalid&next={next}"),
+            "a failed attempt keeps the page to return to"
+        );
+        let (parts, _) = send(
+            &router,
+            form_post(
+                "/auth/sign-in",
+                &format!(
+                    "email=alice%40example.test&password=correct+horse+battery+staple&next={next}"
+                ),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(location(&parts), launch_main);
+        // Another site, or the sign-in page itself, is never a return target.
+        for next in [
+            "%2F%2Fevil.test",
+            "https%3A%2F%2Fevil.test",
+            "%2F%5Cevil.test",
+            "%2Fdashboard%2Fsign-in",
+        ] {
+            let (parts, _) = send(
+                &router,
+                form_post(
+                    "/auth/sign-in",
+                    &format!(
+                        "email=alice%40example.test&password=correct+horse+battery+staple&next={next}"
+                    ),
+                    None,
+                ),
+            )
+            .await;
+            assert_eq!(location(&parts), HOME_PATH, "{next}");
+        }
         // A viewer is refused and told why.
         let (parts, _) = send(&router, get_with_cookie(&launch(main), &bob)).await;
         assert_eq!(
