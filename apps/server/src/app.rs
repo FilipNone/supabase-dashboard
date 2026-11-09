@@ -925,8 +925,9 @@ mod tests {
         builder.body(Body::empty()).unwrap()
     }
 
-    #[tokio::test]
-    async fn studio_opens_only_through_the_dashboard() {
+    /// A router with Studio hosts under `studio.localhost:3000` and an
+    /// owner, alice, already bootstrapped.
+    async fn studio_router(db: &Database) -> (Router, crate::studio_host::StudioHosts) {
         use supabase_dashboard_adapters::{
             net::TargetPolicy,
             studio_proxy::{StudioProxy, StudioProxySettings},
@@ -935,11 +936,6 @@ mod tests {
 
         use crate::{studio::StudioGateway, studio_host::StudioHosts};
 
-        let Some(scratch) = ScratchDb::create("http_studio").await else {
-            return;
-        };
-        let db = Database::connect(&scratch.settings).await.unwrap();
-        db.migrate().await.unwrap();
         let cipher = CredentialCipher::from_base64(&SecretString::from(
             "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
         ))
@@ -993,6 +989,17 @@ mod tests {
             studio: Some(Arc::new(gateway)),
         };
         let router = router(state, &test_limits());
+        (router, hosts)
+    }
+
+    #[tokio::test]
+    async fn studio_opens_only_through_the_dashboard() {
+        let Some(scratch) = ScratchDb::create("http_studio").await else {
+            return;
+        };
+        let db = Database::connect(&scratch.settings).await.unwrap();
+        db.migrate().await.unwrap();
+        let (router, hosts) = studio_router(&db).await;
 
         let bob_id: uuid::Uuid = sqlx::query_scalar(
             "INSERT INTO accounts (id, email, display_name, password_hash) \
@@ -1295,6 +1302,157 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(opened, 2);
+
+        db.close().await;
+        scratch.drop().await;
+    }
+
+    /// A value from the disposable stack's env file.
+    fn fixture_value(name: &str) -> String {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/supabase/fixture.env"
+        );
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}=")))
+            .unwrap()
+            .to_owned()
+    }
+
+    /// The same flow against the disposable stack's real Studio and Kong
+    /// gateway (`tests/fixtures/supabase`). Skipped unless both
+    /// `SUPABASE_DASHBOARD_TEST_DATABASE_URL` and
+    /// `SUPABASE_DASHBOARD_TEST_FIXTURE_URL` are set.
+    #[tokio::test]
+    async fn studio_opens_the_fixture_studio() {
+        let Ok(fixture_url) = std::env::var("SUPABASE_DASHBOARD_TEST_FIXTURE_URL") else {
+            eprintln!("skipping: SUPABASE_DASHBOARD_TEST_FIXTURE_URL is not set");
+            return;
+        };
+        let Some(scratch) = ScratchDb::create("http_studio_fixture").await else {
+            return;
+        };
+        let db = Database::connect(&scratch.settings).await.unwrap();
+        db.migrate().await.unwrap();
+        let (router, hosts) = studio_router(&db).await;
+        let bob_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO accounts (id, email, display_name, password_hash) \
+             SELECT gen_random_uuid(), 'bob@example.test', 'Bob', password_hash FROM accounts \
+             RETURNING id",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let alice = sign_in_cookie(&router, "alice%40example.test").await;
+        let bob = sign_in_cookie(&router, "bob%40example.test").await;
+        let (_, body) = send(
+            &router,
+            form_post(CreateOrganization::PATH, "name=Acme", Some(&alice)),
+        )
+        .await;
+        let acme: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let acme_id = acme["id"].as_str().unwrap().to_owned();
+        sqlx::query(
+            "INSERT INTO organization_members (organization_id, account_id, role) \
+             VALUES ($1::uuid, $2, 'viewer')",
+        )
+        .bind(&acme_id)
+        .bind(bob_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let (_, body) = send(
+            &router,
+            form_post(
+                RegisterProject::PATH,
+                &format!(
+                    "organization_id={acme_id}&name=Fixture&allow_unencrypted=true&api_url={}",
+                    url::form_urlencoded::byte_serialize(fixture_url.as_bytes())
+                        .collect::<String>()
+                ),
+                Some(&alice),
+            ),
+        )
+        .await;
+        let project: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let id: uuid::Uuid = project["id"].as_str().unwrap().parse().unwrap();
+        let (parts, body) = send(
+            &router,
+            form_post(
+                ReplaceStudioLogin::PATH,
+                &format!(
+                    "id={id}&username={}&password={}",
+                    fixture_value("DASHBOARD_USERNAME"),
+                    fixture_value("DASHBOARD_PASSWORD")
+                ),
+                Some(&alice),
+            ),
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        let launch = format!("/dashboard/project/{id}");
+
+        // A viewer is refused before anything reaches the gateway.
+        let (parts, _) = send(&router, get_with_cookie(&launch, &bob)).await;
+        assert_eq!(
+            location(&parts),
+            format!("/dashboard/org/{acme_id}/projects/{id}?studio=forbidden")
+        );
+
+        // The owner is handed over to the project's Studio host.
+        let (parts, _) = send(&router, get_with_cookie(&launch, &alice)).await;
+        let target = url::Url::parse(location(&parts)).unwrap();
+        let handoff = format!("{}?{}", target.path(), target.query().unwrap());
+        let host = hosts.host(id);
+        let (parts, _) = send(&router, studio_get(&host, &handoff, None)).await;
+        assert_eq!(location(&parts), "/project/default");
+        let studio_cookie = parts.headers[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+
+        // Studio's root sends the browser to its project page, as a path on
+        // the Studio host, and the page itself loads.
+        let (parts, _) = send(&router, studio_get(&host, "/", Some(&studio_cookie))).await;
+        assert_eq!(parts.status, StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(location(&parts), "/project/default");
+        let (parts, body) = send(
+            &router,
+            studio_get(&host, "/project/default", Some(&studio_cookie)),
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::OK);
+        assert!(body.contains("<title"), "{body}");
+
+        // Studio's SQL endpoint runs a query for a same-origin request and
+        // never sees one from another site.
+        let query = |site: &'static str| {
+            Request::post("/api/platform/pg-meta/default/query")
+                .header(header::HOST, &host)
+                .header(header::COOKIE, &studio_cookie)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("sec-fetch-site", site)
+                .header("sec-fetch-mode", "cors")
+                .body(Body::from(r#"{"query":"select 40 + 2 as answer"}"#))
+                .unwrap()
+        };
+        let (parts, body) = send(&router, query("same-origin")).await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        let rows: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(rows[0]["answer"], 42);
+        let (parts, _) = send(&router, query("same-site")).await;
+        assert_eq!(parts.status, StatusCode::FORBIDDEN);
+
+        // Signing out ends Studio access on the next request.
+        let (parts, _) = send(&router, form_post("/auth/sign-out", "", Some(&alice))).await;
+        assert_eq!(parts.status, StatusCode::SEE_OTHER);
+        let (parts, _) = send(&router, query("same-origin")).await;
+        assert_eq!(parts.status, StatusCode::UNAUTHORIZED);
 
         db.close().await;
         scratch.drop().await;

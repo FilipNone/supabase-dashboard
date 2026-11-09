@@ -41,6 +41,8 @@ docker compose -p sd-fixture down -v
 | Studio route: reports a gateway that opens Studio without a login | Mock gateway only | `crates/adapters/tests/gateway_mock.rs` |
 | Studio forwarding: the stored login replaces the browser's, Studio's redirect comes back as a path, pages and Studio's own API answer | Verified against the same Studio and gateway | `fixture_studio_is_reached_through_the_proxy` in `crates/adapters/tests/gateway_fixture.rs` |
 | Envoy gateway, new-style `sb_publishable_`/`sb_secret_` keys | Not tested | No fixture yet |
-| Studio through the dashboard (Table editor, SQL editor, Auth, Storage, and the rest) | Not implemented | M3, see `docs/adr/0002-studio-access.md` |
+| Studio through the dashboard: launcher, one-time code, Studio host cookie, Studio's redirect and project page, a same-origin SQL query through Studio's API, a cross-site write refused, a viewer refused, sign-out ending access | Verified against Studio 2026.11.02-sha-a05e7ec via Kong 3.9.3 | `studio_opens_the_fixture_studio` in `apps/server/src/app.rs`, CI job `fixture` |
+| Studio pages in a browser through the dashboard: Home, Table editor (a table and row created through the SQL API are listed), SQL editor, Auth users | Checked by hand in headless Chromium on 2026-11-09, light and dark themes, at 1280×720; no page errors | Not automated |
+| Studio pages whose services are not in the fixture: Storage, Realtime inspector, Edge Functions, logs | Not checked | The fixture has no Storage, Realtime, Functions, or analytics services |
 
 Update the baseline only together with a fixture change and a passing CI run.
