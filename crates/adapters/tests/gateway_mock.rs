@@ -249,3 +249,47 @@ async fn untrusted_certificates_fail_as_tls_errors() {
         check.status
     );
 }
+
+/// Imitates the gateway's Studio route: basic auth in front of a Studio
+/// that redirects `/` to its project page.
+fn studio_gateway(protected: bool) -> Router {
+    // "supabase:studio-password-for-tests"
+    const GOOD: &str = "Basic c3VwYWJhc2U6c3R1ZGlvLXBhc3N3b3JkLWZvci10ZXN0cw==";
+    Router::new().route(
+        "/",
+        get(move |headers: HeaderMap| async move {
+            let authorized = headers
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                == Some(GOOD);
+            if protected && !authorized {
+                StatusCode::UNAUTHORIZED.into_response()
+            } else {
+                Redirect::temporary("/project/default").into_response()
+            }
+        }),
+    )
+}
+
+#[tokio::test]
+async fn studio_login_is_checked_and_an_open_studio_is_reported() {
+    let good = SecretString::from("supabase:studio-password-for-tests");
+    let bad = SecretString::from("supabase:wrong-password-for-tests");
+    let probe = probe(loopback());
+
+    let url = serve(studio_gateway(true)).await;
+    let check = probe.check(&url, StackService::Studio, &good).await;
+    assert_eq!(check.status, ServiceStatus::Healthy);
+    let check = probe.check(&url, StackService::Studio, &bad).await;
+    assert_eq!(
+        check.status,
+        ServiceStatus::KeyRejected { http_status: 401 }
+    );
+
+    let url = serve(studio_gateway(false)).await;
+    let check = probe.check(&url, StackService::Studio, &good).await;
+    assert_eq!(
+        check.status,
+        ServiceStatus::Unprotected { http_status: 307 }
+    );
+}

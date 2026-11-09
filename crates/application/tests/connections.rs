@@ -19,7 +19,7 @@ use supabase_dashboard_domain::{
     authz::OrgRole,
     connection::{
         ApiKeyError, CredentialKind, CredentialState, ServiceCheck, ServiceStatus, SkipReason,
-        StackService,
+        StackService, check_studio_login,
     },
     project::ProjectUrl,
 };
@@ -35,6 +35,7 @@ const KEY_A: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
 const KEY_B: &str = "HxwdHhscGRgXFhUUExIREA8ODQwLCgkIBwYFBAMCAQA=";
 const ANON: &str = "anon-key-value-for-tests";
 const SERVICE: &str = "service-role-key-value-for-tests";
+const STUDIO_PASSWORD: &str = "studio-password-for-tests";
 
 fn ctx() -> RequestContext<'static> {
     RequestContext {
@@ -327,9 +328,24 @@ async fn checks_prefer_the_least_privileged_key_and_are_saved() {
         .await
         .unwrap();
 
+    // A Studio login must come in its stored `user:password` form.
+    assert!(matches!(
+        f.connections
+            .replace_credential(
+                &owner,
+                id,
+                CredentialKind::StudioLogin,
+                &SecretString::from(STUDIO_PASSWORD),
+                ctx()
+            )
+            .await,
+        Err(ConnectionError::Input(_))
+    ));
+    let studio = check_studio_login("supabase", STUDIO_PASSWORD).unwrap();
     for (kind, value) in [
         (CredentialKind::AnonKey, ANON),
         (CredentialKind::ServiceRoleKey, SERVICE),
+        (CredentialKind::StudioLogin, studio.as_str()),
     ] {
         f.connections
             .replace_credential(&owner, id, kind, &SecretString::from(value), ctx())
@@ -349,6 +365,7 @@ async fn checks_prefer_the_least_privileged_key_and_are_saved() {
         vec![
             (StackService::Auth, ANON.to_owned()),
             (StackService::Rest, SERVICE.to_owned()),
+            (StackService::Studio, studio.clone()),
         ]
     );
     // Saved reports carry statuses only.
@@ -358,7 +375,7 @@ async fn checks_prefer_the_least_privileged_key_and_are_saved() {
             .fetch_one(f.db.pool())
             .await
             .unwrap();
-    assert!(!saved.contains(ANON) && !saved.contains(SERVICE));
+    assert!(!saved.contains(ANON) && !saved.contains(SERVICE) && !saved.contains(STUDIO_PASSWORD));
 }
 
 #[tokio::test]
@@ -431,12 +448,19 @@ async fn keys_from_another_server_key_are_reported_unreadable() {
     .await
     .unwrap();
     let report = f.connections.check_now(&owner, second).await.unwrap();
-    assert!(report.checks.iter().all(|c| matches!(
-        c.status,
-        ServiceStatus::NotChecked {
-            reason: SkipReason::UnreadableKey
-        }
-    )));
+    // Only API keys were copied; the Studio row reports a missing login.
+    assert!(
+        report
+            .checks
+            .iter()
+            .filter(|c| c.service != StackService::Studio)
+            .all(|c| matches!(
+                c.status,
+                ServiceStatus::NotChecked {
+                    reason: SkipReason::UnreadableKey
+                }
+            ))
+    );
 
     // Removing works even without a matching key.
     other

@@ -17,7 +17,10 @@ use reqwest::{
 use secrecy::{ExposeSecret, SecretString};
 use supabase_dashboard_application::connections::{ProbeFuture, StackProbe};
 use supabase_dashboard_domain::{
-    connection::{ServiceCheck, ServiceStatus, StackService, UnreachableReason, sanitize_version},
+    connection::{
+        ServiceCheck, ServiceStatus, StackService, UnreachableReason, sanitize_version,
+        split_studio_login,
+    },
     project::ProjectUrl,
 };
 use tokio::time::Instant;
@@ -109,6 +112,9 @@ impl GatewayProbe {
         if literal.is_some_and(|ip| !self.policy.allows(ip)) {
             return unreachable(UnreachableReason::DestinationNotAllowed);
         }
+        if service == StackService::Studio {
+            return self.check_studio(url, key).await;
+        }
         let mut headers = HeaderMap::new();
         let Ok(mut apikey) = HeaderValue::from_str(key.expose_secret()) else {
             // Stored keys are validated as printable ASCII, so this means
@@ -134,7 +140,7 @@ impl GatewayProbe {
                 },
                 // The REST root is the OpenAPI description, which can be
                 // large. The status is enough; the body is not read.
-                StackService::Rest => (ServiceStatus::Healthy, None),
+                StackService::Rest | StackService::Studio => (ServiceStatus::Healthy, None),
             }
         } else {
             (status_failure(status), None)
@@ -144,6 +150,73 @@ impl GatewayProbe {
             status,
             version,
             latency_ms,
+        }
+    }
+}
+
+impl GatewayProbe {
+    /// Studio's route must refuse a request without the login and accept
+    /// one with it. Studio answers `/` with a redirect to its project page,
+    /// so a redirect counts as success; it is not followed.
+    async fn check_studio(&self, url: reqwest::Url, login: &SecretString) -> ServiceCheck {
+        let service = StackService::Studio;
+        let done = |status, latency_ms| ServiceCheck {
+            service,
+            status,
+            version: None,
+            latency_ms,
+        };
+        let Some((username, password)) = split_studio_login(login.expose_secret()) else {
+            return done(
+                ServiceStatus::Unreachable {
+                    reason: UnreachableReason::InvalidResponse,
+                },
+                None,
+            );
+        };
+        let open = match self.client.get(url.clone()).send().await {
+            Ok(response) => response.status(),
+            Err(err) => {
+                return done(
+                    ServiceStatus::Unreachable {
+                        reason: classify(&err),
+                    },
+                    None,
+                );
+            }
+        };
+        if open.is_success() || open.is_redirection() {
+            return done(
+                ServiceStatus::Unprotected {
+                    http_status: open.as_u16(),
+                },
+                None,
+            );
+        }
+        let started = Instant::now();
+        let response = match self
+            .client
+            .get(url)
+            .basic_auth(username, Some(password))
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                return done(
+                    ServiceStatus::Unreachable {
+                        reason: classify(&err),
+                    },
+                    None,
+                );
+            }
+        };
+        let latency_ms = u32::try_from(started.elapsed().as_millis()).ok();
+        let status = response.status();
+        if status.is_success() || status.is_redirection() {
+            done(ServiceStatus::Healthy, latency_ms)
+        } else {
+            done(status_failure(status), latency_ms)
         }
     }
 }
@@ -163,6 +236,7 @@ const fn path(service: StackService) -> &'static str {
     match service {
         StackService::Auth => "/auth/v1/health",
         StackService::Rest => "/rest/v1/",
+        StackService::Studio => "/",
     }
 }
 
@@ -170,6 +244,7 @@ const fn accept(service: StackService) -> &'static str {
     match service {
         StackService::Auth => "application/json",
         StackService::Rest => "application/openapi+json",
+        StackService::Studio => "text/html",
     }
 }
 

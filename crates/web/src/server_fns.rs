@@ -224,6 +224,29 @@ pub async fn replace_project_credential(
         .await?)
 }
 
+/// Stores or replaces the gateway's Studio login for a project.
+#[server]
+pub async fn replace_studio_login(
+    id: Uuid,
+    username: String,
+    password: SecretInput,
+) -> Result<(), AppError> {
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    let login = supabase_dashboard_domain::connection::check_studio_login(&username, &password.0)
+        .map_err(supabase_dashboard_application::connections::ConnectionError::from)?;
+    let value = secrecy::SecretString::from(login);
+    Ok(org_context::connections()?
+        .replace_credential(
+            &session,
+            id,
+            CredentialKind::StudioLogin,
+            &value,
+            audit.get(),
+        )
+        .await?)
+}
+
 #[server]
 pub async fn remove_project_credential(id: Uuid, kind: CredentialKind) -> Result<(), AppError> {
     let session = org_context::session()?;

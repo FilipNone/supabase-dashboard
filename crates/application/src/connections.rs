@@ -79,10 +79,11 @@ pub trait StackProbe: Send + Sync {
 /// works is preferred: Auth's health endpoint accepts the anon key, while
 /// PostgREST's root (its OpenAPI description) is limited to the service role
 /// in current upstream gateway configurations.
-pub const fn key_preference(service: StackService) -> [CredentialKind; 2] {
+pub const fn key_preference(service: StackService) -> &'static [CredentialKind] {
     match service {
-        StackService::Auth => [CredentialKind::AnonKey, CredentialKind::ServiceRoleKey],
-        StackService::Rest => [CredentialKind::ServiceRoleKey, CredentialKind::AnonKey],
+        StackService::Auth => &[CredentialKind::AnonKey, CredentialKind::ServiceRoleKey],
+        StackService::Rest => &[CredentialKind::ServiceRoleKey, CredentialKind::AnonKey],
+        StackService::Studio => &[CredentialKind::StudioLogin],
     }
 }
 
@@ -319,7 +320,7 @@ impl ConnectionService {
         stored: &[StoredCredential],
     ) -> Result<SecretString, SkipReason> {
         let mut unreadable = false;
-        for kind in key_preference(service) {
+        for &kind in key_preference(service) {
             let Some(credential) = stored.iter().find(|c| c.kind == kind) else {
                 continue;
             };

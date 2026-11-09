@@ -9,7 +9,8 @@ use leptos::{form::ActionForm, prelude::*};
 use supabase_dashboard_domain::{
     connection::{
         API_KEY_MAX_LEN, CredentialKind, CredentialOverview, CredentialState, CredentialStatus,
-        HealthReport, ServiceCheck, ServiceStatus, SkipReason,
+        HealthReport, STUDIO_PASSWORD_MAX_LEN, STUDIO_PASSWORD_MIN_LEN, STUDIO_USERNAME_MAX_LEN,
+        ServiceCheck, ServiceStatus, SkipReason, StackService,
     },
     project::ProjectSummary,
 };
@@ -19,7 +20,7 @@ use crate::{
     error::AppError,
     pages::account::utc_minutes,
     server_fns::{
-        CheckProjectHealth, RemoveProjectCredential, ReplaceProjectCredential,
+        CheckProjectHealth, RemoveProjectCredential, ReplaceProjectCredential, ReplaceStudioLogin,
         get_project_credentials, get_project_health,
     },
 };
@@ -108,7 +109,7 @@ fn report_view(report: HealthReport) -> impl IntoView {
 }
 
 fn check_row(check: ServiceCheck) -> impl IntoView {
-    let (badge_class, label, detail) = describe(&check.status);
+    let (badge_class, label, detail) = describe(check.service, &check.status);
     view! {
         <tr>
             <td>{check.service.label()}</td>
@@ -125,13 +126,29 @@ fn check_row(check: ServiceCheck) -> impl IntoView {
 }
 
 /// Badge class, short label, and an optional explanation.
-fn describe(status: &ServiceStatus) -> (&'static str, String, Option<&'static str>) {
+fn describe(
+    service: StackService,
+    status: &ServiceStatus,
+) -> (&'static str, String, Option<&'static str>) {
+    let studio = service == StackService::Studio;
     match status {
         ServiceStatus::Healthy => ("badge badge-ok", "Healthy".into(), None),
+        ServiceStatus::KeyRejected { http_status } if studio => (
+            "badge badge-error",
+            format!("Login rejected (HTTP {http_status})"),
+            Some("The gateway refused the stored Studio login. Replace it under Settings."),
+        ),
         ServiceStatus::KeyRejected { http_status } => (
             "badge badge-error",
             format!("Key rejected (HTTP {http_status})"),
             Some("The gateway refused the stored key. Replace it under Settings."),
+        ),
+        ServiceStatus::Unprotected { http_status } => (
+            "badge badge-error",
+            format!("No password (HTTP {http_status})"),
+            Some(
+                "The gateway opens Studio without a password, so anyone who can reach the API URL can use it without the dashboard. Set DASHBOARD_PASSWORD on the stack and restart its gateway.",
+            ),
         ),
         ServiceStatus::Unhealthy { http_status } if (300..400).contains(http_status) => (
             "badge badge-error",
@@ -152,6 +169,7 @@ fn describe(status: &ServiceStatus) -> (&'static str, String, Option<&'static st
             "badge badge-muted",
             "Not checked".into(),
             Some(match reason {
+                SkipReason::MissingKey if studio => "No Studio login is stored for this project.",
                 SkipReason::MissingKey => "No API key is stored for this project.",
                 SkipReason::UnreadableKey => {
                     "The stored key was encrypted with a different server key. Enter it again under Settings."
@@ -223,6 +241,7 @@ fn keys_view(
     let rows = overview
         .credentials
         .into_iter()
+        .filter(|status| CredentialKind::API_KEYS.contains(&status.kind))
         .map(|status| key_row(status, id.clone(), can_manage, can_save, replace, remove))
         .collect_view();
     view! {
@@ -242,22 +261,7 @@ fn key_row(
     let kind = status.kind;
     let field_id = format!("key-{}", kind.as_str());
     let hint_id = format!("{field_id}-hint");
-    let (badge, state_text, stored) = match status.state {
-        CredentialState::NotSet => ("badge badge-muted", "Not set".to_owned(), false),
-        CredentialState::Set { updated_at } => (
-            "badge badge-ok",
-            format!("Set {} (UTC)", utc_minutes(updated_at)),
-            true,
-        ),
-        CredentialState::Unreadable { updated_at } => (
-            "badge badge-error",
-            format!(
-                "Unreadable, saved {} (UTC) under a different server key",
-                utc_minutes(updated_at)
-            ),
-            true,
-        ),
-    };
+    let (badge, state_text, stored) = state_badge(&status.state);
     let kind_value = kind.as_str();
     view! {
         <div class="key-item">
@@ -305,5 +309,123 @@ fn key_row(
                 </ActionForm>
             })}
         </div>
+    }
+}
+
+fn state_badge(state: &CredentialState) -> (&'static str, String, bool) {
+    match *state {
+        CredentialState::NotSet => ("badge badge-muted", "Not set".to_owned(), false),
+        CredentialState::Set { updated_at } => (
+            "badge badge-ok",
+            format!("Set {} (UTC)", utc_minutes(updated_at)),
+            true,
+        ),
+        CredentialState::Unreadable { updated_at } => (
+            "badge badge-error",
+            format!(
+                "Unreadable, saved {} (UTC) under a different server key",
+                utc_minutes(updated_at)
+            ),
+            true,
+        ),
+    }
+}
+
+/// The settings page's Studio section: the gateway login the dashboard
+/// adds when it opens the project's Studio for a member.
+#[component]
+pub fn StudioLoginPanel(project: ProjectSummary) -> impl IntoView {
+    let id = project.id;
+    let can_manage = project
+        .role
+        .allows(supabase_dashboard_domain::authz::Permission::ProjectCredentialsReplace);
+    let replace = ServerAction::<ReplaceStudioLogin>::new();
+    let remove = ServerAction::<RemoveProjectCredential>::new();
+    let overview = Resource::new(
+        move || (replace.version().get(), remove.version().get()),
+        move |_| get_project_credentials(id),
+    );
+    let form = move |overview: CredentialOverview| {
+        let state = overview
+            .credentials
+            .iter()
+            .find(|c| c.kind == CredentialKind::StudioLogin)
+            .map_or(CredentialState::NotSet, |c| c.state.clone());
+        let (badge, text, stored) = state_badge(&state);
+        let can_save = can_manage && overview.storage_available;
+        let id = id.to_string();
+        view! {
+            <p><span class=badge>{text}</span></p>
+            {let id = id.clone(); can_save.then(move || view! {
+                <ActionForm action=replace attr:class="stacked-form">
+                    <input type="hidden" name="id" value=id.clone()/>
+                    <label class="field">
+                        <span class="field-label">"User name (DASHBOARD_USERNAME)"</span>
+                        <input
+                            class="input" name="username" required autocomplete="off"
+                            spellcheck="false" value="supabase"
+                            maxlength=STUDIO_USERNAME_MAX_LEN.to_string()
+                        />
+                    </label>
+                    <label class="field">
+                        <span class="field-label">
+                            {if stored { "New password (DASHBOARD_PASSWORD)" } else { "Password (DASHBOARD_PASSWORD)" }}
+                        </span>
+                        <input
+                            class="input" name="password" type="password" required
+                            autocomplete="new-password" spellcheck="false"
+                            minlength=STUDIO_PASSWORD_MIN_LEN.to_string()
+                            maxlength=STUDIO_PASSWORD_MAX_LEN.to_string()
+                            aria-describedby="studio-password-hint"
+                        />
+                        <span class="field-hint" id="studio-password-hint">
+                            {format!("At least {STUDIO_PASSWORD_MIN_LEN} characters. Use a long random value that only the dashboard knows, set the same value on the stack, and restart its gateway.")}
+                        </span>
+                    </label>
+                    <div>
+                        <button type="submit" class="button button-primary"
+                            disabled=move || replace.pending().get()>
+                            "Save Studio login"
+                        </button>
+                    </div>
+                </ActionForm>
+            })}
+            {(can_manage && stored).then(|| view! {
+                <ActionForm action=remove>
+                    <input type="hidden" name="id" value=id.clone()/>
+                    <input type="hidden" name="kind" value=CredentialKind::StudioLogin.as_str()/>
+                    <button type="submit" class="button" disabled=move || remove.pending().get()>
+                        "Remove Studio login"
+                    </button>
+                </ActionForm>
+            })}
+        }
+    };
+
+    view! {
+        <section class="panel" aria-labelledby="studio-login-title">
+            <h2 class="section-title" id="studio-login-title">"Studio access"</h2>
+            <p class="section-text">
+                "The stack's gateway protects Studio with a user name and password. The dashboard keeps them encrypted on the server and adds them when a member opens Studio, so members never see them. Anyone who opens Studio can run any SQL and read the stack's keys; owners, admins, and developers can open it, viewers cannot."
+            </p>
+            <Transition fallback=|| view! { <p class="loading" role="status">"Loading…"</p> }>
+                {move || overview.get().map(|result| match result {
+                    Ok(overview) => form(overview).into_any(),
+                    Err(err) => view! {
+                        <StatePanel
+                            tone=StateTone::Error
+                            title="Studio login unavailable".to_string()
+                            detail=err.to_string()
+                        />
+                    }
+                    .into_any(),
+                })}
+            </Transition>
+            {move || feedback(replace.value().get(), "Studio login saved.")}
+            {move || feedback(remove.value().get(), "Studio login removed.")}
+            {(!can_manage).then(|| view! {
+                <p class="field-hint">"Only owners and administrators can change the Studio login."</p>
+            })}
+        </section>
     }
 }

@@ -36,6 +36,7 @@ docker compose -p sd-fixture down -v
 | Auth health and version through the gateway (anon key) | Verified against GoTrue v2.197.0 via Kong 3.9.3 | `crates/adapters/tests/gateway_fixture.rs`, CI job `fixture` |
 | PostgREST reachability through the gateway (service role key; the gateway refuses the anon key on the root path with 403) | Verified against PostgREST v14.18 via Kong 3.9.3 | same test |
 | Wrong key reported as rejected (401) | Verified | same test |
+| Studio route: refuses requests without the login, accepts the stored login, reports a gateway that needs no password | Mock gateway only | `crates/adapters/tests/gateway_mock.rs`; the fixture has no Studio yet |
 | Envoy gateway, new-style `sb_publishable_`/`sb_secret_` keys | Not tested | No fixture yet |
 | Studio through the dashboard (Table editor, SQL editor, Auth, Storage, and the rest) | Not implemented | M3, see `docs/adr/0002-studio-access.md` |
 

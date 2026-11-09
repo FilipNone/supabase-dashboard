@@ -68,10 +68,7 @@ impl OrgRole {
                 | P::StudioOpen => true,
             },
             Self::Developer => match permission {
-                P::OrgRead
-                | P::MembersRead
-                | P::ProjectRead
-                | P::StudioOpen => true,
+                P::OrgRead | P::MembersRead | P::ProjectRead | P::StudioOpen => true,
                 P::OrgUpdate
                 | P::OrgDelete
                 | P::MembersManage
@@ -214,12 +211,7 @@ mod tests {
                 P::ProjectUnregister,
                 P::StudioOpen,
             ],
-            Developer => &[
-                P::OrgRead,
-                P::MembersRead,
-                P::ProjectRead,
-                P::StudioOpen,
-            ],
+            Developer => &[P::OrgRead, P::MembersRead, P::ProjectRead, P::StudioOpen],
             Viewer => &[P::OrgRead, P::MembersRead, P::ProjectRead],
         }
     }

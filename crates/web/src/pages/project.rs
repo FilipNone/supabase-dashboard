@@ -22,7 +22,7 @@ use crate::{
         page::{PageHeader, StatePanel, StateTone},
     },
     error::AppError,
-    pages::project_connection::{ApiKeysPanel, HealthPanel},
+    pages::project_connection::{ApiKeysPanel, HealthPanel, StudioLoginPanel},
     server_fns::{
         ChangeProjectUrl, RegisterProject, RenameProject, UnregisterProject, get_organization,
         get_project,
@@ -364,6 +364,7 @@ pub fn ProjectSettingsPage() -> impl IntoView {
                     {rename_feedback}
                 </section>
                 {url_zone}
+                <StudioLoginPanel project=project.clone()/>
                 <ApiKeysPanel project=project.clone()/>
                 {danger_zone}
             }

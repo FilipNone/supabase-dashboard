@@ -24,15 +24,22 @@ pub enum CredentialKind {
     AnonKey,
     /// The service_role or secret key. It bypasses row-level security.
     ServiceRoleKey,
+    /// The gateway's basic-auth login for Studio (`DASHBOARD_USERNAME` and
+    /// `DASHBOARD_PASSWORD`), stored as `username:password`. Whoever holds
+    /// it has full control of the project through Studio.
+    StudioLogin,
 }
 
 impl CredentialKind {
-    pub const ALL: [Self; 2] = [Self::AnonKey, Self::ServiceRoleKey];
+    pub const ALL: [Self; 3] = [Self::AnonKey, Self::ServiceRoleKey, Self::StudioLogin];
+    /// The kinds shown in the API keys section.
+    pub const API_KEYS: [Self; 2] = [Self::AnonKey, Self::ServiceRoleKey];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::AnonKey => "anon_key",
             Self::ServiceRoleKey => "service_role_key",
+            Self::StudioLogin => "studio_login",
         }
     }
 
@@ -44,6 +51,7 @@ impl CredentialKind {
         match self {
             Self::AnonKey => "Anon (publishable) key",
             Self::ServiceRoleKey => "Service role (secret) key",
+            Self::StudioLogin => "Studio login",
         }
     }
 
@@ -52,6 +60,7 @@ impl CredentialKind {
         match self {
             Self::AnonKey => "ANON_KEY",
             Self::ServiceRoleKey => "SERVICE_ROLE_KEY",
+            Self::StudioLogin => "DASHBOARD_USERNAME and DASHBOARD_PASSWORD",
         }
     }
 }
@@ -68,12 +77,70 @@ pub enum ApiKeyError {
     SecretInAnonSlot,
     #[error("this looks like a publishable key; paste it into the anon field instead")]
     PublishableInSecretSlot,
+    #[error(
+        "the Studio user name must be 1 to {STUDIO_USERNAME_MAX_LEN} characters without spaces or colons"
+    )]
+    StudioUsername,
+    #[error(
+        "the Studio password must be {STUDIO_PASSWORD_MIN_LEN} to {STUDIO_PASSWORD_MAX_LEN} characters without control characters"
+    )]
+    StudioPasswordLength,
+    #[error(
+        "this is the example password from the upstream .env file; set a new one on the stack first"
+    )]
+    StudioDefaultPassword,
+}
+
+pub const STUDIO_USERNAME_MAX_LEN: usize = 64;
+/// Anyone who guesses it controls the project, so short passwords are
+/// refused even though the gateway would accept them.
+pub const STUDIO_PASSWORD_MIN_LEN: usize = 16;
+pub const STUDIO_PASSWORD_MAX_LEN: usize = 256;
+/// `DASHBOARD_PASSWORD` in upstream's `.env.example`.
+const UPSTREAM_EXAMPLE_PASSWORD: &str = "this_password_is_insecure_and_should_be_updated";
+
+/// Checks a Studio login and returns it as `username:password`, the form
+/// it is stored and sent in. The user name is trimmed; the password is
+/// taken as typed.
+pub fn check_studio_login(username: &str, password: &str) -> Result<String, ApiKeyError> {
+    let username = username.trim();
+    if username.is_empty()
+        || username.len() > STUDIO_USERNAME_MAX_LEN
+        || username
+            .chars()
+            .any(|c| c == ':' || c.is_whitespace() || c.is_control() || !c.is_ascii())
+    {
+        return Err(ApiKeyError::StudioUsername);
+    }
+    let length = password.chars().count();
+    if !(STUDIO_PASSWORD_MIN_LEN..=STUDIO_PASSWORD_MAX_LEN).contains(&length)
+        || password.chars().any(char::is_control)
+    {
+        return Err(ApiKeyError::StudioPasswordLength);
+    }
+    if password == UPSTREAM_EXAMPLE_PASSWORD {
+        return Err(ApiKeyError::StudioDefaultPassword);
+    }
+    Ok(format!("{username}:{password}"))
+}
+
+/// Splits a stored Studio login back into user name and password. The
+/// user name cannot contain a colon, so the first one separates them.
+pub fn split_studio_login(stored: &str) -> Option<(&str, &str)> {
+    stored.split_once(':')
 }
 
 /// Checks the shape of a pasted key and returns it trimmed. It catches
 /// typos and keys pasted into the wrong field. Whether the stack accepts the
 /// key is only known after a check.
 pub fn check_api_key(kind: CredentialKind, raw: &str) -> Result<&str, ApiKeyError> {
+    if kind == CredentialKind::StudioLogin {
+        // The stored form comes from [`check_studio_login`]; checking it
+        // again here keeps one entry point for every credential.
+        let (username, password) = split_studio_login(raw).ok_or(ApiKeyError::StudioUsername)?;
+        check_studio_login(username, password)?;
+        return Ok(raw);
+    }
     let value = raw.trim();
     if value.is_empty() {
         return Err(ApiKeyError::Empty);
@@ -136,15 +203,18 @@ pub enum StackService {
     Auth,
     /// PostgREST, checked at `/rest/v1/`.
     Rest,
+    /// Studio, behind the gateway's basic-auth route at `/`.
+    Studio,
 }
 
 impl StackService {
-    pub const ALL: [Self; 2] = [Self::Auth, Self::Rest];
+    pub const ALL: [Self; 3] = [Self::Auth, Self::Rest, Self::Studio];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::Auth => "Auth",
             Self::Rest => "REST API (PostgREST)",
+            Self::Studio => "Studio",
         }
     }
 }
@@ -210,6 +280,11 @@ pub enum ServiceStatus {
     Unreachable {
         reason: UnreachableReason,
     },
+    /// The gateway serves Studio without asking for a password, so anyone
+    /// who can reach the API URL can open it without the dashboard.
+    Unprotected {
+        http_status: u16,
+    },
     NotChecked {
         reason: SkipReason,
     },
@@ -256,6 +331,49 @@ mod tests {
             assert_eq!(CredentialKind::parse(kind.as_str()), Some(kind));
         }
         assert_eq!(CredentialKind::parse("password"), None);
+    }
+
+    #[test]
+    fn studio_logins_are_checked() {
+        use ApiKeyError as E;
+        let password = "a-long-random-password";
+        assert_eq!(
+            check_studio_login(" supabase ", password).as_deref(),
+            Ok("supabase:a-long-random-password")
+        );
+        assert_eq!(check_studio_login("", password), Err(E::StudioUsername));
+        assert_eq!(check_studio_login("a:b", password), Err(E::StudioUsername));
+        assert_eq!(check_studio_login("a b", password), Err(E::StudioUsername));
+        assert_eq!(
+            check_studio_login("supabase", "short"),
+            Err(E::StudioPasswordLength)
+        );
+        assert_eq!(
+            check_studio_login("supabase", &"a".repeat(STUDIO_PASSWORD_MAX_LEN + 1)),
+            Err(E::StudioPasswordLength)
+        );
+        assert_eq!(
+            check_studio_login("supabase", "line\nbreak-password-long"),
+            Err(E::StudioPasswordLength)
+        );
+        assert_eq!(
+            check_studio_login("supabase", UPSTREAM_EXAMPLE_PASSWORD),
+            Err(E::StudioDefaultPassword)
+        );
+        // A colon in the password survives the round trip.
+        let stored = check_studio_login("u", "pass:word-long-enough").unwrap();
+        assert_eq!(
+            split_studio_login(&stored),
+            Some(("u", "pass:word-long-enough"))
+        );
+        assert_eq!(
+            check_api_key(CredentialKind::StudioLogin, &stored),
+            Ok(stored.as_str())
+        );
+        assert_eq!(
+            check_api_key(CredentialKind::StudioLogin, "nocolon"),
+            Err(E::StudioUsername)
+        );
     }
 
     #[test]
