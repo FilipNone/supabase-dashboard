@@ -10,5 +10,6 @@ pub mod organizations;
 pub mod password;
 pub mod projects;
 pub mod secrets;
+pub mod studio;
 pub mod throttle;
 pub mod token;

@@ -22,7 +22,7 @@ The dashboard is the only way into a project's Studio. It authenticates the pers
 ### Hosts
 
 - The dashboard keeps its own host, `SUPABASE_DASHBOARD_PUBLIC_URL` (for example `https://dashboard.example.com`).
-- Each project's Studio gets its own host under a base domain set by the deployment, `SUPABASE_DASHBOARD_STUDIO_DOMAIN` (for example `studio.example.com`). A project is served at `https://<label>.studio.example.com`, where `<label>` is a non-secret label stored with the project. The label stays the same when the project is renamed.
+- Each project's Studio gets its own host under a base domain set by the deployment, `SUPABASE_DASHBOARD_STUDIO_DOMAIN` (for example `studio.example.com`). A project is served at `https://<label>.studio.example.com`, where `<label>` is the project's ID in 32-character hex form (a UUID without dashes, which fits in a 63-character DNS label). The ID is not a secret, and it stays the same when the project is renamed.
 - Every Studio host points at the dashboard process (a wildcard DNS record and certificate, or one record and certificate per project). The dashboard looks at the `Host` header first: a known Studio host goes to the Studio gateway code, and any other host goes to the normal dashboard routes. An unknown host under the Studio domain gets a plain 404.
 - Giving each project its own origin keeps one project's Studio from reading another project's cookies or pages. The dashboard's own `__Host-` session cookie is never sent to Studio hosts.
 
