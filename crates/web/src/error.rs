@@ -48,6 +48,7 @@ mod server {
         organizations::OrganizationError,
         projects::ProjectError,
         schema::SchemaError,
+        sql::SqlError,
     };
 
     use super::AppError;
@@ -148,6 +149,20 @@ mod server {
                 SchemaError::Unavailable => Self::Unavailable,
                 SchemaError::Internal(err) => {
                     tracing::error!(error = %err, "schema read failed");
+                    Self::Unavailable
+                }
+            }
+        }
+    }
+
+    impl From<SqlError> for AppError {
+        fn from(err: SqlError) -> Self {
+            match err {
+                SqlError::NotFound => Self::NotFound,
+                SqlError::Forbidden => Self::Forbidden,
+                SqlError::Unavailable => Self::Unavailable,
+                SqlError::Internal(err) => {
+                    tracing::error!(error = %err, "sql run failed");
                     Self::Unavailable
                 }
             }

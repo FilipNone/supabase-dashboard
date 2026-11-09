@@ -17,6 +17,7 @@ use supabase_dashboard_domain::{
     organization::{MemberSummary, OrganizationSummary},
     project::ProjectSummary,
     schema::{MetaUnavailable, RowPage, SchemaListing, TableDefinition, TableListing},
+    sql::SqlOutcome,
 };
 use uuid::Uuid;
 
@@ -84,6 +85,7 @@ mod org_context {
         organizations::OrganizationService,
         projects::ProjectService,
         schema::SchemaService,
+        sql::SqlService,
     };
 
     use crate::error::AppError;
@@ -130,6 +132,13 @@ mod org_context {
     pub fn schema() -> Result<Arc<SchemaService>, AppError> {
         use_context::<Arc<SchemaService>>().ok_or_else(|| {
             tracing::error!("schema service is not configured");
+            AppError::Unavailable
+        })
+    }
+
+    pub fn sql() -> Result<Arc<SqlService>, AppError> {
+        use_context::<Arc<SqlService>>().ok_or_else(|| {
+            tracing::error!("sql service is not configured");
             AppError::Unavailable
         })
     }
@@ -317,6 +326,30 @@ pub async fn get_table_rows(
     let filters = parse_filters(&filters).map_err(|err| rejected(&err))?;
     Ok(org_context::schema()?
         .rows(&session, id, table_id, page, sort, filters)
+        .await?)
+}
+
+/// Runs SQL on a project's database as written. Only roles that may run
+/// SQL get here; the text is never logged or audited.
+#[server]
+pub async fn run_sql(id: Uuid, sql: String) -> Result<SqlOutcome, AppError> {
+    let session = org_context::session()?;
+    let sql = supabase_dashboard_domain::sql::SqlText::parse(&sql)
+        .map_err(|err| AppError::Rejected(format!("{}.", capitalize(&err.to_string()))))?;
+    let audit = org_context::AuditContext::current();
+    Ok(org_context::sql()?
+        .run(&session, id, &sql, audit.get())
+        .await?)
+}
+
+/// Cancels the caller's running SQL on a project. Gives the number of
+/// statements the database was asked to stop; zero means none was running.
+#[server]
+pub async fn cancel_sql(id: Uuid) -> Result<Result<u32, MetaUnavailable>, AppError> {
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    Ok(org_context::sql()?
+        .cancel(&session, id, audit.get())
         .await?)
 }
 

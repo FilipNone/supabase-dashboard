@@ -69,7 +69,7 @@ All settings are environment variables. Invalid values stop the server at startu
 | `SUPABASE_DASHBOARD_DB_ACQUIRE_TIMEOUT_SECS` | 5 | 1 to 120 |
 | `SUPABASE_DASHBOARD_DB_STATEMENT_TIMEOUT_SECS` | 30 | 1 to 3600; set as PostgreSQL `statement_timeout` |
 | `SUPABASE_DASHBOARD_MAX_BODY_BYTES` | 1048576 | 1 KiB to 64 MiB; larger requests get 413 |
-| `SUPABASE_DASHBOARD_REQUEST_TIMEOUT_SECS` | 30 | 1 to 600; slower requests get 408 |
+| `SUPABASE_DASHBOARD_REQUEST_TIMEOUT_SECS` | 30 | 1 to 600; slower requests get 408. Keep it above 26 so a long SQL editor query reports the database timeout instead of a 408 |
 | `SUPABASE_DASHBOARD_READINESS_TIMEOUT_SECS` | 2 | 1 to 30 |
 | `SUPABASE_DASHBOARD_SESSION_LIFETIME_HOURS` | 12 | 1 to 720; absolute session lifetime from sign-in |
 | `SUPABASE_DASHBOARD_SESSION_IDLE_TIMEOUT_MINS` | 60 | 5 to 1440; must not exceed the lifetime |

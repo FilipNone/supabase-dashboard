@@ -217,20 +217,39 @@ pub(crate) fn classify(err: &reqwest::Error) -> UnreachableReason {
 }
 
 pub(crate) async fn read_bounded(
-    mut response: Response,
+    response: Response,
     limit: usize,
 ) -> Result<Vec<u8>, UnreachableReason> {
+    read_limited(response, limit)
+        .await
+        .map_err(|err| match err {
+            ReadError::TooLarge => UnreachableReason::InvalidResponse,
+            ReadError::Failed(reason) => reason,
+        })
+}
+
+/// Why a body was not read.
+pub(crate) enum ReadError {
+    /// The body was longer than the limit. Reading stopped there.
+    TooLarge,
+    Failed(UnreachableReason),
+}
+
+pub(crate) async fn read_limited(
+    mut response: Response,
+    limit: usize,
+) -> Result<Vec<u8>, ReadError> {
     let mut body = Vec::new();
     loop {
         match response.chunk().await {
             Ok(Some(chunk)) => {
                 if body.len().saturating_add(chunk.len()) > limit {
-                    return Err(UnreachableReason::InvalidResponse);
+                    return Err(ReadError::TooLarge);
                 }
                 body.extend_from_slice(&chunk);
             }
             Ok(None) => return Ok(body),
-            Err(err) => return Err(classify(&err)),
+            Err(err) => return Err(ReadError::Failed(classify(&err))),
         }
     }
 }

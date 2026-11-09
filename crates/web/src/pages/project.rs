@@ -167,7 +167,7 @@ pub fn NewProjectPage() -> impl IntoView {
 }
 
 #[derive(Clone, Copy)]
-struct ProjectContext {
+pub(crate) struct ProjectContext {
     project: Resource<Result<ProjectSummary, AppError>>,
     rename: ServerAction<RenameProject>,
     change_url: ServerAction<ChangeProjectUrl>,
@@ -231,6 +231,7 @@ pub fn ProjectLayout() -> impl IntoView {
                             <nav class="tabs" aria-label="Project">
                                 <A href=base.clone() exact=true attr:class="tab">"Overview"</A>
                                 <A href=format!("{base}/editor") attr:class="tab">"Table editor"</A>
+                                <A href=format!("{base}/sql") attr:class="tab">"SQL editor"</A>
                                 <A href=format!("{base}/settings") attr:class="tab">"Settings"</A>
                             </nav>
                             <Outlet/>
@@ -253,7 +254,7 @@ pub fn ProjectLayout() -> impl IntoView {
     }
 }
 
-fn loaded_project(ctx: ProjectContext) -> Option<ProjectSummary> {
+pub(crate) fn loaded_project(ctx: ProjectContext) -> Option<ProjectSummary> {
     ctx.project.get().and_then(Result::ok)
 }
 

@@ -395,3 +395,123 @@ async fn fixture_meta_lists_structure() {
         MetaUnavailable::ForeignRows
     );
 }
+
+#[tokio::test]
+async fn fixture_sql_runs_with_limits_and_can_be_cancelled() {
+    use std::time::Duration;
+
+    use supabase_dashboard_application::sql::SqlRunner;
+    use supabase_dashboard_domain::sql::{
+        SQL_RESULT_ROW_LIMIT, SqlFailure, SqlText, sql_application_name,
+    };
+    use uuid::Uuid;
+
+    let Ok(raw) = std::env::var(ENV) else {
+        eprintln!("skipping: {ENV} is not set");
+        return;
+    };
+    let url = ProjectUrl::parse(&raw).unwrap();
+    let probe = GatewayProbe::new(GatewaySettings {
+        policy: TargetPolicy {
+            allow_loopback: true,
+        },
+        ..GatewaySettings::default()
+    })
+    .unwrap();
+    let service = SecretString::from(fixture_value("SERVICE_ROLE_KEY"));
+    let sql = |text: &str| SqlText::parse(text).unwrap();
+    let run_id = Uuid::new_v4();
+
+    // Columns keep PostgreSQL's order, and the connection carries the
+    // dashboard's timeout and the run's name.
+    let result = probe
+        .run(
+            &url,
+            &service,
+            &sql("select current_setting('statement_timeout') as z_timeout, \
+                  current_setting('application_name') as \"App\", null::text as a_null"),
+            run_id,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.columns, ["z_timeout", "App", "a_null"]);
+    let text = |col: usize| result.rows[0][col].as_ref().map(|c| c.text.clone());
+    assert_eq!(text(0).as_deref(), Some("20s"));
+    assert_eq!(text(1), Some(sql_application_name(run_id)));
+    assert_eq!(text(2), None);
+
+    // Session settings end with the request: postgres-meta opens a new
+    // connection each time.
+    probe
+        .run(&url, &service, &sql("set work_mem = '7MB'"), Uuid::new_v4())
+        .await
+        .unwrap();
+    let after = probe
+        .run(&url, &service, &sql("show work_mem"), Uuid::new_v4())
+        .await
+        .unwrap();
+    assert_ne!(after.rows[0][0].as_ref().unwrap().text, "7MB");
+
+    // Statements without rows, and rows past the limit.
+    let empty = probe
+        .run(
+            &url,
+            &service,
+            &sql("create temp table t (x int); insert into t values (1)"),
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+    assert!(empty.columns.is_empty());
+    let many = probe
+        .run(
+            &url,
+            &service,
+            &sql("select g from generate_series(1, 1500) as g"),
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(many.row_count, 1500);
+    assert_eq!(many.rows.len(), SQL_RESULT_ROW_LIMIT);
+
+    match probe
+        .run(&url, &service, &sql("selec 1"), Uuid::new_v4())
+        .await
+    {
+        Err(SqlFailure::Database { code, message }) => {
+            assert_eq!(code.as_deref(), Some("42601"));
+            assert!(message.contains("LINE 1: selec 1"), "{message}");
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // A cancel finds the run by its connection name and stops it.
+    let sleeper = Uuid::new_v4();
+    let running = {
+        let probe = probe.clone();
+        let url = url.clone();
+        let service = service.clone();
+        tokio::spawn(async move {
+            probe
+                .run(&url, &service, &sql("select pg_sleep(15)"), sleeper)
+                .await
+        })
+    };
+    let mut cancelled = 0;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        cancelled = probe.cancel(&url, &service, sleeper).await.unwrap();
+        if cancelled > 0 {
+            break;
+        }
+    }
+    assert_eq!(cancelled, 1);
+    let outcome = tokio::time::timeout(Duration::from_secs(5), running)
+        .await
+        .expect("the cancelled statement should stop at once")
+        .unwrap();
+    assert_eq!(outcome, Err(SqlFailure::Timeout));
+    // Nothing is left to cancel.
+    assert_eq!(probe.cancel(&url, &service, sleeper).await.unwrap(), 0);
+}

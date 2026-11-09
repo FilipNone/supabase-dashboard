@@ -25,6 +25,7 @@ use supabase_dashboard_application::{
     projects::ProjectService,
     schema::SchemaService,
     secrets::{CredentialCipher, KeyError},
+    sql::SqlService,
 };
 use supabase_dashboard_persistence::{Database, PersistenceError};
 use tokio::net::TcpListener;
@@ -223,7 +224,12 @@ async fn run() -> Result<(), StartupError> {
             cipher.clone(),
             gateway.clone(),
         )),
-        schema: Arc::new(SchemaService::new(db.clone(), cipher, gateway)),
+        schema: Arc::new(SchemaService::new(
+            db.clone(),
+            cipher.clone(),
+            gateway.clone(),
+        )),
+        sql: Arc::new(SqlService::new(db.clone(), cipher, gateway)),
         cookie: CookieSettings::new(secure_cookie, config.session_lifetime.as_secs()),
         expected_origin: config
             .public_url

@@ -43,6 +43,7 @@ pub fn router(state: AppState, limits: &HttpLimits) -> Router {
     let projects = state.projects.clone();
     let connections = state.connections.clone();
     let schema = state.schema.clone();
+    let sql = state.sql.clone();
     let auth = state.auth.clone();
     let leptos_options = state.leptos_options.clone();
     let x_request_id = HeaderName::from_static("x-request-id");
@@ -64,6 +65,7 @@ pub fn router(state: AppState, limits: &HttpLimits) -> Router {
                 provide_context(projects.clone());
                 provide_context(connections.clone());
                 provide_context(schema.clone());
+                provide_context(sql.clone());
                 provide_context(auth.clone());
             },
             move || shell(leptos_options.clone()),
@@ -149,18 +151,19 @@ mod tests {
         organizations::OrganizationService,
         projects::ProjectService,
         schema::SchemaService,
+        sql::SqlService,
     };
     use supabase_dashboard_persistence::{Database, DatabaseSettings};
     use supabase_dashboard_web::{
         app::SIGN_IN_PATH,
         server_fns::{
-            AdminListAccounts, AdminSetAccountDisabled, ChangePassword, CheckProjectHealth,
-            CreateInvitation, CreateOrganization, GetCurrentAccount, GetInstallationHealth,
-            GetOrganization, GetProject, GetProjectCredentials, GetProjectHealth, GetTable,
-            ListOrganizations, ListProjects, ListSchemas, ListSessions, ListTables,
-            PreviewInvitation, RegisterProject, RemoveProjectCredential, RenameOrganization,
-            ReplaceProjectCredential, RevokeSession, SignUpWithInvitation, UnregisterProject,
-            UpdateProfile,
+            AdminListAccounts, AdminSetAccountDisabled, CancelSql, ChangePassword,
+            CheckProjectHealth, CreateInvitation, CreateOrganization, GetCurrentAccount,
+            GetInstallationHealth, GetOrganization, GetProject, GetProjectCredentials,
+            GetProjectHealth, GetTable, ListOrganizations, ListProjects, ListSchemas, ListSessions,
+            ListTables, PreviewInvitation, RegisterProject, RemoveProjectCredential,
+            RenameOrganization, ReplaceProjectCredential, RevokeSession, RunSql,
+            SignUpWithInvitation, UnregisterProject, UpdateProfile,
         },
     };
     use tower::ServiceExt;
@@ -197,7 +200,12 @@ mod tests {
                 cipher.clone(),
                 gateway.clone(),
             )),
-            schema: Arc::new(SchemaService::new(db.clone(), cipher, gateway)),
+            schema: Arc::new(SchemaService::new(
+                db.clone(),
+                cipher.clone(),
+                gateway.clone(),
+            )),
+            sql: Arc::new(SqlService::new(db.clone(), cipher, gateway)),
             db,
             readiness_timeout: Duration::from_secs(1),
             auth: Arc::new(auth),
@@ -837,6 +845,31 @@ mod tests {
             bodies.push(body);
         }
         let page = format!("/dashboard/project/{project_id}/editor/1");
+        let (parts, body) = send(&router, get_with_cookie(&page, &alice)).await;
+        assert_eq!(parts.status, StatusCode::OK);
+        bodies.push(body);
+
+        // SQL runs the same way: refused to outsiders, checked before
+        // anything is sent, and never echoing the key.
+        let (_, body) = call(RunSql::PATH, format!("id={project_id}&sql=select+1"), &bob).await;
+        assert!(body.contains("NotFound"), "{body}");
+        let (_, body) = call(CancelSql::PATH, format!("id={project_id}"), &bob).await;
+        assert!(body.contains("NotFound"), "{body}");
+        let (_, body) = call(RunSql::PATH, format!("id={project_id}&sql=+%0A"), &alice).await;
+        assert!(body.contains("Enter a SQL statement"), "{body}");
+        let (parts, body) = call(
+            RunSql::PATH,
+            format!("id={project_id}&sql=select+1"),
+            &alice,
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        assert!(body.contains("destination_not_allowed"), "{body}");
+        bodies.push(body);
+        let (parts, body) = call(CancelSql::PATH, format!("id={project_id}"), &alice).await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        assert_eq!(body, r#"{"Ok":0}"#);
+        let page = format!("/dashboard/project/{project_id}/sql");
         let (parts, body) = send(&router, get_with_cookie(&page, &alice)).await;
         assert_eq!(parts.status, StatusCode::OK);
         bodies.push(body);
