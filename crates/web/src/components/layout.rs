@@ -125,7 +125,8 @@ pub fn DashboardLayout() -> impl IntoView {
 enum PageScope {
     None,
     Organization(Uuid),
-    Project(Uuid),
+    /// The organization in the path, then the project.
+    Project(Uuid, Uuid),
 }
 
 fn page_scope(path: &str) -> PageScope {
@@ -134,8 +135,15 @@ fn page_scope(path: &str) -> PageScope {
             .and_then(|rest| rest.split('/').next())
             .and_then(|id| id.parse::<Uuid>().ok())
     };
-    if let Some(id) = id_after("/dashboard/project/") {
-        PageScope::Project(id)
+    let project_in_org = path
+        .strip_prefix("/dashboard/org/")
+        .and_then(|rest| rest.split_once("/projects/"))
+        .and_then(|(org, rest)| {
+            let project = rest.split('/').next()?.parse::<Uuid>().ok()?;
+            Some((org.parse::<Uuid>().ok()?, project))
+        });
+    if let Some((org, id)) = project_in_org {
+        PageScope::Project(org, id)
     } else if let Some(id) = id_after("/dashboard/org/").or_else(|| id_after("/dashboard/new/")) {
         PageScope::Organization(id)
     } else {
@@ -156,10 +164,11 @@ async fn load_scope(scope: PageScope) -> ScopeContext {
     let (organization, project) = match scope {
         PageScope::None => return ScopeContext::default(),
         PageScope::Organization(id) => (id, None),
-        // On a project page the organization comes from the project.
-        PageScope::Project(id) => match get_project(id).await {
-            Ok(project) => (project.organization_id, Some(project.id)),
-            Err(_) => return ScopeContext::default(),
+        // A project page shows its menus only when the project belongs to
+        // the organization in the path, like the page itself.
+        PageScope::Project(org, id) => match get_project(id).await {
+            Ok(project) if project.organization_id == org => (org, Some(project.id)),
+            _ => return ScopeContext::default(),
         },
     };
     ScopeContext {
@@ -258,7 +267,7 @@ fn ProjectMenu(
             let selected = (current == Some(project.id)).then_some("page");
             view! {
                 <li>
-                    <a href=project_path(project.id) aria-current=selected>
+                    <a href=project_path(organization, project.id) aria-current=selected>
                         {project.name.as_str().to_owned()}
                     </a>
                 </li>
@@ -345,13 +354,18 @@ mod tests {
     #[test]
     fn page_scope_reads_ids_from_known_paths_only() {
         let id = uuid::Uuid::nil();
+        let org = uuid::Uuid::max();
         assert_eq!(
-            page_scope(&format!("/dashboard/project/{id}/settings")),
-            PageScope::Project(id)
+            page_scope(&format!("/dashboard/org/{org}/projects/{id}/settings")),
+            PageScope::Project(org, id)
         );
         assert_eq!(
-            page_scope(&format!("/dashboard/project/{id}")),
-            PageScope::Project(id)
+            page_scope(&format!("/dashboard/org/{org}/projects/{id}")),
+            PageScope::Project(org, id)
+        );
+        assert_eq!(
+            page_scope(&format!("/dashboard/org/{org}/projects/not-a-uuid")),
+            PageScope::Organization(org)
         );
         assert_eq!(
             page_scope(&format!("/dashboard/org/{id}/team")),
@@ -361,7 +375,10 @@ mod tests {
             page_scope(&format!("/dashboard/new/{id}")),
             PageScope::Organization(id)
         );
-        assert_eq!(page_scope("/dashboard/project/not-a-uuid"), PageScope::None);
+        assert_eq!(
+            page_scope(&format!("/dashboard/project/{id}")),
+            PageScope::None
+        );
         assert_eq!(page_scope("/dashboard/organizations"), PageScope::None);
         assert_eq!(
             page_scope(&format!("/elsewhere/project/{id}")),

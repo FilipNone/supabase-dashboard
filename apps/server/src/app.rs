@@ -701,13 +701,18 @@ mod tests {
         assert!(body.contains("NotFound"), "{body}");
 
         // The project page renders for Alice and leaks nothing to Bob.
-        let page = format!("/dashboard/project/{project_id}");
+        let page = format!("/dashboard/org/{acme_id}/projects/{project_id}");
         let (parts, body) = send(&router, get_with_cookie(&page, &bob)).await;
         assert_eq!(parts.status, StatusCode::OK);
         assert!(body.contains("Project unavailable"), "{body}");
         assert!(!body.contains("acme.example"), "{body}");
         let (_, body) = send(&router, get_with_cookie(&page, &alice)).await;
         assert!(body.contains("Acme Prod") && body.contains("https://supabase.acme.example"));
+        // The organization in the path has to be the project's own.
+        let elsewhere = format!("/dashboard/org/{made_up}/projects/{project_id}");
+        let (_, body) = send(&router, get_with_cookie(&elsewhere, &alice)).await;
+        assert!(body.contains("Project unavailable"), "{body}");
+        assert!(!body.contains("acme.example"), "{body}");
 
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM projects")
             .fetch_one(db.pool())
@@ -814,7 +819,7 @@ mod tests {
             "{}",
             bodies[1]
         );
-        let page = format!("/dashboard/project/{project_id}/settings");
+        let page = format!("/dashboard/org/{acme_id}/projects/{project_id}/settings");
         let (parts, body) = send(&router, get_with_cookie(&page, &alice)).await;
         assert_eq!(parts.status, StatusCode::OK);
         bodies.push(body);

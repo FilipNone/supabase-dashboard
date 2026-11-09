@@ -102,16 +102,16 @@ pub fn App() -> impl IntoView {
                         <Route path=path!("me") view=AccountProfilePage/>
                         <Route path=path!("security") view=AccountSecurityPage/>
                     </ParentRoute>
+                    <ParentRoute path=path!("org/:org_id/projects/:project_id") view=ProjectLayout>
+                        <Route path=path!("") view=ProjectOverviewPage/>
+                        <Route path=path!("settings") view=ProjectSettingsPage/>
+                    </ParentRoute>
                     <ParentRoute path=path!("org/:org_id") view=OrganizationLayout>
                         <Route path=path!("") view=OrganizationProjectsPage/>
                         <Route path=path!("general") view=OrganizationGeneralPage/>
                         <Route path=path!("team") view=OrganizationTeamPage/>
                     </ParentRoute>
                     <Route path=path!("new/:org_id") view=NewProjectPage/>
-                    <ParentRoute path=path!("project/:project_id") view=ProjectLayout>
-                        <Route path=path!("") view=ProjectOverviewPage/>
-                        <Route path=path!("settings") view=ProjectSettingsPage/>
-                    </ParentRoute>
                 </ParentRoute>
             </Routes>
         </Router>

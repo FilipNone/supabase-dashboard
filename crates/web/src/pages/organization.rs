@@ -188,7 +188,7 @@ fn ProjectGrid(list: Vec<ProjectSummary>) -> impl IntoView {
                         .then(|| view! { <span class="badge badge-error">"Plain HTTP"</span> });
                     view! {
                         <li>
-                            <a class="card-link card-stack" href=project_path(project.id)>
+                            <a class="card-link card-stack" href=project_path(project.organization_id, project.id)>
                                 <span class="card-title">{project.name.as_str().to_owned()}</span>
                                 <span class="card-meta url-text">{project.api_url.as_str().to_owned()}</span>
                                 {insecure}

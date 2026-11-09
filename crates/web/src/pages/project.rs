@@ -29,8 +29,9 @@ use crate::{
     },
 };
 
-pub fn project_path(id: Uuid) -> String {
-    format!("/dashboard/project/{id}")
+/// The dashboard's own page for a project: status, health, and settings.
+pub fn project_path(organization_id: Uuid, id: Uuid) -> String {
+    format!("/dashboard/org/{organization_id}/projects/{id}")
 }
 
 fn org_path(id: Uuid) -> String {
@@ -69,7 +70,10 @@ pub fn NewProjectPage() -> impl IntoView {
             if let Some(refresh) = refresh {
                 refresh.projects_changed();
             }
-            navigate(&project_path(project.id), Default::default());
+            navigate(
+                &project_path(project.organization_id, project.id),
+                Default::default(),
+            );
         }
     });
     // The HTTP confirmation only appears for an http:// URL.
@@ -173,11 +177,13 @@ struct ProjectContext {
     change_url: ServerAction<ChangeProjectUrl>,
 }
 
-/// `/dashboard/project/:project_id`: loads the project and renders its tabs.
-/// A malformed ID, an unknown project, and one in another organization all
+/// `/dashboard/org/:org_id/projects/:project_id`: loads the project and
+/// renders its tabs. A malformed ID, an unknown project, one in another
+/// organization, and one whose organization does not match the path all
 /// show the same not-found state.
 #[component]
 pub fn ProjectLayout() -> impl IntoView {
+    let org_id = param_uuid("org_id");
     let id = param_uuid("project_id");
     let rename = ServerAction::<RenameProject>::new();
     let change_url = ServerAction::<ChangeProjectUrl>::new();
@@ -185,11 +191,17 @@ pub fn ProjectLayout() -> impl IntoView {
     // user left it, so they can correct the value or confirm plain HTTP.
     let saved = RwSignal::new(0u32);
     let project = Resource::new(
-        move || (id.get(), saved.get()),
-        |(id, _)| async move {
-            match id {
-                Some(id) => get_project(id).await,
-                None => Err(AppError::NotFound),
+        move || (org_id.get(), id.get(), saved.get()),
+        |(org_id, id, _)| async move {
+            match (org_id, id) {
+                (Some(org_id), Some(id)) => get_project(id).await.and_then(|p| {
+                    if p.organization_id == org_id {
+                        Ok(p)
+                    } else {
+                        Err(AppError::NotFound)
+                    }
+                }),
+                _ => Err(AppError::NotFound),
             }
         },
     );
@@ -219,7 +231,7 @@ pub fn ProjectLayout() -> impl IntoView {
             {move || {
                 project.get().map(|result| match result {
                     Ok(project) => {
-                        let base = project_path(project.id);
+                        let base = project_path(project.organization_id, project.id);
                         view! {
                             <Title text=project.name.as_str().to_owned()/>
                             <header class="page-header">
