@@ -12,6 +12,7 @@ use leptos_router::{
 };
 use supabase_dashboard_domain::{
     authz::Permission,
+    connection::{CredentialKind, CredentialState},
     project::{PROJECT_NAME_MAX_CHARS, PROJECT_URL_MAX_LEN, ProjectSummary},
 };
 use uuid::Uuid;
@@ -25,7 +26,7 @@ use crate::{
     pages::project_connection::{ApiKeysPanel, HealthPanel, StudioLoginPanel},
     server_fns::{
         ChangeProjectUrl, RegisterProject, RenameProject, UnregisterProject, get_organization,
-        get_project,
+        get_project, get_project_credentials,
     },
 };
 
@@ -331,6 +332,49 @@ fn studio_access_note(project: &ProjectSummary) -> &'static str {
     }
 }
 
+/// Shown until the gateway's Studio login is stored and readable. Without it
+/// nobody can open Studio here, and whoever knows the stack's own Studio
+/// password can still open it directly.
+#[component]
+fn StudioLoginWarning(project: ProjectSummary) -> impl IntoView {
+    let id = project.id;
+    let settings = format!("{}/settings", project_path(project.organization_id, id));
+    let can_save = project.role.allows(Permission::ProjectCredentialsReplace);
+    let overview = Resource::new(move || id, get_project_credentials);
+    view! {
+        <Transition fallback=|| ()>
+            {move || {
+                let missing = overview.get().and_then(Result::ok).is_some_and(|overview| {
+                    !overview.credentials.iter().any(|c| {
+                        c.kind == CredentialKind::StudioLogin
+                            && matches!(c.state, CredentialState::Set { .. })
+                    })
+                });
+                let settings = settings.clone();
+                missing.then(|| view! {
+                    <section class="panel panel-warning" aria-labelledby="studio-login-warning-title">
+                        <h2 class="section-title" id="studio-login-warning-title">"No Studio login saved"</h2>
+                        <p class="field-hint">
+                            "Nobody can open this project's Studio through the dashboard yet. Until the \
+                             gateway's Studio password is changed to one only the dashboard knows, anyone \
+                             who has it can open Studio directly, without the dashboard's roles or audit log."
+                        </p>
+                        {if can_save {
+                            view! {
+                                <p><a href=settings>"Save the Studio login in Settings"</a></p>
+                            }.into_any()
+                        } else {
+                            view! {
+                                <p class="field-hint">"An owner or admin can save it."</p>
+                            }.into_any()
+                        }}
+                    </section>
+                })
+            }}
+        </Transition>
+    }
+}
+
 fn loaded_project(ctx: ProjectContext) -> Option<ProjectSummary> {
     ctx.project.get().and_then(Result::ok)
 }
@@ -374,6 +418,7 @@ pub fn ProjectOverviewPage() -> impl IntoView {
                         </div>
                     </dl>
                 </section>
+                <StudioLoginWarning project=project.clone()/>
                 <HealthPanel project=project.clone()/>
             }
         })}

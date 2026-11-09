@@ -1044,6 +1044,16 @@ mod tests {
         let (main, other) = (ids[0], ids[1]);
         let launch = |id: uuid::Uuid| format!("/dashboard/project/{id}");
 
+        // Until a Studio login is saved, the project page warns every
+        // member, and only those who can save it get the link.
+        let page = format!("/dashboard/org/{acme_id}/projects/{main}");
+        let (_, body) = send(&router, get_with_cookie(&page, &alice)).await;
+        assert!(body.contains("No Studio login saved"), "{body}");
+        assert!(body.contains("Save the Studio login in Settings"));
+        let (_, body) = send(&router, get_with_cookie(&page, &bob)).await;
+        assert!(body.contains("No Studio login saved"));
+        assert!(body.contains("An owner or admin can save it."));
+
         // Without a saved login, the member is sent to the project page.
         let (parts, _) = send(&router, get_with_cookie(&launch(main), &alice)).await;
         assert_eq!(
@@ -1062,8 +1072,8 @@ mod tests {
 
         // The project page offers Studio to the owner, explains a refusal
         // with a fixed text, and offers nothing to a viewer.
-        let page = format!("/dashboard/org/{acme_id}/projects/{main}");
         let (_, body) = send(&router, get_with_cookie(&page, &alice)).await;
+        assert!(!body.contains("No Studio login saved"));
         assert!(
             body.contains(&format!(r#"href="{}" rel="external""#, launch(main))),
             "{body}"

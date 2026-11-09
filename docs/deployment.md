@@ -2,7 +2,7 @@
 
 This guide runs a released build on one Linux server from the prebuilt container image `ghcr.io/filipnone/supabase-dashboard`. Nothing is compiled on the server. To build from source, see [docs/development.md](https://github.com/FilipNone/supabase-dashboard/blob/main/docs/development.md).
 
-Development releases (`0.1.0-dev.N`) are previews. The dashboard can manage operator accounts, organizations, members, invitations, and a registry of self-hosted stacks. It can store a stack's API keys and check whether its Auth and REST services answer; it does not browse or change anything in a stack yet. Expect breaking changes between dev releases.
+Development releases (`0.1.0-dev.N`) are previews. The dashboard can manage operator accounts, organizations, members, invitations, and a registry of self-hosted stacks. It can store a stack's API keys and Studio login, check whether its Auth, REST, and Studio routes answer, and open the stack's own Studio for members whose role allows it (see "Studio access" below). Expect breaking changes between dev releases.
 
 ## What you need
 
@@ -94,6 +94,34 @@ Everything is set in `.env`. `compose.yaml` passes it to the dashboard container
 The encryption key is not in `.env`. `compose.yaml` mounts `secret.key` as a Compose secret at `/run/secrets/secret_key` and points `SUPABASE_DASHBOARD_SECRET_KEY_FILE` at it, so the key does not appear in `docker inspect`.
 
 To check a stack that runs on the same server, register it by an address the container can reach, such as the host's private network address. Loopback addresses are refused unless `SUPABASE_DASHBOARD_ALLOW_LOOPBACK_TARGETS=true`, and inside the container `127.0.0.1` is the container itself.
+
+## Studio access
+
+Members open a project's Studio through the dashboard, which serves each project's Studio on its own host under `SUPABASE_DASHBOARD_STUDIO_DOMAIN` (see `docs/adr/0002-studio-access.md`). To turn it on:
+
+1. Pick a domain that is not the dashboard's own host and not a parent of it, for example `studio.example.com` next to `dashboard.example.com`, and set `SUPABASE_DASHBOARD_STUDIO_DOMAIN=studio.example.com` in `.env`.
+2. Point `*.studio.example.com` at the dashboard server (a wildcard DNS record), and give the reverse proxy a certificate for it. A wildcard certificate needs the ACME DNS challenge. The proxy must pass the original `Host` header through, because the dashboard picks the project from it.
+3. For each project, save the stack gateway's Studio login on the project's Settings page.
+
+Requests on a Studio host are limited by `SUPABASE_DASHBOARD_STUDIO_MAX_BODY_BYTES` (50 MiB by default) and `SUPABASE_DASHBOARD_STUDIO_REQUEST_TIMEOUT_SECS` (300 seconds). If the reverse proxy has its own body limit or timeout, raise it to match, or Storage uploads and long SQL queries in Studio fail at the proxy.
+
+### Closing the stack's own Studio entrance
+
+A self-hosted stack serves Studio itself, behind HTTP basic auth on the gateway's catch-all `/` route, using `DASHBOARD_USERNAME` and `DASHBOARD_PASSWORD` from the stack's `.env`. Anyone who knows that password can open Studio directly, without the dashboard's sign-in, roles, or audit log. Make the dashboard the only holder of it:
+
+1. Generate a long random password. Upstream requires at least one letter and no special characters; hex output fits:
+
+   ```sh
+   openssl rand -hex 32
+   ```
+
+2. Set it as `DASHBOARD_PASSWORD` in the stack's `.env`, and restart the stack's API gateway so it reads the new value.
+3. Save the same username and password on the project's Settings page in the dashboard, then run "Check now" on the project page. The Studio row should report that the stored login is accepted.
+4. Do not keep the password anywhere else. If someone needs Studio, give them a dashboard role that allows it.
+
+Where the network allows it, also keep the gateway's Studio route away from the internet: for example, let only the dashboard server reach the stack's gateway port, or put the stack's public API behind a separate proxy that serves only the API paths (`/auth/v1/`, `/rest/v1/`, `/storage/v1/`, `/realtime/v1/`, `/functions/v1/`, and the others your apps use). These setups depend on the stack's gateway and network and have not been tested with this dashboard yet.
+
+The project page warns every member until a Studio login is saved.
 
 ## Operations
 

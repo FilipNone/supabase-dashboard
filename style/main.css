@@ -329,6 +329,8 @@ code { font-family: var(--font-mono); font-size: var(--text-sm); }
   margin: 0; padding: var(--space-3); border-radius: var(--radius-md);
   background: var(--color-ok-bg); color: var(--color-ok-text); font-size: var(--text-sm);
 }
+.panel-warning { border-color: var(--color-error-text); }
+.panel-warning p { margin: 0; }
 .page-notice { margin-bottom: var(--space-6); }
 .input[readonly] { background: var(--color-surface-raised); color: var(--color-text-muted); }
 .button:focus-visible, .card-link:focus-visible, .tab:focus-visible {
