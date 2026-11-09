@@ -4,12 +4,17 @@
 //! database-side statement timeout. Results are cut to a fixed number of
 //! rows, columns, and characters per value. Read-only members see a
 //! permission notice instead of the editor.
+//!
+//! The side list holds saved snippets: the member's own and the ones
+//! shared with the project. Snippets are stored by the dashboard, not by
+//! the stack.
 
 use leptos::{ev, prelude::*};
 use leptos_meta::Title;
 use supabase_dashboard_domain::{
-    authz::Permission,
+    authz::{OrgRole, Permission},
     schema::{Cell, MetaUnavailable},
+    snippet::{SNIPPET_LIST_LIMIT, SNIPPET_NAME_MAX_CHARS, SnippetList, SnippetVisibility},
     sql::{
         SQL_RESULT_COLUMN_LIMIT, SQL_RESULT_ROW_LIMIT, SQL_STATEMENT_TIMEOUT_SECS, SqlFailure,
         SqlOutcome, SqlResult,
@@ -18,10 +23,22 @@ use supabase_dashboard_domain::{
 use uuid::Uuid;
 
 use crate::{
-    components::page::{StatePanel, StateTone},
+    components::{
+        dialog::{ConfirmDialog, DialogCancel},
+        page::{StatePanel, StateTone},
+    },
     pages::project::{ProjectContext, loaded_project, project_path},
-    server_fns::{CancelSql, RunSql},
+    server_fns::{CancelSql, DeleteSnippet, GetSnippet, RunSql, SaveSnippet, list_snippets},
 };
+
+/// The snippet loaded into the editor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OpenSnippet {
+    id: Uuid,
+    /// The caller wrote it, so saving replaces it.
+    mine: bool,
+    shared: bool,
+}
 
 #[component]
 pub fn SqlEditorPage() -> impl IntoView {
@@ -32,7 +49,7 @@ pub fn SqlEditorPage() -> impl IntoView {
         <Title text="SQL editor"/>
         {move || loaded_project(ctx).map(|project| {
             if project.role.allows(Permission::SqlExecute) {
-                view! { <SqlEditor project_id=project.id/> }.into_any()
+                view! { <SqlEditor project_id=project.id role=project.role/> }.into_any()
             } else {
                 view! {
                     <StatePanel
@@ -49,8 +66,62 @@ pub fn SqlEditorPage() -> impl IntoView {
 }
 
 #[component]
-fn SqlEditor(project_id: Uuid) -> impl IntoView {
+fn SqlEditor(project_id: Uuid, role: OrgRole) -> impl IntoView {
     let text = RwSignal::new(String::new());
+    let name = RwSignal::new(String::new());
+    let visibility = RwSignal::new(SnippetVisibility::Private);
+    let open = RwSignal::new(None::<OpenSnippet>);
+    let load = ServerAction::<GetSnippet>::new();
+    let save = ServerAction::<SaveSnippet>::new();
+    let remove = ServerAction::<DeleteSnippet>::new();
+    let snippets = Resource::new(
+        move || (save.version().get(), remove.version().get()),
+        move |_| list_snippets(project_id),
+    );
+    Effect::new(move |_| {
+        if let Some(Ok(snippet)) = load.value().get() {
+            let summary = snippet.summary;
+            text.set(snippet.content);
+            name.set(summary.name.into());
+            visibility.set(summary.visibility);
+            open.set(Some(OpenSnippet {
+                id: summary.id,
+                mine: summary.mine,
+                shared: summary.visibility == SnippetVisibility::Project,
+            }));
+        }
+    });
+    Effect::new(move |_| {
+        if let Some(Ok(id)) = save.value().get() {
+            open.set(Some(OpenSnippet {
+                id,
+                mine: true,
+                shared: visibility.get_untracked() == SnippetVisibility::Project,
+            }));
+        }
+    });
+    Effect::new(move |_| {
+        if let Some(Ok(())) = remove.value().get() {
+            open.set(None);
+        }
+    });
+    let open_snippet = move |snippet_id: Uuid| {
+        save.clear();
+        remove.clear();
+        load.dispatch(GetSnippet {
+            id: project_id,
+            snippet_id,
+        });
+    };
+    let new_query = move |_| {
+        load.clear();
+        save.clear();
+        remove.clear();
+        open.set(None);
+        text.set(String::new());
+        name.set(String::new());
+        visibility.set(SnippetVisibility::Private);
+    };
     let run = ServerAction::<RunSql>::new();
     let cancel = ServerAction::<CancelSql>::new();
     let pending = run.pending();
@@ -89,7 +160,25 @@ fn SqlEditor(project_id: Uuid) -> impl IntoView {
         })
     };
 
-    view! {
+    let sidebar = view! {
+        <aside class="panel sql-snippets" aria-labelledby="snippets-title">
+            <div class="sql-snippets-head">
+                <h2 class="section-title" id="snippets-title">"Snippets"</h2>
+                <button type="button" class="button" on:click=new_query>"New query"</button>
+            </div>
+            <Transition fallback=|| view! { <p class="loading" role="status">"Loading snippets…"</p> }>
+                {move || snippets.get().map(|answer| match answer {
+                    Ok(list) => snippet_list(list, open, open_snippet).into_any(),
+                    Err(err) => view! { <p class="form-error" role="alert">{err.to_string()}</p> }.into_any(),
+                })}
+            </Transition>
+            {move || load.value().get().and_then(Result::err).map(|err| view! {
+                <p class="form-error" role="alert">{err.to_string()}</p>
+            })}
+        </aside>
+    }
+    .into_any();
+    let editor = view! {
         <section class="panel sql-editor" aria-labelledby="sql-title">
             <h2 class="section-title" id="sql-title">"SQL editor"</h2>
             <form class="stacked-form" on:submit=on_submit>
@@ -125,7 +214,11 @@ fn SqlEditor(project_id: Uuid) -> impl IntoView {
                 </div>
             </form>
             {cancel_note}
+            <SnippetSave project_id role text name visibility open save remove/>
         </section>
+    }
+    .into_any();
+    let output = view! {
         <div class="sql-output" aria-live="polite" aria-busy=move || pending.get().to_string()>
             {move || {
                 if pending.get() {
@@ -140,6 +233,197 @@ fn SqlEditor(project_id: Uuid) -> impl IntoView {
                 }
             }}
         </div>
+    }
+    .into_any();
+    view! {
+        <div class="sql-layout">
+            {sidebar}
+            <div class="sql-main">{editor}{output}</div>
+        </div>
+    }
+}
+
+/// The snippet list, shared ones first, each a button that loads it.
+fn snippet_list(
+    list: SnippetList,
+    open: RwSignal<Option<OpenSnippet>>,
+    open_snippet: impl Fn(Uuid) + Copy + Send + Sync + 'static,
+) -> impl IntoView {
+    if list.items.is_empty() {
+        return view! {
+            <p class="field-hint">"No snippets yet. Save a query to keep it here."</p>
+        }
+        .into_any();
+    }
+    let (shared, private): (Vec<_>, Vec<_>) = list
+        .items
+        .into_iter()
+        .partition(|item| item.visibility == SnippetVisibility::Project);
+    let group =
+        move |title: &'static str,
+              items: Vec<supabase_dashboard_domain::snippet::SnippetSummary>| {
+            (!items.is_empty()).then(|| {
+                let entries = items
+                .into_iter()
+                .map(|item| {
+                    let id = item.id;
+                    let author = (!item.mine).then(|| {
+                        view! { <span class="snippet-author">{item.author.clone()}</span> }
+                    });
+                    view! {
+                        <li>
+                            <button
+                                type="button"
+                                class="snippet-link"
+                                aria-current=move || {
+                                    (open.get().map(|o| o.id) == Some(id)).then_some("true")
+                                }
+                                on:click=move |_| open_snippet(id)
+                            >
+                                <span class="snippet-name">{item.name.as_str().to_owned()}</span>
+                                {author}
+                            </button>
+                        </li>
+                    }
+                })
+                .collect_view();
+                view! {
+                    <h3 class="snippet-group">{title}</h3>
+                    <ul class="snippet-items">{entries}</ul>
+                }
+            })
+        };
+    let cut = list.truncated.then(|| {
+        view! {
+            <p class="field-hint">{format!("Only the first {SNIPPET_LIST_LIMIT} snippets are listed.")}</p>
+        }
+    });
+    view! {
+        {group("Shared", shared)}
+        {group("Private", private)}
+        {cut}
+    }
+    .into_any()
+}
+
+/// Saves the editor's text as a snippet, and deletes the open one.
+#[component]
+fn SnippetSave(
+    project_id: Uuid,
+    role: OrgRole,
+    text: RwSignal<String>,
+    name: RwSignal<String>,
+    visibility: RwSignal<SnippetVisibility>,
+    open: RwSignal<Option<OpenSnippet>>,
+    save: ServerAction<SaveSnippet>,
+    remove: ServerAction<DeleteSnippet>,
+) -> impl IntoView {
+    let on_save = move |ev: ev::SubmitEvent| {
+        ev.prevent_default();
+        remove.clear();
+        // Someone else's snippet is saved as a new one of the caller's.
+        let snippet_id = open.get_untracked().filter(|o| o.mine).map(|o| o.id);
+        save.dispatch(SaveSnippet {
+            id: project_id,
+            snippet_id,
+            name: name.get_untracked(),
+            visibility: visibility.get_untracked(),
+            sql: text.get_untracked(),
+        });
+    };
+    let on_delete = move |ev: ev::SubmitEvent| {
+        ev.prevent_default();
+        if let Some(snippet) = open.get_untracked() {
+            save.clear();
+            remove.dispatch(DeleteSnippet {
+                id: project_id,
+                snippet_id: snippet.id,
+            });
+        }
+    };
+    let may_delete = move || {
+        open.get()
+            .is_some_and(|o| o.mine || (o.shared && role.allows(Permission::SqlSnippetsManage)))
+    };
+    let save_label = move || match open.get() {
+        Some(o) if o.mine => "Save snippet",
+        Some(_) => "Save as my snippet",
+        None => "Save as snippet",
+    };
+    let status = move || {
+        if save.pending().get() || remove.pending().get() {
+            return None;
+        }
+        let saved = save
+            .value()
+            .get()
+            .map(|answer| answer.map(|_| "Snippet saved."));
+        let deleted = remove
+            .value()
+            .get()
+            .map(|answer| answer.map(|()| "Snippet deleted."));
+        saved.or(deleted).map(|answer| match answer {
+            Ok(text) => view! { <p class="form-ok" role="status">{text}</p> }.into_any(),
+            Err(err) => {
+                view! { <p class="form-error" role="alert">{err.to_string()}</p> }.into_any()
+            }
+        })
+    };
+    view! {
+        <form class="sql-save" on:submit=on_save aria-label="Save as snippet">
+            <label class="field">
+                <span class="field-label">"Snippet name"</span>
+                <input
+                    class="input"
+                    name="name"
+                    required
+                    maxlength=SNIPPET_NAME_MAX_CHARS.to_string()
+                    autocomplete="off"
+                    prop:value=move || name.get()
+                    on:input=move |ev| name.set(event_target_value(&ev))
+                />
+            </label>
+            <label class="field">
+                <span class="field-label">"Visible to"</span>
+                <select
+                    class="input"
+                    name="visibility"
+                    prop:value=move || visibility.get().as_str()
+                    on:change=move |ev| {
+                        if let Some(v) = SnippetVisibility::parse(&event_target_value(&ev)) {
+                            visibility.set(v);
+                        }
+                    }
+                >
+                    {[SnippetVisibility::Private, SnippetVisibility::Project]
+                        .into_iter()
+                        .map(|v| view! {
+                            <option value=v.as_str() selected=move || visibility.get() == v>{v.label()}</option>
+                        })
+                        .collect_view()}
+                </select>
+            </label>
+            <div class="sql-actions">
+                <button type="submit" class="button" disabled=move || save.pending().get()>
+                    {save_label}
+                </button>
+                <Show when=may_delete>
+                    <ConfirmDialog trigger="Delete snippet" title="Delete this snippet?">
+                        <form class="dialog-form" on:submit=on_delete>
+                            <p>{move || format!(
+                                "“{}” is removed for everyone who can see it. Nothing on the project's database changes.",
+                                name.get()
+                            )}</p>
+                            <div class="dialog-actions">
+                                <DialogCancel/>
+                                <button type="submit" class="button button-danger">"Delete snippet"</button>
+                            </div>
+                        </form>
+                    </ConfirmDialog>
+                </Show>
+            </div>
+        </form>
+        {status}
     }
 }
 

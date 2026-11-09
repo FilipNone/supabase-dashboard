@@ -11,6 +11,7 @@ pub mod invitations;
 pub mod organizations;
 pub mod projects;
 pub mod sessions;
+pub mod snippets;
 
 use std::time::Duration;
 

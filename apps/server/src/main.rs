@@ -25,6 +25,7 @@ use supabase_dashboard_application::{
     projects::ProjectService,
     schema::SchemaService,
     secrets::{CredentialCipher, KeyError},
+    snippets::SnippetService,
     sql::SqlService,
 };
 use supabase_dashboard_persistence::{Database, PersistenceError};
@@ -230,6 +231,7 @@ async fn run() -> Result<(), StartupError> {
             gateway.clone(),
         )),
         sql: Arc::new(SqlService::new(db.clone(), cipher, gateway)),
+        snippets: Arc::new(SnippetService::new(db.clone())),
         cookie: CookieSettings::new(secure_cookie, config.session_lifetime.as_secs()),
         expected_origin: config
             .public_url

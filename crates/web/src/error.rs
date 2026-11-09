@@ -48,6 +48,7 @@ mod server {
         organizations::OrganizationError,
         projects::ProjectError,
         schema::SchemaError,
+        snippets::SnippetError,
         sql::SqlError,
     };
 
@@ -163,6 +164,20 @@ mod server {
                 SqlError::Unavailable => Self::Unavailable,
                 SqlError::Internal(err) => {
                     tracing::error!(error = %err, "sql run failed");
+                    Self::Unavailable
+                }
+            }
+        }
+    }
+
+    impl From<SnippetError> for AppError {
+        fn from(err: SnippetError) -> Self {
+            match err {
+                SnippetError::NotFound => Self::NotFound,
+                SnippetError::Forbidden => Self::Forbidden,
+                SnippetError::LimitReached => Self::Rejected(sentence(&err.to_string())),
+                SnippetError::Internal(err) => {
+                    tracing::error!(error = %err, "snippet operation failed");
                     Self::Unavailable
                 }
             }

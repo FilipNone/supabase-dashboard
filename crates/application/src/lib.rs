@@ -11,6 +11,7 @@ pub mod password;
 pub mod projects;
 pub mod schema;
 pub mod secrets;
+pub mod snippets;
 pub mod sql;
 pub mod throttle;
 pub mod token;

@@ -44,6 +44,7 @@ pub fn router(state: AppState, limits: &HttpLimits) -> Router {
     let connections = state.connections.clone();
     let schema = state.schema.clone();
     let sql = state.sql.clone();
+    let snippets = state.snippets.clone();
     let auth = state.auth.clone();
     let leptos_options = state.leptos_options.clone();
     let x_request_id = HeaderName::from_static("x-request-id");
@@ -66,6 +67,7 @@ pub fn router(state: AppState, limits: &HttpLimits) -> Router {
                 provide_context(connections.clone());
                 provide_context(schema.clone());
                 provide_context(sql.clone());
+                provide_context(snippets.clone());
                 provide_context(auth.clone());
             },
             move || shell(leptos_options.clone()),
@@ -151,6 +153,7 @@ mod tests {
         organizations::OrganizationService,
         projects::ProjectService,
         schema::SchemaService,
+        snippets::SnippetService,
         sql::SqlService,
     };
     use supabase_dashboard_persistence::{Database, DatabaseSettings};
@@ -158,12 +161,13 @@ mod tests {
         app::SIGN_IN_PATH,
         server_fns::{
             AdminListAccounts, AdminSetAccountDisabled, CancelSql, ChangePassword,
-            CheckProjectHealth, CreateInvitation, CreateOrganization, GetCurrentAccount,
-            GetInstallationHealth, GetOrganization, GetProject, GetProjectCredentials,
-            GetProjectHealth, GetTable, ListOrganizations, ListProjects, ListSchemas, ListSessions,
-            ListTables, PreviewInvitation, RegisterProject, RemoveProjectCredential,
-            RenameOrganization, ReplaceProjectCredential, RevokeSession, RunSql,
-            SignUpWithInvitation, UnregisterProject, UpdateProfile,
+            CheckProjectHealth, CreateInvitation, CreateOrganization, DeleteSnippet,
+            GetCurrentAccount, GetInstallationHealth, GetOrganization, GetProject,
+            GetProjectCredentials, GetProjectHealth, GetSnippet, GetTable, ListOrganizations,
+            ListProjects, ListSchemas, ListSessions, ListSnippets, ListTables, PreviewInvitation,
+            RegisterProject, RemoveProjectCredential, RenameOrganization, ReplaceProjectCredential,
+            RevokeSession, RunSql, SaveSnippet, SignUpWithInvitation, UnregisterProject,
+            UpdateProfile,
         },
     };
     use tower::ServiceExt;
@@ -206,6 +210,7 @@ mod tests {
                 gateway.clone(),
             )),
             sql: Arc::new(SqlService::new(db.clone(), cipher, gateway)),
+            snippets: Arc::new(SnippetService::new(db.clone())),
             db,
             readiness_timeout: Duration::from_secs(1),
             auth: Arc::new(auth),
@@ -869,6 +874,52 @@ mod tests {
         let (parts, body) = call(CancelSql::PATH, format!("id={project_id}"), &alice).await;
         assert_eq!(parts.status, StatusCode::OK, "{body}");
         assert_eq!(body, r#"{"Ok":0}"#);
+
+        // Snippets: saved by the dashboard, invisible to outsiders.
+        let (parts, body) = call(
+            SaveSnippet::PATH,
+            format!("id={project_id}&name=Top+users&visibility=private&sql=select+1"),
+            &alice,
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        let snippet_id: uuid::Uuid = serde_json::from_str(&body).unwrap();
+        let (_, body) = call(
+            SaveSnippet::PATH,
+            format!("id={project_id}&name=+&visibility=private&sql=select+1"),
+            &alice,
+        )
+        .await;
+        assert!(body.contains("Enter a name"), "{body}");
+        let (_, body) = call(ListSnippets::PATH, format!("id={project_id}"), &alice).await;
+        assert!(body.contains("Top users"), "{body}");
+        let (_, body) = call(
+            GetSnippet::PATH,
+            format!("id={project_id}&snippet_id={snippet_id}"),
+            &alice,
+        )
+        .await;
+        assert!(body.contains("select 1"), "{body}");
+        for (path, args) in [
+            (ListSnippets::PATH, String::new()),
+            (GetSnippet::PATH, format!("&snippet_id={snippet_id}")),
+            (DeleteSnippet::PATH, format!("&snippet_id={snippet_id}")),
+            (
+                SaveSnippet::PATH,
+                format!("&snippet_id={snippet_id}&name=x&visibility=project&sql=select+2"),
+            ),
+        ] {
+            let (_, body) = call(path, format!("id={project_id}{args}"), &bob).await;
+            assert!(body.contains("NotFound"), "{path}: {body}");
+        }
+        let (parts, body) = call(
+            DeleteSnippet::PATH,
+            format!("id={project_id}&snippet_id={snippet_id}"),
+            &alice,
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+
         let page = format!("/dashboard/project/{project_id}/sql");
         let (parts, body) = send(&router, get_with_cookie(&page, &alice)).await;
         assert_eq!(parts.status, StatusCode::OK);

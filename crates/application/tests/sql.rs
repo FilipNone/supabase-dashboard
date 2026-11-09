@@ -328,15 +328,21 @@ async fn failures_are_reported_and_audited_without_the_text() {
     );
     // Only the two runs that reached the stack are audited.
     assert_eq!(audit_outcomes(&f.db, id).await, ["failure", "failure"]);
-    // Audit rows carry no statement text.
-    let leaked: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM audit_events WHERE action = 'sql.execute' \
-         AND (coalesce(target_id, '') LIKE '%bad%' OR coalesce(request_id, '') LIKE '%bad%')",
+    // Audit rows name the project and request, and carry no statement
+    // text. (Matching on "bad" would also hit hex digits of a UUID.)
+    let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT target_type, target_id, request_id FROM audit_events \
+         WHERE action = 'sql.execute'",
     )
-    .fetch_one(f.db.pool())
+    .fetch_all(f.db.pool())
     .await
     .unwrap();
-    assert_eq!(leaked, 0);
+    assert_eq!(rows.len(), 2);
+    for (target_type, target_id, request_id) in rows {
+        assert_eq!(target_type, "project");
+        assert_eq!(target_id, Some(id.to_string()));
+        assert_eq!(request_id.as_deref(), Some("req-sql"));
+    }
 }
 
 #[tokio::test]

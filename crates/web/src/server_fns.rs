@@ -17,6 +17,7 @@ use supabase_dashboard_domain::{
     organization::{MemberSummary, OrganizationSummary},
     project::ProjectSummary,
     schema::{MetaUnavailable, RowPage, SchemaListing, TableDefinition, TableListing},
+    snippet::{Snippet, SnippetList, SnippetVisibility},
     sql::SqlOutcome,
 };
 use uuid::Uuid;
@@ -85,6 +86,7 @@ mod org_context {
         organizations::OrganizationService,
         projects::ProjectService,
         schema::SchemaService,
+        snippets::SnippetService,
         sql::SqlService,
     };
 
@@ -132,6 +134,13 @@ mod org_context {
     pub fn schema() -> Result<Arc<SchemaService>, AppError> {
         use_context::<Arc<SchemaService>>().ok_or_else(|| {
             tracing::error!("schema service is not configured");
+            AppError::Unavailable
+        })
+    }
+
+    pub fn snippets() -> Result<Arc<SnippetService>, AppError> {
+        use_context::<Arc<SnippetService>>().ok_or_else(|| {
+            tracing::error!("snippet service is not configured");
             AppError::Unavailable
         })
     }
@@ -350,6 +359,56 @@ pub async fn cancel_sql(id: Uuid) -> Result<Result<u32, MetaUnavailable>, AppErr
     let audit = org_context::AuditContext::current();
     Ok(org_context::sql()?
         .cancel(&session, id, audit.get())
+        .await?)
+}
+
+/// The caller's SQL snippets and the ones shared with the project.
+#[server]
+pub async fn list_snippets(id: Uuid) -> Result<SnippetList, AppError> {
+    let session = org_context::session()?;
+    Ok(org_context::snippets()?.list(&session, id).await?)
+}
+
+#[server]
+pub async fn get_snippet(id: Uuid, snippet_id: Uuid) -> Result<Snippet, AppError> {
+    let session = org_context::session()?;
+    Ok(org_context::snippets()?
+        .get(&session, id, snippet_id)
+        .await?)
+}
+
+/// Saves the editor's text as a snippet: a new one without `snippet_id`,
+/// otherwise the caller's own existing one. Gives the snippet's ID.
+#[server]
+pub async fn save_snippet(
+    id: Uuid,
+    snippet_id: Option<Uuid>,
+    name: String,
+    visibility: SnippetVisibility,
+    sql: String,
+) -> Result<Uuid, AppError> {
+    let session = org_context::session()?;
+    let input = supabase_dashboard_domain::snippet::SnippetInput::parse(&name, visibility, &sql)
+        .map_err(|err| AppError::Rejected(format!("{}.", capitalize(&err.to_string()))))?;
+    let audit = org_context::AuditContext::current();
+    let snippets = org_context::snippets()?;
+    match snippet_id {
+        None => Ok(snippets.create(&session, id, &input, audit.get()).await?),
+        Some(snippet_id) => {
+            snippets
+                .update(&session, id, snippet_id, &input, audit.get())
+                .await?;
+            Ok(snippet_id)
+        }
+    }
+}
+
+#[server]
+pub async fn delete_snippet(id: Uuid, snippet_id: Uuid) -> Result<(), AppError> {
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    Ok(org_context::snippets()?
+        .delete(&session, id, snippet_id, audit.get())
         .await?)
 }
 

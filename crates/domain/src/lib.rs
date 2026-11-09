@@ -12,5 +12,6 @@ pub mod invitation;
 pub mod organization;
 pub mod project;
 pub mod schema;
+pub mod snippet;
 pub mod sql;
 pub mod theme;

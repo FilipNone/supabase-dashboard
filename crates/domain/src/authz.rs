@@ -68,6 +68,7 @@ impl OrgRole {
                 | P::TableDataRead
                 | P::TableDataWrite
                 | P::SqlExecute
+                | P::SqlSnippetsManage
                 | P::SchemaChange => true,
             },
             Self::Developer => match permission {
@@ -85,13 +86,15 @@ impl OrgRole {
                 | P::ProjectRegister
                 | P::ProjectUpdate
                 | P::ProjectCredentialsReplace
-                | P::ProjectUnregister => false,
+                | P::ProjectUnregister
+                | P::SqlSnippetsManage => false,
             },
             Self::Viewer => match permission {
                 P::OrgRead | P::MembersRead | P::ProjectRead | P::TableDataRead => true,
                 // Arbitrary SQL cannot be proven read-only by inspection, so
                 // read-only members get no SQL access at all.
                 P::SqlExecute
+                | P::SqlSnippetsManage
                 | P::OrgUpdate
                 | P::OrgDelete
                 | P::MembersManage
@@ -129,11 +132,14 @@ pub enum Permission {
     TableDataRead,
     TableDataWrite,
     SqlExecute,
+    /// Delete SQL snippets other members shared with the project. Authors
+    /// always manage their own.
+    SqlSnippetsManage,
     SchemaChange,
 }
 
 impl Permission {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::OrgRead,
         Self::OrgUpdate,
         Self::OrgDelete,
@@ -148,6 +154,7 @@ impl Permission {
         Self::TableDataRead,
         Self::TableDataWrite,
         Self::SqlExecute,
+        Self::SqlSnippetsManage,
         Self::SchemaChange,
     ];
 }
@@ -226,6 +233,7 @@ mod tests {
                 P::TableDataRead,
                 P::TableDataWrite,
                 P::SqlExecute,
+                P::SqlSnippetsManage,
                 P::SchemaChange,
             ],
             Developer => &[
