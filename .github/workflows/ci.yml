@@ -93,6 +93,8 @@ jobs:
           curl -fsS -o /dev/null http://127.0.0.1:54380/
           # The gateway refuses requests without a key.
           test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:54321/auth/v1/health)" = 401
+          # Studio sits behind the gateway's basic-auth catch-all route.
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:54321/project/default)" = 401
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2

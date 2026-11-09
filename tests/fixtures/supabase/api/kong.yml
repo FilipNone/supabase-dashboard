@@ -4,12 +4,15 @@
 # see LICENSE-APACHE); this file stays under Apache-2.0. It keeps only the
 # Auth and PostgREST routes, in upstream's legacy API key mode, and the
 # same key-auth and ACL rules: the PostgREST root (OpenAPI) is limited to
-# the service role, other routes accept the anon key too.
-# kong-entrypoint.sh substitutes $SUPABASE_ANON_KEY and $SUPABASE_SERVICE_KEY.
+# the service role, other routes accept the anon key too. Every other path
+# goes to Studio behind basic auth, as upstream's `dashboard` service does.
+# kong-entrypoint.sh substitutes $SUPABASE_ANON_KEY, $SUPABASE_SERVICE_KEY,
+# $DASHBOARD_USERNAME, and $DASHBOARD_PASSWORD.
 _format_version: '2.1'
 _transform: true
 
 consumers:
+  - username: DASHBOARD
   - username: anon
     keyauth_credentials:
       - key: $SUPABASE_ANON_KEY
@@ -22,6 +25,11 @@ acls:
     group: anon
   - consumer: service_role
     group: admin
+
+basicauth_credentials:
+  - consumer: DASHBOARD
+    username: '$DASHBOARD_USERNAME'
+    password: '$DASHBOARD_PASSWORD'
 
 services:
   - name: auth-v1
@@ -99,3 +107,17 @@ services:
           allow:
             - admin
             - anon
+
+  # Studio: every path the routes above do not claim.
+  - name: dashboard
+    url: http://studio:3000/
+    routes:
+      - name: dashboard-all
+        strip_path: true
+        paths:
+          - /
+    plugins:
+      - name: cors
+      - name: basic-auth
+        config:
+          hide_credentials: true

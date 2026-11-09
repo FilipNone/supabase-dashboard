@@ -2,8 +2,9 @@
 #
 # Adapted from supabase/supabase docker/docker-compose.yml. This file stays
 # under Apache-2.0 (see LICENSE-APACHE), not the MIT option. It is
-# reduced to the services the dashboard talks to first. Image tags match the
-# upstream file as of 2026-11-07. All ports bind to 127.0.0.1 and there is
+# reduced to the services the dashboard talks to first, plus Studio behind
+# the gateway's basic-auth catch-all route. Image tags match the upstream
+# file as of 2026-11-07, except Studio, which matches it as of 2026-11-09. All ports bind to 127.0.0.1 and there is
 # no persistent volume: `down` discards everything.
 #
 #   docker compose -f tests/fixtures/supabase/docker-compose.yml \
@@ -101,6 +102,44 @@ services:
       # Administrative API: loopback only, never exposed beyond the host.
       - "127.0.0.1:54380:8080"
 
+  # Studio has no port of its own: it is reached only through the gateway's
+  # catch-all route, which asks for DASHBOARD_USERNAME and DASHBOARD_PASSWORD.
+  studio:
+    image: supabase/studio:2026.11.02-sha-a05e7ec
+    depends_on:
+      meta:
+        condition: service_started
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "node -e \"fetch('http://localhost:3000/api/platform/profile').then((r) => {if (r.status !== 200) throw new Error(r.status)})\""
+        ]
+      timeout: 10s
+      interval: 5s
+      retries: 20
+      start_period: 20s
+    environment:
+      HOSTNAME: "0.0.0.0"
+      STUDIO_PG_META_URL: http://meta:8080
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_HOST: db
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_USER_READ_WRITE: postgres
+      PG_META_CRYPTO_KEY: ${PG_META_CRYPTO_KEY}
+      PGRST_DB_SCHEMAS: public
+      PGRST_DB_MAX_ROWS: 1000
+      PGRST_DB_EXTRA_SEARCH_PATH: public
+      DEFAULT_ORGANIZATION_NAME: Fixture Organization
+      DEFAULT_PROJECT_NAME: Fixture Project
+      SUPABASE_URL: http://gateway:8000
+      SUPABASE_PUBLIC_URL: http://127.0.0.1:54321
+      SUPABASE_ANON_KEY: ${ANON_KEY}
+      SUPABASE_SERVICE_KEY: ${SERVICE_ROLE_KEY}
+      AUTH_JWT_SECRET: ${JWT_SECRET}
+      ENABLED_FEATURES_LOGS_ALL: "false"
+
   # API gateway in front of auth and rest, as in a standard self-hosted
   # stack. Upstream defaults to Envoy and ships Kong as an override; the
   # fixture uses Kong because its route config is much smaller.
@@ -111,15 +150,19 @@ services:
         condition: service_healthy
       rest:
         condition: service_healthy
+      studio:
+        condition: service_healthy
     entrypoint: ["/bin/sh", "/home/kong/kong-entrypoint.sh"]
     environment:
       KONG_DATABASE: "off"
       KONG_DECLARATIVE_CONFIG: /usr/local/kong/kong.yml
       KONG_ROUTER_FLAVOR: expressions
       KONG_DNS_ORDER: LAST,A,CNAME
-      KONG_PLUGINS: request-transformer,key-auth,acl
+      KONG_PLUGINS: request-transformer,cors,key-auth,acl,basic-auth
       SUPABASE_ANON_KEY: ${ANON_KEY}
       SUPABASE_SERVICE_KEY: ${SERVICE_ROLE_KEY}
+      DASHBOARD_USERNAME: ${DASHBOARD_USERNAME}
+      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD}
     volumes:
       - ./api/kong.yml:/home/kong/temp.yml:ro
       - ./api/kong-entrypoint.sh:/home/kong/kong-entrypoint.sh:ro
