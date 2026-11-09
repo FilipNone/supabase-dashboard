@@ -11,9 +11,13 @@ publish.workspace = true
 [dependencies]
 supabase-dashboard-application.workspace = true
 supabase-dashboard-domain.workspace = true
+bytes = "1"
+futures-core = "0.3"
+http.workspace = true
 # No default features: TLS comes from the preconfigured rustls config below,
 # with the ring provider, instead of reqwest's aws-lc-rs default.
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+# `stream` lets Studio request bodies flow through without buffering.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "stream"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 secrecy.workspace = true
 serde.workspace = true
@@ -26,6 +30,8 @@ webpki-roots = "1"
 
 [dev-dependencies]
 axum.workspace = true
+futures-util = { version = "0.3", default-features = false }
+http-body-util = "0.1"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]

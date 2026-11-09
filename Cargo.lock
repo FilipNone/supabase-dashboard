@@ -2206,6 +2206,7 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "futures-core",
+ "futures-util",
  "http",
  "http-body",
  "http-body-util",
@@ -2222,12 +2223,14 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
 ]
 
@@ -2940,6 +2943,11 @@ name = "supabase-dashboard-adapters"
 version = "0.1.0-dev.4"
 dependencies = [
  "axum",
+ "bytes",
+ "futures-core",
+ "futures-util",
+ "http",
+ "http-body-util",
  "reqwest",
  "rustls",
  "secrecy",

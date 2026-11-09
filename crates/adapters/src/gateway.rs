@@ -102,14 +102,7 @@ impl GatewayProbe {
         let Ok(url) = reqwest::Url::parse(&format!("{}{}", api_url.as_str(), path(service))) else {
             return unreachable(UnreachableReason::InvalidResponse);
         };
-        // The resolver only sees host names; address literals are checked
-        // here, before anything is sent.
-        let literal = match url.host() {
-            Some(url::Host::Ipv4(ip)) => Some(std::net::IpAddr::V4(ip)),
-            Some(url::Host::Ipv6(ip)) => Some(std::net::IpAddr::V6(ip)),
-            _ => None,
-        };
-        if literal.is_some_and(|ip| !self.policy.allows(ip)) {
+        if refused_literal(&url, self.policy) {
             return unreachable(UnreachableReason::DestinationNotAllowed);
         }
         if service == StackService::Studio {
@@ -232,6 +225,18 @@ impl StackProbe for GatewayProbe {
     }
 }
 
+/// Whether `url` names an IP address the policy refuses. The resolver only
+/// sees host names, so address literals are checked before anything is
+/// sent.
+pub(crate) fn refused_literal(url: &reqwest::Url, policy: TargetPolicy) -> bool {
+    let literal = match url.host() {
+        Some(url::Host::Ipv4(ip)) => Some(std::net::IpAddr::V4(ip)),
+        Some(url::Host::Ipv6(ip)) => Some(std::net::IpAddr::V6(ip)),
+        _ => None,
+    };
+    literal.is_some_and(|ip| !policy.allows(ip))
+}
+
 const fn path(service: StackService) -> &'static str {
     match service {
         StackService::Auth => "/auth/v1/health",
@@ -308,7 +313,7 @@ fn auth_version(body: &[u8]) -> Option<String> {
 /// rustls with the ring provider (the one SQLx already uses) and the
 /// Mozilla root store from `webpki-roots`. Stacks behind a private CA are
 /// not supported yet.
-fn tls_config() -> Result<rustls::ClientConfig, GatewayError> {
+pub(crate) fn tls_config() -> Result<rustls::ClientConfig, GatewayError> {
     let roots = rustls::RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };
