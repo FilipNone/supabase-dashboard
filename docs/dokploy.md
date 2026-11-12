@@ -75,6 +75,12 @@ Audit events, with target type `dokploy` and Dokploy's host name as the target (
 
 Denied attempts have no target, since nothing is read before the role check.
 
+### Dokploy's internal address
+
+When the dashboard runs as a Dokploy service attached to `dokploy-network`, Dokploy's API answers inside that network at `http://dokploy:3000`. This was checked against the fixture's Dokploy v0.31.1: `dokploy-network` is an attachable overlay network, and a container on it got `"v0.31.1"` from `settings.getDokployVersion` with the key. The address is private, so the address policy allows it without extra settings. The page marks it as plain HTTP: the key crosses Dokploy's overlay network unencrypted, since Docker encrypts overlay traffic only for networks created with the `encrypted` option. The connect form mentions this address; the dashboard does not try it on its own, because it contacts only URLs an administrator or the deployment gave it.
+
+Dokploy's documentation describes compose services without "isolated deployment" as sharing `dokploy-network`; with isolated deployment, a service gets its own network, so use Dokploy's public URL or attach the dashboard to `dokploy-network` as well.
+
 ### Supplied by the deployment
 
 The deployment can supply the connection instead, with `SUPABASE_DASHBOARD_DOKPLOY_URL` and `SUPABASE_DASHBOARD_DOKPLOY_API_KEY_FILE`, a file holding the key alone such as a Docker secret. Both are needed, and so is an encryption key; otherwise the server refuses to start. The file is read once at startup.

@@ -141,7 +141,7 @@ fn not_connected_view(storage_available: bool, actions: Actions) -> AnyView {
                     />
                 </label>
                 <p class="field-hint" id="dokploy-url-hint">
-                    "The address you open Dokploy at, without /api. The dashboard server must be allowed to reach it; see the deployment guide."
+                    "The address you open Dokploy at, without /api. The dashboard server must be allowed to reach it; see the deployment guide. When the dashboard runs in Dokploy on dokploy-network, http://dokploy:3000 reaches Dokploy inside that network."
                 </p>
                 <label class="field" for="dokploy-key">
                     <span class="field-label">"API key"</span>
