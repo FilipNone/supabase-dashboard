@@ -129,7 +129,10 @@ fn history_view(history: HealthHistory) -> impl IntoView {
             utc_minutes(since),
         ),
     };
-    let chart = (history.total > 0).then(|| health_chart(history.hours, history.read_at));
+    // Erased so the hydrate build's nested view types stay within the
+    // compiler's query depth in release builds.
+    let chart =
+        (history.total > 0).then(|| health_chart(history.hours, history.read_at).into_any());
     let table = (!history.recent.is_empty()).then(|| {
         let rows = history.recent.into_iter().map(history_row).collect_view();
         view! {
@@ -146,6 +149,7 @@ fn history_view(history: HealthHistory) -> impl IntoView {
                 </table>
             </div>
         }
+        .into_any()
     });
     view! {
         <h3 class="subsection-title">"Recent checks"</h3>
