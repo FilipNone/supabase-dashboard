@@ -149,6 +149,19 @@ jobs:
 
   dokploy:
     runs-on: ubuntu-latest
+    # The connect, replace, and remove test also needs a metadata database.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: dashboard
+          POSTGRES_PASSWORD: ci-only
+          POSTGRES_DB: dashboard
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U dashboard"
+          --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@v4
       # Dokploy runs in a swarm inside a Docker-in-Docker container, so the
@@ -164,6 +177,11 @@ jobs:
         env:
           SUPABASE_DASHBOARD_TEST_DOKPLOY_URL: http://127.0.0.1:54340
         run: cargo test -p supabase-dashboard-adapters --locked --test dokploy_fixture
+      - name: Dokploy connection tests against the fixture
+        env:
+          SUPABASE_DASHBOARD_TEST_DOKPLOY_URL: http://127.0.0.1:54340
+          SUPABASE_DASHBOARD_TEST_DATABASE_URL: postgres://dashboard:ci-only@127.0.0.1:5432/dashboard
+        run: cargo test -p supabase-dashboard-server --locked dokploy
       - name: Show logs on failure
         if: failure()
         run: |

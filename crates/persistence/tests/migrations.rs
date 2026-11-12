@@ -67,3 +67,59 @@ async fn invalid_url_error_does_not_echo_the_url() {
     let err = Database::connect_lazy(&settings).unwrap_err().to_string();
     assert!(!err.contains("hunter2"), "{err}");
 }
+
+#[tokio::test]
+async fn the_dokploy_connection_is_a_singleton_that_outlives_its_author() {
+    let Some(scratch) = ScratchDb::create("dokploy_row").await else {
+        return;
+    };
+    let db = Database::connect(&scratch.settings).await.unwrap();
+    db.migrate().await.unwrap();
+    let account: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO accounts (id, email, display_name, password_hash) \
+         VALUES (gen_random_uuid(), 'a@example.test', 'A', \
+                 '$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2hoYXNoaGFzaA') \
+         RETURNING id",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let insert = |url: &'static str| {
+        sqlx::query(
+            "INSERT INTO dokploy_connection \
+                 (url, key_id, nonce, ciphertext, version, connected_by) \
+             VALUES ($1, 'k1', $2, $3, 'v0.31.1', $4)",
+        )
+        .bind(url)
+        .bind(vec![0u8; 12])
+        .bind(vec![0u8; 17])
+        .bind(account)
+        .execute(db.pool())
+    };
+    insert("https://one.example.test").await.unwrap();
+    assert!(
+        insert("https://two.example.test").await.is_err(),
+        "one connection per installation"
+    );
+    // A short nonce or ciphertext is refused.
+    assert!(
+        sqlx::query("UPDATE dokploy_connection SET nonce = '\\x00'")
+            .execute(db.pool())
+            .await
+            .is_err()
+    );
+
+    // Deleting the account that connected it keeps the connection.
+    sqlx::query("DELETE FROM accounts WHERE id = $1")
+        .bind(account)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let stored = db.find_dokploy_connection().await.unwrap().unwrap();
+    assert_eq!(stored.url, "https://one.example.test");
+    assert_eq!(stored.connected_by, None);
+    assert!(!format!("{stored:?}").contains("ciphertext"));
+
+    db.close().await;
+    scratch.drop().await;
+}

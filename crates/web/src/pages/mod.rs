@@ -1,5 +1,6 @@
 pub mod account;
 pub mod admin;
+mod admin_dokploy;
 mod health_chart;
 pub mod invite;
 pub mod not_found;

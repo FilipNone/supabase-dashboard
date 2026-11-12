@@ -16,10 +16,15 @@ use reqwest::{
     redirect,
 };
 use secrecy::{ExposeSecret, SecretString};
+use supabase_dashboard_application::dokploy::{ConnectFuture, DokployConnector};
 use supabase_dashboard_domain::{
     connection::UnreachableReason,
-    dokploy::{DokployUrl, DokployVersion, TESTED_DOKPLOY_VERSION, supported_dokploy_range},
+    dokploy::{DokployUrl, DokployVersion},
 };
+
+/// Defined with the domain types so the application layer can name it;
+/// re-exported here for callers of the client.
+pub use supabase_dashboard_domain::dokploy::DokployError;
 
 use crate::{
     gateway::{GatewayError, classify, refused_literal},
@@ -48,26 +53,6 @@ impl Default for DokploySettings {
             extra_roots: ExtraRoots::default(),
         }
     }
-}
-
-/// Why a Dokploy call failed. The messages name no address, key, or
-/// response text, so they can be shown to the admin as they are.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum DokployError {
-    #[error("Dokploy could not be reached. {}", .0.message())]
-    Unreachable(UnreachableReason),
-    #[error("Dokploy refused the API key. Check that it is current and not revoked.")]
-    KeyRejected,
-    #[error("Dokploy answered with HTTP {0}.")]
-    Http(u16),
-    #[error("Dokploy sent an answer the dashboard could not read.")]
-    InvalidResponse,
-    #[error(
-        "Dokploy {found} is not supported. This dashboard works with Dokploy {}, tested with {}.",
-        supported_dokploy_range(),
-        TESTED_DOKPLOY_VERSION
-    )]
-    UnsupportedVersion { found: DokployVersion },
 }
 
 /// A Dokploy that answered with a supported version.
@@ -102,6 +87,11 @@ impl DokployClient {
             clients: Arc::new(clients),
             policy,
         })
+    }
+
+    /// The client as the application's [`DokployConnector`].
+    pub fn shared(settings: DokploySettings) -> Result<Arc<dyn DokployConnector>, GatewayError> {
+        Ok(Arc::new(Self::new(settings)?))
     }
 
     /// Reads Dokploy's version with `key` and refuses a release the
@@ -162,6 +152,16 @@ impl DokployClient {
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(DokployError::KeyRejected),
             status => Err(DokployError::Http(status.as_u16())),
         }
+    }
+}
+
+impl DokployConnector for DokployClient {
+    fn connect<'a>(&'a self, url: &'a DokployUrl, key: &'a SecretString) -> ConnectFuture<'a> {
+        Box::pin(async move {
+            DokployClient::connect(self, url, key)
+                .await
+                .map(|connection| connection.version)
+        })
     }
 }
 

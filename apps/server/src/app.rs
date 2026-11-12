@@ -45,6 +45,7 @@ pub fn router(state: AppState, limits: &HttpLimits) -> Router {
     let projects = state.projects.clone();
     let connections = state.connections.clone();
     let studio_access = state.studio_access.clone();
+    let dokploy = state.dokploy.clone();
     let auth = state.auth.clone();
     let leptos_options = state.leptos_options.clone();
     let x_request_id = HeaderName::from_static("x-request-id");
@@ -85,6 +86,7 @@ pub fn router(state: AppState, limits: &HttpLimits) -> Router {
                 provide_context(projects.clone());
                 provide_context(connections.clone());
                 provide_context(studio_access.clone());
+                provide_context(dokploy.clone());
                 provide_context(auth.clone());
             },
             move || shell(leptos_options.clone()),
@@ -172,6 +174,7 @@ mod tests {
     use http_body_util::BodyExt;
     use leptos::{config::LeptosOptions, server_fn::ServerFn};
     use secrecy::SecretString;
+    use supabase_dashboard_adapters::net::TargetPolicy;
     use supabase_dashboard_application::{
         auth::{AuthConfig, AuthService},
         connections::ConnectionService,
@@ -184,11 +187,12 @@ mod tests {
         app::SIGN_IN_PATH,
         server_fns::{
             AdminListAccounts, AdminSetAccountDisabled, ChangePassword, CheckProjectHealth,
-            CreateInvitation, CreateOrganization, GetCurrentAccount, GetInstallationHealth,
-            GetOrganization, GetProject, GetProjectAuthorities, GetProjectCredentials,
-            GetProjectHealth, GetStudioAccessLog, ListOrganizations, ListProjects, ListSessions,
-            PreviewInvitation, RegisterProject, RemoveProjectAuthorities, RemoveProjectCredential,
-            RenameOrganization, ReplaceProjectAuthorities, ReplaceProjectCredential,
+            ConnectDokploy, CreateInvitation, CreateOrganization, DisconnectDokploy,
+            GetCurrentAccount, GetDokployConnection, GetInstallationHealth, GetOrganization,
+            GetProject, GetProjectAuthorities, GetProjectCredentials, GetProjectHealth,
+            GetStudioAccessLog, ListOrganizations, ListProjects, ListSessions, PreviewInvitation,
+            RegisterProject, RemoveProjectAuthorities, RemoveProjectCredential, RenameOrganization,
+            ReplaceDokployKey, ReplaceProjectAuthorities, ReplaceProjectCredential,
             ReplaceStudioLogin, RevokeSession, SignUpWithInvitation, UnregisterProject,
             UpdateProfile,
         },
@@ -217,6 +221,36 @@ mod tests {
         cipher: Option<supabase_dashboard_application::secrets::CredentialCipher>,
         access_log_days: Option<u16>,
     ) -> Router {
+        router_with_dokploy_policy(db, cipher, access_log_days, TargetPolicy::default()).await
+    }
+
+    /// A Dokploy service whose connector applies `policy`.
+    fn dokploy_service(
+        db: &Database,
+        cipher: Option<supabase_dashboard_application::secrets::CredentialCipher>,
+        policy: TargetPolicy,
+    ) -> Arc<supabase_dashboard_application::dokploy::DokployService> {
+        Arc::new(
+            supabase_dashboard_application::dokploy::DokployService::new(
+                db.clone(),
+                cipher,
+                supabase_dashboard_adapters::dokploy::DokployClient::shared(
+                    supabase_dashboard_adapters::dokploy::DokploySettings {
+                        policy,
+                        ..Default::default()
+                    },
+                )
+                .unwrap(),
+            ),
+        )
+    }
+
+    async fn router_with_dokploy_policy(
+        db: Database,
+        cipher: Option<supabase_dashboard_application::secrets::CredentialCipher>,
+        access_log_days: Option<u16>,
+        dokploy_policy: TargetPolicy,
+    ) -> Router {
         let auth = AuthService::new(db.clone(), AuthConfig::default())
             .await
             .unwrap();
@@ -228,6 +262,7 @@ mod tests {
                 .build(),
             organizations: Arc::new(OrganizationService::new(db.clone())),
             projects: Arc::new(ProjectService::new(db.clone())),
+            dokploy: dokploy_service(&db, cipher.clone(), dokploy_policy),
             connections: Arc::new(ConnectionService::new(
                 db.clone(),
                 cipher,
@@ -1181,10 +1216,7 @@ mod tests {
     /// A router with Studio hosts under `studio.localhost:3000` and an
     /// owner, alice, already bootstrapped.
     async fn studio_router(db: &Database) -> (Router, crate::studio_host::StudioHosts) {
-        use supabase_dashboard_adapters::{
-            net::TargetPolicy,
-            studio_proxy::{StudioProxy, StudioProxySettings},
-        };
+        use supabase_dashboard_adapters::studio_proxy::{StudioProxy, StudioProxySettings};
         use supabase_dashboard_application::{secrets::CredentialCipher, studio::StudioService};
 
         use crate::{studio::StudioGateway, studio_host::StudioHosts};
@@ -1229,6 +1261,7 @@ mod tests {
                 .build(),
             organizations: Arc::new(OrganizationService::new(db.clone())),
             projects: Arc::new(ProjectService::new(db.clone())),
+            dokploy: dokploy_service(db, Some(cipher.clone()), TargetPolicy::default()),
             // The gateways in these tests listen on loopback.
             connections: Arc::new(ConnectionService::new(
                 db.clone(),
@@ -2313,6 +2346,254 @@ mod tests {
         assert_eq!(body, "true");
         let (parts, _) = call(ListSessions::PATH, String::new(), &bob).await;
         assert_eq!(parts.status, StatusCode::UNAUTHORIZED);
+
+        db.close().await;
+        scratch.drop().await;
+    }
+
+    /// Percent-encodes every byte but ASCII letters and digits, for a form
+    /// body.
+    fn form_value(raw: &str) -> String {
+        raw.bytes()
+            .map(|b| {
+                if b.is_ascii_alphanumeric() {
+                    (b as char).to_string()
+                } else {
+                    format!("%{b:02X}")
+                }
+            })
+            .collect()
+    }
+
+    /// Alice is the bootstrapped owner and installation administrator; Bob
+    /// is a plain account. Returns their session cookies.
+    async fn admin_and_member(db: &Database, router: &Router) -> (String, String) {
+        AuthService::new(db.clone(), AuthConfig::default())
+            .await
+            .unwrap()
+            .bootstrap_owner(
+                "alice@example.test",
+                "Alice",
+                &SecretString::from("correct horse battery staple"),
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO accounts (id, email, display_name, password_hash) \
+             SELECT gen_random_uuid(), 'bob@example.test', 'Bob', password_hash FROM accounts",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        (
+            sign_in_cookie(router, "alice%40example.test").await,
+            sign_in_cookie(router, "bob%40example.test").await,
+        )
+    }
+
+    fn test_cipher() -> supabase_dashboard_application::secrets::CredentialCipher {
+        supabase_dashboard_application::secrets::CredentialCipher::from_base64(&SecretString::from(
+            "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+        ))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn only_installation_admins_reach_the_dokploy_connection() {
+        let Some(scratch) = ScratchDb::create("http_dokploy").await else {
+            return;
+        };
+        let db = Database::connect(&scratch.settings).await.unwrap();
+        db.migrate().await.unwrap();
+        let router = router_with_cipher(db.clone(), Some(test_cipher())).await;
+        let (alice, bob) = admin_and_member(&db, &router).await;
+        let call = |path: &'static str, body: &str, cookie: &str| {
+            send(&router, form_post(path, body, Some(cookie)))
+        };
+
+        // Bob is refused every call, and his page says so.
+        for (path, body) in [
+            (GetDokployConnection::PATH, ""),
+            (
+                ConnectDokploy::PATH,
+                "url=https%3A%2F%2Fdokploy.example.test&key=marker-key",
+            ),
+            (ReplaceDokployKey::PATH, "key=marker-key"),
+            (DisconnectDokploy::PATH, ""),
+        ] {
+            let (parts, response) = call(path, body, &bob).await;
+            assert_eq!(parts.status, StatusCode::FORBIDDEN, "{path}: {response}");
+            assert!(response.contains("Forbidden"), "{path}: {response}");
+        }
+        let (parts, body) = send(&router, get_with_cookie("/dashboard/admin", &bob)).await;
+        assert_eq!(parts.status, StatusCode::OK);
+        assert!(
+            body.contains(
+                "Only installation administrators can see or change the Dokploy connection."
+            ),
+            "{body}"
+        );
+
+        // Alice sees that nothing is connected, with the connect form.
+        let (parts, body) = call(GetDokployConnection::PATH, "", &alice).await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        assert!(body.contains(r#""connection":null"#), "{body}");
+        assert!(body.contains(r#""storage_available":true"#), "{body}");
+        let (parts, body) = send(&router, get_with_cookie("/dashboard/admin", &alice)).await;
+        assert_eq!(parts.status, StatusCode::OK);
+        assert!(body.contains("Not connected"), "{body}");
+        assert!(body.contains(r#"id="dokploy-key""#), "{body}");
+        assert!(body.contains(r#"type="password""#), "{body}");
+
+        // Malformed input is refused with a message; nothing is called.
+        let (parts, body) = call(
+            ConnectDokploy::PATH,
+            "url=dokploy.example.test&key=marker-key",
+            &alice,
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(body.contains("Enter Dokploy's address"), "{body}");
+        // Loopback is not enrolled on this server, so the key is never sent.
+        let (parts, body) = call(
+            ConnectDokploy::PATH,
+            "url=http%3A%2F%2F127.0.0.1%3A9&key=marker-key",
+            &alice,
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(body.contains("Dokploy could not be reached"), "{body}");
+        assert!(body.contains("does not contact"), "{body}");
+        assert!(!body.contains("marker"), "{body}");
+        let (parts, body) = call(ReplaceDokployKey::PATH, "key=marker-key", &alice).await;
+        assert_eq!(parts.status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(body.contains("Dokploy is not connected"), "{body}");
+        let failures: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_events \
+             WHERE action = 'dokploy.connect' AND outcome = 'failure' AND target_id = '127.0.0.1'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(failures, 1);
+        let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM dokploy_connection")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(stored, 0);
+
+        db.close().await;
+        scratch.drop().await;
+    }
+
+    /// Against the disposable Dokploy fixture (`tests/fixtures/dokploy`).
+    /// Skipped unless `SUPABASE_DASHBOARD_TEST_DOKPLOY_URL` is set as well.
+    #[tokio::test]
+    async fn an_admin_connects_replaces_and_removes_dokploy() {
+        let Ok(dokploy_url) = std::env::var("SUPABASE_DASHBOARD_TEST_DOKPLOY_URL") else {
+            eprintln!("skipping: SUPABASE_DASHBOARD_TEST_DOKPLOY_URL is not set");
+            return;
+        };
+        let Some(scratch) = ScratchDb::create("http_dokploy_fixture").await else {
+            return;
+        };
+        let key_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/dokploy/api-key"
+        );
+        let key = std::fs::read_to_string(key_path)
+            .expect("run tests/fixtures/dokploy/setup.sh first")
+            .trim()
+            .to_owned();
+        let db = Database::connect(&scratch.settings).await.unwrap();
+        db.migrate().await.unwrap();
+        // The fixture listens on loopback, which this server enrolls.
+        let router = router_with_dokploy_policy(
+            db.clone(),
+            Some(test_cipher()),
+            None,
+            TargetPolicy {
+                allow_loopback: true,
+            },
+        )
+        .await;
+        let (alice, _bob) = admin_and_member(&db, &router).await;
+        let call =
+            |path: &'static str, body: String| send(&router, form_post(path, &body, Some(&alice)));
+        let url = form_value(&dokploy_url);
+        // Never print a response that might hold the key.
+        let leaks = |body: &str| body.contains(key.as_str());
+
+        // A key Dokploy does not know is refused and not stored.
+        let (parts, body) = call(
+            ConnectDokploy::PATH,
+            format!("url={url}&key=not-a-dokploy-key"),
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(body.contains("Dokploy refused the API key"), "{body}");
+
+        // The fixture's key connects; the answer has the version, not the key.
+        let (parts, body) = call(
+            ConnectDokploy::PATH,
+            format!("url={url}&key={}", form_value(&key)),
+        )
+        .await;
+        assert!(!leaks(&body), "the connect response contains the key");
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        assert!(
+            body.contains(r#""version":{"major":0,"minor":31,"patch":1}"#),
+            "{body}"
+        );
+        assert!(body.contains(r#""by":"Alice""#), "{body}");
+        let (parts, page) = send(&router, get_with_cookie("/dashboard/admin", &alice)).await;
+        assert_eq!(parts.status, StatusCode::OK);
+        assert!(!leaks(&page), "the admin page contains the key");
+        assert!(page.contains("v0.31.1"), "{page}");
+        assert!(page.contains("Remove connection"), "{page}");
+        let audit: String =
+            sqlx::query_scalar("SELECT string_agg(row_to_json(a)::text, ' ') FROM audit_events a")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert!(!leaks(&audit), "the audit log contains the key");
+
+        // Replacing: a refused key keeps the stored one; the same key again
+        // is accepted and records who replaced it.
+        let (parts, body) = call(ReplaceDokployKey::PATH, "key=not-a-dokploy-key".to_owned()).await;
+        assert_eq!(parts.status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        let (parts, body) =
+            call(ReplaceDokployKey::PATH, format!("key={}", form_value(&key))).await;
+        assert!(!leaks(&body), "the replace response contains the key");
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        assert!(body.contains(r#""key_replaced":{"#), "{body}");
+
+        // Removing forgets it; Dokploy itself is not called.
+        let (parts, body) = call(DisconnectDokploy::PATH, String::new()).await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        let (_, body) = call(GetDokployConnection::PATH, String::new()).await;
+        assert!(body.contains(r#""connection":null"#), "{body}");
+        let outcomes: Vec<(String, String)> = sqlx::query_as(
+            "SELECT action, outcome FROM audit_events WHERE action LIKE 'dokploy.%' \
+             ORDER BY occurred_at, id",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        let outcomes: Vec<(&str, &str)> = outcomes
+            .iter()
+            .map(|(a, o)| (a.as_str(), o.as_str()))
+            .collect();
+        assert_eq!(
+            outcomes,
+            [
+                ("dokploy.connect", "failure"),
+                ("dokploy.connect", "success"),
+                ("dokploy.key_replace", "failure"),
+                ("dokploy.key_replace", "success"),
+                ("dokploy.disconnect", "success"),
+            ]
+        );
 
         db.close().await;
         scratch.drop().await;

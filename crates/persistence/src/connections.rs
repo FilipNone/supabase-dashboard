@@ -252,10 +252,14 @@ impl Database {
         Ok(true)
     }
 
-    /// How many stored keys each encryption key ID holds.
+    /// How many stored keys each encryption key ID holds: project keys and
+    /// the Dokploy API key.
     pub async fn count_credentials_by_key(&self) -> Result<Vec<(String, i64)>, PersistenceError> {
         sqlx::query_as(
-            "SELECT key_id, count(*) FROM project_credentials GROUP BY key_id ORDER BY key_id",
+            "SELECT key_id, count(*) FROM ( \
+                 SELECT key_id FROM project_credentials \
+                 UNION ALL SELECT key_id FROM dokploy_connection \
+             ) stored GROUP BY key_id ORDER BY key_id",
         )
         .fetch_all(&self.pool)
         .await

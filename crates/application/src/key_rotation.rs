@@ -1,4 +1,5 @@
-//! Moving stored project credentials to the current encryption key.
+//! Moving stored credentials (project keys and the Dokploy API key) to
+//! the current encryption key.
 //!
 //! After an operator installs a new key and keeps the old one as a previous
 //! key, `reseal_credentials` opens every value written under a previous key
@@ -67,6 +68,46 @@ pub async fn key_usage(
     Ok(usage)
 }
 
+/// The installation's Dokploy key, bound to its URL instead of a project.
+async fn reseal_dokploy_key(
+    db: &Database,
+    cipher: &CredentialCipher,
+    summary: &mut RotationSummary,
+) -> Result<(), RotationError> {
+    let Some((url, stored)) = db.find_dokploy_key_not_under(cipher.key_id()).await? else {
+        return Ok(());
+    };
+    let sealed = Sealed {
+        key_id: stored.key_id,
+        nonce: stored.nonce,
+        ciphertext: stored.ciphertext,
+    };
+    let resealed = match cipher.reseal_dokploy_key(&url, &sealed) {
+        Ok(Some(resealed)) => resealed,
+        Ok(None) => return Ok(()),
+        Err(CipherError::Undecryptable) => {
+            summary.unreadable += 1;
+            return Ok(());
+        }
+        Err(CipherError::Randomness) => return Err(RotationError::Randomness),
+    };
+    let replaced = db
+        .reseal_dokploy_key(
+            &url,
+            &sealed.nonce,
+            &resealed.key_id,
+            &resealed.nonce,
+            &resealed.ciphertext,
+        )
+        .await?;
+    if replaced {
+        summary.resealed += 1;
+    } else {
+        summary.changed_meanwhile += 1;
+    }
+    Ok(())
+}
+
 /// Seals every stored value that is not under the current key again under
 /// it, where a previous key can open it.
 pub async fn reseal_credentials(
@@ -117,6 +158,7 @@ pub async fn reseal_credentials(
             }
         }
     }
+    reseal_dokploy_key(db, cipher, &mut summary).await?;
     db.record_audit_event(&AuditEvent {
         actor_account_id: None,
         action: "credentials.reseal",

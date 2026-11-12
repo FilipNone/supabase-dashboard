@@ -18,6 +18,7 @@ mod telemetry;
 use std::{process::ExitCode, sync::Arc, time::Duration};
 
 use supabase_dashboard_adapters::{
+    dokploy::{DokployClient, DokploySettings},
     gateway::{GatewayError, GatewayProbe, GatewaySettings},
     net::TargetPolicy,
     studio_proxy::{StudioProxy, StudioProxySettings},
@@ -26,6 +27,7 @@ use supabase_dashboard_adapters::{
 use supabase_dashboard_application::{
     auth::{AuthConfig, AuthError, AuthService, BootstrapError, PasswordResetError},
     connections::{ConnectionService, ScheduledChecks},
+    dokploy::DokployService,
     key_rotation::{RotationError, key_usage, reseal_credentials},
     organizations::OrganizationService,
     projects::ProjectService,
@@ -262,15 +264,16 @@ async fn report_key_usage(db: &Database, cipher: &CredentialCipher) -> Result<()
     if usage.previous > 0 {
         tracing::warn!(
             count = usage.previous,
-            "stored project credentials are still under a previous encryption key; \
+            "stored credentials (project keys or the Dokploy key) are still under a previous \
+             encryption key; \
              run `supabase-dashboard-server rotate-secret-key`"
         );
     }
     if usage.unknown > 0 {
         tracing::warn!(
             count = usage.unknown,
-            "stored project credentials are under an encryption key this server does not have; \
-             they cannot be used until they are entered again"
+            "stored credentials (project keys or the Dokploy key) are under an encryption key \
+             this server does not have; they cannot be used until they are entered again"
         );
     }
     Ok(())
@@ -300,7 +303,8 @@ async fn rotate_secret_key() -> Result<(), StartupError> {
     if summary.unreadable > 0 {
         println!(
             "{} credential(s) are under a key this server does not have and were left as they \
-             are. Enter them again on each project's settings page.",
+             are. Enter them again on each project's settings page, or replace the Dokploy key on \
+             the administrator page.",
             summary.unreadable
         );
     }
@@ -339,12 +343,15 @@ async fn run() -> Result<(), StartupError> {
             report_key_usage(&db, cipher).await?;
         }
         None => tracing::warn!(
-            "no credential encryption key is configured; project API keys cannot be stored \
+            "no credential encryption key is configured; project API keys and the Dokploy key \
+             cannot be stored \
              (set SUPABASE_DASHBOARD_SECRET_KEY_FILE)"
         ),
     }
     if config.allow_loopback_targets {
-        tracing::warn!("project checks may connect to loopback addresses");
+        tracing::warn!(
+            "project checks and the Dokploy connection may connect to loopback addresses"
+        );
     }
     let policy = TargetPolicy {
         allow_loopback: config.allow_loopback_targets,
@@ -354,6 +361,11 @@ async fn run() -> Result<(), StartupError> {
         policy,
         extra_roots: extra_roots.clone(),
         ..GatewaySettings::default()
+    })?;
+    let dokploy_client = DokployClient::shared(DokploySettings {
+        policy,
+        extra_roots: extra_roots.clone(),
+        ..DokploySettings::default()
     })?;
     let studio = match (&config.studio_hosts, &config.public_url) {
         (Some(hosts), Some(public_url)) => {
@@ -399,6 +411,11 @@ async fn run() -> Result<(), StartupError> {
     ));
     tokio::spawn(prune_studio_access(Arc::clone(&studio_access)));
 
+    let dokploy = Arc::new(DokployService::new(
+        db.clone(),
+        cipher.clone(),
+        dokploy_client,
+    ));
     let connections = Arc::new(ConnectionService::new(db.clone(), cipher, probe));
     match config.health_check_interval {
         Some(interval) => {
@@ -424,6 +441,7 @@ async fn run() -> Result<(), StartupError> {
         projects: Arc::new(ProjectService::new(db.clone())),
         connections,
         studio_access,
+        dokploy,
         cookie: CookieSettings::new(secure_cookie, config.session_lifetime.as_secs()),
         expected_origin: config
             .public_url

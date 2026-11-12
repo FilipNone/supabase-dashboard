@@ -74,6 +74,7 @@ mod server {
     use supabase_dashboard_application::{
         auth::{AccountUpdateError, AdminError, AuthError, InvitationSignUpError},
         connections::ConnectionError,
+        dokploy::DokployServiceError,
         organizations::OrganizationError,
         projects::ProjectError,
         studio_access::StudioAccessError,
@@ -178,6 +179,30 @@ mod server {
                 StudioAccessError::Forbidden => Self::Forbidden,
                 StudioAccessError::Internal(err) => {
                     tracing::error!(error = %err, "Studio access log could not be read");
+                    Self::Unavailable
+                }
+            }
+        }
+    }
+
+    impl From<DokployServiceError> for AppError {
+        fn from(err: DokployServiceError) -> Self {
+            match err {
+                DokployServiceError::Forbidden => Self::Forbidden,
+                // Dokploy's own errors name no address or key, so they are
+                // shown as they are.
+                DokployServiceError::StorageUnavailable
+                | DokployServiceError::AlreadyConnected
+                | DokployServiceError::NotConnected
+                | DokployServiceError::Url(_)
+                | DokployServiceError::Key(_)
+                | DokployServiceError::Dokploy(_) => Self::Rejected(sentence(&err.to_string())),
+                DokployServiceError::Cipher(err) => {
+                    tracing::error!(error = %err, "Dokploy key encryption failed");
+                    Self::Unavailable
+                }
+                DokployServiceError::Internal(err) => {
+                    tracing::error!(error = %err, "Dokploy connection operation failed");
                     Self::Unavailable
                 }
             }

@@ -1,10 +1,13 @@
-//! Encryption of project credentials at rest.
+//! Encryption of stored credentials at rest: project keys and the
+//! installation's Dokploy API key.
 //!
 //! Each value is sealed with AES-256-GCM (RustCrypto `aes-gcm`) under a key
 //! the deployment supplies, with a fresh random 96-bit nonce. The associated
 //! data binds a ciphertext to its project and credential kind, so a row
 //! copied onto another project or kind fails to decrypt instead of being
-//! used there.
+//! used there. The Dokploy key is bound to the Dokploy URL it was accepted
+//! by, so a stored URL changed in the database cannot redirect the key to
+//! another server.
 //!
 //! The metadata database stores the key's ID next to each ciphertext. A row
 //! written under a different key is reported as unreadable rather than
@@ -157,10 +160,69 @@ impl CredentialCipher {
         kind: CredentialKind,
         value: &SecretString,
     ) -> Result<Sealed, CipherError> {
+        self.seal_bound(&associated_data(project_id, kind), value)
+    }
+
+    /// Whether a stored value was written under the current key or a
+    /// previous one.
+    pub fn can_open(&self, key_id: &str) -> bool {
+        self.key(key_id).is_some()
+    }
+
+    /// Opens a value sealed under a previous key and seals it again under
+    /// the current one, bound to the same project and kind. Returns `None`
+    /// when the value is already under the current key.
+    pub fn reseal(
+        &self,
+        project_id: Uuid,
+        kind: CredentialKind,
+        sealed: &Sealed,
+    ) -> Result<Option<Sealed>, CipherError> {
+        self.reseal_bound(&associated_data(project_id, kind), sealed)
+    }
+
+    pub fn open(
+        &self,
+        project_id: Uuid,
+        kind: CredentialKind,
+        sealed: &Sealed,
+    ) -> Result<SecretString, CipherError> {
+        self.open_bound(&associated_data(project_id, kind), sealed)
+    }
+
+    /// Seals the installation's Dokploy API key, bound to the Dokploy URL
+    /// that accepted it.
+    pub fn seal_dokploy_key(
+        &self,
+        dokploy_url: &str,
+        value: &SecretString,
+    ) -> Result<Sealed, CipherError> {
+        self.seal_bound(&dokploy_associated_data(dokploy_url), value)
+    }
+
+    /// Opens the stored Dokploy API key. Fails when the stored URL is not
+    /// the one the key was sealed with.
+    pub fn open_dokploy_key(
+        &self,
+        dokploy_url: &str,
+        sealed: &Sealed,
+    ) -> Result<SecretString, CipherError> {
+        self.open_bound(&dokploy_associated_data(dokploy_url), sealed)
+    }
+
+    /// [`Self::reseal`] for the Dokploy API key.
+    pub fn reseal_dokploy_key(
+        &self,
+        dokploy_url: &str,
+        sealed: &Sealed,
+    ) -> Result<Option<Sealed>, CipherError> {
+        self.reseal_bound(&dokploy_associated_data(dokploy_url), sealed)
+    }
+
+    fn seal_bound(&self, aad: &str, value: &SecretString) -> Result<Sealed, CipherError> {
         let mut nonce_bytes = [0u8; NONCE_LEN];
         getrandom::fill(&mut nonce_bytes).map_err(|_| CipherError::Randomness)?;
         let nonce = Nonce::<Aes256Gcm>::from(nonce_bytes);
-        let aad = associated_data(project_id, kind);
         let ciphertext = self
             .current
             .cipher
@@ -180,34 +242,15 @@ impl CredentialCipher {
         })
     }
 
-    /// Whether a stored value was written under the current key or a
-    /// previous one.
-    pub fn can_open(&self, key_id: &str) -> bool {
-        self.key(key_id).is_some()
-    }
-
-    /// Opens a value sealed under a previous key and seals it again under
-    /// the current one, bound to the same project and kind. Returns `None`
-    /// when the value is already under the current key.
-    pub fn reseal(
-        &self,
-        project_id: Uuid,
-        kind: CredentialKind,
-        sealed: &Sealed,
-    ) -> Result<Option<Sealed>, CipherError> {
+    fn reseal_bound(&self, aad: &str, sealed: &Sealed) -> Result<Option<Sealed>, CipherError> {
         if sealed.key_id == self.current.key_id {
             return Ok(None);
         }
-        let value = self.open(project_id, kind, sealed)?;
-        self.seal(project_id, kind, &value).map(Some)
+        let value = self.open_bound(aad, sealed)?;
+        self.seal_bound(aad, &value).map(Some)
     }
 
-    pub fn open(
-        &self,
-        project_id: Uuid,
-        kind: CredentialKind,
-        sealed: &Sealed,
-    ) -> Result<SecretString, CipherError> {
+    fn open_bound(&self, aad: &str, sealed: &Sealed) -> Result<SecretString, CipherError> {
         let key = self.key(&sealed.key_id).ok_or(CipherError::Undecryptable)?;
         let nonce_bytes: [u8; NONCE_LEN] = sealed
             .nonce
@@ -215,7 +258,6 @@ impl CredentialCipher {
             .try_into()
             .map_err(|_| CipherError::Undecryptable)?;
         let nonce = Nonce::<Aes256Gcm>::from(nonce_bytes);
-        let aad = associated_data(project_id, kind);
         let plaintext = key
             .cipher
             .decrypt(
@@ -237,6 +279,10 @@ fn associated_data(project_id: Uuid, kind: CredentialKind) -> String {
         "supabase-dashboard:project-credential:v1:{project_id}:{}",
         kind.as_str()
     )
+}
+
+fn dokploy_associated_data(dokploy_url: &str) -> String {
+    format!("supabase-dashboard:dokploy-key:v1:{dokploy_url}")
 }
 
 #[cfg(test)]
@@ -405,6 +451,47 @@ mod tests {
             rotated
                 .reseal(Uuid::from_u128(8), CredentialKind::ServiceRoleKey, &sealed)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn dokploy_keys_are_bound_to_their_url_and_rotate() {
+        let old = cipher(KEY_A);
+        let url = "https://dokploy.example.test";
+        let value = SecretString::from("dokploy-api-key");
+        let sealed = old.seal_dokploy_key(url, &value).unwrap();
+        assert_eq!(
+            old.open_dokploy_key(url, &sealed).unwrap().expose_secret(),
+            "dokploy-api-key"
+        );
+        // Another URL, or a project slot, cannot open it.
+        assert!(
+            old.open_dokploy_key("https://attacker.example.test", &sealed)
+                .is_err()
+        );
+        assert!(
+            old.open(Uuid::nil(), CredentialKind::AnonKey, &sealed)
+                .is_err()
+        );
+
+        let mut rotated = cipher(KEY_B);
+        rotated
+            .add_previous_keys(&SecretString::from(KEY_A))
+            .unwrap();
+        let resealed = rotated.reseal_dokploy_key(url, &sealed).unwrap().unwrap();
+        assert_eq!(resealed.key_id, rotated.key_id());
+        assert_eq!(
+            cipher(KEY_B)
+                .open_dokploy_key(url, &resealed)
+                .unwrap()
+                .expose_secret(),
+            "dokploy-api-key"
+        );
+        assert!(
+            rotated
+                .reseal_dokploy_key(url, &resealed)
+                .unwrap()
+                .is_none()
         );
     }
 

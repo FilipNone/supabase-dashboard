@@ -1,6 +1,6 @@
 //! Installation administration: every dashboard account, with the means to
-//! disable and re-enable them, and a read-only list of every organization
-//! and registered project.
+//! disable and re-enable them, a read-only list of every organization and
+//! registered project, and the installation's Dokploy connection.
 //!
 //! The server refuses these calls for anyone who is not an installation
 //! administrator; the sidebar link is hidden for them only as a courtesy.
@@ -17,7 +17,7 @@ use crate::{
     components::dialog::{ConfirmDialog, DialogCancel},
     components::page::{PageHeader, StatePanel, StateTone},
     error::AppError,
-    pages::organization::health_badges,
+    pages::{admin_dokploy::DokployPanel, organization::health_badges},
     server_fns::{AdminSetAccountDisabled, admin_list_accounts, admin_list_resources},
 };
 
@@ -69,6 +69,7 @@ pub fn AdminPage() -> impl IntoView {
             </Transition>
         </section>
         <RegisteredResources/>
+        <DokployPanel/>
     }
 }
 

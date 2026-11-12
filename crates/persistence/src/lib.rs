@@ -7,6 +7,7 @@ pub mod accounts;
 pub mod admin;
 pub mod audit;
 pub mod connections;
+pub mod dokploy;
 pub mod invitations;
 pub mod organizations;
 pub mod projects;

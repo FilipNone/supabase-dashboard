@@ -16,6 +16,7 @@ use supabase_dashboard_domain::{
         CredentialKind, CredentialOverview, HealthDigest, HealthHistory, HealthReport,
         SavedCredential,
     },
+    dokploy::DokployOverview,
     health::InstallationHealth,
     invitation::{InvitationCode, InvitationPreview, InvitationSummary, IssuedInvitation},
     organization::{MemberSummary, OrganizationSummary},
@@ -85,6 +86,7 @@ mod org_context {
     use supabase_dashboard_application::{
         auth::{AuthService, CurrentSession, RequestContext},
         connections::ConnectionService,
+        dokploy::DokployService,
         organizations::OrganizationService,
         projects::ProjectService,
         studio_access::StudioAccessService,
@@ -134,6 +136,13 @@ mod org_context {
     pub fn connections() -> Result<Arc<ConnectionService>, AppError> {
         use_context::<Arc<ConnectionService>>().ok_or_else(|| {
             tracing::error!("connection service is not configured");
+            AppError::Unavailable
+        })
+    }
+
+    pub fn dokploy() -> Result<Arc<DokployService>, AppError> {
+        use_context::<Arc<DokployService>>().ok_or_else(|| {
+            tracing::error!("Dokploy service is not configured");
             AppError::Unavailable
         })
     }
@@ -660,5 +669,52 @@ pub async fn admin_set_account_disabled(
     let audit = org_context::AuditContext::current();
     Ok(org_context::auth()?
         .admin_set_account_disabled(&session, account_id, disabled, audit.get())
+        .await?)
+}
+
+/// The installation's Dokploy connection, without its key. Installation
+/// administrators only.
+#[server]
+pub async fn get_dokploy_connection() -> Result<DokployOverview, AppError> {
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    Ok(org_context::dokploy()?
+        .overview(&session, audit.get())
+        .await?)
+}
+
+/// Connects the installation to Dokploy. The key is stored only after
+/// Dokploy accepts it and reports a supported version. Installation
+/// administrators only.
+#[server]
+pub async fn connect_dokploy(url: String, key: SecretInput) -> Result<DokployOverview, AppError> {
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    let key = secrecy::SecretString::from(key.0);
+    Ok(org_context::dokploy()?
+        .connect(&session, &url, &key, audit.get())
+        .await?)
+}
+
+/// Replaces the stored Dokploy key with one Dokploy accepts. Installation
+/// administrators only.
+#[server]
+pub async fn replace_dokploy_key(key: SecretInput) -> Result<DokployOverview, AppError> {
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    let key = secrecy::SecretString::from(key.0);
+    Ok(org_context::dokploy()?
+        .replace_key(&session, &key, audit.get())
+        .await?)
+}
+
+/// Deletes the dashboard's record of the Dokploy connection. Nothing in
+/// Dokploy changes. Installation administrators only.
+#[server]
+pub async fn disconnect_dokploy() -> Result<(), AppError> {
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    Ok(org_context::dokploy()?
+        .remove(&session, audit.get())
         .await?)
 }

@@ -9,7 +9,10 @@
 
 use std::fmt;
 
-use crate::project::ProjectUrl;
+use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
+
+use crate::{account::DisplayName, connection::UnreachableReason, project::ProjectUrl};
 
 /// The Dokploy release the provider tests run against
 /// (`tests/fixtures/dokploy`).
@@ -22,10 +25,15 @@ pub const TESTED_DOKPLOY_VERSION: DokployVersion = DokployVersion {
 /// Longest version string accepted from Dokploy.
 const MAX_VERSION_LEN: usize = 32;
 
+/// Longest Dokploy API key accepted. Dokploy's keys are far shorter; the
+/// bound only keeps a pasted mistake from being sent or stored.
+pub const DOKPLOY_KEY_MAX_LEN: usize = 512;
+
 /// Dokploy's base URL, such as `https://dokploy.example.com`, without
 /// `/api`. Same shape rules as a project's API URL: http or https, a host,
 /// no user name, password, query, or fragment, and no trailing slash.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct DokployUrl(ProjectUrl);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -45,6 +53,20 @@ impl DokployUrl {
         self.0.as_str()
     }
 
+    /// Whether the key travels over HTTPS.
+    pub fn is_encrypted(&self) -> bool {
+        self.0.is_encrypted()
+    }
+
+    /// The host name or address, for audit records and messages. Never
+    /// empty: parsing requires a host.
+    pub fn host(&self) -> String {
+        url::Url::parse(self.as_str())
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_owned))
+            .unwrap_or_default()
+    }
+
     /// The URL of one API call, such as `settings.getDokployVersion`.
     pub fn api(&self, call: &str) -> String {
         format!("{}/api/{call}", self.as_str())
@@ -53,7 +75,7 @@ impl DokployUrl {
 
 /// A Dokploy release number, as `settings.getDokployVersion` reports it
 /// (`"v0.31.1"`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct DokployVersion {
     pub major: u32,
     pub minor: u32,
@@ -102,6 +124,94 @@ pub fn supported_dokploy_range() -> String {
         "v{}.{}.x",
         TESTED_DOKPLOY_VERSION.major, TESTED_DOKPLOY_VERSION.minor
     )
+}
+
+/// Why a Dokploy call failed. The messages name no address, key, or
+/// response text, so they can be shown to the admin as they are.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DokployError {
+    #[error("Dokploy could not be reached. {}", .0.message())]
+    Unreachable(UnreachableReason),
+    /// Dokploy answers a revoked, expired, or rate-limited key alike.
+    #[error(
+        "Dokploy refused the API key. Check that it is current, not revoked, and has no rate limit."
+    )]
+    KeyRejected,
+    #[error("Dokploy answered with HTTP {0}.")]
+    Http(u16),
+    #[error("Dokploy sent an answer the dashboard could not read.")]
+    InvalidResponse,
+    #[error(
+        "Dokploy {found} is not supported. This dashboard works with Dokploy {}, tested with {}.",
+        supported_dokploy_range(),
+        TESTED_DOKPLOY_VERSION
+    )]
+    UnsupportedVersion { found: DokployVersion },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum DokployKeyError {
+    #[error("enter the Dokploy API key")]
+    Empty,
+    #[error("the Dokploy API key must be at most {DOKPLOY_KEY_MAX_LEN} characters")]
+    TooLong,
+    #[error("the Dokploy API key must not contain spaces or control characters")]
+    InvalidCharacters,
+}
+
+/// Checks the shape of a pasted Dokploy API key and returns it without
+/// surrounding whitespace. Whether Dokploy accepts it is learned only by
+/// calling Dokploy with it.
+pub fn check_dokploy_key(raw: &str) -> Result<&str, DokployKeyError> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err(DokployKeyError::Empty);
+    }
+    if value.len() > DOKPLOY_KEY_MAX_LEN {
+        return Err(DokployKeyError::TooLong);
+    }
+    // Visible ASCII only: the key travels in an HTTP header.
+    if !value.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(DokployKeyError::InvalidCharacters);
+    }
+    Ok(value)
+}
+
+/// Who did something to the stored connection, and when. `by` is `None`
+/// once that account has been deleted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DokployChange {
+    pub at: OffsetDateTime,
+    pub by: Option<DisplayName>,
+}
+
+/// The installation's Dokploy connection as the administrator page shows
+/// it. It never holds the API key, only whether this server can read the
+/// stored one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DokployConnectionSummary {
+    pub url: DokployUrl,
+    /// The version Dokploy reported when the key last connected.
+    pub version: DokployVersion,
+    /// When the stored key last connected: when it was connected, or last
+    /// replaced.
+    pub verified_at: OffsetDateTime,
+    pub connected: DokployChange,
+    /// The last key replacement, if the key was replaced since connecting.
+    pub key_replaced: Option<DokployChange>,
+    /// Whether this server can decrypt the stored key. `false` when it was
+    /// written under an encryption key this server does not have.
+    pub key_readable: bool,
+}
+
+/// What the administrator page's Dokploy section shows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DokployOverview {
+    /// Whether the server has a credential encryption key, without which
+    /// no key can be stored.
+    pub storage_available: bool,
+    /// `None` when Dokploy is not connected.
+    pub connection: Option<DokployConnectionSummary>,
 }
 
 #[cfg(test)]
@@ -167,9 +277,49 @@ mod tests {
     }
 
     #[test]
+    fn keys_are_trimmed_and_bounded() {
+        assert_eq!(check_dokploy_key("  abcDEF123_-.  \n"), Ok("abcDEF123_-."));
+        assert_eq!(check_dokploy_key(" \t"), Err(DokployKeyError::Empty));
+        assert_eq!(
+            check_dokploy_key(&"k".repeat(DOKPLOY_KEY_MAX_LEN + 1)),
+            Err(DokployKeyError::TooLong)
+        );
+        assert!(check_dokploy_key(&"k".repeat(DOKPLOY_KEY_MAX_LEN)).is_ok());
+        for bad in ["two words", "tab\there", "nul\0", "é-key", "line\nbreak"] {
+            assert_eq!(
+                check_dokploy_key(bad),
+                Err(DokployKeyError::InvalidCharacters),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn error_messages_name_no_address() {
+        let messages = [
+            DokployError::Unreachable(UnreachableReason::DestinationNotAllowed).to_string(),
+            DokployError::KeyRejected.to_string(),
+            DokployError::UnsupportedVersion {
+                found: DokployVersion::parse("v0.32.0").unwrap(),
+            }
+            .to_string(),
+        ];
+        assert!(messages[2].contains("v0.32.0") && messages[2].contains("v0.31.x"));
+        for message in messages {
+            assert!(!message.contains("127.0.0.1"), "{message}");
+            assert!(!message.contains("http"), "{message}");
+        }
+    }
+
+    #[test]
     fn dokploy_urls_follow_the_api_url_rules() {
         let url = DokployUrl::parse(" https://dokploy.example.com/ ").unwrap();
         assert_eq!(url.as_str(), "https://dokploy.example.com");
+        assert_eq!(url.host(), "dokploy.example.com");
+        assert_eq!(
+            DokployUrl::parse("http://10.0.0.5:3000").unwrap().host(),
+            "10.0.0.5"
+        );
         assert_eq!(
             url.api("settings.getDokployVersion"),
             "https://dokploy.example.com/api/settings.getDokployVersion"

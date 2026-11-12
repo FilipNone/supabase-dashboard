@@ -58,7 +58,10 @@ inner docker service inspect dokploy >/dev/null 2>&1 ||
 
 # Wait for Dokploy's API, then create the fixture's admin (the first
 # account becomes the owner) and an API key for the tests. The key is
-# written to `api-key` next to this script, which git ignores.
+# written to `api-key` next to this script, which git ignores. Like
+# Dokploy's own "Add API key" form, the key has no rate limit: without
+# `rateLimitEnabled: false`, better-auth's default allows 10 requests a day
+# and then refuses the key with 401, as if it were invalid.
 url=http://127.0.0.1:54340
 i=0
 until [ "$(curl -s -o /dev/null -w '%{http_code}' "$url/api/health")" = 200 ]; do
@@ -88,7 +91,7 @@ curl -sf -c "$jar" -H 'Content-Type: application/json' -H "Origin: $url" \
 organization=$(curl -sf -b "$jar" -H "Origin: $url" "$url/api/auth/organization/list" |
     python3 -I -c 'import json, sys; print(json.load(sys.stdin)[0]["id"])')
 curl -sf -b "$jar" -H 'Content-Type: application/json' -H "Origin: $url" \
-    -d "{\"json\":{\"name\":\"fixture\",\"metadata\":{\"organizationId\":\"$organization\"}}}" \
+    -d "{\"json\":{\"name\":\"fixture\",\"rateLimitEnabled\":false,\"metadata\":{\"organizationId\":\"$organization\"}}}" \
     "$url/api/trpc/user.createApiKey" |
     python3 -I -c 'import json, sys; sys.stdout.write(json.load(sys.stdin)["result"]["data"]["json"]["key"])' \
         >"$here/api-key"

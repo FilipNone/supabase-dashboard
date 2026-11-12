@@ -3,8 +3,9 @@ use std::{sync::Arc, time::Duration};
 use axum::extract::FromRef;
 use leptos::config::LeptosOptions;
 use supabase_dashboard_application::{
-    auth::AuthService, connections::ConnectionService, organizations::OrganizationService,
-    projects::ProjectService, studio_access::StudioAccessService,
+    auth::AuthService, connections::ConnectionService, dokploy::DokployService,
+    organizations::OrganizationService, projects::ProjectService,
+    studio_access::StudioAccessService,
 };
 use supabase_dashboard_persistence::Database;
 
@@ -20,6 +21,8 @@ pub struct AppState {
     pub projects: Arc<ProjectService>,
     pub connections: Arc<ConnectionService>,
     pub studio_access: Arc<StudioAccessService>,
+    /// The installation's Dokploy connection.
+    pub dokploy: Arc<DokployService>,
     pub cookie: CookieSettings,
     /// `scheme://host[:port]` of the public URL. `None` only in development
     /// without a public URL, where the Host header is compared instead.

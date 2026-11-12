@@ -184,3 +184,29 @@ async fn errors_never_carry_the_key() {
     let err = client().connect(&url, &key("bad\nkey")).await.unwrap_err();
     assert_eq!(err, DokployError::KeyRejected);
 }
+
+#[tokio::test]
+async fn the_application_connector_reports_the_version_or_the_refusal() {
+    // A trait object, as the server holds it.
+    let connector = DokployClient::shared(DokploySettings {
+        policy: TargetPolicy {
+            allow_loopback: true,
+        },
+        ..DokploySettings::default()
+    })
+    .unwrap();
+    let url = serve(dokploy(r#""v0.31.1""#)).await;
+    assert_eq!(
+        connector.connect(&url, &key(GOOD_KEY)).await.unwrap(),
+        TESTED_DOKPLOY_VERSION
+    );
+    assert_eq!(
+        connector.connect(&url, &key("wrong")).await.unwrap_err(),
+        DokployError::KeyRejected
+    );
+    let newer = serve(dokploy(r#""v0.32.0""#)).await;
+    assert!(matches!(
+        connector.connect(&newer, &key(GOOD_KEY)).await.unwrap_err(),
+        DokployError::UnsupportedVersion { .. }
+    ));
+}
