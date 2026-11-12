@@ -428,11 +428,13 @@ async fn studio_requests_are_logged_for_owners_and_admins_to_read() {
             let StudioAccessLog::On {
                 entries,
                 retention_days,
-            } = log.read(&owner, id).await.unwrap()
+                older,
+            } = log.read(&owner, id, None).await.unwrap()
             else {
                 panic!("the log is on");
             };
             assert_eq!(retention_days, 7);
+            assert_eq!(older, None);
             if entries.len() == 2 || waited > 50 {
                 break entries;
             }
@@ -460,13 +462,13 @@ async fn studio_requests_are_logged_for_owners_and_admins_to_read() {
         .unwrap();
     assert_eq!(total, 3);
 
-    assert!(log.read(&admin, id).await.is_ok());
+    assert!(log.read(&admin, id, None).await.is_ok());
     assert!(matches!(
-        log.read(&developer, id).await,
+        log.read(&developer, id, None).await,
         Err(StudioAccessError::Forbidden)
     ));
     assert!(matches!(
-        log.read(&outsider, id).await,
+        log.read(&outsider, id, None).await,
         Err(StudioAccessError::NotFound)
     ));
 
@@ -482,6 +484,83 @@ async fn studio_requests_are_logged_for_owners_and_admins_to_read() {
     .unwrap();
     assert_eq!(log.prune().await.unwrap(), 1);
     let off = StudioAccessService::new(f.db.clone(), None);
-    assert_eq!(off.read(&owner, id).await.unwrap(), StudioAccessLog::Off);
+    assert_eq!(
+        off.read(&owner, id, None).await.unwrap(),
+        StudioAccessLog::Off
+    );
     assert_eq!(off.prune().await.unwrap(), 3);
+}
+
+#[tokio::test]
+async fn the_access_log_pages_through_entries_with_the_same_time() {
+    let Some(scratch) = ScratchDb::create("studio_access_pages").await else {
+        return;
+    };
+    let f = setup(&scratch).await;
+    let owner = account(&f.db, "Owner").await;
+    let (_, id) = project(&f, &owner, "Acme").await;
+    let outsider = account(&f.db, "Outsider").await;
+    let (_, other) = project(&f, &outsider, "Globex").await;
+    // 250 entries over 3 timestamps, so pages split entries with equal times.
+    sqlx::query(
+        "INSERT INTO studio_access_log (project_id, account_id, at, method, path, status) \
+         SELECT $1, $2, now() - make_interval(secs => n % 3), 'GET', '/p/' || n, 200 \
+         FROM generate_series(1, 250) AS n",
+    )
+    .bind(id)
+    .bind(owner.account.id)
+    .execute(f.db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO studio_access_log (project_id, account_id, at, method, path, status) \
+         VALUES ($1, $2, now(), 'GET', '/other', 200)",
+    )
+    .bind(other)
+    .bind(outsider.account.id)
+    .execute(f.db.pool())
+    .await
+    .unwrap();
+    let log = StudioAccessService::new(f.db.clone(), Some(7));
+    let page = async |before| match log.read(&owner, id, before).await.unwrap() {
+        StudioAccessLog::On { entries, older, .. } => (entries, older),
+        StudioAccessLog::Off => panic!("the log is on"),
+    };
+
+    let mut seen = Vec::new();
+    let mut before = None;
+    let mut sizes = Vec::new();
+    loop {
+        let (entries, older) = page(before).await;
+        sizes.push(entries.len());
+        assert!(
+            entries
+                .windows(2)
+                .all(|w| (w[0].at, w[0].id) > (w[1].at, w[1].id))
+        );
+        seen.extend(entries.iter().map(|e| e.path.clone()));
+        match older {
+            Some(next) => {
+                assert_eq!(Some(next), entries.last().map(|e| e.id));
+                before = Some(next);
+            }
+            None => break,
+        }
+    }
+    assert_eq!(sizes, vec![100, 100, 50]);
+    seen.sort();
+    seen.dedup();
+    assert_eq!(seen.len(), 250, "no entry repeated or skipped");
+    assert!(!seen.contains(&"/other".to_owned()));
+
+    // Another project's entry id, or one that no longer exists, is not a
+    // way into that project's log: the page is empty.
+    let other_entry: i64 =
+        sqlx::query_scalar("SELECT id FROM studio_access_log WHERE project_id = $1")
+            .bind(other)
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(page(Some(other_entry)).await, (Vec::new(), None));
+    assert_eq!(page(Some(i64::MAX)).await, (Vec::new(), None));
 }

@@ -560,12 +560,25 @@ pub fn StudioLoginPanel(project: ProjectSummary) -> impl IntoView {
 pub fn StudioAccessPanel(project: ProjectSummary) -> impl IntoView {
     let id = project.id;
     let reload = RwSignal::new(0_u32);
-    let log = Resource::new(move || reload.get(), move |_| get_studio_access_log(id));
+    // Where each page after the newest starts; the last one is shown. Only
+    // one page of entries is held in the browser at a time.
+    let pages = RwSignal::new(Vec::<i64>::new());
+    let log = Resource::new(
+        move || (reload.get(), pages.with(|pages| pages.last().copied())),
+        move |(_, before)| get_studio_access_log(id, before),
+    );
     view! {
         <section class="panel" aria-labelledby="studio-log-title">
             <div class="section-header">
                 <h2 class="section-title" id="studio-log-title">"Studio access log"</h2>
-                <button type="button" class="button" on:click=move |_| reload.update(|n| *n = n.wrapping_add(1))>
+                <button
+                    type="button"
+                    class="button"
+                    on:click=move |_| {
+                        pages.set(Vec::new());
+                        reload.update(|n| *n = n.wrapping_add(1));
+                    }
+                >
                     "Refresh"
                 </button>
             </div>
@@ -578,8 +591,8 @@ pub fn StudioAccessPanel(project: ProjectSummary) -> impl IntoView {
                         </p>
                     }
                     .into_any(),
-                    Ok(StudioAccessLog::On { retention_days, entries }) => {
-                        access_log_view(retention_days, entries).into_any()
+                    Ok(StudioAccessLog::On { retention_days, entries, older }) => {
+                        access_log_view(retention_days, entries, older, pages).into_any()
                     }
                     Err(err) => view! {
                         <StatePanel
@@ -595,13 +608,61 @@ pub fn StudioAccessPanel(project: ProjectSummary) -> impl IntoView {
     }
 }
 
-fn access_log_view(retention_days: u16, entries: Vec<StudioAccessEntry>) -> impl IntoView {
+fn access_log_view(
+    retention_days: u16,
+    entries: Vec<StudioAccessEntry>,
+    older: Option<i64>,
+    pages: RwSignal<Vec<i64>>,
+) -> impl IntoView {
     let days = if retention_days == 1 { "day" } else { "days" };
+    let page = pages.with_untracked(Vec::len) + 1;
+    let first_page = page == 1;
+    let pager = (!first_page || older.is_some()).then(|| {
+        view! {
+            <nav class="pager" aria-label="Access log pages">
+                <button
+                    type="button"
+                    class="button"
+                    disabled=first_page
+                    on:click=move |_| pages.set(Vec::new())
+                >
+                    "Newest"
+                </button>
+                <button
+                    type="button"
+                    class="button"
+                    disabled=first_page
+                    on:click=move |_| pages.update(|pages| {
+                        pages.pop();
+                    })
+                >
+                    "Newer"
+                </button>
+                <span class="field-hint" aria-live="polite">{format!("Page {page}")}</span>
+                <button
+                    type="button"
+                    class="button"
+                    disabled=older.is_none()
+                    on:click=move |_| {
+                        if let Some(before) = older {
+                            pages.update(|pages| pages.push(before));
+                        }
+                    }
+                >
+                    "Older"
+                </button>
+            </nav>
+        }
+    });
     if entries.is_empty() {
+        let text = if first_page {
+            format!("No Studio requests in the last {retention_days} {days}.")
+        } else {
+            "No older requests are left. The oldest ones may have passed the retention period since this page was opened.".to_owned()
+        };
         return view! {
-            <p class="section-text">
-                {format!("No Studio requests in the last {retention_days} {days}.")}
-            </p>
+            <p class="section-text">{text}</p>
+            {pager}
         }
         .into_any();
     }
@@ -609,13 +670,13 @@ fn access_log_view(retention_days: u16, entries: Vec<StudioAccessEntry>) -> impl
     view! {
         <p class="section-text">
             {format!(
-                "The newest {STUDIO_ACCESS_PAGE} requests at most, from the last {retention_days} {days}. \
+                "Requests from the last {retention_days} {days}, newest first, {STUDIO_ACCESS_PAGE} per page. \
                  Only the method, path, and status are kept; query strings, SQL, and data are not."
             )}
         </p>
         <div class="table-wrap" role="region" aria-label="Studio requests" tabindex="0">
             <table class="data-table">
-                <caption class="visually-hidden">"Studio requests, newest first"</caption>
+                <caption class="visually-hidden">{format!("Studio requests, newest first, page {page}")}</caption>
                 <thead>
                     <tr>
                         <th scope="col">"Time (UTC)"</th>
@@ -627,6 +688,7 @@ fn access_log_view(retention_days: u16, entries: Vec<StudioAccessEntry>) -> impl
                 <tbody>{rows}</tbody>
             </table>
         </div>
+        {pager}
     }
     .into_any()
 }

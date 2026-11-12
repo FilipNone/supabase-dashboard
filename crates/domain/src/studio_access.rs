@@ -57,6 +57,8 @@ pub struct NewStudioAccess {
 /// One recorded request as the settings page shows it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StudioAccessEntry {
+    /// The entry's sequence number, for paging. Not a secret.
+    pub id: i64,
     pub at: OffsetDateTime,
     /// `None` when the account no longer exists.
     pub member: Option<StudioAccessMember>,
@@ -80,6 +82,9 @@ pub enum StudioAccessLog {
         retention_days: u16,
         /// Newest first, at most [`STUDIO_ACCESS_PAGE`].
         entries: Vec<StudioAccessEntry>,
+        /// The `id` of the last entry, when older entries follow; pass it
+        /// back to read the next page.
+        older: Option<i64>,
     },
 }
 

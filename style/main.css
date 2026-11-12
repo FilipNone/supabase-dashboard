@@ -446,6 +446,7 @@ td { vertical-align: middle; }
 .card-stack > * { max-width: 100%; }
 .card-meta { color: var(--color-text-muted); font-size: var(--text-sm); }
 .request-path { overflow-wrap: anywhere; }
+.pager { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); margin-top: var(--space-4); }
 .url-text { overflow-wrap: anywhere; font-family: var(--font-mono, ui-monospace, monospace); }
 .card-meta.url-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .checkbox-field { display: flex; align-items: flex-start; gap: var(--space-2); font-size: var(--text-sm); }

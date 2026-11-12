@@ -295,12 +295,17 @@ pub async fn get_project_health_history(id: Uuid) -> Result<HealthHistory, AppEr
         .await?)
 }
 
-/// The newest requests members sent through the project's Studio host,
-/// for owners and admins.
+/// Requests members sent through the project's Studio host, for owners and
+/// admins: the newest page, or the page older than entry `before`.
 #[server]
-pub async fn get_studio_access_log(id: Uuid) -> Result<StudioAccessLog, AppError> {
+pub async fn get_studio_access_log(
+    id: Uuid,
+    before: Option<i64>,
+) -> Result<StudioAccessLog, AppError> {
     let session = org_context::session()?;
-    Ok(org_context::studio_access()?.read(&session, id).await?)
+    Ok(org_context::studio_access()?
+        .read(&session, id, before)
+        .await?)
 }
 
 /// The last check of each project in an organization, in short. Projects

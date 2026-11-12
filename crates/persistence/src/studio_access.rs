@@ -54,15 +54,22 @@ impl Database {
         Ok(done.rows_affected())
     }
 
-    /// The newest `limit` entries of a project within `retention_days`.
+    /// The newest `limit` entries of a project within `retention_days`,
+    /// starting after the entry with id `before` when given. Entries are
+    /// ordered by time and then id, so a page boundary between entries with
+    /// the same time neither repeats nor skips one. An id that is not one
+    /// of this project's entries (another project's, or one already pruned)
+    /// gives an empty page.
     pub async fn list_studio_access(
         &self,
         project_id: Uuid,
         retention_days: u16,
+        before: Option<i64>,
         limit: u16,
     ) -> Result<Vec<StudioAccessEntry>, PersistenceError> {
         #[derive(sqlx::FromRow)]
         struct Row {
+            id: i64,
             at: OffsetDateTime,
             display_name: Option<String>,
             email: Option<String>,
@@ -71,20 +78,25 @@ impl Database {
             status: i16,
         }
         let rows: Vec<Row> = sqlx::query_as(
-            "SELECT l.at, a.display_name, a.email, l.method, l.path, l.status \
+            "SELECT l.id, l.at, a.display_name, a.email, l.method, l.path, l.status \
              FROM studio_access_log l LEFT JOIN accounts a ON a.id = l.account_id \
              WHERE l.project_id = $1 AND l.at >= now() - make_interval(days => $2) \
+               AND ($4::bigint IS NULL OR (l.at, l.id) < ( \
+                   SELECT c.at, c.id FROM studio_access_log c \
+                   WHERE c.id = $4 AND c.project_id = $1)) \
              ORDER BY l.at DESC, l.id DESC LIMIT $3",
         )
         .bind(project_id)
         .bind(i32::from(retention_days))
         .bind(i64::from(limit))
+        .bind(before)
         .fetch_all(&self.pool)
         .await
         .map_err(query_err)?;
         rows.into_iter()
             .map(|row| {
                 Ok(StudioAccessEntry {
+                    id: row.id,
                     at: row.at,
                     member: match (row.display_name, row.email) {
                         (Some(display_name), Some(email)) => Some(StudioAccessMember {

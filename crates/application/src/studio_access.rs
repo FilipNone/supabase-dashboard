@@ -67,11 +67,14 @@ impl StudioAccessService {
         self.retention_days
     }
 
-    /// The newest entries of one project, for its owners and admins.
+    /// One page of a project's entries, newest first, for its owners and
+    /// admins: the newest ones, or those older than the entry with id
+    /// `before`.
     pub async fn read(
         &self,
         current: &CurrentSession,
         project_id: Uuid,
+        before: Option<i64>,
     ) -> Result<StudioAccessLog, StudioAccessError> {
         let access = self
             .db
@@ -84,13 +87,26 @@ impl StudioAccessService {
         let Some(retention_days) = self.retention_days else {
             return Ok(StudioAccessLog::Off);
         };
-        let entries = self
+        // One more than a page tells whether an older page exists.
+        let mut entries = self
             .db
-            .list_studio_access(project_id, retention_days, STUDIO_ACCESS_PAGE)
+            .list_studio_access(
+                project_id,
+                retention_days,
+                before,
+                STUDIO_ACCESS_PAGE.saturating_add(1),
+            )
             .await?;
+        let older = if entries.len() > usize::from(STUDIO_ACCESS_PAGE) {
+            entries.truncate(usize::from(STUDIO_ACCESS_PAGE));
+            entries.last().map(|entry| entry.id)
+        } else {
+            None
+        };
         Ok(StudioAccessLog::On {
             retention_days,
             entries,
+            older,
         })
     }
 
