@@ -284,6 +284,26 @@ async fn fixture_studio_is_reached_through_the_proxy() {
         .collect();
     assert_eq!(slugs, ["hello"], "{functions}");
 
+    // The SQL editor's saved snippets live in the folder the fixture gives
+    // Studio; without it Studio answers 500 here.
+    let response = proxy
+        .forward(
+            &url,
+            &studio_login(),
+            None,
+            site,
+            get(
+                "/api/platform/projects/default/content/count?type=sql",
+                HeaderMap::new(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let counts: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(counts["private"].is_number(), "{counts}");
+
     // Without the right login the gateway refuses, and the refusal is
     // passed back as it is.
     let response = proxy

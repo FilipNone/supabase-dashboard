@@ -245,8 +245,13 @@ services:
       # Studio's Edge Functions page reads the functions from this folder,
       # mounted read-only as upstream does.
       EDGE_FUNCTIONS_MANAGEMENT_FOLDER: /app/edge-functions
+      # The SQL editor keeps saved snippets in this folder, as upstream
+      # does; here it lasts only as long as the container.
+      SNIPPETS_MANAGEMENT_FOLDER: /app/snippets
     volumes:
       - ./functions:/app/edge-functions:ro
+    tmpfs:
+      - /app/snippets
 
   # API gateway in front of auth and rest, as in a standard self-hosted
   # stack. Upstream defaults to Envoy and ships Kong as an override; the
