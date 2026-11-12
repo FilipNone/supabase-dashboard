@@ -28,10 +28,12 @@ use supabase_dashboard_adapters::{
 use supabase_dashboard_application::{
     auth::{AuthConfig, AuthError, AuthService, BootstrapError, PasswordResetError},
     connections::{ConnectionService, ScheduledChecks},
-    dokploy::{DokployCredentials, DokployService},
+    dokploy::{DokployConnector, DokployCredentials, DokployService},
+    jobs::{JobHandler, JobRunner, RunnerSettings},
     key_rotation::{RotationError, key_usage, reseal_credentials},
     organizations::OrganizationService,
     projects::ProjectService,
+    provisioning::{ComposeApi, ProvisionStackHandler},
     secrets::{CredentialCipher, KeyError},
     studio::StudioService,
     studio_access::{StudioAccessRecorder, StudioAccessService},
@@ -307,6 +309,8 @@ const MAX_DOKPLOY_KEY_FILE_BYTES: u64 = 4096;
 
 /// Longest pause between attempts to reach Dokploy at startup.
 const MAX_DOKPLOY_RETRY_PAUSE: Duration = Duration::from_secs(300);
+/// How long a stopping server waits for a running job step to save.
+const JOB_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 
 /// Warns when stored values are under a key other than the current one.
 async fn report_key_usage(db: &Database, cipher: &CredentialCipher) -> Result<(), StartupError> {
@@ -414,12 +418,12 @@ async fn run() -> Result<(), StartupError> {
     })?;
     // The deployment's Dokploy URL is enrolled, so it may be on loopback;
     // an administrator's is held to the same rules as project checks.
-    let dokploy_client = DokployClient::shared(DokploySettings {
+    let dokploy_client = Arc::new(DokployClient::new(DokploySettings {
         policy,
         extra_roots: extra_roots.clone(),
         enrolled_url: config.dokploy.as_ref().map(|dokploy| dokploy.url.clone()),
         ..DokploySettings::default()
-    })?;
+    })?);
     let studio = match (&config.studio_hosts, &config.public_url) {
         (Some(hosts), Some(public_url)) => {
             let service =
@@ -465,13 +469,36 @@ async fn run() -> Result<(), StartupError> {
     tokio::spawn(prune_studio_access(Arc::clone(&studio_access)));
 
     let dokploy = Arc::new(
-        DokployService::new(db.clone(), cipher.clone(), dokploy_client)
-            .with_public_host(config.public_url.as_ref().and_then(url::Url::host_str)),
+        DokployService::new(
+            db.clone(),
+            cipher.clone(),
+            Arc::clone(&dokploy_client) as Arc<dyn DokployConnector>,
+        )
+        .with_public_host(config.public_url.as_ref().and_then(url::Url::host_str)),
     );
     tokio::spawn(start_dokploy(
         Arc::clone(&dokploy),
         deployment_dokploy(&config)?,
     ));
+    // Provisioning jobs run in this process, one step at a time under a
+    // lease, so a job left by a stopped server resumes here.
+    let provision: Arc<dyn JobHandler> = Arc::new(ProvisionStackHandler::new(
+        db.clone(),
+        cipher.clone(),
+        Arc::clone(&dokploy),
+        dokploy_client as Arc<dyn ComposeApi>,
+        Arc::clone(&probe),
+    ));
+    let runner = JobRunner::new(db.clone(), vec![provision], RunnerSettings::default());
+    let (stop_jobs, mut jobs_stopped) = tokio::sync::watch::channel(false);
+    let jobs = tokio::spawn(async move {
+        runner
+            .run(async move {
+                // An error means the sender is gone, which is also a stop.
+                let _ = jobs_stopped.changed().await;
+            })
+            .await;
+    });
     let connections = Arc::new(ConnectionService::new(db.clone(), cipher, probe));
     match config.health_check_interval {
         Some(interval) => {
@@ -528,6 +555,15 @@ async fn run() -> Result<(), StartupError> {
         .await
         .map_err(StartupError::Serve)?;
 
+    // A step in progress finishes and saves; the runner stops before the
+    // next claim. Its lease lets another server resume a job cut short.
+    let _ = stop_jobs.send(true);
+    if tokio::time::timeout(JOB_SHUTDOWN_GRACE, jobs)
+        .await
+        .is_err()
+    {
+        tracing::warn!("a job step was still running at shutdown; it resumes after its lease");
+    }
     tracing::info!("draining database connections");
     db.close().await;
     tracing::info!("shutdown complete");

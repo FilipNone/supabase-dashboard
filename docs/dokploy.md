@@ -83,7 +83,7 @@ The variables are `POSTGRES_PASSWORD`, `JWT_SECRET`, `ANON_KEY`, `SERVICE_ROLE_K
 
 ### The provisioning job
 
-`crates/application/src/provisioning` holds the job that will create stacks; nothing in the server starts it yet. An owner or admin picks a name, a host, and one of the organization's targets. The server checks the role, the host (a lowercase name of two or more labels, not an IP address), and the target, generates the stack's secrets, and queues a job with the secrets encrypted apart from its data. The job then runs these steps, saving after each:
+`crates/application/src/provisioning` holds the job that creates stacks. The server runs it in its own process, and a job left by a stopped server resumes once its lease runs out; no page queues one yet. An owner or admin picks a name, a host, and one of the organization's targets. The server checks the role, the host (a lowercase name of two or more labels, not an IP address), and the target, generates the stack's secrets, and queues a job with the secrets encrypted apart from its data. The job then runs these steps, saving after each:
 
 1. Check that the account that asked may still register projects in the organization, and that the target is still allowed.
 2. Look up the compose service by its name, `sd-` and the job ID, and create it only if there is none.
