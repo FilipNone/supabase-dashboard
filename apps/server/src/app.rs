@@ -1750,18 +1750,76 @@ mod tests {
         assert!(body.contains(r#""result":"confirmed""#), "{body}");
         let launch = format!("/dashboard/project/{id}");
 
-        // A viewer is refused before anything reaches the gateway.
+        // A viewer is refused before anything reaches the gateway, and a
+        // non-member sees the same page as for a project that does not exist.
         let (parts, _) = send(&router, get_with_cookie(&launch, &bob)).await;
         assert_eq!(
             location(&parts),
             format!("/dashboard/org/{acme_id}/projects/{id}?studio=forbidden")
         );
+        let mut members = Vec::new();
+        for (name, role) in [
+            ("carol", Some("admin")),
+            ("dave", Some("developer")),
+            ("erin", None),
+        ] {
+            let account: uuid::Uuid = sqlx::query_scalar(
+                "INSERT INTO accounts (id, email, display_name, password_hash) \
+                 SELECT gen_random_uuid(), $1, $2, password_hash FROM accounts LIMIT 1 \
+                 RETURNING id",
+            )
+            .bind(format!("{name}@example.test"))
+            .bind(name)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            if let Some(role) = role {
+                sqlx::query(
+                    "INSERT INTO organization_members (organization_id, account_id, role) \
+                     VALUES ($1::uuid, $2, $3)",
+                )
+                .bind(&acme_id)
+                .bind(account)
+                .bind(role)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            }
+            let cookie = sign_in_cookie(&router, &format!("{name}%40example.test")).await;
+            members.push((name, role.is_some(), cookie));
+        }
+        let host = hosts.host(id);
+        for (name, member, cookie) in &members {
+            let (parts, body) = send(&router, get_with_cookie(&launch, cookie)).await;
+            if !member {
+                assert_eq!(parts.status, StatusCode::NOT_FOUND, "{name}");
+                assert!(!body.contains(&host), "{name}");
+                continue;
+            }
+            // Admins and developers reach the fixture's Studio page.
+            let target = url::Url::parse(location(&parts)).unwrap();
+            let handoff = format!("{}?{}", target.path(), target.query().unwrap());
+            let (parts, _) = send(&router, studio_get(&host, &handoff, None)).await;
+            assert_eq!(location(&parts), "/project/default", "{name}");
+            let cookie = parts.headers[header::SET_COOKIE]
+                .to_str()
+                .unwrap()
+                .split(';')
+                .next()
+                .unwrap()
+                .to_owned();
+            let (parts, _) = send(
+                &router,
+                studio_get(&host, "/project/default", Some(&cookie)),
+            )
+            .await;
+            assert_eq!(parts.status, StatusCode::OK, "{name}");
+        }
 
         // The owner is handed over to the project's Studio host.
         let (parts, _) = send(&router, get_with_cookie(&launch, &alice)).await;
         let target = url::Url::parse(location(&parts)).unwrap();
         let handoff = format!("{}?{}", target.path(), target.query().unwrap());
-        let host = hosts.host(id);
         let (parts, _) = send(&router, studio_get(&host, &handoff, None)).await;
         assert_eq!(location(&parts), "/project/default");
         let studio_cookie = parts.headers[header::SET_COOKIE]
