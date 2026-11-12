@@ -1015,6 +1015,19 @@ mod tests {
         let (parts, body) = send(&router, get_with_cookie(&page, &alice)).await;
         assert_eq!(parts.status, StatusCode::OK);
         bodies.push(body);
+        // The setup page registration leads to shows the same forms in order
+        // and never the stored value either.
+        let setup = format!("/dashboard/org/{acme_id}/projects/{project_id}/setup");
+        let (parts, body) = send(&router, get_with_cookie(&setup, &alice)).await;
+        assert_eq!(parts.status, StatusCode::OK);
+        assert!(body.contains("Set up this project"), "{body}");
+        let keys = body.find(r#"id="api-keys""#).expect("api keys step");
+        let login = body
+            .find(r#"id="studio-login""#)
+            .expect("studio login step");
+        let check = body.find(r#"id="first-check""#).expect("first check step");
+        assert!(keys < login && login < check);
+        bodies.push(body);
         for body in &bodies {
             assert!(!body.contains("redaction-marker"), "{body}");
         }

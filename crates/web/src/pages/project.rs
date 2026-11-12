@@ -113,7 +113,10 @@ pub fn NewProjectPage() -> impl IntoView {
                 refresh.projects_changed();
             }
             navigate(
-                &project_path(project.organization_id, project.id),
+                &format!(
+                    "{}/setup",
+                    project_path(project.organization_id, project.id)
+                ),
                 Default::default(),
             );
         }
@@ -372,6 +375,7 @@ fn setup_state(state: &CredentialState) -> Option<(&'static str, &'static str)> 
 fn SetupChecklist(project: ProjectSummary) -> impl IntoView {
     let id = project.id;
     let settings = format!("{}/settings", project_path(project.organization_id, id));
+    let setup = format!("{}/setup", project_path(project.organization_id, id));
     let can_save = project.role.allows(Permission::ProjectCredentialsReplace);
     let overview = Resource::new(move || id, get_project_credentials);
     view! {
@@ -434,9 +438,14 @@ fn SetupChecklist(project: ProjectSummary) -> impl IntoView {
                         "This dashboard server has no encryption key configured, so nothing can be saved yet. Set SUPABASE_DASHBOARD_SECRET_KEY_FILE and restart it."
                     </p>
                 });
-                let who = (!can_save).then(|| view! {
-                    <p class="field-hint">"An owner or admin can save them."</p>
-                });
+                let who = if can_save {
+                    view! {
+                        <p><a href=setup.clone()>"Go through the setup steps"</a></p>
+                    }
+                    .into_any()
+                } else {
+                    view! { <p class="field-hint">"An owner or admin can save them."</p> }.into_any()
+                };
                 Some(view! {
                     <section class="panel panel-warning" aria-labelledby="setup-title">
                         <h2 class="section-title" id="setup-title">"Finish connecting this project"</h2>
@@ -454,6 +463,59 @@ fn SetupChecklist(project: ProjectSummary) -> impl IntoView {
 
 fn loaded_project(ctx: ProjectContext) -> Option<ProjectSummary> {
     ctx.project.get().and_then(Result::ok)
+}
+
+/// `/dashboard/org/:org_id/projects/:project_id/setup`: where registering
+/// a project leads. The steps that connect it, in the order they depend on
+/// each other, each saved on its own: the API keys, the project's own
+/// certificate authorities when its gateway uses HTTPS, the Studio login
+/// (tried against the gateway, so after the authorities), and a first
+/// check. The same forms are on the settings page.
+#[component]
+pub fn ProjectSetupPage() -> impl IntoView {
+    let Some(ctx) = use_context::<ProjectContext>() else {
+        return ().into_any();
+    };
+    view! {
+        {move || loaded_project(ctx).map(|project| {
+            let https = project.api_url.is_encrypted();
+            let can_save = project.role.allows(Permission::ProjectCredentialsReplace);
+            let overview = project_path(project.organization_id, project.id);
+            let authorities_step = https.then(|| view! {
+                <li>
+                    <a href="#authorities">"Certificate authorities"</a>
+                    " (optional): only if the gateway's certificate comes from a private authority."
+                </li>
+            });
+            let who = (!can_save).then(|| view! {
+                <p class="field-hint">"Only owners and administrators can save these. You can still run a check."</p>
+            });
+            view! {
+                <section class="panel" aria-labelledby="setup-steps-title">
+                    <h2 class="section-title" id="setup-steps-title">"Set up this project"</h2>
+                    <p class="section-text">
+                        "The project is registered. These steps give the dashboard what it needs to check the stack and open its Studio. Each one saves on its own, and the same forms are on the Settings tab."
+                    </p>
+                    <ol class="setup-progress">
+                        <li><a href="#api-keys">"API keys"</a>": the anon and service role keys, used by the service checks."</li>
+                        {authorities_step}
+                        <li><a href="#studio-login">"Studio login"</a>": the gateway's Studio user name and password, so members can open Studio."</li>
+                        <li><a href="#first-check">"First check"</a>": run Check now to confirm the keys work."</li>
+                    </ol>
+                    {who}
+                </section>
+                <ApiKeysPanel project=project.clone()/>
+                {https.then(|| view! { <AuthoritiesPanel project=project.clone()/> })}
+                <StudioLoginPanel project=project.clone()/>
+                <div id="first-check">
+                    <HealthPanel project=project.clone()/>
+                </div>
+                <p><a class="button" href=overview>"Done, go to the overview"</a></p>
+            }
+            .into_any()
+        })}
+    }
+    .into_any()
 }
 
 /// Registry details and the last service check.
