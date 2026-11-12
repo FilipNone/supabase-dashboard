@@ -19,7 +19,7 @@ use supabase_dashboard_domain::{
     authz::OrgRole,
     connection::{CredentialKind, ServiceCheck, ServiceStatus, StackService, check_studio_login},
     project::ProjectUrl,
-    studio_access::{NewStudioAccess, StudioAccessLog, loggable_path},
+    studio_access::{NewStudioAccess, STUDIO_ACCESS_EXPORT_MAX, StudioAccessLog, loggable_path},
 };
 use supabase_dashboard_persistence::{Database, accounts::AccountRecord};
 use uuid::Uuid;
@@ -664,4 +664,54 @@ async fn the_access_log_filters_by_member() {
             .await,
         Err(StudioAccessError::Forbidden)
     ));
+}
+
+#[tokio::test]
+async fn exports_stop_at_the_row_limit() {
+    let Some(scratch) = ScratchDb::create("studio_access_export").await else {
+        return;
+    };
+    let f = setup(&scratch).await;
+    let owner = account(&f.db, "Owner").await;
+    let (_, id) = project(&f, &owner, "Acme").await;
+    let extra = 5;
+    sqlx::query(
+        "INSERT INTO studio_access_log (project_id, account_id, at, method, path, status) \
+         SELECT $1, $2, now() - make_interval(secs => n), 'GET', '/p/' || n, 200 \
+         FROM generate_series(1, $3) AS n",
+    )
+    .bind(id)
+    .bind(owner.account.id)
+    .bind(i32::try_from(STUDIO_ACCESS_EXPORT_MAX + extra).unwrap())
+    .execute(f.db.pool())
+    .await
+    .unwrap();
+    let log = StudioAccessService::new(f.db.clone(), Some(7));
+    let export = log.export(&owner, id, None, ctx()).await.unwrap().unwrap();
+    assert_eq!(export.entries.len(), STUDIO_ACCESS_EXPORT_MAX);
+    assert!(export.truncated);
+    assert_eq!(export.entries[0].path, "/p/1", "newest first");
+    assert!(
+        export
+            .entries
+            .windows(2)
+            .all(|w| (w[0].at, w[0].id) > (w[1].at, w[1].id))
+    );
+
+    // Exactly at the limit is not cut.
+    sqlx::query(
+        "DELETE FROM studio_access_log WHERE id IN \
+         (SELECT id FROM studio_access_log ORDER BY at LIMIT $1)",
+    )
+    .bind(i64::try_from(extra).unwrap())
+    .execute(f.db.pool())
+    .await
+    .unwrap();
+    let export = log.export(&owner, id, None, ctx()).await.unwrap().unwrap();
+    assert_eq!(export.entries.len(), STUDIO_ACCESS_EXPORT_MAX);
+    assert!(!export.truncated);
+
+    // With the log off there is nothing to export.
+    let off = StudioAccessService::new(f.db.clone(), None);
+    assert_eq!(off.export(&owner, id, None, ctx()).await.unwrap(), None);
 }

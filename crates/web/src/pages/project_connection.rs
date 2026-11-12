@@ -17,7 +17,10 @@ use supabase_dashboard_domain::{
         ServiceStatus, SkipReason, StackService, VersionSupport,
     },
     project::ProjectSummary,
-    studio_access::{STUDIO_ACCESS_PAGE, StudioAccessEntry, StudioAccessLog, StudioAccessMember},
+    studio_access::{
+        STUDIO_ACCESS_EXPORT_MAX, STUDIO_ACCESS_PAGE, StudioAccessEntry, StudioAccessLog,
+        StudioAccessMember,
+    },
 };
 
 use crate::{
@@ -695,7 +698,7 @@ pub fn StudioAccessPanel(project: ProjectSummary) -> impl IntoView {
             {move || {
                 let shown = member.with(Option::is_some)
                     || choices.with(|(members, _)| !members.is_empty());
-                shown.then(|| access_member_filter(member, choices, pages).into_any())
+                shown.then(|| access_member_filter(id, member, choices, pages).into_any())
             }}
             <Transition fallback=|| view! { <p class="loading" role="status">"Loading the access log…"</p> }>
                 {move || log.get().map(|result| match result {
@@ -727,6 +730,7 @@ pub fn StudioAccessPanel(project: ProjectSummary) -> impl IntoView {
 /// Picks whose requests the log shows. Changing it starts again from the
 /// newest page.
 fn access_member_filter(
+    project_id: Uuid,
     member: RwSignal<Option<Uuid>>,
     choices: RwSignal<(Vec<StudioAccessMember>, bool)>,
     pages: RwSignal<Vec<i64>>,
@@ -748,6 +752,13 @@ fn access_member_filter(
                 })
                 .collect_view()
         })
+    };
+    let export_href = move || {
+        let base = format!("/dashboard/project/{project_id}/studio-access.csv");
+        match member.get() {
+            Some(account_id) => format!("{base}?member={account_id}"),
+            None => base,
+        }
     };
     let more = move || {
         choices.with(|(_, more)| *more).then(|| {
@@ -773,9 +784,30 @@ fn access_member_filter(
                     {options}
                 </select>
             </label>
+            // A file download, not a page: the router must not handle it.
+            <a class="button" rel="external" download href=export_href>"Export CSV"</a>
         </div>
         {more}
+        <p class="field-hint">
+            {format!(
+                "The export holds the newest {} requests at most, for the member chosen above.",
+                grouped(STUDIO_ACCESS_EXPORT_MAX)
+            )}
+        </p>
     }
+}
+
+/// `10000` as `10,000`.
+fn grouped(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn access_log_view(
@@ -894,5 +926,18 @@ fn access_row(entry: StudioAccessEntry) -> impl IntoView {
             <td class="request"><code class="request-path">{format!("{} {}", entry.method, entry.path)}</code></td>
             <td><span class=class>{entry.status}</span></td>
         </tr>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::grouped;
+
+    #[test]
+    fn numbers_are_grouped_by_thousands() {
+        assert_eq!(grouped(0), "0");
+        assert_eq!(grouped(999), "999");
+        assert_eq!(grouped(10_000), "10,000");
+        assert_eq!(grouped(1_234_567), "1,234,567");
     }
 }

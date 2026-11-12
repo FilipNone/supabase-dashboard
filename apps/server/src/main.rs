@@ -1,5 +1,6 @@
 //! supabase-dashboard HTTP server.
 
+mod access_export;
 mod app;
 mod cli;
 mod config;

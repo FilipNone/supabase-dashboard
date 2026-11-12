@@ -379,7 +379,7 @@ fn plain(status: StatusCode, message: &'static str) -> Response {
     (status, [(header::CACHE_CONTROL, "no-store")], message).into_response()
 }
 
-fn page(status: StatusCode, title: &str, body: &str) -> Response {
+pub(crate) fn page(status: StatusCode, title: &str, body: &str) -> Response {
     let html = format!(
         "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
@@ -391,7 +391,7 @@ fn page(status: StatusCode, title: &str, body: &str) -> Response {
     (status, [(header::CACHE_CONTROL, "no-store")], Html(html)).into_response()
 }
 
-fn not_found_page() -> Response {
+pub(crate) fn not_found_page() -> Response {
     page(
         StatusCode::NOT_FOUND,
         "Project unavailable",

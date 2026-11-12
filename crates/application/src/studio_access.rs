@@ -15,15 +15,18 @@ use std::sync::{
 use supabase_dashboard_domain::{
     authz::Permission,
     studio_access::{
-        NewStudioAccess, STUDIO_ACCESS_MAX_RETENTION_DAYS, STUDIO_ACCESS_MEMBER_CHOICES,
-        STUDIO_ACCESS_PAGE, StudioAccessLog,
+        NewStudioAccess, STUDIO_ACCESS_EXPORT_MAX, STUDIO_ACCESS_MAX_RETENTION_DAYS,
+        STUDIO_ACCESS_MEMBER_CHOICES, STUDIO_ACCESS_PAGE, StudioAccessEntry, StudioAccessLog,
     },
 };
-use supabase_dashboard_persistence::{Database, PersistenceError};
+use supabase_dashboard_persistence::{
+    Database, PersistenceError,
+    audit::{AuditEvent, AuditOutcome},
+};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::auth::CurrentSession;
+use crate::auth::{CurrentSession, RequestContext};
 
 /// Requests waiting to be written. Beyond this, new entries are dropped.
 pub const QUEUE_CAPACITY: usize = 4096;
@@ -43,6 +46,18 @@ pub enum StudioAccessError {
     Forbidden,
     #[error(transparent)]
     Internal(#[from] PersistenceError),
+}
+
+/// Rows read per query when exporting.
+const EXPORT_BATCH: u16 = 1000;
+
+/// The entries of one export, newest first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StudioAccessExport {
+    pub entries: Vec<StudioAccessEntry>,
+    /// Older entries within the retention period were left out to keep the
+    /// export at [`STUDIO_ACCESS_EXPORT_MAX`].
+    pub truncated: bool,
 }
 
 /// Reading and pruning the log.
@@ -123,6 +138,72 @@ impl StudioAccessService {
             members,
             more_members,
         })
+    }
+
+    /// The newest entries of a project, at most
+    /// [`STUDIO_ACCESS_EXPORT_MAX`], only `member`'s when given, for its
+    /// owners and admins. `None` when the log is off. Audited as
+    /// `studio_access.export`, including refusals.
+    pub async fn export(
+        &self,
+        current: &CurrentSession,
+        project_id: Uuid,
+        member: Option<Uuid>,
+        ctx: RequestContext<'_>,
+    ) -> Result<Option<StudioAccessExport>, StudioAccessError> {
+        const ACTION: &str = "studio_access.export";
+        let access = self
+            .db
+            .find_project_access(project_id, current.account.id)
+            .await?
+            .ok_or(StudioAccessError::NotFound)?;
+        let audit = |outcome| AuditEvent {
+            actor_account_id: Some(current.account.id),
+            action: ACTION,
+            target_type: Some("project"),
+            target_id: Some(project_id.to_string()),
+            outcome,
+            request_id: ctx.request_id,
+        };
+        if !access.role.allows(Permission::AuditRead) {
+            if let Err(err) = self
+                .db
+                .record_audit_event(&audit(AuditOutcome::Denied))
+                .await
+            {
+                tracing::error!(error = %err, "could not record audit event");
+            }
+            return Err(StudioAccessError::Forbidden);
+        }
+        let Some(retention_days) = self.retention_days else {
+            return Ok(None);
+        };
+        // One more than the limit tells whether entries were left out.
+        let wanted = STUDIO_ACCESS_EXPORT_MAX.saturating_add(1);
+        let mut entries: Vec<StudioAccessEntry> = Vec::new();
+        let mut before = None;
+        loop {
+            let left = wanted.saturating_sub(entries.len());
+            let batch = u16::try_from(left)
+                .unwrap_or(EXPORT_BATCH)
+                .min(EXPORT_BATCH);
+            let page = self
+                .db
+                .list_studio_access(project_id, retention_days, member, before, batch)
+                .await?;
+            let got = page.len();
+            before = page.last().map(|entry| entry.id);
+            entries.extend(page);
+            if got < usize::from(batch) || entries.len() >= wanted {
+                break;
+            }
+        }
+        let truncated = entries.len() > STUDIO_ACCESS_EXPORT_MAX;
+        entries.truncate(STUDIO_ACCESS_EXPORT_MAX);
+        self.db
+            .record_audit_event(&audit(AuditOutcome::Success))
+            .await?;
+        Ok(Some(StudioAccessExport { entries, truncated }))
     }
 
     /// Deletes entries past the retention period. With the log turned off,

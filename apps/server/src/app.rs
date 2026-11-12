@@ -25,7 +25,7 @@ use tower_http::{
     trace::TraceLayer,
 };
 
-use crate::{error, health, session, state::AppState, studio};
+use crate::{access_export, error, health, session, state::AppState, studio};
 
 pub struct HttpLimits {
     pub max_body_bytes: usize,
@@ -70,6 +70,10 @@ pub fn router(state: AppState, limits: &HttpLimits) -> Router {
         .route("/auth/sign-in", post(session::sign_in))
         .route("/auth/sign-out", post(session::sign_out))
         .route("/dashboard/project/{project_id}", get(studio::launch))
+        .route(
+            "/dashboard/project/{project_id}/studio-access.csv",
+            get(access_export::studio_access_csv_download),
+        )
         .route("/api/{*rest}", any(error::api_not_found))
         .leptos_routes_with_context(
             &state,
@@ -203,10 +207,18 @@ mod tests {
         db: Database,
         cipher: Option<supabase_dashboard_application::secrets::CredentialCipher>,
     ) -> Router {
+        router_with_options(db, cipher, None).await
+    }
+
+    async fn router_with_options(
+        db: Database,
+        cipher: Option<supabase_dashboard_application::secrets::CredentialCipher>,
+        access_log_days: Option<u16>,
+    ) -> Router {
         let auth = AuthService::new(db.clone(), AuthConfig::default())
             .await
             .unwrap();
-        let studio_access = Arc::new(StudioAccessService::new(db.clone(), None));
+        let studio_access = Arc::new(StudioAccessService::new(db.clone(), access_log_days));
         let state = AppState {
             leptos_options: LeptosOptions::builder()
                 .output_name("supabase-dashboard")
@@ -767,6 +779,140 @@ mod tests {
 
         db.close().await;
         scratch.drop().await;
+    }
+
+    #[tokio::test]
+    async fn the_access_log_downloads_as_csv_for_owners_only() {
+        let Some(scratch) = ScratchDb::create("http_access_csv").await else {
+            return;
+        };
+        let db = Database::connect(&scratch.settings).await.unwrap();
+        db.migrate().await.unwrap();
+        let router = router_with_options(db.clone(), None, Some(7)).await;
+        AuthService::new(db.clone(), AuthConfig::default())
+            .await
+            .unwrap()
+            .bootstrap_owner(
+                "alice@example.test",
+                "Alice",
+                &SecretString::from("correct horse battery staple"),
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO accounts (id, email, display_name, password_hash) \
+             SELECT gen_random_uuid(), 'bob@example.test', '=cmd|calc', password_hash \
+             FROM accounts",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let alice = sign_in_cookie(&router, "alice%40example.test").await;
+        let bob = sign_in_cookie(&router, "bob%40example.test").await;
+        let (_, body) = send(
+            &router,
+            form_post(CreateOrganization::PATH, "name=Acme", Some(&alice)),
+        )
+        .await;
+        let org: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let org_id = org["id"].as_str().unwrap().to_owned();
+        let (parts, body) = send(
+            &router,
+            form_post(
+                RegisterProject::PATH,
+                &format!(
+                    "organization_id={org_id}&name=Lab&api_url=http%3A%2F%2F10.0.0.5%3A8000\
+                     &allow_unencrypted=true"
+                ),
+                Some(&alice),
+            ),
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        let project: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let project_id = project["id"].as_str().unwrap().to_owned();
+        sqlx::query(
+            "INSERT INTO organization_members (organization_id, account_id, role) \
+             SELECT $1::uuid, id, 'viewer' FROM accounts WHERE email = 'bob@example.test'",
+        )
+        .bind(&org_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO studio_access_log (project_id, account_id, at, method, path, status) \
+             SELECT $1::uuid, a.id, now() - make_interval(secs => n), 'GET', '/p/' || n, 200 \
+             FROM accounts a, generate_series(1, 3) AS n",
+        )
+        .bind(&project_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let path = format!("/dashboard/project/{project_id}/studio-access.csv");
+
+        let (parts, body) = send(&router, get_with_cookie(&path, &alice)).await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        assert_eq!(
+            parts.headers[header::CONTENT_TYPE],
+            "text/csv; charset=utf-8"
+        );
+        assert_eq!(
+            parts.headers[header::CONTENT_DISPOSITION],
+            format!("attachment; filename=\"studio-access-{project_id}.csv\"").as_str()
+        );
+        assert_eq!(parts.headers[header::CACHE_CONTROL], "no-store");
+        let lines: Vec<_> = body.split("\r\n").filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines[0], "id,time_utc,member,email,method,path,status");
+        assert_eq!(lines.len(), 7, "{body}");
+        // Bob's display name is defused, not a formula.
+        assert!(body.contains("\"'=cmd|calc\",bob@example.test"), "{body}");
+
+        // One member's requests only.
+        let bob_id: uuid::Uuid =
+            sqlx::query_scalar("SELECT id FROM accounts WHERE email = 'bob@example.test'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let (parts, body) = send(
+            &router,
+            get_with_cookie(&format!("{path}?member={bob_id}"), &alice),
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::OK);
+        assert_eq!(body.matches("bob@example.test").count(), 3, "{body}");
+        assert!(!body.contains("alice@example.test"));
+        let (parts, _) = send(
+            &router,
+            get_with_cookie(&format!("{path}?member=nope"), &alice),
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::BAD_REQUEST);
+
+        // A viewer is refused, and so is anyone outside the organization.
+        let (parts, body) = send(&router, get_with_cookie(&path, &bob)).await;
+        assert_eq!(parts.status, StatusCode::FORBIDDEN);
+        assert!(!body.contains("/p/1"));
+        let elsewhere = format!(
+            "/dashboard/project/{}/studio-access.csv",
+            uuid::Uuid::now_v7()
+        );
+        let (parts, _) = send(&router, get_with_cookie(&elsewhere, &alice)).await;
+        assert_eq!(parts.status, StatusCode::NOT_FOUND);
+        // Without a session, the sign-in page.
+        let (parts, _) = send(&router, get(&path)).await;
+        assert_eq!(parts.status, StatusCode::SEE_OTHER);
+        assert!(location(&parts).starts_with("/dashboard/sign-in"));
+
+        let audited: Vec<(String, String)> = sqlx::query_as(
+            "SELECT outcome, target_id FROM audit_events \
+             WHERE action = 'studio_access.export' ORDER BY id",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        let outcomes: Vec<_> = audited.iter().map(|(o, _)| o.as_str()).collect();
+        assert_eq!(outcomes, ["success", "success", "denied"]);
+        assert!(audited.iter().all(|(_, target)| *target == project_id));
     }
 
     #[tokio::test]
