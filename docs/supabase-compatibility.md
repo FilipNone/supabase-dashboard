@@ -16,7 +16,7 @@ Versions match the upstream `docker/docker-compose.yml` in supabase/supabase on 
 | Studio | `supabase/studio:2026.11.02-sha-a05e7ec` (pinned 2026-11-09) | `studio` | none: only through the gateway |
 | Storage | `supabase/storage-api:v1.89.12` (pinned 2026-11-09; file backend, no image transformations) | `storage` | none: only through the gateway |
 | Realtime | `supabase/realtime:v2.148.3` (pinned 2026-11-09) | `realtime` | none: only through the gateway |
-| Edge Functions | `supabase/edge-runtime:v1.77.9` (pinned 2026-11-12; upstream's `main` router with `VERIFY_JWT` on, no user functions) | `functions` | none: only through the gateway |
+| Edge Functions | `supabase/edge-runtime:v1.77.9` (pinned 2026-11-12; upstream's `main` router with `VERIFY_JWT` on, and one synthetic function, `hello`, that returns a fixed body; Studio reads the same folder read-only) | `functions` | none: only through the gateway |
 
 Upstream now defaults to an Envoy gateway and keeps Kong as an alternative. The fixture uses Kong with a reduced `api/kong.yml` (Auth, REST, Storage, Realtime, and Edge Functions routes, legacy JWT API keys, and the basic-auth catch-all route to Studio) because its configuration is much smaller; the routes, key checks, and Studio login match upstream's. The Studio login is `DASHBOARD_USERNAME` and `DASHBOARD_PASSWORD` in `fixture.env`. An Envoy fixture is still to do.
 
@@ -57,6 +57,7 @@ docker compose -p sd-fixture down -v
 | Studio pages in a browser through the dashboard: Home, Table editor (a table and row created through the SQL API are listed), SQL editor, Auth users | Checked by hand in headless Chromium on 2026-11-09, light and dark themes, at 1280×720; no page errors | Not automated |
 | Studio's Storage buckets page through the dashboard (bucket list loads through Studio's API), and a file upload into a bucket | Bucket list checked by hand in Chromium on 2026-11-09; upload checked in headless Chromium on 2026-11-12 with a synthetic 23-byte file, which the Storage API then listed | Not automated. Studio lists objects through its own API on the Studio host, but sends the upload from the browser straight to the stack's public API URL (`/storage/v1/upload/resumable`, answered 201), not through the dashboard |
 | Studio's Realtime inspector: joins a channel and receives presence | Checked by hand in Chromium on 2026-11-09 | Not automated. The inspector's WebSocket goes from the browser straight to the stack's public API URL with the service role key, not through the dashboard |
-| Studio's Edge Functions page, and logs | Not checked | The fixture runs Edge Functions but does not give Studio the functions folder; it has no analytics service |
+| Studio's Edge Functions page: lists the functions in its mounted folder (`hello`, not the router) | Verified against Studio 2026.11.02-sha-a05e7ec via Kong 3.9.3; page checked in headless Chromium through the dashboard on 2026-11-12 at 1280 and 390 wide in both themes | `fixture_studio_is_reached_through_the_proxy` in `crates/adapters/tests/gateway_fixture.rs` reads the list through the Studio proxy, CI job `fixture`. Deploying or editing functions from Studio is not checked |
+| Studio's logs pages | Not checked | The fixture has no analytics service |
 
 Update the baseline only together with a fixture change and a passing CI run. For Auth, PostgREST, and Storage, also change `StackService::tested_version` in `crates/domain/src/connection.rs`.

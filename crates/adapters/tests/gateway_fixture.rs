@@ -261,6 +261,29 @@ async fn fixture_studio_is_reached_through_the_proxy() {
     let profile: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(profile.is_object(), "{profile}");
 
+    // Studio's Edge Functions page lists the functions in its mounted
+    // folder; the fixture's synthetic `hello` is one, the router is not.
+    let response = proxy
+        .forward(
+            &url,
+            &studio_login(),
+            None,
+            site,
+            get("/api/v1/projects/default/functions", HeaderMap::new()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let functions: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let slugs: Vec<&str> = functions
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["slug"].as_str())
+        .collect();
+    assert_eq!(slugs, ["hello"], "{functions}");
+
     // Without the right login the gateway refuses, and the refusal is
     // passed back as it is.
     let response = proxy
