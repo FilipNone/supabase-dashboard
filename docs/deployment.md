@@ -2,7 +2,7 @@
 
 This guide runs a released build on one Linux server from the prebuilt container image `ghcr.io/filipnone/supabase-dashboard`. Nothing is compiled on the server. To build from source, see [docs/development.md](https://github.com/FilipNone/supabase-dashboard/blob/main/docs/development.md).
 
-Development releases (`0.1.0-dev.N`) are previews. The dashboard can manage operator accounts, organizations, members, invitations, and a registry of self-hosted stacks. It can store a stack's API keys and Studio login, check whether its Auth, REST, and Studio routes answer, and open the stack's own Studio for members whose role allows it (see "Studio access" below). Expect breaking changes between dev releases.
+Development releases (`0.N.0-dev.N`) are previews. The dashboard can manage operator accounts, organizations, members, invitations, and a registry of self-hosted stacks. It can store a stack's API keys and Studio login, check whether its Auth, REST, and Studio routes answer, and open the stack's own Studio for members whose role allows it (see "Studio access" below). Expect breaking changes between dev releases.
 
 ## What you need
 
@@ -25,9 +25,9 @@ The metadata database belongs to the dashboard. It is separate from the database
 1. Download and unpack the bundle from the release page:
 
    ```sh
-   curl -fLO https://github.com/FilipNone/supabase-dashboard/releases/download/v0.1.0-dev.4/supabase-dashboard-0.1.0-dev.4-docker.tar.gz
-   tar -xzf supabase-dashboard-0.1.0-dev.4-docker.tar.gz
-   cd supabase-dashboard-0.1.0-dev.4-docker
+   curl -fLO https://github.com/FilipNone/supabase-dashboard/releases/download/v0.2.0-dev.1/supabase-dashboard-0.2.0-dev.1-docker.tar.gz
+   tar -xzf supabase-dashboard-0.2.0-dev.1-docker.tar.gz
+   cd supabase-dashboard-0.2.0-dev.1-docker
    ```
 
    `SHA256SUMS` on the release page lists the checksum of each file.

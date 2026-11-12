@@ -211,6 +211,7 @@ Release checks include a fresh installation, Studio access tests for each role, 
 
 ## Revision history
 
+- 2026-11-12: released `v0.2.0-dev.1`, the first release with Studio access (M3), scheduled health checks and history, the connection guidance, encryption key rotation, and the Dokploy connection. The minor version moved because the table editor of `v0.1.0-dev.4` was replaced by each project's Studio.
 - 2026-11-12: M2: turned on upstream's opaque API keys in the fixture and tested the `sb_publishable_` and `sb_secret_` keys through Envoy, from the settings forms to a full health check.
 - 2026-11-12: M2: added upstream's Envoy gateway to the fixture next to Kong, read the PostgREST version from the OpenAPI description when Envoy hides the `Server` header, and run the gateway and Studio tests through both in CI.
 - 2026-11-12: M2: tested a stack going down and coming back while another project stays healthy, and marked the project overview and diagnostics item done.
