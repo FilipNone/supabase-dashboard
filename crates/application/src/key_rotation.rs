@@ -1,5 +1,5 @@
-//! Moving stored credentials (project keys and the Dokploy API key) to
-//! the current encryption key.
+//! Moving stored credentials (project keys, the Dokploy API key, and the
+//! secrets of unfinished jobs) to the current encryption key.
 //!
 //! After an operator installs a new key and keeps the old one as a previous
 //! key, `reseal_credentials` opens every value written under a previous key
@@ -14,6 +14,7 @@
 use supabase_dashboard_persistence::{
     Database, PersistenceError,
     audit::{AuditEvent, AuditOutcome},
+    jobs::SealedJobSecrets,
 };
 
 use crate::secrets::{CipherError, CredentialCipher, Sealed};
@@ -108,6 +109,57 @@ async fn reseal_dokploy_key(
     Ok(())
 }
 
+/// The secrets of jobs that have not succeeded. A failed job keeps them,
+/// because the stack it made may already use them.
+async fn reseal_job_secrets(
+    db: &Database,
+    cipher: &CredentialCipher,
+    summary: &mut RotationSummary,
+) -> Result<(), RotationError> {
+    let mut after = None;
+    loop {
+        let page = db
+            .job_secrets_not_under(cipher.key_id(), after, PAGE)
+            .await?;
+        let Some((last, _)) = page.last() else {
+            return Ok(());
+        };
+        after = Some(*last);
+        for (job_id, stored) in page {
+            let sealed = Sealed {
+                key_id: stored.key_id,
+                nonce: stored.nonce,
+                ciphertext: stored.ciphertext,
+            };
+            let resealed = match cipher.reseal_job_secrets(job_id, &sealed) {
+                Ok(Some(resealed)) => resealed,
+                Ok(None) => continue,
+                Err(CipherError::Undecryptable) => {
+                    summary.unreadable += 1;
+                    continue;
+                }
+                Err(CipherError::Randomness) => return Err(RotationError::Randomness),
+            };
+            let replaced = db
+                .reseal_job_secrets(
+                    job_id,
+                    &sealed.nonce,
+                    &SealedJobSecrets {
+                        key_id: resealed.key_id,
+                        nonce: resealed.nonce,
+                        ciphertext: resealed.ciphertext,
+                    },
+                )
+                .await?;
+            if replaced {
+                summary.resealed += 1;
+            } else {
+                summary.changed_meanwhile += 1;
+            }
+        }
+    }
+}
+
 /// Seals every stored value that is not under the current key again under
 /// it, where a previous key can open it.
 pub async fn reseal_credentials(
@@ -159,6 +211,7 @@ pub async fn reseal_credentials(
         }
     }
     reseal_dokploy_key(db, cipher, &mut summary).await?;
+    reseal_job_secrets(db, cipher, &mut summary).await?;
     db.record_audit_event(&AuditEvent {
         actor_account_id: None,
         action: "credentials.reseal",

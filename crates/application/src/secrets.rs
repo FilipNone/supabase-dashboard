@@ -207,6 +207,16 @@ impl CredentialCipher {
         self.open_bound(&job_associated_data(job_id), sealed)
     }
 
+    /// The job's secrets sealed under the current key, or `None` when they
+    /// already are.
+    pub fn reseal_job_secrets(
+        &self,
+        job_id: Uuid,
+        sealed: &Sealed,
+    ) -> Result<Option<Sealed>, CipherError> {
+        self.reseal_bound(&job_associated_data(job_id), sealed)
+    }
+
     /// Seals the installation's Dokploy API key, bound to the Dokploy URL
     /// that accepted it.
     pub fn seal_dokploy_key(

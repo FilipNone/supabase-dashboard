@@ -168,7 +168,7 @@ The dashboard can read stored keys under an old encryption key while it moves th
    ```
 
 3. Restart with `docker compose up -d`. The log names the new key's ID and warns that stored keys are still under a previous key.
-4. Run `docker compose exec dashboard supabase-dashboard-server rotate-secret-key`. It reseals every stored key under the new key, including the Dokploy API key, without changing who set each one or when, and is audited as `credentials.reseal`. It can run while people use the dashboard, and running it again is harmless.
+4. Run `docker compose exec dashboard supabase-dashboard-server rotate-secret-key`. It reseals every stored key under the new key, including the Dokploy API key and the secrets of provisioning jobs that have not succeeded, without changing who set each one or when, and is audited as `credentials.reseal`. It can run while people use the dashboard, and running it again is harmless.
 5. When it prints that no stored credential needs a previous key, remove the lines from step 2, delete `previous.keys`, and restart.
 
 Backups taken before the change still need the old key. Store a copy of it with those backups until they expire. A key listed in neither setting cannot be recovered: the command reports how many stored keys it could not read, and those have to be entered again on each project's settings page, or for the Dokploy key, replaced on the administrator page.

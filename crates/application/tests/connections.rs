@@ -16,6 +16,7 @@ use supabase_dashboard_application::{
     organizations::OrganizationService,
     projects::{ProjectService, Registration},
     secrets::CredentialCipher,
+    secrets::Sealed,
 };
 use supabase_dashboard_domain::{
     account::{DisplayName, Email},
@@ -26,9 +27,15 @@ use supabase_dashboard_domain::{
         HEALTH_HISTORY_PAGE, HealthHour, SavedCredential, ServiceCheck, ServiceStatus, SkipReason,
         StackService, UnreachableReason, check_studio_login,
     },
+    job::JobKind,
     project::ProjectUrl,
 };
-use supabase_dashboard_persistence::{Database, accounts::AccountRecord};
+use supabase_dashboard_persistence::{
+    Database,
+    accounts::AccountRecord,
+    audit::{AuditEvent, AuditOutcome},
+    jobs::{NewJob, SealedJobSecrets},
+};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -754,6 +761,76 @@ async fn rotating_the_key_reseals_stored_values() {
             .await
             .unwrap()
     );
+}
+
+#[tokio::test]
+async fn rotating_the_key_reseals_unfinished_jobs_secrets() {
+    let Some(scratch) = ScratchDb::create("conn_reseal_jobs").await else {
+        return;
+    };
+    let f = setup(&scratch, Some(KEY_A)).await;
+    let owner = account(&f.db, "Owner").await;
+    let (org, _) = project(&f, &owner, "Acme").await;
+    let job = Uuid::now_v7();
+    let secret = SecretString::from("synthetic job secret");
+    let sealed = cipher(KEY_A).seal_job_secrets(job, &secret).unwrap();
+    f.db.insert_job(
+        &NewJob {
+            id: job,
+            kind: JobKind::ProvisionStack.as_str(),
+            organization_id: org,
+            step: "check",
+            data: "{}",
+            secrets: Some(&SealedJobSecrets {
+                key_id: sealed.key_id,
+                nonce: sealed.nonce,
+                ciphertext: sealed.ciphertext,
+            }),
+            created_by: owner.account.id,
+        },
+        &AuditEvent {
+            actor_account_id: Some(owner.account.id),
+            action: "job.test",
+            target_type: Some("job"),
+            target_id: Some(job.to_string()),
+            outcome: AuditOutcome::Success,
+            request_id: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut rotated = cipher(KEY_B);
+    rotated
+        .add_previous_keys(&SecretString::from(KEY_A))
+        .unwrap();
+    assert_eq!(key_usage(&f.db, &rotated).await.unwrap().previous, 1);
+    assert_eq!(
+        reseal_credentials(&f.db, &rotated).await.unwrap(),
+        RotationSummary {
+            resealed: 1,
+            unreadable: 0,
+            changed_meanwhile: 0
+        }
+    );
+    assert_eq!(key_usage(&f.db, &rotated).await.unwrap().current, 1);
+
+    // The new key alone opens them, still bound to their job.
+    let stored = f.db.job_secrets(job).await.unwrap().unwrap();
+    let stored = Sealed {
+        key_id: stored.key_id,
+        nonce: stored.nonce,
+        ciphertext: stored.ciphertext,
+    };
+    let new_only = cipher(KEY_B);
+    assert_eq!(
+        new_only
+            .open_job_secrets(job, &stored)
+            .unwrap()
+            .expose_secret(),
+        "synthetic job secret"
+    );
+    assert!(new_only.open_job_secrets(Uuid::now_v7(), &stored).is_err());
 }
 
 #[tokio::test]

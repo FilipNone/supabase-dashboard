@@ -249,6 +249,65 @@ impl Database {
         Ok(held)
     }
 
+    /// Up to `limit` jobs whose secrets are not sealed under `key_id`, in
+    /// job order, starting after `after`.
+    pub async fn job_secrets_not_under(
+        &self,
+        key_id: &str,
+        after: Option<Uuid>,
+        limit: i64,
+    ) -> Result<Vec<(Uuid, SealedJobSecrets)>, PersistenceError> {
+        let rows: Vec<(Uuid, String, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+            "SELECT job_id, key_id, nonce, ciphertext FROM job_secrets \
+             WHERE key_id <> $1 AND ($2::uuid IS NULL OR job_id > $2) \
+             ORDER BY job_id LIMIT $3",
+        )
+        .bind(key_id)
+        .bind(after)
+        .bind(limit.clamp(1, MAX_ROWS))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(query_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|(job_id, key_id, nonce, ciphertext)| {
+                (
+                    job_id,
+                    SealedJobSecrets {
+                        key_id,
+                        nonce,
+                        ciphertext,
+                    },
+                )
+            })
+            .collect())
+    }
+
+    /// Replaces a job's sealed secrets with the same value sealed under
+    /// another key. Returns `false` when they are gone or changed since
+    /// they were read (their nonce differs).
+    pub async fn reseal_job_secrets(
+        &self,
+        job_id: Uuid,
+        old_nonce: &[u8],
+        sealed: &SealedJobSecrets,
+    ) -> Result<bool, PersistenceError> {
+        let updated = sqlx::query(
+            "UPDATE job_secrets SET key_id = $3, nonce = $4, ciphertext = $5 \
+             WHERE job_id = $1 AND nonce = $2",
+        )
+        .bind(job_id)
+        .bind(old_nonce)
+        .bind(&sealed.key_id)
+        .bind(&sealed.nonce)
+        .bind(&sealed.ciphertext)
+        .execute(&self.pool)
+        .await
+        .map_err(query_err)?
+        .rows_affected();
+        Ok(updated == 1)
+    }
+
     pub async fn job_secrets(
         &self,
         id: Uuid,
