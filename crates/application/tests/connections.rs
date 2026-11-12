@@ -261,6 +261,15 @@ async fn only_owners_and_admins_change_keys_and_values_stay_encrypted() {
                 .await,
             Err(ConnectionError::Forbidden)
         ));
+        // The Studio login gives full control of the project, so the same
+        // roles are refused before the gateway is asked about it.
+        let studio = SecretString::from(check_studio_login("supabase", STUDIO_PASSWORD).unwrap());
+        assert!(matches!(
+            f.connections
+                .replace_credential(who, id, CredentialKind::StudioLogin, &studio, ctx())
+                .await,
+            Err(ConnectionError::Forbidden)
+        ));
         // Every member can see whether a key is set, but not its value.
         let overview = f.connections.credentials(who, id).await.unwrap();
         assert!(matches!(
@@ -275,8 +284,9 @@ async fn only_owners_and_admins_change_keys_and_values_stay_encrypted() {
     );
     assert_eq!(
         audit_count(&f.db, "project.credential.replace", "denied").await,
-        2
+        4
     );
+    assert!(f.probe.calls.lock().unwrap().is_empty());
 
     // The stored row holds neither the value nor anything that contains it.
     let (ciphertext, key_id): (Vec<u8>, String) =

@@ -995,6 +995,25 @@ mod tests {
         .await;
         assert!(body.contains("NotFound"), "{body}");
 
+        // The Studio login is stored even though the gateway cannot be
+        // reached to confirm it, and its password never comes back either.
+        let (parts, body) = call(
+            ReplaceStudioLogin::PATH,
+            format!("id={project_id}&username=supabase&password=redaction-marker-studio"),
+            &alice,
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        assert!(body.contains("unconfirmed"), "{body}");
+        assert!(!body.contains("redaction-marker"), "{body}");
+        let (_, body) = call(
+            ReplaceStudioLogin::PATH,
+            format!("id={project_id}&username=supabase&password=bob-studio-password-0123"),
+            &bob,
+        )
+        .await;
+        assert!(body.contains("NotFound"), "{body}");
+
         let mut bodies = Vec::new();
         for path in [
             GetProjectCredentials::PATH,
@@ -1040,19 +1059,26 @@ mod tests {
         for body in &bodies {
             assert!(!body.contains("redaction-marker"), "{body}");
         }
-        let stored: Vec<u8> = sqlx::query_scalar("SELECT ciphertext FROM project_credentials")
-            .fetch_one(db.pool())
+        let stored: Vec<Vec<u8>> = sqlx::query_scalar("SELECT ciphertext FROM project_credentials")
+            .fetch_all(db.pool())
             .await
             .unwrap();
-        assert!(!String::from_utf8_lossy(&stored).contains("redaction-marker"));
+        assert_eq!(stored.len(), 2);
+        assert!(
+            stored
+                .iter()
+                .all(|c| !String::from_utf8_lossy(c).contains("redaction-marker"))
+        );
 
-        let (parts, body) = call(
-            RemoveProjectCredential::PATH,
-            format!("id={project_id}&kind=anon_key"),
-            &alice,
-        )
-        .await;
-        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        for kind in ["anon_key", "studio_login"] {
+            let (parts, body) = call(
+                RemoveProjectCredential::PATH,
+                format!("id={project_id}&kind={kind}"),
+                &alice,
+            )
+            .await;
+            assert_eq!(parts.status, StatusCode::OK, "{kind}: {body}");
+        }
         let (_, body) = call(
             GetProjectCredentials::PATH,
             format!("id={project_id}"),
