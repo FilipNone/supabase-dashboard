@@ -288,6 +288,69 @@ impl StackService {
     }
 }
 
+impl StackService {
+    /// The version the dashboard is tested against, for services that
+    /// report their version. It matches the image in the Supabase fixture
+    /// and the baseline in `docs/supabase-compatibility.md`.
+    pub const fn tested_version(self) -> Option<&'static str> {
+        match self {
+            Self::Auth => Some("2.197.0"),
+            Self::Storage => Some("1.89.12"),
+            Self::Rest | Self::Realtime | Self::Studio => None,
+        }
+    }
+
+    /// How a version this service reported compares with the tested one.
+    /// `None` when there is no tested version to compare with.
+    pub fn version_support(self, reported: &str) -> Option<VersionSupport> {
+        let tested = self.tested_version()?;
+        let (Some(have), Some(want)) = (parse_version(reported), parse_version(tested)) else {
+            return Some(VersionSupport::Unrecognized);
+        };
+        Some(match have.cmp(&want) {
+            std::cmp::Ordering::Equal => VersionSupport::Tested,
+            std::cmp::Ordering::Less => VersionSupport::Older { tested },
+            std::cmp::Ordering::Greater => VersionSupport::Newer { tested },
+        })
+    }
+}
+
+/// A reported version against the tested one. Only the release number is
+/// compared; a pre-release or build suffix is ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionSupport {
+    Tested,
+    /// Older than the tested version. Studio pages may call APIs this
+    /// version lacks.
+    Older {
+        tested: &'static str,
+    },
+    /// Newer than the tested version, so not covered by the tests yet.
+    Newer {
+        tested: &'static str,
+    },
+    /// Not a version number the dashboard can compare.
+    Unrecognized,
+}
+
+/// Reads `v2.197.0`, `1.89.12`, or `v2.197.0-rc.1` as (major, minor,
+/// patch). A missing patch counts as 0.
+fn parse_version(raw: &str) -> Option<(u64, u64, u64)> {
+    let raw = raw.trim();
+    let raw = raw.strip_prefix('v').unwrap_or(raw);
+    let release = raw.split(['-', '+']).next()?;
+    let mut parts = release.split('.');
+    let mut next = |required: bool| match parts.next() {
+        Some(part) if !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()) => {
+            part.parse::<u64>().ok()
+        }
+        None if !required => Some(0),
+        _ => None,
+    };
+    let version = (next(true)?, next(true)?, next(false)?);
+    parts.next().is_none().then_some(version)
+}
+
 /// Why a service could not be reached. Each variant maps to a fixed message,
 /// so no internal error text reaches the browser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -653,6 +716,63 @@ mod tests {
             Err(E::PublishableInSecretSlot)
         );
         assert!(check_api_key(K::ServiceRoleKey, "sb_secret_abc").is_ok());
+    }
+
+    #[test]
+    fn reported_versions_are_compared_with_the_tested_ones() {
+        use VersionSupport::*;
+        let auth = StackService::Auth;
+        assert_eq!(auth.version_support("v2.197.0"), Some(Tested));
+        assert_eq!(auth.version_support("2.197.0"), Some(Tested));
+        assert_eq!(auth.version_support("v2.197.0-rc.2"), Some(Tested));
+        assert_eq!(
+            auth.version_support("v2.180.3"),
+            Some(Older { tested: "2.197.0" })
+        );
+        assert_eq!(auth.version_support("v2.197"), Some(Tested));
+        assert_eq!(
+            auth.version_support("v2.196"),
+            Some(Older { tested: "2.197.0" })
+        );
+        assert_eq!(
+            auth.version_support("v2.198.0"),
+            Some(Newer { tested: "2.197.0" })
+        );
+        assert_eq!(
+            auth.version_support("v3.0.0"),
+            Some(Newer { tested: "2.197.0" })
+        );
+        for odd in [
+            "",
+            "latest",
+            "v2",
+            "v2.x.0",
+            "2.197.0.1",
+            "v2..0",
+            "v-2.1.0",
+        ] {
+            assert_eq!(auth.version_support(odd), Some(Unrecognized), "{odd}");
+        }
+        assert_eq!(
+            StackService::Storage.version_support("1.89.12"),
+            Some(Tested)
+        );
+        assert_eq!(StackService::Rest.version_support("v14.18"), None);
+        assert_eq!(StackService::Realtime.version_support("v2.148.3"), None);
+    }
+
+    #[test]
+    fn tested_versions_match_the_fixture_and_the_baseline() {
+        let fixture = include_str!("../../../tests/fixtures/supabase/docker-compose.yml");
+        let baseline = include_str!("../../../docs/supabase-compatibility.md");
+        for (service, image) in [
+            (StackService::Auth, "supabase/gotrue"),
+            (StackService::Storage, "supabase/storage-api"),
+        ] {
+            let tag = format!("{image}:v{}", service.tested_version().unwrap());
+            assert!(fixture.contains(&tag), "fixture does not use {tag}");
+            assert!(baseline.contains(&tag), "baseline does not list {tag}");
+        }
     }
 
     #[test]

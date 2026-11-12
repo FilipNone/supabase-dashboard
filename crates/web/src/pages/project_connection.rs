@@ -12,7 +12,7 @@ use supabase_dashboard_domain::{
         HEALTH_HISTORY_MAX_ENTRIES, HEALTH_HISTORY_RETENTION_DAYS, HealthHistory,
         HealthHistoryEntry, HealthReport, KeyExpiry, STUDIO_PASSWORD_MAX_LEN,
         STUDIO_PASSWORD_MIN_LEN, STUDIO_USERNAME_MAX_LEN, SavedCredential, ServiceCheck,
-        ServiceStatus, SkipReason, StackService,
+        ServiceStatus, SkipReason, StackService, VersionSupport,
     },
     project::ProjectSummary,
     studio_access::{STUDIO_ACCESS_PAGE, StudioAccessEntry, StudioAccessLog},
@@ -199,6 +199,32 @@ fn report_view(report: HealthReport) -> impl IntoView {
     }
 }
 
+/// The reported version, and how it compares with the tested one.
+fn version_cell(service: StackService, version: Option<String>) -> impl IntoView {
+    let Some(version) = version else {
+        return view! { "Not reported" }.into_any();
+    };
+    let note = service
+        .version_support(&version)
+        .map(|support| match support {
+            VersionSupport::Tested => "Tested version".to_owned(),
+            VersionSupport::Older { tested } => {
+                format!("Older than the tested v{tested}; some Studio pages may fail.")
+            }
+            VersionSupport::Newer { tested } => {
+                format!("Newer than the tested v{tested}.")
+            }
+            VersionSupport::Unrecognized => {
+                "Not a version number the dashboard can compare.".to_owned()
+            }
+        });
+    view! {
+        {version}
+        {note.map(|text| view! { <span class="field-hint status-detail">{text}</span> })}
+    }
+    .into_any()
+}
+
 fn check_row(check: ServiceCheck) -> impl IntoView {
     let (badge_class, label, detail) = describe(check.service, &check.status);
     view! {
@@ -208,7 +234,7 @@ fn check_row(check: ServiceCheck) -> impl IntoView {
                 <span class=badge_class>{label}</span>
                 {detail.map(|text| view! { <span class="field-hint status-detail">{text}</span> })}
             </td>
-            <td>{check.version.unwrap_or_else(|| "Not reported".to_owned())}</td>
+            <td>{version_cell(check.service, check.version)}</td>
             <td class="nowrap">
                 {check.latency_ms.map_or_else(|| "–".to_owned(), |ms| format!("{ms} ms"))}
             </td>
