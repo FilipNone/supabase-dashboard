@@ -392,7 +392,7 @@ code { font-family: var(--font-mono); font-size: var(--text-sm); }
 .dialog-form { display: grid; gap: var(--space-4); font-size: var(--text-md); }
 .dialog-form p { margin: 0; color: var(--color-text-muted); }
 .dialog-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--space-2); }
-.badge + .badge, td > .badge { margin-left: var(--space-2); }
+.badge + .badge { margin-left: var(--space-2); }
 
 @media (max-width: 640px) {
   .panel { padding: var(--space-4); }

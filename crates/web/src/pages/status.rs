@@ -49,7 +49,7 @@ fn HealthTable(report: InstallationHealth) -> impl IntoView {
         .into_any();
     }
     view! {
-        <div class="table-wrap">
+        <div class="table-wrap" role="region" aria-label="Component health" tabindex="0">
             <table class="data-table">
                 <caption class="visually-hidden">"Component health"</caption>
                 <thead>

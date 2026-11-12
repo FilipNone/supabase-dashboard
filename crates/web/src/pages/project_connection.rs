@@ -20,7 +20,7 @@ use supabase_dashboard_domain::{
 use crate::{
     components::page::{StatePanel, StateTone},
     error::AppError,
-    pages::account::utc_minutes,
+    pages::account::{utc_minutes, utc_seconds},
     server_fns::{
         CheckProjectHealth, RemoveProjectCredential, ReplaceProjectCredential, ReplaceStudioLogin,
         get_project_credentials, get_project_health, get_project_health_history,
@@ -122,7 +122,7 @@ fn history_view(history: HealthHistory) -> impl IntoView {
     let table = (!history.recent.is_empty()).then(|| {
         let rows = history.recent.into_iter().map(history_row).collect_view();
         view! {
-            <div class="table-wrap">
+            <div class="table-wrap" role="region" aria-label="Recent checks, newest first" tabindex="0">
                 <table class="data-table">
                     <caption class="visually-hidden">"Recent checks, newest first"</caption>
                     <thead>
@@ -161,7 +161,7 @@ fn history_row(entry: HealthHistoryEntry) -> impl IntoView {
         .then(|| format!("Not checked: {}", names(&entry.not_checked)));
     view! {
         <tr>
-            <td class="nowrap">{utc_minutes(entry.checked_at)}</td>
+            <td class="nowrap">{utc_seconds(entry.checked_at)}</td>
             <td>
                 <span class=class>{label}</span>
                 {failing.map(|text| view! { <span class="status-detail">{text}</span> })}
@@ -180,7 +180,7 @@ fn report_view(report: HealthReport) -> impl IntoView {
                 utc_minutes(report.checked_at)
             )}
         </p>
-        <div class="table-wrap">
+        <div class="table-wrap" role="region" aria-label="Service health" tabindex="0">
             <table class="data-table">
                 <caption class="visually-hidden">"Service health"</caption>
                 <thead>

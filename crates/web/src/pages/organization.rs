@@ -529,7 +529,7 @@ fn MemberTable(
         })
         .collect_view();
     view! {
-        <div class="table-wrap">
+        <div class="table-wrap" role="region" aria-label="Organization members" tabindex="0">
             <table class="data-table">
                 <caption class="visually-hidden">"Organization members"</caption>
                 <thead>
@@ -750,7 +750,7 @@ fn InvitationTable(
         })
         .collect_view();
     view! {
-        <div class="table-wrap">
+        <div class="table-wrap" role="region" aria-label="Open invitations" tabindex="0">
             <table class="data-table">
                 <caption class="visually-hidden">"Open invitations"</caption>
                 <thead>

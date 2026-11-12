@@ -293,7 +293,7 @@ fn SessionTable(
         })
         .collect_view();
     view! {
-        <div class="table-wrap">
+        <div class="table-wrap" role="region" aria-label="Signed-in sessions" tabindex="0">
             <table class="data-table">
                 <caption class="visually-hidden">"Signed-in sessions"</caption>
                 <thead>
@@ -323,6 +323,19 @@ fn SessionTable(
 }
 
 /// `2026-11-07 14:05`, in UTC.
+/// A UTC time to the second, for lists where several entries can fall in
+/// the same minute.
+pub fn utc_seconds(at: OffsetDateTime) -> String {
+    let at = at.to_offset(time::UtcOffset::UTC);
+    format!(
+        "{} {:02}:{:02}:{:02}",
+        at.date(),
+        at.hour(),
+        at.minute(),
+        at.second()
+    )
+}
+
 pub fn utc_minutes(at: OffsetDateTime) -> String {
     let at = at.to_offset(time::UtcOffset::UTC);
     format!("{} {:02}:{:02}", at.date(), at.hour(), at.minute())

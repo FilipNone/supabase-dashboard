@@ -176,7 +176,7 @@ fn OrganizationTable(list: Vec<AdminOrganizationSummary>, truncated: bool) -> im
         })
         .collect_view();
     view! {
-        <div class="table-wrap">
+        <div class="table-wrap" role="region" aria-label="Organizations" tabindex="0">
             <table class="data-table">
                 <caption class="visually-hidden">"Organizations"</caption>
                 <thead>
@@ -230,7 +230,7 @@ fn ProjectTable(list: Vec<AdminProjectSummary>, truncated: bool) -> impl IntoVie
         .collect_view();
     view! {
         <p class="section-text" role="status">{summary}</p>
-        <div class="table-wrap">
+        <div class="table-wrap" role="region" aria-label="Registered projects" tabindex="0">
             <table class="data-table">
                 <caption class="visually-hidden">"Registered projects"</caption>
                 <thead>
@@ -308,7 +308,7 @@ fn AccountTable(
         })
         .collect_view();
     view! {
-        <div class="table-wrap">
+        <div class="table-wrap" role="region" aria-label="Dashboard accounts" tabindex="0">
             <table class="data-table">
                 <caption class="visually-hidden">"Dashboard accounts"</caption>
                 <thead>
