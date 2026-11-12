@@ -110,6 +110,10 @@ jobs:
           test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:54321/project/default)" = 401
           # Realtime's tenant administration stays closed at the gateway.
           test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:54321/realtime/v1/api/tenants)" = 403
+          # The same through upstream's Envoy gateway.
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:54323/auth/v1/health)" = 401
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:54323/project/default)" = 401
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:54323/realtime/v1/api/tenants)" = 403
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
@@ -120,6 +124,15 @@ jobs:
       - name: Open the fixture's Studio through the dashboard
         env:
           SUPABASE_DASHBOARD_TEST_FIXTURE_URL: http://127.0.0.1:54321
+          SUPABASE_DASHBOARD_TEST_DATABASE_URL: postgres://dashboard:ci-only@127.0.0.1:5432/dashboard
+        run: cargo test -p supabase-dashboard-server --locked studio_opens_the_fixture_studio
+      - name: Adapter tests through the Envoy gateway
+        env:
+          SUPABASE_DASHBOARD_TEST_FIXTURE_URL: http://127.0.0.1:54323
+        run: cargo test -p supabase-dashboard-adapters --locked --test gateway_fixture
+      - name: Open the fixture's Studio through the Envoy gateway
+        env:
+          SUPABASE_DASHBOARD_TEST_FIXTURE_URL: http://127.0.0.1:54323
           SUPABASE_DASHBOARD_TEST_DATABASE_URL: postgres://dashboard:ci-only@127.0.0.1:5432/dashboard
         run: cargo test -p supabase-dashboard-server --locked studio_opens_the_fixture_studio
       - name: Show logs on failure

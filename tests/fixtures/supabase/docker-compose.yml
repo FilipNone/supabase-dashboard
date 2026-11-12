@@ -5,7 +5,8 @@
 # reduced to the services the dashboard talks to first, plus Studio behind
 # the gateway's basic-auth catch-all route and the Storage, Realtime, and
 # Edge Functions services behind Studio's pages. Image tags match the upstream
-# file as of 2026-11-07, except Studio, which matches it as of 2026-11-09. All ports bind to 127.0.0.1 and there is
+# file as of 2026-11-07, except Studio, which matches it as of 2026-11-09,
+# and the Envoy gateway, as of 2026-11-12. All ports bind to 127.0.0.1 and there is
 # no persistent volume: `down` discards everything.
 #
 #   docker compose -f tests/fixtures/supabase/docker-compose.yml \
@@ -254,8 +255,9 @@ services:
       - /app/snippets
 
   # API gateway in front of auth and rest, as in a standard self-hosted
-  # stack. Upstream defaults to Envoy and ships Kong as an override; the
-  # fixture uses Kong because its route config is much smaller.
+  # stack. Upstream defaults to Envoy and ships Kong as a deprecated
+  # override; the fixture runs both, Kong here with a reduced route config
+  # on port 54321 and Envoy below with upstream's config on port 54323.
   gateway:
     image: kong/kong:3.9.3
     depends_on:
@@ -289,6 +291,49 @@ services:
       - "127.0.0.1:54321:8000"
     healthcheck:
       test: ["CMD", "kong", "health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # Upstream's default gateway, in front of the same services. Its config in
+  # api/envoy is upstream's, unchanged, in legacy API key mode: the
+  # sb_publishable_ and sb_secret_ keys stay empty.
+  envoy:
+    image: envoyproxy/envoy:v1.39.6
+    depends_on:
+      auth:
+        condition: service_healthy
+      rest:
+        condition: service_healthy
+      storage:
+        condition: service_healthy
+      realtime:
+        condition: service_healthy
+      functions:
+        condition: service_healthy
+      studio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "/docker-entrypoint.sh"]
+    environment:
+      ANON_KEY: ${ANON_KEY}
+      SERVICE_ROLE_KEY: ${SERVICE_ROLE_KEY}
+      SUPABASE_PUBLISHABLE_KEY: ""
+      SUPABASE_SECRET_KEY: ""
+      ANON_KEY_ASYMMETRIC: ""
+      SERVICE_ROLE_KEY_ASYMMETRIC: ""
+      SUPABASE_PUBLIC_URL: http://127.0.0.1:54323
+      DASHBOARD_USERNAME: ${DASHBOARD_USERNAME}
+      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD}
+    volumes:
+      - ./api/envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
+      - ./api/envoy/cds.yaml:/etc/envoy/cds.yaml:ro
+      - ./api/envoy/lds.template.yaml:/etc/envoy/lds.template.yaml:ro
+      - ./api/envoy/docker-entrypoint.sh:/docker-entrypoint.sh:ro
+    ports:
+      - "127.0.0.1:54323:8000"
+    healthcheck:
+      # The image has no curl or wget, as upstream notes.
+      test: ["CMD-SHELL", "timeout 1 bash -c '</dev/tcp/127.0.0.1/8000'"]
       interval: 5s
       timeout: 5s
       retries: 20

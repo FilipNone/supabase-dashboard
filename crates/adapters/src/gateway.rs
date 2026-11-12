@@ -35,6 +35,10 @@ use crate::{
 /// Largest response body read from a health endpoint.
 const MAX_HEALTH_BODY_BYTES: usize = 64 * 1024;
 
+/// How much of PostgREST's OpenAPI description is read for its version,
+/// which comes in the `info` object near the start.
+const MAX_OPENAPI_PREFIX_BYTES: usize = 16 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct GatewaySettings {
     pub policy: TargetPolicy,
@@ -172,13 +176,20 @@ impl GatewayProbe {
                     Err(reason) => (ServiceStatus::Unreachable { reason }, None),
                 },
                 // The REST root is the OpenAPI description, which can be
-                // large, so its version comes from the `Server` header
-                // instead. Realtime's ping says only "Success". The body is
-                // not read.
-                StackService::Rest => (
-                    ServiceStatus::Healthy,
-                    rest_version(response.headers().get(SERVER)),
-                ),
+                // large. Kong passes on PostgREST's `Server` header, which
+                // names the version; Envoy replaces it, so then the version
+                // comes from the start of the description instead.
+                StackService::Rest => {
+                    let version = match rest_version(response.headers().get(SERVER)) {
+                        Some(version) => Some(version),
+                        None => read_prefix(response, MAX_OPENAPI_PREFIX_BYTES)
+                            .await
+                            .ok()
+                            .and_then(|prefix| openapi_version(&prefix)),
+                    };
+                    (ServiceStatus::Healthy, version)
+                }
+                // Realtime's ping says only "Success"; its body is not read.
                 StackService::Realtime | StackService::Functions | StackService::Studio => {
                     (ServiceStatus::Healthy, None)
                 }
@@ -438,6 +449,60 @@ async fn read_bounded(mut response: Response) -> Result<Vec<u8>, UnreachableReas
     }
 }
 
+/// Reads at most `limit` bytes of the body and drops the rest unread.
+async fn read_prefix(mut response: Response, limit: usize) -> Result<Vec<u8>, UnreachableReason> {
+    let mut body = Vec::new();
+    while body.len() < limit {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let room = limit.saturating_sub(body.len());
+                body.extend_from_slice(chunk.get(..room).unwrap_or(&chunk));
+            }
+            Ok(None) => break,
+            Err(err) => return Err(classify(&err)),
+        }
+    }
+    Ok(body)
+}
+
+/// PostgREST's OpenAPI description gives its own version as
+/// `info.version`, such as `{"swagger":"2.0","info":{...,"version":"14.18"},
+/// ...}`. The description may be cut off anywhere after `info`, so the
+/// top-level keys are walked one value at a time instead of parsing the
+/// whole document; a value before `info` is skipped without being kept.
+fn openapi_version(prefix: &[u8]) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Info {
+        version: Option<String>,
+    }
+    /// Parses one JSON value at the start of `rest` and returns it with
+    /// the number of bytes it took.
+    fn next_value<T: serde::de::DeserializeOwned>(rest: &[u8]) -> Option<(T, usize)> {
+        let mut values = serde_json::Deserializer::from_slice(rest).into_iter::<T>();
+        let value = values.next()?.ok()?;
+        Some((value, values.byte_offset()))
+    }
+    fn skip_space(rest: &[u8]) -> &[u8] {
+        let start = rest
+            .iter()
+            .position(|b| !b.is_ascii_whitespace())
+            .unwrap_or(rest.len());
+        rest.get(start..).unwrap_or_default()
+    }
+
+    let mut rest = skip_space(prefix).strip_prefix(b"{")?;
+    loop {
+        let (key, used) = next_value::<String>(rest)?;
+        rest = skip_space(rest.get(used..)?).strip_prefix(b":")?;
+        if key == "info" {
+            let (info, _) = next_value::<Info>(rest)?;
+            return info.version.and_then(|v| sanitize_version(&v));
+        }
+        let (serde::de::IgnoredAny, used) = next_value(rest)?;
+        rest = skip_space(rest.get(used..)?).strip_prefix(b",")?;
+    }
+}
+
 /// GoTrue's health endpoint answers `{"version": "...", "name": "GoTrue",
 /// ...}`. A body without a usable version still counts as healthy.
 fn auth_version(body: &[u8]) -> Option<String> {
@@ -452,8 +517,8 @@ fn auth_version(body: &[u8]) -> Option<String> {
 }
 
 /// PostgREST names itself in the `Server` header, such as
-/// `postgrest/14.18`. Kong passes the header through; a gateway that
-/// replaces it with its own name leaves the version unknown.
+/// `postgrest/14.18`. Kong passes the header through; Envoy replaces it
+/// with its own name.
 fn rest_version(server: Option<&HeaderValue>) -> Option<String> {
     let server = server?.to_str().ok()?;
     let (name, version) = server.split_once('/')?;
@@ -535,6 +600,44 @@ mod tests {
         assert_eq!(read("postgrest/"), None);
         assert_eq!(read(&format!("postgrest/{}", "1".repeat(100))), None);
         assert_eq!(rest_version(None), None);
+    }
+
+    #[test]
+    fn rest_version_is_read_from_the_openapi_description() {
+        assert_eq!(
+            openapi_version(
+                br#"{"swagger":"2.0","info":{"description":"","title":"standard public schema","version":"14.18"},"host":"0.0.0.0:3000","paths":{"#
+            ),
+            Some("14.18".into())
+        );
+        // Keys before `info`, whitespace, and a description that mentions
+        // a version of its own.
+        assert_eq!(
+            openapi_version(
+                br#" { "swagger" : "2.0" , "x" : {"info":{"version":"9"}}, "info" : {"description":"\"version\":\"1\"","version":"12.2.3"}"#
+            ),
+            Some("12.2.3".into())
+        );
+        // `info` without a version, cut off before `info` ends, not an
+        // object, or a version that is not a plain version.
+        assert_eq!(
+            openapi_version(br#"{"swagger":"2.0","info":{"title":"t"}}"#),
+            None
+        );
+        assert_eq!(
+            openapi_version(br#"{"swagger":"2.0","info":{"version":"14"#),
+            None
+        );
+        assert_eq!(openapi_version(br#"{"swagger":"2.0","#), None);
+        assert_eq!(openapi_version(br#"["info"]"#), None);
+        assert_eq!(openapi_version(b""), None);
+        assert_eq!(openapi_version(br#"{"info":{"version":"1 "}}"#), None);
+        assert_eq!(
+            openapi_version(
+                format!(r#"{{"info":{{"version":"{}"}}}}"#, "1".repeat(100)).as_bytes()
+            ),
+            None
+        );
     }
 
     #[test]

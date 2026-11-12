@@ -155,9 +155,10 @@ cargo clippy -p supabase-dashboard-web --target wasm32-unknown-unknown --feature
 cargo test --workspace
 SUPABASE_DASHBOARD_TEST_DATABASE_URL=postgres://... cargo test --workspace
 SUPABASE_DASHBOARD_TEST_FIXTURE_URL=http://127.0.0.1:54321 cargo test -p supabase-dashboard-adapters
+SUPABASE_DASHBOARD_TEST_FIXTURE_URL=http://127.0.0.1:54323 cargo test -p supabase-dashboard-adapters --test gateway_fixture
 cargo leptos build
 ```
 
-The database tests create and drop their own scratch databases, so the role in the URL needs `CREATEDB`. Without the variable they print a skip message and pass. The fixture URL points the adapter tests at the gateway of the disposable Supabase stack described in `docs/supabase-compatibility.md`; without it that test is skipped too.
+The database tests create and drop their own scratch databases, so the role in the URL needs `CREATEDB`. Without the variable they print a skip message and pass. The fixture URL points the adapter tests at a gateway of the disposable Supabase stack described in `docs/supabase-compatibility.md`: port 54321 is Kong and 54323 is Envoy, both in front of the same services. Without it that test is skipped too.
 
 The WASM clippy run also catches server-only crates leaking into the browser build: `cargo tree -p supabase-dashboard-web --target wasm32-unknown-unknown --features hydrate -e normal` must not list `sqlx`, `axum`, `tokio`, `argon2`, `reqwest`, `supabase-dashboard-persistence`, `supabase-dashboard-application`, or `supabase-dashboard-adapters`. CI checks this.
