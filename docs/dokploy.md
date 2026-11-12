@@ -83,7 +83,7 @@ The variables are `POSTGRES_PASSWORD`, `JWT_SECRET`, `ANON_KEY`, `SERVICE_ROLE_K
 
 ### The provisioning job
 
-`crates/application/src/provisioning` holds the job that creates stacks. The server runs it in its own process, and a job left by a stopped server resumes once its lease runs out; no page queues one yet. An owner or admin picks a name, a host, and one of the organization's targets. The server checks the role, the host (a lowercase name of two or more labels, not an IP address), and the target, generates the stack's secrets, and queues a job with the secrets encrypted apart from its data. The job then runs these steps, saving after each:
+`crates/application/src/provisioning` holds the job that creates stacks. The server runs it in its own process, and a job left by a stopped server resumes once its lease runs out. An owner or admin starts one with **Create a new stack** on the organization's Projects page (`/dashboard/new/<organization>/stack`), picking a name, a host, and one of the organization's targets, and choosing whether the stack is served over HTTPS (checked by default; the form warns that without it keys travel in plain text). When Dokploy is not connected, no target is allowed, or the default target cannot be read, the page says so and points to an installation administrator instead of showing the form. The form also says that the host's DNS must point at the Dokploy server, and that Dokploy keeps the stack's variables, so anyone with access to the service in Dokploy can read its secrets. The server checks the role, the host (a lowercase name of two or more labels, not an IP address), and the target, generates the stack's secrets, and queues a job with the secrets encrypted apart from its data. The job then runs these steps, saving after each:
 
 1. Check that the account that asked may still register projects in the organization, and that the target is still allowed.
 2. Look up the compose service by its name, `sd-` and the job ID, and create it only if there is none.
@@ -95,7 +95,11 @@ The variables are `POSTGRES_PASSWORD`, `JWT_SECRET`, `ANON_KEY`, `SERVICE_ROLE_K
 8. Check the role again, then register the project with its anon key, service role key, Studio login, and Dokploy service in one transaction.
 9. Check Auth at the public URL with the anon key, for about five minutes. If it does not answer, the job still succeeds and says to check the host's DNS.
 
-When Dokploy does not answer, the step runs again after 30 seconds, up to ten times in a row. A deployment request whose answer was lost is not sent again; the job waits for its title to appear. Any other refusal fails the job, and what it made stays in Dokploy, with the job's secrets kept. Tests with a fake Dokploy cover a full run, lost answers to the create and deploy requests, a failed deployment, a stack that never answers, and an account that loses its role while the job waits.
+When Dokploy does not answer, the step runs again after 30 seconds, up to ten times in a row. A deployment request whose answer was lost is not sent again; the job waits for its title to appear. Any other refusal fails the job, and what it made stays in Dokploy, with the job's secrets kept.
+
+After queuing, the browser goes to the job's page (`/dashboard/org/<organization>/provisioning/<job>`), which any member of the organization can open. It shows the name, the address, the state, each step above as done, in progress, pending, failed, or not run, the job's message, and a link to the project once it is registered. While the job is unfinished the page reloads it every five seconds, and stops when it finishes or the job turns out to be missing or not allowed; a failed reload is tried again. The Projects page lists the organization's 20 latest jobs with their state. None of these show the job's saved data or secrets.
+
+Tests with a fake Dokploy cover a full run, lost answers to the create and deploy requests, a failed deployment, a stack that never answers, and an account that loses its role while the job waits.
 
 ## Connecting
 
