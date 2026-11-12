@@ -429,7 +429,8 @@ async fn studio_requests_are_logged_for_owners_and_admins_to_read() {
                 entries,
                 retention_days,
                 older,
-            } = log.read(&owner, id, None).await.unwrap()
+                ..
+            } = log.read(&owner, id, None, None).await.unwrap()
             else {
                 panic!("the log is on");
             };
@@ -462,13 +463,13 @@ async fn studio_requests_are_logged_for_owners_and_admins_to_read() {
         .unwrap();
     assert_eq!(total, 3);
 
-    assert!(log.read(&admin, id, None).await.is_ok());
+    assert!(log.read(&admin, id, None, None).await.is_ok());
     assert!(matches!(
-        log.read(&developer, id, None).await,
+        log.read(&developer, id, None, None).await,
         Err(StudioAccessError::Forbidden)
     ));
     assert!(matches!(
-        log.read(&outsider, id, None).await,
+        log.read(&outsider, id, None, None).await,
         Err(StudioAccessError::NotFound)
     ));
 
@@ -485,7 +486,7 @@ async fn studio_requests_are_logged_for_owners_and_admins_to_read() {
     assert_eq!(log.prune().await.unwrap(), 1);
     let off = StudioAccessService::new(f.db.clone(), None);
     assert_eq!(
-        off.read(&owner, id, None).await.unwrap(),
+        off.read(&owner, id, None, None).await.unwrap(),
         StudioAccessLog::Off
     );
     assert_eq!(off.prune().await.unwrap(), 3);
@@ -522,7 +523,7 @@ async fn the_access_log_pages_through_entries_with_the_same_time() {
     .await
     .unwrap();
     let log = StudioAccessService::new(f.db.clone(), Some(7));
-    let page = async |before| match log.read(&owner, id, before).await.unwrap() {
+    let page = async |before| match log.read(&owner, id, None, before).await.unwrap() {
         StudioAccessLog::On { entries, older, .. } => (entries, older),
         StudioAccessLog::Off => panic!("the log is on"),
     };
@@ -563,4 +564,104 @@ async fn the_access_log_pages_through_entries_with_the_same_time() {
             .unwrap();
     assert_eq!(page(Some(other_entry)).await, (Vec::new(), None));
     assert_eq!(page(Some(i64::MAX)).await, (Vec::new(), None));
+}
+
+#[tokio::test]
+async fn the_access_log_filters_by_member() {
+    let Some(scratch) = ScratchDb::create("studio_access_member").await else {
+        return;
+    };
+    let f = setup(&scratch).await;
+    let owner = account(&f.db, "Owner").await;
+    let (org, id) = project(&f, &owner, "Acme").await;
+    let admin = account(&f.db, "Admin").await;
+    let gone = account(&f.db, "Gone").await;
+    add_member(&f.db, org, &admin, OrgRole::Admin).await;
+    add_member(&f.db, org, &gone, OrgRole::Developer).await;
+    let outsider = account(&f.db, "Outsider").await;
+    let (_, other) = project(&f, &outsider, "Globex").await;
+    let insert = async |project_id: Uuid, who: Uuid, count: i32, age_days: i32| {
+        sqlx::query(
+            "INSERT INTO studio_access_log (project_id, account_id, at, method, path, status) \
+             SELECT $1, $2, now() - make_interval(days => $4, secs => n), 'GET', '/p/' || n, 200 \
+             FROM generate_series(1, $3) AS n",
+        )
+        .bind(project_id)
+        .bind(who)
+        .bind(count)
+        .bind(age_days)
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    };
+    insert(id, admin.account.id, 150, 0).await;
+    insert(id, owner.account.id, 30, 0).await;
+    insert(id, gone.account.id, 5, 0).await;
+    // Outside the retention period, or in another project: not listed.
+    insert(id, outsider.account.id, 1, 30).await;
+    insert(other, outsider.account.id, 3, 0).await;
+    sqlx::query("DELETE FROM accounts WHERE id = $1")
+        .bind(gone.account.id)
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+
+    let log = StudioAccessService::new(f.db.clone(), Some(7));
+    let read = async |member: Option<Uuid>, before| match log
+        .read(&owner, id, member, before)
+        .await
+        .unwrap()
+    {
+        StudioAccessLog::On {
+            entries,
+            older,
+            members,
+            more_members,
+            ..
+        } => (entries, older, members, more_members),
+        StudioAccessLog::Off => panic!("the log is on"),
+    };
+
+    let (entries, _, members, more) = read(None, None).await;
+    assert_eq!(entries.len(), 100);
+    let names: Vec<_> = members.iter().map(|m| m.display_name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["Admin", "Owner"],
+        "deleted and outside accounts are not listed"
+    );
+    assert!(!more);
+    assert_eq!(members[0].account_id, admin.account.id);
+
+    // One member's requests, paged with the same cursor.
+    let (first, older, _, _) = read(Some(admin.account.id), None).await;
+    assert_eq!(first.len(), 100);
+    assert!(
+        first
+            .iter()
+            .all(|e| e.member.as_ref().map(|m| m.account_id) == Some(admin.account.id))
+    );
+    let (second, last, _, _) = read(Some(admin.account.id), older).await;
+    assert_eq!(second.len(), 50);
+    assert_eq!(last, None);
+    assert!(
+        second
+            .iter()
+            .all(|e| e.member.as_ref().map(|m| m.account_id) == Some(admin.account.id))
+    );
+
+    let (owners, older, _, _) = read(Some(owner.account.id), None).await;
+    assert_eq!((owners.len(), older), (30, None));
+    // A member of another project's log shows nothing here.
+    let (none, older, _, _) = read(Some(outsider.account.id), None).await;
+    assert_eq!((none.len(), older), (0, None));
+
+    // The filter does not open the log to roles that may not read it.
+    let developer = account(&f.db, "Developer").await;
+    add_member(&f.db, org, &developer, OrgRole::Developer).await;
+    assert!(matches!(
+        log.read(&developer, id, Some(developer.account.id), None)
+            .await,
+        Err(StudioAccessError::Forbidden)
+    ));
 }

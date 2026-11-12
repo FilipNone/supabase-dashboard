@@ -296,15 +296,17 @@ pub async fn get_project_health_history(id: Uuid) -> Result<HealthHistory, AppEr
 }
 
 /// Requests members sent through the project's Studio host, for owners and
-/// admins: the newest page, or the page older than entry `before`.
+/// admins: the newest page, or the page older than entry `before`; only
+/// `member`'s requests when given.
 #[server]
 pub async fn get_studio_access_log(
     id: Uuid,
+    member: Option<Uuid>,
     before: Option<i64>,
 ) -> Result<StudioAccessLog, AppError> {
     let session = org_context::session()?;
     Ok(org_context::studio_access()?
-        .read(&session, id, before)
+        .read(&session, id, member, before)
         .await?)
 }
 

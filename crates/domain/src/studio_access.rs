@@ -20,6 +20,9 @@ pub const STUDIO_ACCESS_MAX_RETENTION_DAYS: u16 = 90;
 /// How many entries the project's settings page lists, newest first.
 pub const STUDIO_ACCESS_PAGE: u16 = 100;
 
+/// Most members offered in the log's member filter.
+pub const STUDIO_ACCESS_MEMBER_CHOICES: u16 = 200;
+
 /// The part of a request target that is kept: the path, without query or
 /// fragment, with control characters replaced, and cut to
 /// [`STUDIO_ACCESS_PATH_MAX_LEN`].
@@ -69,6 +72,9 @@ pub struct StudioAccessEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StudioAccessMember {
+    /// The member's account, for filtering by member. An identifier, not a
+    /// credential.
+    pub account_id: Uuid,
     pub display_name: String,
     pub email: String,
 }
@@ -85,6 +91,12 @@ pub enum StudioAccessLog {
         /// The `id` of the last entry, when older entries follow; pass it
         /// back to read the next page.
         older: Option<i64>,
+        /// Members with entries within the retention period, by name, at
+        /// most [`STUDIO_ACCESS_MEMBER_CHOICES`]. Deleted accounts are not
+        /// listed.
+        members: Vec<StudioAccessMember>,
+        /// More members have entries than `members` lists.
+        more_members: bool,
     },
 }
 

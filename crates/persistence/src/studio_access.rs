@@ -55,7 +55,8 @@ impl Database {
     }
 
     /// The newest `limit` entries of a project within `retention_days`,
-    /// starting after the entry with id `before` when given. Entries are
+    /// only those of `member` when given, starting after the entry with id
+    /// `before` when given. Entries are
     /// ordered by time and then id, so a page boundary between entries with
     /// the same time neither repeats nor skips one. An id that is not one
     /// of this project's entries (another project's, or one already pruned)
@@ -64,6 +65,7 @@ impl Database {
         &self,
         project_id: Uuid,
         retention_days: u16,
+        member: Option<Uuid>,
         before: Option<i64>,
         limit: u16,
     ) -> Result<Vec<StudioAccessEntry>, PersistenceError> {
@@ -71,6 +73,7 @@ impl Database {
         struct Row {
             id: i64,
             at: OffsetDateTime,
+            account_id: Option<Uuid>,
             display_name: Option<String>,
             email: Option<String>,
             method: String,
@@ -78,9 +81,11 @@ impl Database {
             status: i16,
         }
         let rows: Vec<Row> = sqlx::query_as(
-            "SELECT l.id, l.at, a.display_name, a.email, l.method, l.path, l.status \
+            "SELECT l.id, l.at, a.id AS account_id, a.display_name, a.email, l.method, l.path, \
+                    l.status \
              FROM studio_access_log l LEFT JOIN accounts a ON a.id = l.account_id \
              WHERE l.project_id = $1 AND l.at >= now() - make_interval(days => $2) \
+               AND ($5::uuid IS NULL OR l.account_id = $5) \
                AND ($4::bigint IS NULL OR (l.at, l.id) < ( \
                    SELECT c.at, c.id FROM studio_access_log c \
                    WHERE c.id = $4 AND c.project_id = $1)) \
@@ -90,6 +95,7 @@ impl Database {
         .bind(i32::from(retention_days))
         .bind(i64::from(limit))
         .bind(before)
+        .bind(member)
         .fetch_all(&self.pool)
         .await
         .map_err(query_err)?;
@@ -98,11 +104,14 @@ impl Database {
                 Ok(StudioAccessEntry {
                     id: row.id,
                     at: row.at,
-                    member: match (row.display_name, row.email) {
-                        (Some(display_name), Some(email)) => Some(StudioAccessMember {
-                            display_name,
-                            email,
-                        }),
+                    member: match (row.account_id, row.display_name, row.email) {
+                        (Some(account_id), Some(display_name), Some(email)) => {
+                            Some(StudioAccessMember {
+                                account_id,
+                                display_name,
+                                email,
+                            })
+                        }
                         _ => None,
                     },
                     method: row.method,
@@ -112,6 +121,44 @@ impl Database {
                 })
             })
             .collect()
+    }
+
+    /// The accounts with entries for a project within `retention_days`,
+    /// ordered by name, at most `limit`.
+    pub async fn list_studio_access_members(
+        &self,
+        project_id: Uuid,
+        retention_days: u16,
+        limit: u16,
+    ) -> Result<Vec<StudioAccessMember>, PersistenceError> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            id: Uuid,
+            display_name: String,
+            email: String,
+        }
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT a.id, a.display_name, a.email FROM accounts a \
+             WHERE EXISTS ( \
+                 SELECT 1 FROM studio_access_log l \
+                 WHERE l.project_id = $1 AND l.account_id = a.id \
+                   AND l.at >= now() - make_interval(days => $2)) \
+             ORDER BY lower(a.display_name), a.email, a.id LIMIT $3",
+        )
+        .bind(project_id)
+        .bind(i32::from(retention_days))
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(query_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| StudioAccessMember {
+                account_id: row.id,
+                display_name: row.display_name,
+                email: row.email,
+            })
+            .collect())
     }
 
     /// Deletes entries older than `retention_days`, at most `batch` at a

@@ -6,6 +6,8 @@
 //! last replaced, and a password field to replace it.
 
 use leptos::{form::ActionForm, prelude::*};
+use uuid::Uuid;
+
 use supabase_dashboard_domain::{
     connection::{
         API_KEY_MAX_LEN, CredentialKind, CredentialOverview, CredentialState, CredentialStatus,
@@ -15,7 +17,7 @@ use supabase_dashboard_domain::{
         ServiceStatus, SkipReason, StackService, VersionSupport,
     },
     project::ProjectSummary,
-    studio_access::{STUDIO_ACCESS_PAGE, StudioAccessEntry, StudioAccessLog},
+    studio_access::{STUDIO_ACCESS_PAGE, StudioAccessEntry, StudioAccessLog, StudioAccessMember},
 };
 
 use crate::{
@@ -650,10 +652,31 @@ pub fn StudioAccessPanel(project: ProjectSummary) -> impl IntoView {
     // Where each page after the newest starts; the last one is shown. Only
     // one page of entries is held in the browser at a time.
     let pages = RwSignal::new(Vec::<i64>::new());
+    // The member whose requests are shown; `None` shows everyone's.
+    let member = RwSignal::new(None::<Uuid>);
     let log = Resource::new(
-        move || (reload.get(), pages.with(|pages| pages.last().copied())),
-        move |(_, before)| get_studio_access_log(id, before),
+        move || {
+            (
+                reload.get(),
+                member.get(),
+                pages.with(|pages| pages.last().copied()),
+            )
+        },
+        move |(_, member, before)| get_studio_access_log(id, member, before),
     );
+    // The filter sits outside the reloading part of the panel, so changing
+    // it keeps focus on it. It shows the members from the latest answer.
+    let choices = RwSignal::new((Vec::<StudioAccessMember>::new(), false));
+    Effect::new(move |_| {
+        if let Some(Ok(StudioAccessLog::On {
+            members,
+            more_members,
+            ..
+        })) = log.get()
+        {
+            choices.set((members, more_members));
+        }
+    });
     view! {
         <section class="panel" aria-labelledby="studio-log-title">
             <div class="section-header">
@@ -669,6 +692,11 @@ pub fn StudioAccessPanel(project: ProjectSummary) -> impl IntoView {
                     "Refresh"
                 </button>
             </div>
+            {move || {
+                let shown = member.with(Option::is_some)
+                    || choices.with(|(members, _)| !members.is_empty());
+                shown.then(|| access_member_filter(member, choices, pages).into_any())
+            }}
             <Transition fallback=|| view! { <p class="loading" role="status">"Loading the access log…"</p> }>
                 {move || log.get().map(|result| match result {
                     Ok(StudioAccessLog::Off) => view! {
@@ -678,8 +706,9 @@ pub fn StudioAccessPanel(project: ProjectSummary) -> impl IntoView {
                         </p>
                     }
                     .into_any(),
-                    Ok(StudioAccessLog::On { retention_days, entries, older }) => {
-                        access_log_view(retention_days, entries, older, pages).into_any()
+                    Ok(StudioAccessLog::On { retention_days, entries, older, .. }) => {
+                        let filtered = member.with_untracked(Option::is_some);
+                        access_log_view(retention_days, entries, older, filtered, pages).into_any()
                     }
                     Err(err) => view! {
                         <StatePanel
@@ -695,10 +724,65 @@ pub fn StudioAccessPanel(project: ProjectSummary) -> impl IntoView {
     }
 }
 
+/// Picks whose requests the log shows. Changing it starts again from the
+/// newest page.
+fn access_member_filter(
+    member: RwSignal<Option<Uuid>>,
+    choices: RwSignal<(Vec<StudioAccessMember>, bool)>,
+    pages: RwSignal<Vec<i64>>,
+) -> impl IntoView {
+    let options = move || {
+        choices.with(|(members, _)| {
+            members
+                .iter()
+                .map(|choice| {
+                    let account_id = choice.account_id;
+                    view! {
+                        <option
+                            value=account_id.to_string()
+                            prop:selected=move || member.get() == Some(account_id)
+                        >
+                            {format!("{} ({})", choice.display_name, choice.email)}
+                        </option>
+                    }
+                })
+                .collect_view()
+        })
+    };
+    let more = move || {
+        choices.with(|(_, more)| *more).then(|| {
+            view! {
+                <p class="field-hint">
+                    "More members have requests than the list can show; only the first ones by name are listed."
+                </p>
+            }
+        })
+    };
+    view! {
+        <div class="inline-form">
+            <label class="field">
+                <span class="field-label">"Member"</span>
+                <select
+                    class="input"
+                    on:change=move |ev| {
+                        member.set(Uuid::parse_str(&event_target_value(&ev)).ok());
+                        pages.set(Vec::new());
+                    }
+                >
+                    <option value="" prop:selected=move || member.get().is_none()>"All members"</option>
+                    {options}
+                </select>
+            </label>
+        </div>
+        {more}
+    }
+}
+
 fn access_log_view(
     retention_days: u16,
     entries: Vec<StudioAccessEntry>,
     older: Option<i64>,
+    filtered: bool,
     pages: RwSignal<Vec<i64>>,
 ) -> impl IntoView {
     let days = if retention_days == 1 { "day" } else { "days" };
@@ -748,7 +832,9 @@ fn access_log_view(
         })
     };
     if entries.is_empty() {
-        let text = if first_page {
+        let text = if first_page && filtered {
+            format!("This member sent no Studio requests in the last {retention_days} {days}.")
+        } else if first_page {
             format!("No Studio requests in the last {retention_days} {days}.")
         } else {
             "No older requests are left. The oldest ones may have passed the retention period since this page was opened.".to_owned()

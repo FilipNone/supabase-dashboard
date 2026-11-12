@@ -15,7 +15,8 @@ use std::sync::{
 use supabase_dashboard_domain::{
     authz::Permission,
     studio_access::{
-        NewStudioAccess, STUDIO_ACCESS_MAX_RETENTION_DAYS, STUDIO_ACCESS_PAGE, StudioAccessLog,
+        NewStudioAccess, STUDIO_ACCESS_MAX_RETENTION_DAYS, STUDIO_ACCESS_MEMBER_CHOICES,
+        STUDIO_ACCESS_PAGE, StudioAccessLog,
     },
 };
 use supabase_dashboard_persistence::{Database, PersistenceError};
@@ -69,11 +70,12 @@ impl StudioAccessService {
 
     /// One page of a project's entries, newest first, for its owners and
     /// admins: the newest ones, or those older than the entry with id
-    /// `before`.
+    /// `before`. With `member`, only that account's entries.
     pub async fn read(
         &self,
         current: &CurrentSession,
         project_id: Uuid,
+        member: Option<Uuid>,
         before: Option<i64>,
     ) -> Result<StudioAccessLog, StudioAccessError> {
         let access = self
@@ -93,6 +95,7 @@ impl StudioAccessService {
             .list_studio_access(
                 project_id,
                 retention_days,
+                member,
                 before,
                 STUDIO_ACCESS_PAGE.saturating_add(1),
             )
@@ -103,10 +106,22 @@ impl StudioAccessService {
         } else {
             None
         };
+        let mut members = self
+            .db
+            .list_studio_access_members(
+                project_id,
+                retention_days,
+                STUDIO_ACCESS_MEMBER_CHOICES.saturating_add(1),
+            )
+            .await?;
+        let more_members = members.len() > usize::from(STUDIO_ACCESS_MEMBER_CHOICES);
+        members.truncate(usize::from(STUDIO_ACCESS_MEMBER_CHOICES));
         Ok(StudioAccessLog::On {
             retention_days,
             entries,
             older,
+            members,
+            more_members,
         })
     }
 
