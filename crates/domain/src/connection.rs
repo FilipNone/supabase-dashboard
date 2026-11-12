@@ -94,6 +94,8 @@ pub enum ApiKeyError {
     SecretInAnonSlot,
     #[error("this looks like a publishable key; paste it into the anon field instead")]
     PublishableInSecretSlot,
+    #[error("this key has expired; generate a new one from the stack's JWT secret")]
+    Expired,
     #[error(
         "the Studio user name must be 1 to {STUDIO_USERNAME_MAX_LEN} characters without spaces or colons"
     )]
@@ -195,12 +197,43 @@ pub enum CredentialState {
     NotSet,
     Set {
         updated_at: OffsetDateTime,
+        /// From the key's own `exp` claim, read on the server without
+        /// verifying the key. `None` for keys without one, including keys
+        /// in the `sb_` format and Studio logins.
+        expires: Option<KeyExpiry>,
     },
     /// Stored, but encrypted with a key this server does not have, for
     /// example after the encryption key was replaced. Enter it again.
     Unreadable {
         updated_at: OffsetDateTime,
     },
+}
+
+/// When a stored key expires, as of the moment the server read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyExpiry {
+    pub at: OffsetDateTime,
+    pub expired: bool,
+    /// Whole days left, rounded down; zero once expired.
+    pub days_left: i64,
+}
+
+impl KeyExpiry {
+    /// Keys expiring within this many days are flagged.
+    pub const WARN_DAYS: i64 = 30;
+
+    pub fn new(at: OffsetDateTime, now: OffsetDateTime) -> Self {
+        let expired = at <= now;
+        Self {
+            at,
+            expired,
+            days_left: if expired { 0 } else { (at - now).whole_days() },
+        }
+    }
+
+    pub fn expires_soon(self) -> bool {
+        !self.expired && self.days_left < Self::WARN_DAYS
+    }
 }
 
 /// What the project's settings page shows about stored keys.
@@ -567,6 +600,22 @@ mod tests {
             check_api_key(CredentialKind::StudioLogin, "nocolon"),
             Err(E::StudioUsername)
         );
+    }
+
+    #[test]
+    fn key_expiry_counts_whole_days() {
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let later = |hours: i64| KeyExpiry::new(now + time::Duration::hours(hours), now);
+        assert!(later(0).expired);
+        assert!(later(-1).expired);
+        assert_eq!(later(-48).days_left, 0);
+        let soon = later(23);
+        assert!(!soon.expired && soon.expires_soon());
+        assert_eq!(soon.days_left, 0);
+        assert_eq!(later(24 * 29 + 23).days_left, 29);
+        assert!(later(24 * 29 + 23).expires_soon());
+        assert!(!later(24 * 30).expires_soon());
+        assert!(!later(-1).expires_soon());
     }
 
     #[test]

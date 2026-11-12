@@ -18,8 +18,8 @@ use supabase_dashboard_domain::{
         ApiKeyError, CredentialKind, CredentialOverview, CredentialState, CredentialStatus,
         HEALTH_CHECK_COOLDOWN_SECS, HEALTH_HISTORY_MAX_ENTRIES, HEALTH_HISTORY_PAGE,
         HEALTH_HISTORY_RETENTION_DAYS, HealthDigest, HealthHistory, HealthHistoryEntry,
-        HealthReport, SavedCredential, ServiceCheck, ServiceStatus, SkipReason, StackService,
-        check_api_key,
+        HealthReport, KeyExpiry, SavedCredential, ServiceCheck, ServiceStatus, SkipReason,
+        StackService, check_api_key,
     },
     project::{MAX_PROJECTS_PER_ORGANIZATION, ProjectUrl},
 };
@@ -34,9 +34,19 @@ use uuid::Uuid;
 
 use crate::{
     auth::{CurrentSession, RequestContext},
+    key_claims,
     organizations::event,
     secrets::{CipherError, CredentialCipher, Sealed},
 };
+
+/// When an API key says it expires. Studio logins are not JWTs.
+fn expiry(kind: CredentialKind, value: &SecretString) -> Option<OffsetDateTime> {
+    use secrecy::ExposeSecret;
+    if kind == CredentialKind::StudioLogin {
+        return None;
+    }
+    key_claims::read_claims(value.expose_secret()).and_then(|claims| claims.expires_at)
+}
 
 /// How long past checks are kept, as the server applies it.
 const RETENTION: HistoryRetention = HistoryRetention {
@@ -202,19 +212,21 @@ impl ConnectionService {
         self.access(current, project_id, Permission::ProjectRead)
             .await?;
         let stored = self.db.list_credentials(project_id).await?;
+        let now = OffsetDateTime::now_utc();
         let credentials = CredentialKind::ALL
             .into_iter()
             .map(|kind| CredentialStatus {
                 kind,
                 state: match stored.iter().find(|c| c.kind == kind) {
                     None => CredentialState::NotSet,
-                    Some(c) if self.cipher.as_ref().is_some_and(|k| k.can_open(&c.key_id)) => {
-                        CredentialState::Set {
+                    Some(c) => match self.open_stored(project_id, c) {
+                        Some(value) => CredentialState::Set {
                             updated_at: c.updated_at,
-                        }
-                    }
-                    Some(c) => CredentialState::Unreadable {
-                        updated_at: c.updated_at,
+                            expires: expiry(kind, &value).map(|at| KeyExpiry::new(at, now)),
+                        },
+                        None => CredentialState::Unreadable {
+                            updated_at: c.updated_at,
+                        },
                     },
                 },
             })
@@ -250,7 +262,11 @@ impl ConnectionService {
             .ok_or(ConnectionError::StorageUnavailable)?;
         let value = {
             use secrecy::ExposeSecret;
-            SecretString::from(check_api_key(kind, value.expose_secret())?)
+            let value = check_api_key(kind, value.expose_secret())?;
+            if kind != CredentialKind::StudioLogin {
+                key_claims::check_claims(kind, value, OffsetDateTime::now_utc())?;
+            }
+            SecretString::from(value)
         };
         let saved = if kind == CredentialKind::StudioLogin {
             let check = self
@@ -513,26 +529,32 @@ impl ConnectionService {
             let Some(credential) = stored.iter().find(|c| c.kind == kind) else {
                 continue;
             };
-            let opened = self.cipher.as_ref().map(|cipher| {
-                cipher.open(
-                    project_id,
-                    kind,
-                    &Sealed {
-                        key_id: credential.key_id.clone(),
-                        nonce: credential.nonce.clone(),
-                        ciphertext: credential.ciphertext.clone(),
-                    },
-                )
-            });
-            match opened {
-                Some(Ok(key)) => return Ok(key),
-                Some(Err(_)) | None => unreadable = true,
+            match self.open_stored(project_id, credential) {
+                Some(key) => return Ok(key),
+                None => unreadable = true,
             }
         }
         Err(if unreadable {
             SkipReason::UnreadableKey
         } else {
             SkipReason::MissingKey
+        })
+    }
+
+    /// A stored key's value, or `None` when this server cannot decrypt it.
+    fn open_stored(&self, project_id: Uuid, credential: &StoredCredential) -> Option<SecretString> {
+        self.cipher.as_ref().and_then(|cipher| {
+            cipher
+                .open(
+                    project_id,
+                    credential.kind,
+                    &Sealed {
+                        key_id: credential.key_id.clone(),
+                        nonce: credential.nonce.clone(),
+                        ciphertext: credential.ciphertext.clone(),
+                    },
+                )
+                .ok()
         })
     }
 

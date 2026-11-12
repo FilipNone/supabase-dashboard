@@ -10,9 +10,9 @@ use supabase_dashboard_domain::{
     connection::{
         API_KEY_MAX_LEN, CredentialKind, CredentialOverview, CredentialState, CredentialStatus,
         HEALTH_HISTORY_MAX_ENTRIES, HEALTH_HISTORY_RETENTION_DAYS, HealthHistory,
-        HealthHistoryEntry, HealthReport, STUDIO_PASSWORD_MAX_LEN, STUDIO_PASSWORD_MIN_LEN,
-        STUDIO_USERNAME_MAX_LEN, SavedCredential, ServiceCheck, ServiceStatus, SkipReason,
-        StackService,
+        HealthHistoryEntry, HealthReport, KeyExpiry, STUDIO_PASSWORD_MAX_LEN,
+        STUDIO_PASSWORD_MIN_LEN, STUDIO_USERNAME_MAX_LEN, SavedCredential, ServiceCheck,
+        ServiceStatus, SkipReason, StackService,
     },
     project::ProjectSummary,
     studio_access::{STUDIO_ACCESS_PAGE, StudioAccessEntry, StudioAccessLog},
@@ -360,11 +360,19 @@ fn key_row(
     let field_id = format!("key-{}", kind.as_str());
     let hint_id = format!("{field_id}-hint");
     let (badge, state_text, stored) = state_badge(&status.state);
+    let expiry = match status.state {
+        CredentialState::Set {
+            expires: Some(expiry),
+            ..
+        } => Some(expiry_badge(expiry)),
+        _ => None,
+    };
     let kind_value = kind.as_str();
     view! {
         <div class="key-item">
             <h3 class="subsection-title">
                 {kind.label()} " " <span class=badge>{state_text}</span>
+                {expiry.map(|(class, text)| view! { <span class=class>{text}</span> })}
             </h3>
             {
                 let (id, field_id, hint_id) = (id.clone(), field_id.clone(), hint_id.clone());
@@ -413,7 +421,7 @@ fn key_row(
 fn state_badge(state: &CredentialState) -> (&'static str, String, bool) {
     match *state {
         CredentialState::NotSet => ("badge badge-muted", "Not set".to_owned(), false),
-        CredentialState::Set { updated_at } => (
+        CredentialState::Set { updated_at, .. } => (
             "badge badge-ok",
             format!("Set {} (UTC)", utc_minutes(updated_at)),
             true,
@@ -426,6 +434,24 @@ fn state_badge(state: &CredentialState) -> (&'static str, String, bool) {
             ),
             true,
         ),
+    }
+}
+
+/// The key's own expiry claim. The gateway passes an expired key on, and
+/// the services behind it then refuse it.
+fn expiry_badge(expiry: KeyExpiry) -> (&'static str, String) {
+    let date = expiry.at.to_offset(time::UtcOffset::UTC).date();
+    if expiry.expired {
+        ("badge badge-error", format!("Expired {date}"))
+    } else if expiry.expires_soon() {
+        let days = match expiry.days_left {
+            0 => "today".to_owned(),
+            1 => "in 1 day".to_owned(),
+            n => format!("in {n} days"),
+        };
+        ("badge badge-error", format!("Expires {date}, {days}"))
+    } else {
+        ("badge badge-muted", format!("Expires {date}"))
     }
 }
 

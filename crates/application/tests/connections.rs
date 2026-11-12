@@ -962,3 +962,112 @@ async fn processes_sharing_the_database_split_scheduled_checks() {
         .unwrap();
     assert_eq!(second.check_due(schedule).await.unwrap().checked, 10);
 }
+
+/// A JWT-shaped key with the given claims. The signature is not checked by
+/// the dashboard, so any value works.
+fn jwt(claims: &str) -> String {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    format!(
+        "{}.{}.not-a-real-signature",
+        URL_SAFE_NO_PAD.encode(r#"{"alg":"HS256","typ":"JWT"}"#),
+        URL_SAFE_NO_PAD.encode(claims)
+    )
+}
+
+#[tokio::test]
+async fn jwt_keys_are_checked_for_role_and_expiry() {
+    let Some(scratch) = ScratchDb::create("conn_jwt").await else {
+        return;
+    };
+    let f = setup(&scratch, Some(KEY_A)).await;
+    let owner = account(&f.db, "Owner").await;
+    let (_, id) = project(&f, &owner, "Acme").await;
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let save = async |kind, value: String| {
+        f.connections
+            .replace_credential(&owner, id, kind, &SecretString::from(value), ctx())
+            .await
+    };
+
+    // A key for the other role, or one already expired, is not stored.
+    assert!(matches!(
+        save(
+            CredentialKind::AnonKey,
+            jwt(&format!(
+                r#"{{"role":"service_role","exp":{}}}"#,
+                now + 86_400
+            ))
+        )
+        .await,
+        Err(ConnectionError::Input(ApiKeyError::SecretInAnonSlot))
+    ));
+    assert!(matches!(
+        save(
+            CredentialKind::ServiceRoleKey,
+            jwt(&format!(r#"{{"role":"anon","exp":{}}}"#, now + 86_400))
+        )
+        .await,
+        Err(ConnectionError::Input(ApiKeyError::PublishableInSecretSlot))
+    ));
+    assert!(matches!(
+        save(
+            CredentialKind::AnonKey,
+            jwt(&format!(r#"{{"role":"anon","exp":{}}}"#, now - 60))
+        )
+        .await,
+        Err(ConnectionError::Input(ApiKeyError::Expired))
+    ));
+    let overview = f.connections.credentials(&owner, id).await.unwrap();
+    assert!(
+        overview
+            .credentials
+            .iter()
+            .all(|c| c.state == CredentialState::NotSet)
+    );
+
+    // Stored keys show their expiry; keys that are not JWTs have none.
+    let anon_exp = now + 10 * 86_400 + 3600;
+    save(
+        CredentialKind::AnonKey,
+        jwt(&format!(r#"{{"role":"anon","exp":{anon_exp}}}"#)),
+    )
+    .await
+    .unwrap();
+    save(CredentialKind::ServiceRoleKey, SERVICE.to_owned())
+        .await
+        .unwrap();
+    let overview = f.connections.credentials(&owner, id).await.unwrap();
+    let expires = |kind| {
+        overview
+            .credentials
+            .iter()
+            .find(|c| c.kind == kind)
+            .and_then(|c| match c.state {
+                CredentialState::Set { expires, .. } => expires,
+                _ => None,
+            })
+    };
+    let anon = expires(CredentialKind::AnonKey).unwrap();
+    assert_eq!(anon.at.unix_timestamp(), anon_exp);
+    assert!(!anon.expired && anon.expires_soon());
+    assert_eq!(anon.days_left, 10);
+    assert_eq!(expires(CredentialKind::ServiceRoleKey), None);
+
+    // A key that expires after it was stored shows as expired.
+    let short = jwt(&format!(r#"{{"role":"anon","exp":{}}}"#, now + 2));
+    save(CredentialKind::AnonKey, short).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let overview = f.connections.credentials(&owner, id).await.unwrap();
+    let anon = overview
+        .credentials
+        .iter()
+        .find(|c| c.kind == CredentialKind::AnonKey)
+        .unwrap();
+    assert!(matches!(
+        anon.state,
+        CredentialState::Set {
+            expires: Some(expiry),
+            ..
+        } if expiry.expired && expiry.days_left == 0
+    ));
+}
