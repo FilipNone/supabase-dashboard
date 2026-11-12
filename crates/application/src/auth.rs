@@ -262,7 +262,7 @@ impl AuthService {
         let display_name = DisplayName::parse(display_name)?;
         check_new_password(password.expose_secret())?;
         if self.is_initialized().await? {
-            return Err(BootstrapError::AlreadyInitialized);
+            return Err(self.refuse_bootstrap().await);
         }
         let password_hash = self.hashing.hash(password).await.map_err(AuthError::from)?;
         let id = Uuid::now_v7();
@@ -290,8 +290,22 @@ impl AuthService {
         if created {
             Ok(id)
         } else {
-            Err(BootstrapError::AlreadyInitialized)
+            Err(self.refuse_bootstrap().await)
         }
+    }
+
+    /// Records a refused bootstrap: someone with server access tried to add
+    /// an owner to an installation that has accounts.
+    async fn refuse_bootstrap(&self) -> BootstrapError {
+        self.audit(
+            None,
+            "account.bootstrap_owner",
+            None,
+            AuditOutcome::Denied,
+            RequestContext::default(),
+        )
+        .await;
+        BootstrapError::AlreadyInitialized
     }
 
     pub async fn sign_in(
@@ -448,12 +462,14 @@ impl AuthService {
         use secrecy::ExposeSecret as _;
         let email = Email::parse(email)?;
         check_new_password(password.expose_secret())?;
-        let account = self
+        let Some(account) = self
             .db
             .find_credentials_by_email(&email)
             .await?
-            .ok_or(PasswordResetError::UnknownAccount)?
-            .account;
+            .map(|found| found.account)
+        else {
+            return Err(self.refuse_reset(None).await);
+        };
         let password_hash = self.hashing.hash(password).await.map_err(AuthError::from)?;
         let event = AuditEvent {
             actor_account_id: None,
@@ -463,10 +479,28 @@ impl AuthService {
             outcome: AuditOutcome::Success,
             request_id: None,
         };
-        self.db
+        match self
+            .db
             .reset_password(account.id, &password_hash, &event)
             .await?
-            .ok_or(PasswordResetError::UnknownAccount)
+        {
+            Some(revoked) => Ok(revoked),
+            None => Err(self.refuse_reset(Some(account.id)).await),
+        }
+    }
+
+    /// Records a reset for an account that does not exist (or was deleted
+    /// while the password was hashed). The email is not recorded.
+    async fn refuse_reset(&self, account: Option<Uuid>) -> PasswordResetError {
+        self.audit(
+            None,
+            "account.password_reset",
+            account.map(|id| ("account", id)),
+            AuditOutcome::Failure,
+            RequestContext::default(),
+        )
+        .await;
+        PasswordResetError::UnknownAccount
     }
 
     /// Every account of the installation, for installation administrators.
@@ -526,8 +560,19 @@ impl AuthService {
         };
         self.require_admin(current, action, Some(account_id), ctx)
             .await?;
+        let refuse = |outcome, error| async move {
+            self.audit(
+                Some(current.account.id),
+                action,
+                Some(("account", account_id)),
+                outcome,
+                ctx,
+            )
+            .await;
+            Err(error)
+        };
         if account_id == current.account.id {
-            return Err(AdminError::CannotDisableSelf);
+            return refuse(AuditOutcome::Denied, AdminError::CannotDisableSelf).await;
         }
         let event = AuditEvent {
             actor_account_id: Some(current.account.id),
@@ -544,8 +589,12 @@ impl AuthService {
         {
             SetDisabledOutcome::Changed { .. } => Ok(true),
             SetDisabledOutcome::Unchanged => Ok(false),
-            SetDisabledOutcome::NotFound => Err(AdminError::NotFound),
-            SetDisabledOutcome::LastAdmin => Err(AdminError::LastAdmin),
+            SetDisabledOutcome::NotFound => {
+                refuse(AuditOutcome::Failure, AdminError::NotFound).await
+            }
+            SetDisabledOutcome::LastAdmin => {
+                refuse(AuditOutcome::Denied, AdminError::LastAdmin).await
+            }
         }
     }
 
@@ -672,16 +721,20 @@ impl AuthService {
             .db
             .revoke_account_session(current.account.id, session_id)
             .await?;
-        if revoked {
-            self.audit(
-                Some(current.account.id),
-                "session.revoke",
-                Some(("session", session_id)),
-                AuditOutcome::Success,
-                ctx,
-            )
-            .await;
-        }
+        // A miss is recorded too: the ID may be another operator's session.
+        let outcome = if revoked {
+            AuditOutcome::Success
+        } else {
+            AuditOutcome::Failure
+        };
+        self.audit(
+            Some(current.account.id),
+            "session.revoke",
+            Some(("session", session_id)),
+            outcome,
+            ctx,
+        )
+        .await;
         Ok(revoked)
     }
 
@@ -748,14 +801,14 @@ impl AuthService {
         use secrecy::ExposeSecret as _;
         let display_name = DisplayName::parse(display_name)?;
         check_new_password(password.expose_secret())?;
-        let token = InvitationToken::parse(code).ok_or(InvitationSignUpError::InvalidInvitation)?;
+        let Some(token) = InvitationToken::parse(code) else {
+            return Err(self.refuse_invitation_sign_up(None, ctx).await);
+        };
         // Look the code up before hashing the password, so an invalid code
         // costs no Argon2 work.
-        let invitation = self
-            .db
-            .find_open_invitation_by_token(token.hash())
-            .await?
-            .ok_or(InvitationSignUpError::InvalidInvitation)?;
+        let Some(invitation) = self.db.find_open_invitation_by_token(token.hash()).await? else {
+            return Err(self.refuse_invitation_sign_up(None, ctx).await);
+        };
         if invitation.account_exists {
             return Err(InvitationSignUpError::AccountExists);
         }
@@ -796,11 +849,29 @@ impl AuthService {
             .await?;
         match outcome {
             AcceptNewAccountOutcome::Joined { organization_id } => Ok(organization_id),
-            AcceptNewAccountOutcome::Invalid | AcceptNewAccountOutcome::EmailMismatch => {
-                Err(InvitationSignUpError::InvalidInvitation)
-            }
+            AcceptNewAccountOutcome::Invalid | AcceptNewAccountOutcome::EmailMismatch => Err(self
+                .refuse_invitation_sign_up(Some(invitation.id), ctx)
+                .await),
             AcceptNewAccountOutcome::AccountExists => Err(InvitationSignUpError::AccountExists),
         }
+    }
+
+    /// Records a sign-up with a code that is malformed, unknown, used,
+    /// withdrawn, or expired. The code itself is not recorded.
+    async fn refuse_invitation_sign_up(
+        &self,
+        invitation: Option<Uuid>,
+        ctx: RequestContext<'_>,
+    ) -> InvitationSignUpError {
+        self.audit(
+            None,
+            "account.create_from_invitation",
+            invitation.map(|id| ("organization_invitation", id)),
+            AuditOutcome::Denied,
+            ctx,
+        )
+        .await;
+        InvitationSignUpError::InvalidInvitation
     }
 
     /// Audit writes are best effort for sign-in and sign-out: a failure is

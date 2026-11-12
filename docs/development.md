@@ -37,7 +37,7 @@ There is no default account and no public sign-up. On a fresh database, create t
 cargo run -p supabase-dashboard-server -- create-owner --email ops@example.test --name "Ops"
 ```
 
-The command prompts for the password twice on a terminal, or reads one line from stdin when piped. There is no `--password` flag, so the password never appears in shell history or the process list. Passwords need at least 12 characters. The command refuses to run once any account exists.
+The command prompts for the password twice on a terminal, or reads one line from stdin when piped. There is no `--password` flag, so the password never appears in shell history or the process list. Passwords need at least 12 characters. The command refuses to run once any account exists, and records the refusal as a denied `account.bootstrap_owner` audit event.
 
 ## Reset a forgotten password
 
@@ -47,7 +47,7 @@ An operator who forgot their password, including the only owner, can be given a 
 cargo run -p supabase-dashboard-server -- reset-password --email ops@example.test
 ```
 
-It reads the new password the same way as `create-owner`, signs the account out of every session, and records an `account.password_reset` audit event without an actor. It does not re-enable a disabled account. The sign-in throttle lives in the server's memory, so an address blocked after failed attempts stays blocked until the window ends (15 minutes by default) or the server restarts. Signed-in operators change their own password under Account, Security.
+It reads the new password the same way as `create-owner`, signs the account out of every session, and records an `account.password_reset` audit event without an actor. An email with no account is recorded as a failure, without the email. It does not re-enable a disabled account. The sign-in throttle lives in the server's memory, so an address blocked after failed attempts stays blocked until the window ends (15 minutes by default) or the server restarts. Signed-in operators change their own password under Account, Security.
 
 Running the binary directly (outside cargo-leptos) needs the Leptos site settings in the environment:
 

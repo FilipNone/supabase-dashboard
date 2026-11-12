@@ -9,9 +9,10 @@ use secrecy::SecretString;
 use supabase_dashboard_application::{
     auth::{
         AccountUpdateError, AdminError, AuthConfig, AuthService, BootstrapError, CurrentSession,
-        PasswordResetError, RequestContext, SignInError,
+        InvitationSignUpError, PasswordResetError, RequestContext, SignInError,
     },
     throttle::ThrottleConfig,
+    token::InvitationToken,
 };
 use supabase_dashboard_domain::connection::{
     HealthReport, ServiceCheck, ServiceStatus, StackService,
@@ -29,6 +30,16 @@ mod common;
 use common::ScratchDb;
 
 const PASSWORD: &str = "correct horse battery staple";
+
+/// Audit rows for `action` with `outcome` ("success", "denied", "failure").
+async fn audited(db: &Database, action: &str, outcome: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE action = $1 AND outcome = $2")
+        .bind(action)
+        .bind(outcome)
+        .fetch_one(db.pool())
+        .await
+        .unwrap()
+}
 
 fn ctx() -> RequestContext<'static> {
     RequestContext {
@@ -81,6 +92,11 @@ async fn bootstrap_validates_and_runs_once() {
         )
         .await;
     assert!(matches!(again, Err(BootstrapError::AlreadyInitialized)));
+    assert_eq!(
+        audited(&db, "account.bootstrap_owner", "denied").await,
+        1,
+        "a repeated bootstrap is recorded"
+    );
 
     let stored: String = sqlx::query_scalar("SELECT password_hash FROM accounts")
         .fetch_one(db.pool())
@@ -252,6 +268,12 @@ async fn sessions_can_be_listed_and_revoked_only_by_their_owner() {
             .await
             .unwrap(),
         "already revoked"
+    );
+    assert_eq!(audited(&db, "session.revoke", "success").await, 1);
+    assert_eq!(
+        audited(&db, "session.revoke", "failure").await,
+        1,
+        "a session ID that is not the caller's is recorded"
     );
     assert!(
         auth.authenticate(second.token.expose_cookie_value())
@@ -460,6 +482,7 @@ async fn password_reset_replaces_the_password_and_ends_every_session() {
         auth.reset_password("nobody@example.test", &new).await,
         Err(PasswordResetError::UnknownAccount)
     ));
+    assert_eq!(audited(&db, "account.password_reset", "failure").await, 1);
     assert!(matches!(
         auth.reset_password("owner@example.test", &SecretString::from("short"))
             .await,
@@ -486,12 +509,7 @@ async fn password_reset_replaces_the_password_and_ends_every_session() {
     auth.sign_in("owner@example.test", &new, ctx())
         .await
         .unwrap();
-    assert_eq!(
-        db.count_audit_events("account.password_reset")
-            .await
-            .unwrap(),
-        1
-    );
+    assert_eq!(audited(&db, "account.password_reset", "success").await, 1);
     db.close().await;
     scratch.drop().await;
 }
@@ -568,6 +586,12 @@ async fn only_installation_admins_manage_accounts() {
             .await,
         Err(AdminError::NotFound)
     ));
+    assert_eq!(
+        audited(&db, "admin.account_disable", "denied").await,
+        2,
+        "Bob's attempt and the owner disabling themselves"
+    );
+    assert_eq!(audited(&db, "admin.account_disable", "failure").await, 1);
 
     // Disabling ends Bob's sessions and blocks sign-in; enabling restores it.
     assert!(
@@ -722,6 +746,44 @@ async fn only_installation_admins_list_registered_resources() {
     assert!(!prod.stale);
     assert!(listed.projects[1].health.is_none());
 
+    db.close().await;
+    scratch.drop().await;
+}
+
+#[tokio::test]
+async fn invalid_invitation_codes_are_audited_at_sign_up() {
+    let Some(scratch) = ScratchDb::create("app_invitation_sign_up_audit").await else {
+        return;
+    };
+    let (db, auth) = service(&scratch).await;
+    bootstrap(&auth).await;
+    let unknown = InvitationToken::generate().unwrap();
+    for code in ["not-a-code", unknown.expose_code()] {
+        assert!(matches!(
+            auth.accept_invitation_with_new_account(
+                code,
+                "Mallory",
+                &SecretString::from(PASSWORD),
+                ctx()
+            )
+            .await,
+            Err(InvitationSignUpError::InvalidInvitation)
+        ));
+    }
+    assert_eq!(
+        audited(&db, "account.create_from_invitation", "denied").await,
+        2
+    );
+    let stored: Vec<String> = sqlx::query_scalar(
+        "SELECT coalesce(target_id, '') FROM audit_events WHERE action = 'account.create_from_invitation'",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert!(
+        stored.iter().all(|t| t.is_empty()),
+        "the code is not recorded: {stored:?}"
+    );
     db.close().await;
     scratch.drop().await;
 }
