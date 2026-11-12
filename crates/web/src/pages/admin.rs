@@ -10,6 +10,7 @@ use leptos_meta::Title;
 use supabase_dashboard_domain::{
     account::AdminAccountSummary,
     admin::{ADMIN_RESOURCE_LIST_LIMIT, AdminOrganizationSummary, AdminProjectSummary},
+    connection::KeyExpiry,
 };
 
 use crate::{
@@ -119,8 +120,17 @@ fn health_summary(list: &[AdminProjectSummary]) -> String {
         .iter()
         .filter(|p| p.health.as_ref().is_none_or(|h| h.stale))
         .count();
+    let certificates = list
+        .iter()
+        .filter(|p| {
+            p.health
+                .as_ref()
+                .and_then(|h| h.certificate)
+                .is_some_and(|c| c.expired || c.expires_soon())
+        })
+        .count();
     let projects = |n: usize| if n == 1 { "project" } else { "projects" };
-    match (failing, unknown) {
+    let checks = match (failing, unknown) {
         (0, 0) => "No listed project failed its last check.".to_owned(),
         (failing, 0) => format!(
             "{failing} {} failed {} last check.",
@@ -136,6 +146,17 @@ fn health_summary(list: &[AdminProjectSummary]) -> String {
             projects(failing),
             if failing == 1 { "its" } else { "their" },
             if unknown == 1 { "was" } else { "were" }
+        ),
+    };
+    match certificates {
+        0 => checks,
+        1 => format!(
+            "{checks} 1 project's gateway certificate has expired or expires within {} days.",
+            KeyExpiry::WARN_DAYS
+        ),
+        n => format!(
+            "{checks} {n} projects' gateway certificates have expired or expire within {} days.",
+            KeyExpiry::WARN_DAYS
         ),
     }
 }
@@ -354,6 +375,7 @@ mod tests {
                 failing,
                 not_checked: Vec::new(),
                 stale,
+                certificate: None,
             }),
         }
     }
@@ -379,6 +401,30 @@ mod tests {
         assert_eq!(
             health_summary(&[failing, stale_failing, never]),
             "2 projects failed their last check; 2 were never checked or last checked over a day ago."
+        );
+    }
+
+    #[test]
+    fn the_summary_counts_certificates_that_need_renewing() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let with = |days: i64| {
+            let mut p = project(Some((Vec::new(), false)));
+            if let Some(h) = p.health.as_mut() {
+                h.certificate = Some(KeyExpiry::new(now + time::Duration::days(days), now));
+            }
+            p
+        };
+        assert_eq!(
+            health_summary(&[with(90)]),
+            "No listed project failed its last check."
+        );
+        assert_eq!(
+            health_summary(&[with(90), with(5)]),
+            "No listed project failed its last check. 1 project's gateway certificate has expired or expires within 30 days."
+        );
+        assert_eq!(
+            health_summary(&[with(-1), with(5)]),
+            "No listed project failed its last check. 2 projects' gateway certificates have expired or expire within 30 days."
         );
     }
 }

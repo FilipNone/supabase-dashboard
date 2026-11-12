@@ -578,6 +578,11 @@ pub struct HealthDigest {
     /// Whether the check was older than [`HEALTH_STALE_AFTER_SECS`] when
     /// the digest was made.
     pub stale: bool,
+    /// The earliest expiry of the TLS certificates the gateway presented
+    /// at that check, counted from when the digest was made, so a
+    /// certificate that has lapsed since shows as expired. `None` over
+    /// plain HTTP.
+    pub certificate: Option<KeyExpiry>,
 }
 
 impl HealthDigest {
@@ -588,6 +593,9 @@ impl HealthDigest {
             failing: report.failing(),
             not_checked: report.not_checked(),
             stale: (now - report.checked_at).whole_seconds() > HEALTH_STALE_AFTER_SECS,
+            certificate: report
+                .certificate_expiry()
+                .map(|expiry| KeyExpiry::new(expiry.at, now)),
         }
     }
 }
@@ -693,6 +701,35 @@ mod tests {
                 .unwrap()
                 .expires_soon()
         );
+    }
+
+    #[test]
+    fn a_digest_counts_the_certificate_from_when_it_is_made() {
+        let checked_at = OffsetDateTime::from_unix_timestamp(1_794_441_600).unwrap();
+        let report = HealthReport {
+            checked_at,
+            checks: vec![ServiceCheck {
+                service: StackService::Auth,
+                status: ServiceStatus::Healthy,
+                version: None,
+                latency_ms: None,
+                certificate_expires_at: Some(checked_at + time::Duration::days(3)),
+            }],
+        };
+        let id = Uuid::nil();
+        let soon = HealthDigest::new(id, &report, checked_at + time::Duration::days(1))
+            .certificate
+            .unwrap();
+        assert_eq!((soon.expired, soon.days_left), (false, 2));
+        let lapsed = HealthDigest::new(id, &report, checked_at + time::Duration::days(4))
+            .certificate
+            .unwrap();
+        assert!(lapsed.expired, "the certificate lapsed after the check");
+        let plain = HealthReport {
+            checked_at,
+            checks: Vec::new(),
+        };
+        assert_eq!(HealthDigest::new(id, &plain, checked_at).certificate, None);
     }
 
     #[test]

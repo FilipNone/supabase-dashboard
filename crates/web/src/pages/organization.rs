@@ -12,7 +12,7 @@ use leptos_router::{
 };
 use supabase_dashboard_domain::{
     authz::{OrgRole, Permission},
-    connection::HealthDigest,
+    connection::{HealthDigest, KeyExpiry},
     invitation::{InvitationSummary, IssuedInvitation},
     organization::{MemberSummary, ORGANIZATION_NAME_MAX_CHARS, OrganizationSummary},
     project::ProjectSummary,
@@ -226,15 +226,44 @@ pub(crate) fn health_badges(digest: Option<&HealthDigest>) -> impl IntoView + us
     let stale = digest
         .stale
         .then(|| view! { <span class="badge badge-muted">"Over a day old"</span> });
+    let certificate = digest
+        .certificate
+        .and_then(certificate_badge)
+        .map(|(label, title)| view! { <span class="badge badge-error" title=title>{label}</span> });
     view! {
         <span class="card-badges">
             <span class=class>{label}</span>
             {stale}
+            {certificate}
         </span>
         {failing}
         <span class="card-meta">{format!("Last check {} UTC", utc_minutes(digest.checked_at))}</span>
     }
     .into_any()
+}
+
+/// A badge for a gateway certificate that has expired or expires within
+/// [`KeyExpiry::WARN_DAYS`], with its date as the title. The certificate is
+/// the one the last check saw; a renewal shows at the next check.
+pub(crate) fn certificate_badge(expiry: KeyExpiry) -> Option<(String, String)> {
+    let date = expiry.at.to_offset(time::UtcOffset::UTC).date();
+    let label = if expiry.expired {
+        "TLS certificate expired".to_owned()
+    } else if expiry.expires_soon() {
+        match expiry.days_left {
+            0 => "TLS certificate expires today".to_owned(),
+            1 => "TLS certificate expires tomorrow".to_owned(),
+            n => format!("TLS certificate expires in {n} days"),
+        }
+    } else {
+        return None;
+    };
+    let title = if expiry.expired {
+        format!("The certificate seen at the last check expired on {date} (UTC)")
+    } else {
+        format!("The certificate seen at the last check expires on {date} (UTC)")
+    };
+    Some((label, title))
 }
 
 #[component]
@@ -765,5 +794,43 @@ fn InvitationTable(
                 <tbody>{rows}</tbody>
             </table>
         </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use time::{Duration, OffsetDateTime};
+
+    use super::*;
+
+    #[test]
+    fn only_lapsed_or_close_certificates_get_a_badge() {
+        // 2026-11-12 00:00:00 UTC.
+        let now = OffsetDateTime::from_unix_timestamp(1_794_441_600).unwrap();
+        let badge =
+            |hours: i64| certificate_badge(KeyExpiry::new(now + Duration::hours(hours), now));
+        assert_eq!(badge(24 * 40), None);
+        assert_eq!(
+            badge(24 * 12).map(|(label, _)| label).as_deref(),
+            Some("TLS certificate expires in 12 days")
+        );
+        assert_eq!(
+            badge(30).map(|(label, _)| label).as_deref(),
+            Some("TLS certificate expires tomorrow")
+        );
+        assert_eq!(
+            badge(2),
+            Some((
+                "TLS certificate expires today".to_owned(),
+                "The certificate seen at the last check expires on 2026-11-12 (UTC)".to_owned()
+            ))
+        );
+        assert_eq!(
+            badge(-30),
+            Some((
+                "TLS certificate expired".to_owned(),
+                "The certificate seen at the last check expired on 2026-11-10 (UTC)".to_owned()
+            ))
+        );
     }
 }
