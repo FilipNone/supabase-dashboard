@@ -2,7 +2,7 @@
 #
 # Adapted from supabase/supabase docker/volumes/api/kong.yml (Apache-2.0,
 # see LICENSE-APACHE); this file stays under Apache-2.0. It keeps the Auth,
-# PostgREST, Realtime, and Storage routes, in upstream's legacy API key
+# PostgREST, Realtime, Storage, and Edge Functions routes, in upstream's legacy API key
 # mode, and the same key-auth and ACL rules: the PostgREST root (OpenAPI)
 # is limited to the service role, other routes accept the anon key too.
 # Storage checks keys itself, and Realtime's tenant and OpenAPI paths are
@@ -216,6 +216,25 @@ services:
           replace:
             headers:
               - "Authorization: $((headers.authorization ~= nil and headers.authorization:sub(1, 10) ~= 'Bearer sb_' and headers.authorization) or headers.apikey)"
+
+  # Edge Functions check the caller's JWT themselves; there is no key-auth
+  # and no CORS plugin, as upstream. In legacy key mode upstream sets no
+  # `sb-api-key`, so the route only strips one the caller sent; its
+  # post-function that drops an empty value is not needed here.
+  - name: functions-v1
+    url: http://functions:9000/
+    read_timeout: 160000
+    routes:
+      - name: functions-v1-all
+        strip_path: true
+        paths:
+          - /functions/v1/
+    plugins:
+      - name: request-transformer
+        config:
+          remove:
+            headers:
+              - "sb-api-key"
 
   # Studio: every path the routes above do not claim.
   - name: dashboard

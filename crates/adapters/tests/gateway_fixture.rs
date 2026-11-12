@@ -124,6 +124,40 @@ async fn fixture_gateway_reports_storage_and_realtime() {
 }
 
 #[tokio::test]
+async fn fixture_gateway_reports_edge_functions() {
+    let Some(url) = fixture_url() else { return };
+    let probe = GatewayProbe::new(GatewaySettings {
+        policy: loopback(),
+        ..GatewaySettings::default()
+    })
+    .unwrap();
+    // The fixture runs upstream's main router with VERIFY_JWT on, so the
+    // key is checked by the router itself, not by the gateway.
+    for key in ["ANON_KEY", "SERVICE_ROLE_KEY"] {
+        let check = probe
+            .check(
+                &url,
+                StackService::Functions,
+                &SecretString::from(fixture_value(key)),
+            )
+            .await;
+        assert_eq!(check.status, ServiceStatus::Healthy, "{key}");
+        assert_eq!(check.version, None);
+    }
+    assert_eq!(
+        probe
+            .check(
+                &url,
+                StackService::Functions,
+                &SecretString::from("not-a-key")
+            )
+            .await
+            .status,
+        ServiceStatus::KeyRejected { http_status: 401 }
+    );
+}
+
+#[tokio::test]
 async fn fixture_studio_route_needs_the_login() {
     let Some(url) = fixture_url() else { return };
     let probe = GatewayProbe::new(GatewaySettings {

@@ -80,7 +80,7 @@ pub fn HealthPanel(project: ProjectSummary) -> impl IntoView {
                         <StatePanel
                             tone=StateTone::Empty
                             title="Not checked yet".to_string()
-                            detail="Run a check to see whether the stack's Auth, REST, Storage, Realtime, and Studio services answer. Checks use the API keys and the Studio login stored under Settings.".to_string()
+                            detail="Run a check to see whether the stack's Auth, REST, Storage, Realtime, Edge Functions, and Studio services answer. Checks use the API keys and the Studio login stored under Settings.".to_string()
                         />
                     }
                     .into_any(),
@@ -264,6 +264,13 @@ fn describe(
             "badge badge-error",
             format!("Login rejected (HTTP {http_status})"),
             Some("The gateway refused the stored Studio login. Replace it under Settings."),
+        ),
+        ServiceStatus::KeyRejected { http_status } if service == StackService::Functions => (
+            "badge badge-error",
+            format!("Key rejected (HTTP {http_status})"),
+            Some(
+                "The Edge Functions router refused the stored key. Replace it under Settings, or check the stack's JWT_SECRET.",
+            ),
         ),
         ServiceStatus::KeyRejected { http_status } => (
             "badge badge-error",
@@ -471,7 +478,7 @@ fn key_row(
             <p class="field-hint" id=hint_id>
                 {format!("{} in the stack's .env file.", kind.env_name())}
                 {matches!(kind, CredentialKind::AnonKey)
-                    .then_some(" Used for the Auth, Storage, and Realtime checks.")}
+                    .then_some(" Used for the Auth, Storage, Realtime, and Edge Functions checks.")}
                 {matches!(kind, CredentialKind::ServiceRoleKey)
                     .then_some(" Used for the REST check, which current gateway configurations limit to this key.")}
             </p>

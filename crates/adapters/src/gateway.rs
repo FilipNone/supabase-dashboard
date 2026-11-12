@@ -11,7 +11,7 @@ use std::{sync::Arc, time::Duration};
 
 use reqwest::{
     Client, Response, StatusCode,
-    header::{ACCEPT, HeaderMap, HeaderValue, SERVER},
+    header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, SERVER},
     redirect,
 };
 use secrecy::{ExposeSecret, SecretString};
@@ -123,6 +123,15 @@ impl GatewayProbe {
             return unreachable(UnreachableReason::InvalidResponse);
         };
         apikey.set_sensitive(true);
+        if service == StackService::Functions {
+            // The functions router reads the JWT from `Authorization` only.
+            let Ok(mut bearer) = HeaderValue::from_str(&format!("Bearer {}", key.expose_secret()))
+            else {
+                return unreachable(UnreachableReason::InvalidResponse);
+            };
+            bearer.set_sensitive(true);
+            headers.insert(AUTHORIZATION, bearer);
+        }
         headers.insert("apikey", apikey);
         headers.insert(ACCEPT, HeaderValue::from_static(accept(service)));
 
@@ -133,6 +142,14 @@ impl GatewayProbe {
         };
         let latency_ms = u32::try_from(started.elapsed().as_millis()).ok();
         let status = response.status();
+        if service == StackService::Functions {
+            return ServiceCheck {
+                service,
+                status: functions_status(response).await,
+                version: None,
+                latency_ms,
+            };
+        }
         let (status, version) = if status.is_success() {
             match service {
                 StackService::Auth => match read_bounded(response).await {
@@ -151,7 +168,9 @@ impl GatewayProbe {
                     ServiceStatus::Healthy,
                     rest_version(response.headers().get(SERVER)),
                 ),
-                StackService::Realtime | StackService::Studio => (ServiceStatus::Healthy, None),
+                StackService::Realtime | StackService::Functions | StackService::Studio => {
+                    (ServiceStatus::Healthy, None)
+                }
             }
         } else {
             (status_failure(status), None)
@@ -261,6 +280,7 @@ const fn path(service: StackService) -> &'static str {
         StackService::Rest => "/rest/v1/",
         StackService::Storage => "/storage/v1/version",
         StackService::Realtime => "/realtime/v1/api/ping",
+        StackService::Functions => "/functions/v1/",
         StackService::Studio => "/",
     }
 }
@@ -270,7 +290,7 @@ const fn accept(service: StackService) -> &'static str {
         StackService::Auth => "application/json",
         StackService::Rest => "application/openapi+json",
         StackService::Storage => "text/plain",
-        StackService::Realtime => "application/json",
+        StackService::Realtime | StackService::Functions => "application/json",
         StackService::Studio => "text/html",
     }
 }
@@ -282,6 +302,49 @@ fn status_failure(status: StatusCode) -> ServiceStatus {
     } else {
         ServiceStatus::Unhealthy { http_status }
     }
+}
+
+/// The Edge Functions router answers a request without a function name
+/// with a 404 and `sb-error-code: NOT_FOUND`; routers from before 2025
+/// answered it with a 400 and `{"msg": "missing function name in
+/// request"}`. Either means the router runs and accepted the key. A 404
+/// without the header comes from the gateway, which has no route for
+/// functions.
+async fn functions_status(response: Response) -> ServiceStatus {
+    let status = response.status();
+    if status.is_success() {
+        return ServiceStatus::Healthy;
+    }
+    if status == StatusCode::NOT_FOUND {
+        let routed = response
+            .headers()
+            .get("sb-error-code")
+            .is_some_and(|code| code.as_bytes() == b"NOT_FOUND");
+        return if routed {
+            ServiceStatus::Healthy
+        } else {
+            status_failure(status)
+        };
+    }
+    if status == StatusCode::BAD_REQUEST {
+        return match read_bounded(response).await {
+            Ok(body) if missing_function_name(&body) => ServiceStatus::Healthy,
+            Ok(_) => status_failure(status),
+            Err(reason) => ServiceStatus::Unreachable { reason },
+        };
+    }
+    status_failure(status)
+}
+
+fn missing_function_name(body: &[u8]) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Refusal {
+        msg: Option<String>,
+    }
+    serde_json::from_slice::<Refusal>(body)
+        .ok()
+        .and_then(|r| r.msg)
+        .is_some_and(|msg| msg == "missing function name in request")
 }
 
 /// Maps a request error to a fixed reason. The error itself may name
@@ -398,6 +461,15 @@ mod tests {
         assert_eq!(read("postgrest/"), None);
         assert_eq!(read(&format!("postgrest/{}", "1".repeat(100))), None);
         assert_eq!(rest_version(None), None);
+    }
+
+    #[test]
+    fn the_old_functions_router_refusal_is_recognized() {
+        assert!(missing_function_name(
+            br#"{"msg":"missing function name in request"}"#
+        ));
+        assert!(!missing_function_name(br#"{"msg":"Invalid JWT"}"#));
+        assert!(!missing_function_name(b"missing function name in request"));
     }
 
     #[test]

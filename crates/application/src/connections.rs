@@ -102,12 +102,14 @@ pub trait StackProbe: Send + Sync {
 /// works is preferred: Auth's health endpoint accepts the anon key, while
 /// PostgREST's root (its OpenAPI description) is limited to the service role
 /// in current upstream gateway configurations. Storage's version path and
-/// Realtime's ping answer the anon key.
+/// Realtime's ping answer the anon key, and so does the Edge Functions
+/// router.
 pub const fn key_preference(service: StackService) -> &'static [CredentialKind] {
     match service {
-        StackService::Auth | StackService::Storage | StackService::Realtime => {
-            &[CredentialKind::AnonKey, CredentialKind::ServiceRoleKey]
-        }
+        StackService::Auth
+        | StackService::Storage
+        | StackService::Realtime
+        | StackService::Functions => &[CredentialKind::AnonKey, CredentialKind::ServiceRoleKey],
         StackService::Rest => &[CredentialKind::ServiceRoleKey, CredentialKind::AnonKey],
         StackService::Studio => &[CredentialKind::StudioLogin],
     }

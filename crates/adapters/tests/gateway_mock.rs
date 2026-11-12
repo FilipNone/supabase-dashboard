@@ -81,6 +81,26 @@ fn gateway() -> Router {
                 }
             }),
         )
+        .route("/functions/v1/", get(functions_router))
+}
+
+/// Upstream's Edge Functions router: it checks the JWT in `Authorization`
+/// and answers a request without a function name with its own 404.
+async fn functions_router(headers: HeaderMap) -> axum::response::Response {
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    let (status, code) = if bearer == Some(&format!("Bearer {GOOD_KEY}")) {
+        (StatusCode::NOT_FOUND, "NOT_FOUND")
+    } else {
+        (StatusCode::UNAUTHORIZED, "UNAUTHORIZED_INVALID_JWT_FORMAT")
+    };
+    (
+        status,
+        [("sb-error-code", code)],
+        format!(r#"{{"code":"{code}","message":"x"}}"#),
+    )
+        .into_response()
 }
 
 /// A gateway that routes only Auth, like a stack without Storage or
@@ -124,6 +144,38 @@ async fn healthy_services_report_status_and_version() {
     assert_eq!(storage.version.as_deref(), Some("1.89.12"));
     let realtime = probe.check(&url, StackService::Realtime, &key).await;
     assert_eq!(realtime.status, ServiceStatus::Healthy);
+    let functions = probe.check(&url, StackService::Functions, &key).await;
+    assert_eq!(functions.status, ServiceStatus::Healthy);
+    assert!(functions.latency_ms.is_some());
+}
+
+#[tokio::test]
+async fn an_older_functions_router_counts_as_healthy() {
+    // Routers from before 2025 refused a missing function name with a 400.
+    let old = |body: &'static str| {
+        Router::new().route(
+            "/functions/v1/",
+            get(move || async move { (StatusCode::BAD_REQUEST, body) }),
+        )
+    };
+    let probe = probe(loopback());
+    let key = SecretString::from(GOOD_KEY);
+    let url = serve(old(r#"{"msg":"missing function name in request"}"#)).await;
+    assert_eq!(
+        probe
+            .check(&url, StackService::Functions, &key)
+            .await
+            .status,
+        ServiceStatus::Healthy
+    );
+    let url = serve(old(r#"{"msg":"something else"}"#)).await;
+    assert_eq!(
+        probe
+            .check(&url, StackService::Functions, &key)
+            .await
+            .status,
+        ServiceStatus::Unhealthy { http_status: 400 }
+    );
 }
 
 #[tokio::test]
@@ -131,7 +183,13 @@ async fn services_without_a_route_are_reported_as_not_found() {
     let url = serve(auth_only_gateway()).await;
     let probe = probe(loopback());
     let key = SecretString::from(GOOD_KEY);
-    for service in [StackService::Storage, StackService::Realtime] {
+    // The gateway's own 404 has no `sb-error-code`, so it is not taken for
+    // the functions router's answer.
+    for service in [
+        StackService::Storage,
+        StackService::Realtime,
+        StackService::Functions,
+    ] {
         assert_eq!(
             probe.check(&url, service, &key).await.status,
             ServiceStatus::Unhealthy { http_status: 404 },
@@ -155,6 +213,13 @@ async fn rejected_keys_are_reported() {
     );
     assert_eq!(
         probe.check(&url, StackService::Realtime, &key).await.status,
+        ServiceStatus::KeyRejected { http_status: 401 }
+    );
+    assert_eq!(
+        probe
+            .check(&url, StackService::Functions, &key)
+            .await
+            .status,
         ServiceStatus::KeyRejected { http_status: 401 }
     );
 }

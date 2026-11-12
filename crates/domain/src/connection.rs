@@ -264,16 +264,22 @@ pub enum StackService {
     /// the service answers; it does not open a WebSocket or check the
     /// tenant's database connection.
     Realtime,
+    /// Edge Functions, checked at `/functions/v1/` with no function name.
+    /// Upstream's main router answers that with a 404 carrying
+    /// `sb-error-code: NOT_FOUND`, after checking the caller's JWT when
+    /// `VERIFY_JWT` is on. No function is run.
+    Functions,
     /// Studio, behind the gateway's basic-auth route at `/`.
     Studio,
 }
 
 impl StackService {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Auth,
         Self::Rest,
         Self::Storage,
         Self::Realtime,
+        Self::Functions,
         Self::Studio,
     ];
 
@@ -283,6 +289,7 @@ impl StackService {
             Self::Rest => "REST API (PostgREST)",
             Self::Storage => "Storage",
             Self::Realtime => "Realtime",
+            Self::Functions => "Edge Functions",
             Self::Studio => "Studio",
         }
     }
@@ -297,7 +304,7 @@ impl StackService {
             Self::Auth => Some("2.197.0"),
             Self::Rest => Some("14.18"),
             Self::Storage => Some("1.89.12"),
-            Self::Realtime | Self::Studio => None,
+            Self::Realtime | Self::Functions | Self::Studio => None,
         }
     }
 

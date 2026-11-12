@@ -384,6 +384,7 @@ async fn checks_prefer_the_least_privileged_key_and_are_saved() {
             (StackService::Rest, SERVICE.to_owned()),
             (StackService::Storage, ANON.to_owned()),
             (StackService::Realtime, ANON.to_owned()),
+            (StackService::Functions, ANON.to_owned()),
             (StackService::Studio, studio.clone()),
         ]
     );
@@ -805,8 +806,9 @@ async fn health_digests_cover_one_organization_for_its_members() {
         .unwrap()
         .id;
 
-    // Only the anon key is stored: Auth, Storage, and Realtime are checked
-    // with it, REST falls back to it, and Studio has no login.
+    // Only the anon key is stored: Auth, Storage, Realtime, and Edge
+    // Functions are checked with it, REST falls back to it, and Studio has
+    // no login.
     f.connections
         .replace_credential(
             &owner,

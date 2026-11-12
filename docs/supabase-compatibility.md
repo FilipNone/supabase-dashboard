@@ -16,10 +16,11 @@ Versions match the upstream `docker/docker-compose.yml` in supabase/supabase on 
 | Studio | `supabase/studio:2026.11.02-sha-a05e7ec` (pinned 2026-11-09) | `studio` | none: only through the gateway |
 | Storage | `supabase/storage-api:v1.89.12` (pinned 2026-11-09; file backend, no image transformations) | `storage` | none: only through the gateway |
 | Realtime | `supabase/realtime:v2.148.3` (pinned 2026-11-09) | `realtime` | none: only through the gateway |
+| Edge Functions | `supabase/edge-runtime:v1.77.9` (pinned 2026-11-12; upstream's `main` router with `VERIFY_JWT` on, no user functions) | `functions` | none: only through the gateway |
 
-Upstream now defaults to an Envoy gateway and keeps Kong as an alternative. The fixture uses Kong with a reduced `api/kong.yml` (Auth, REST, Storage, and Realtime routes, legacy JWT API keys, and the basic-auth catch-all route to Studio) because its configuration is much smaller; the routes, key checks, and Studio login match upstream's. The Studio login is `DASHBOARD_USERNAME` and `DASHBOARD_PASSWORD` in `fixture.env`. An Envoy fixture is still to do.
+Upstream now defaults to an Envoy gateway and keeps Kong as an alternative. The fixture uses Kong with a reduced `api/kong.yml` (Auth, REST, Storage, Realtime, and Edge Functions routes, legacy JWT API keys, and the basic-auth catch-all route to Studio) because its configuration is much smaller; the routes, key checks, and Studio login match upstream's. The Studio login is `DASHBOARD_USERNAME` and `DASHBOARD_PASSWORD` in `fixture.env`. An Envoy fixture is still to do.
 
-Not in the fixture yet: imgproxy, Edge Functions, Supavisor, analytics. The Studio pages that need them are added as those pages are checked through the dashboard.
+Not in the fixture yet: imgproxy, Supavisor, analytics. The `functions` service's router imports `jsr:@panva/jose` when it starts, so the fixture needs access to the JSR registry. The Studio pages that need them are added as those pages are checked through the dashboard.
 
 ## Fixture
 
@@ -41,6 +42,7 @@ docker compose -p sd-fixture down -v
 | Wrong key reported as rejected (401) | Verified | same test |
 | Storage reachability and version through the gateway (`/storage/v1/version`, anon key) | Verified against Storage v1.89.12 via Kong 3.9.3 | `fixture_gateway_reports_storage_and_realtime` in `crates/adapters/tests/gateway_fixture.rs`, CI job `fixture` |
 | Realtime reachability through the gateway (`/realtime/v1/api/ping`, anon key; no WebSocket and no tenant database check) | Verified against Realtime v2.148.3 via Kong 3.9.3 | same test |
+| Edge Functions reachability through the gateway (`/functions/v1/` with no function name, anon key in `apikey` and `Authorization`): the router's own 404 with `sb-error-code: NOT_FOUND` counts as healthy, and so does the 400 "missing function name in request" of routers from before 2025. The router, not the gateway, checks the key | Verified against edge-runtime v1.77.9 via Kong 3.9.3; the older router's answer against the mock gateway only | `fixture_gateway_reports_edge_functions` in `crates/adapters/tests/gateway_fixture.rs`, CI job `fixture`; `an_older_functions_router_counts_as_healthy` in `crates/adapters/tests/gateway_mock.rs` |
 | A service the gateway has no route for is reported as not found (404) | Mock gateway only | `services_without_a_route_are_reported_as_not_found` in `crates/adapters/tests/gateway_mock.rs` |
 | Studio route: refuses requests without the login or with a wrong one, accepts the stored login | Verified against Studio 2026.11.02-sha-a05e7ec via Kong 3.9.3 | `fixture_studio_route_needs_the_login` in `crates/adapters/tests/gateway_fixture.rs`, CI job `fixture` |
 | Saving a Studio login tries it against the Studio route first and refuses a login the gateway rejects | Verified against Studio 2026.11.02-sha-a05e7ec via Kong 3.9.3 | `studio_opens_the_fixture_studio` in `apps/server/src/app.rs` (saves the fixture's login through the settings form); refusal covered by application tests |
@@ -52,6 +54,6 @@ docker compose -p sd-fixture down -v
 | Studio pages in a browser through the dashboard: Home, Table editor (a table and row created through the SQL API are listed), SQL editor, Auth users | Checked by hand in headless Chromium on 2026-11-09, light and dark themes, at 1280×720; no page errors | Not automated |
 | Studio's Storage buckets page through the dashboard (bucket list loads through Studio's API) | Checked by hand in Chromium on 2026-11-09 | Not automated; uploads not checked |
 | Studio's Realtime inspector: joins a channel and receives presence | Checked by hand in Chromium on 2026-11-09 | Not automated. The inspector's WebSocket goes from the browser straight to the stack's public API URL with the service role key, not through the dashboard |
-| Studio pages whose services are not in the fixture: Edge Functions, logs | Not checked | The fixture has no Functions or analytics services |
+| Studio's Edge Functions page, and logs | Not checked | The fixture runs Edge Functions but does not give Studio the functions folder; it has no analytics service |
 
 Update the baseline only together with a fixture change and a passing CI run. For Auth, PostgREST, and Storage, also change `StackService::tested_version` in `crates/domain/src/connection.rs`.
