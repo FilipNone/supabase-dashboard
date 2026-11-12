@@ -126,15 +126,20 @@ jobs:
           SUPABASE_DASHBOARD_TEST_FIXTURE_URL: http://127.0.0.1:54321
           SUPABASE_DASHBOARD_TEST_DATABASE_URL: postgres://dashboard:ci-only@127.0.0.1:5432/dashboard
         run: cargo test -p supabase-dashboard-server --locked studio_opens_the_fixture_studio
+      # Envoy also translates the opaque sb_ keys; Kong runs in legacy key mode.
       - name: Adapter tests through the Envoy gateway
         env:
           SUPABASE_DASHBOARD_TEST_FIXTURE_URL: http://127.0.0.1:54323
+          SUPABASE_DASHBOARD_TEST_FIXTURE_NEW_KEYS_URL: http://127.0.0.1:54323
         run: cargo test -p supabase-dashboard-adapters --locked --test gateway_fixture
-      - name: Open the fixture's Studio through the Envoy gateway
+      - name: Open the fixture's Studio and check the new keys through the Envoy gateway
         env:
           SUPABASE_DASHBOARD_TEST_FIXTURE_URL: http://127.0.0.1:54323
+          SUPABASE_DASHBOARD_TEST_FIXTURE_NEW_KEYS_URL: http://127.0.0.1:54323
           SUPABASE_DASHBOARD_TEST_DATABASE_URL: postgres://dashboard:ci-only@127.0.0.1:5432/dashboard
-        run: cargo test -p supabase-dashboard-server --locked studio_opens_the_fixture_studio
+        run: >-
+          cargo test -p supabase-dashboard-server --locked --
+          studio_opens_the_fixture_studio the_new_api_keys_pass_a_fixture_check
       - name: Show logs on failure
         if: failure()
         run: docker compose -p sd-fixture logs --no-color --tail 100

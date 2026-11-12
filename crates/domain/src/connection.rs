@@ -72,11 +72,12 @@ impl CredentialKind {
         }
     }
 
-    /// Name of the variable that holds this key in the stack's `.env`.
+    /// Name of the variable that holds this key in the stack's `.env`:
+    /// the legacy JWT, or the opaque key upstream's newer setup adds.
     pub const fn env_name(self) -> &'static str {
         match self {
-            Self::AnonKey => "ANON_KEY",
-            Self::ServiceRoleKey => "SERVICE_ROLE_KEY",
+            Self::AnonKey => "ANON_KEY or SUPABASE_PUBLISHABLE_KEY",
+            Self::ServiceRoleKey => "SERVICE_ROLE_KEY or SUPABASE_SECRET_KEY",
             Self::StudioLogin => "DASHBOARD_USERNAME and DASHBOARD_PASSWORD",
         }
     }

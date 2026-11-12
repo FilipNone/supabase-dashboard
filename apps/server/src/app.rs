@@ -1872,6 +1872,75 @@ mod tests {
         scratch.drop().await;
     }
 
+    /// The opaque `sb_` keys, stored through the settings forms, pass a
+    /// health check through a gateway that translates them (the fixture's
+    /// Envoy). Skipped unless `SUPABASE_DASHBOARD_TEST_DATABASE_URL` and
+    /// `SUPABASE_DASHBOARD_TEST_FIXTURE_NEW_KEYS_URL` are set.
+    #[tokio::test]
+    async fn the_new_api_keys_pass_a_fixture_check() {
+        let Ok(fixture_url) = std::env::var("SUPABASE_DASHBOARD_TEST_FIXTURE_NEW_KEYS_URL") else {
+            eprintln!("skipping: SUPABASE_DASHBOARD_TEST_FIXTURE_NEW_KEYS_URL is not set");
+            return;
+        };
+        let Some(scratch) = ScratchDb::create("http_new_keys_fixture").await else {
+            return;
+        };
+        let db = Database::connect(&scratch.settings).await.unwrap();
+        db.migrate().await.unwrap();
+        let (router, _) = studio_router(&db).await;
+        let alice = sign_in_cookie(&router, "alice%40example.test").await;
+        let call =
+            |path: &'static str, body: String| send(&router, form_post(path, &body, Some(&alice)));
+        let (_, body) = call(CreateOrganization::PATH, "name=Acme".into()).await;
+        let acme: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let acme_id = acme["id"].as_str().unwrap().to_owned();
+        let (_, body) = call(
+            RegisterProject::PATH,
+            format!(
+                "organization_id={acme_id}&name=Fixture&allow_unencrypted=true&api_url={}",
+                url::form_urlencoded::byte_serialize(fixture_url.as_bytes()).collect::<String>()
+            ),
+        )
+        .await;
+        let project: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let id = project["id"].as_str().unwrap().to_owned();
+        for (kind, name) in [
+            ("anon_key", "SUPABASE_PUBLISHABLE_KEY"),
+            ("service_role_key", "SUPABASE_SECRET_KEY"),
+        ] {
+            let (parts, body) = call(
+                ReplaceProjectCredential::PATH,
+                format!("id={id}&kind={kind}&value={}", fixture_value(name)),
+            )
+            .await;
+            assert_eq!(parts.status, StatusCode::OK, "{body}");
+        }
+        let (parts, body) = call(
+            ReplaceStudioLogin::PATH,
+            format!(
+                "id={id}&username={}&password={}",
+                fixture_value("DASHBOARD_USERNAME"),
+                fixture_value("DASHBOARD_PASSWORD")
+            ),
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+
+        let (parts, body) = call(CheckProjectHealth::PATH, format!("id={id}")).await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        let report: supabase_dashboard_domain::connection::HealthReport =
+            serde_json::from_str(&body).unwrap();
+        assert_eq!(report.checks.len(), 6, "{body}");
+        assert!(report.failing().is_empty(), "{body}");
+        assert!(report.not_checked().is_empty(), "{body}");
+        // Neither key comes back in the report.
+        assert!(!body.contains("sb_publishable_"), "{body}");
+        assert!(!body.contains("sb_secret_"), "{body}");
+
+        db.close().await;
+        scratch.drop().await;
+    }
+
     #[tokio::test]
     async fn invitation_links_work_without_a_session() {
         let Some(scratch) = ScratchDb::create("http_invites").await else {

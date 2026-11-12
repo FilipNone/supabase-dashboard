@@ -64,7 +64,7 @@ pub fn ConnectPanel(project: ProjectSummary) -> impl IntoView {
         <section class="panel" id="connect" aria-labelledby="connect-title">
             <h2 class="section-title" id="connect-title">"Connect to this project"</h2>
             <p class="section-text">
-                "Applications reach every service through the gateway at the API URL. Browser and mobile apps use the anon key, which row-level security limits. The service role key bypasses row-level security, so keep it on servers you control. The dashboard does not show either key; they are ANON_KEY and SERVICE_ROLE_KEY in the stack's configuration."
+                "Applications reach every service through the gateway at the API URL. Browser and mobile apps use the anon key, which row-level security limits. The service role key bypasses row-level security, so keep it on servers you control. The dashboard does not show either key; they are ANON_KEY and SERVICE_ROLE_KEY in the stack's configuration, or SUPABASE_PUBLISHABLE_KEY and SUPABASE_SECRET_KEY where the stack uses the newer opaque keys."
             </p>
             {plain_http}
             <div class="table-wrap">

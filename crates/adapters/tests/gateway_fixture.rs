@@ -34,6 +34,20 @@ fn fixture_url() -> Option<ProjectUrl> {
     }
 }
 
+/// A gateway that translates the opaque `sb_` keys: the fixture's Envoy,
+/// for example `http://127.0.0.1:54323`. Kong runs in legacy key mode.
+const NEW_KEYS_ENV: &str = "SUPABASE_DASHBOARD_TEST_FIXTURE_NEW_KEYS_URL";
+
+fn new_keys_url() -> Option<ProjectUrl> {
+    match std::env::var(NEW_KEYS_ENV) {
+        Ok(raw) => Some(ProjectUrl::parse(&raw).unwrap()),
+        Err(_) => {
+            eprintln!("skipping: {NEW_KEYS_ENV} is not set");
+            None
+        }
+    }
+}
+
 /// The fixture binds to loopback.
 fn loopback() -> TargetPolicy {
     TargetPolicy {
@@ -160,6 +174,68 @@ async fn fixture_gateway_reports_edge_functions() {
             .status,
         ServiceStatus::KeyRejected { http_status: 401 }
     );
+}
+
+#[tokio::test]
+async fn fixture_gateway_accepts_the_new_api_keys() {
+    let Some(url) = new_keys_url() else { return };
+    let probe = GatewayProbe::new(GatewaySettings {
+        policy: loopback(),
+        ..GatewaySettings::default()
+    })
+    .unwrap();
+    let publishable = SecretString::from(fixture_value("SUPABASE_PUBLISHABLE_KEY"));
+    let secret = SecretString::from(fixture_value("SUPABASE_SECRET_KEY"));
+    let check = |service, key: &SecretString| {
+        let (probe, url, key) = (probe.clone(), url.clone(), key.clone());
+        async move { probe.check(&url, service, &key, None).await }
+    };
+
+    // The opaque keys stand in for the anon and service role JWTs, with the
+    // same results: only the secret key opens the PostgREST root.
+    for key in [&publishable, &secret] {
+        let auth = check(StackService::Auth, key).await;
+        assert_eq!(auth.status, ServiceStatus::Healthy);
+        assert_eq!(auth.version.as_deref(), Some("v2.197.0"));
+        for service in [
+            StackService::Storage,
+            StackService::Realtime,
+            StackService::Functions,
+        ] {
+            assert_eq!(
+                check(service, key).await.status,
+                ServiceStatus::Healthy,
+                "{service:?}"
+            );
+        }
+    }
+    let rest = check(StackService::Rest, &secret).await;
+    assert_eq!(rest.status, ServiceStatus::Healthy);
+    assert_eq!(rest.version.as_deref(), Some("14.18"));
+    assert_eq!(
+        check(StackService::Rest, &publishable).await.status,
+        ServiceStatus::KeyRejected { http_status: 403 }
+    );
+
+    // A key the stack never issued is refused.
+    for unknown in [
+        "sb_publishable_unknown.to.this.stack",
+        "sb_secret_unknown.to.this.stack",
+    ] {
+        let unknown = SecretString::from(unknown);
+        for service in [
+            StackService::Auth,
+            StackService::Rest,
+            StackService::Realtime,
+            StackService::Functions,
+        ] {
+            assert_eq!(
+                check(service, &unknown).await.status,
+                ServiceStatus::KeyRejected { http_status: 401 },
+                "{service:?}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
