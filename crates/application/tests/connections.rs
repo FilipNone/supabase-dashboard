@@ -56,12 +56,14 @@ fn cipher(key: &str) -> CredentialCipher {
 
 /// Records which key each service was checked with, and which bundle it
 /// trusted. Reports healthy, except for Studio when `studio` holds another
-/// answer.
+/// answer, and except for every service of a stack whose API URL is in
+/// `down`, which cannot be reached.
 #[derive(Default)]
 struct FakeProbe {
     calls: Mutex<Vec<(StackService, String)>>,
     bundles: Mutex<Vec<Option<String>>>,
     studio: Mutex<Option<ServiceStatus>>,
+    down: Mutex<Vec<String>>,
 }
 
 /// A stand-in for a PEM bundle: the fake probe accepts text made of these
@@ -71,7 +73,7 @@ const FAKE_CERT: &str = "-----BEGIN CERTIFICATE----- fake";
 impl StackProbe for FakeProbe {
     fn check<'a>(
         &'a self,
-        _api_url: &'a ProjectUrl,
+        api_url: &'a ProjectUrl,
         service: StackService,
         key: &'a SecretString,
         authorities: Option<&'a ProjectAuthorities>,
@@ -84,7 +86,16 @@ impl StackProbe for FakeProbe {
             .lock()
             .unwrap()
             .push(authorities.map(|a| a.as_str().to_owned()));
+        let down = self
+            .down
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|url| url == api_url.as_str());
         let status = match service {
+            _ if down => Some(ServiceStatus::Unreachable {
+                reason: UnreachableReason::Connect,
+            }),
             StackService::Studio => self.studio.lock().unwrap().clone(),
             _ => None,
         }
@@ -1071,6 +1082,90 @@ async fn health_history_is_kept_for_members_within_its_limits() {
         f.connections.health_history(&outsider, id).await,
         Err(ConnectionError::NotFound)
     ));
+}
+
+#[tokio::test]
+async fn an_outage_shows_and_clears_without_touching_other_projects() {
+    let Some(scratch) = ScratchDb::create("conn_outage").await else {
+        return;
+    };
+    let f = setup(&scratch, Some(KEY_A)).await;
+    let owner = account(&f.db, "Owner").await;
+    let (org, broken) = project(&f, &owner, "Acme").await;
+    let steady = f
+        .projects
+        .register(
+            &owner,
+            org,
+            Registration {
+                name: "Staging",
+                api_url: "https://staging.example.test",
+                allow_unencrypted: false,
+            },
+            ctx(),
+        )
+        .await
+        .unwrap()
+        .id;
+    for id in [broken, steady] {
+        for (kind, value) in [
+            (CredentialKind::AnonKey, ANON),
+            (CredentialKind::ServiceRoleKey, SERVICE),
+        ] {
+            f.connections
+                .replace_credential(&owner, id, kind, &SecretString::from(value), ctx())
+                .await
+                .unwrap();
+        }
+    }
+    let age_reports = || async {
+        sqlx::query("UPDATE project_health_reports SET checked_at = now() - interval '1 minute'")
+            .execute(f.db.pool())
+            .await
+            .unwrap();
+    };
+
+    // One stack goes down: its services are unreachable, and the other
+    // project's check is unaffected.
+    let broken_url = f
+        .projects
+        .get(&owner, broken)
+        .await
+        .unwrap()
+        .api_url
+        .as_str()
+        .to_owned();
+    f.probe.down.lock().unwrap().push(broken_url);
+    let outage = f.connections.check_now(&owner, broken).await.unwrap();
+    assert!(outage.failing().contains(&StackService::Auth), "{outage:?}");
+    assert!(outage.failing().contains(&StackService::Rest));
+    let steady_report = f.connections.check_now(&owner, steady).await.unwrap();
+    assert!(steady_report.failing().is_empty(), "{steady_report:?}");
+
+    // It comes back: the next check is healthy again, the history keeps
+    // the failed check, and the other project's last report is unchanged.
+    f.probe.down.lock().unwrap().clear();
+    age_reports().await;
+    let recovered = f.connections.check_now(&owner, broken).await.unwrap();
+    assert!(recovered.failing().is_empty(), "{recovered:?}");
+    assert_eq!(
+        f.connections.last_report(&owner, broken).await.unwrap(),
+        Some(recovered)
+    );
+    let history = f.connections.health_history(&owner, broken).await.unwrap();
+    assert_eq!((history.total, history.with_failures), (2, 1));
+    assert!(history.recent[0].failing.is_empty());
+    assert!(history.recent[1].failing.contains(&StackService::Auth));
+    let steady_history = f.connections.health_history(&owner, steady).await.unwrap();
+    assert_eq!((steady_history.total, steady_history.with_failures), (1, 0));
+    let steady_last = f
+        .connections
+        .last_report(&owner, steady)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(steady_last.failing().is_empty());
+    assert_eq!(steady_last.checks, steady_report.checks);
 }
 
 #[tokio::test]
