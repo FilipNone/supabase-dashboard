@@ -366,3 +366,108 @@ async fn fixture_dokploy_creates_configures_and_deploys_a_compose_service() {
     )
     .await;
 }
+
+/// The pinned Supabase stack, deployed through the fixture with its
+/// mounted files and generated variables. Dokploy reports the deployment
+/// done only once every service the gateway depends on is healthy. Pulls
+/// about ten images into the fixture's Docker, so it is opt-in:
+/// `cargo test -p supabase-dashboard-adapters --test dokploy_fixture -- --ignored`.
+#[tokio::test]
+#[ignore = "deploys a whole Supabase stack into the Dokploy fixture"]
+async fn fixture_dokploy_deploys_the_pinned_supabase_stack() {
+    use std::time::Duration;
+    use supabase_dashboard_application::{
+        stack_secrets::StackSecrets,
+        stack_template::{COMPOSE_FILE, GATEWAY_PORT, GATEWAY_SERVICE, STACK_FILES, stack_env},
+    };
+    use supabase_dashboard_domain::{
+        dokploy_compose::{DeploymentStatus, NewCompose, NewComposeDomain},
+        dokploy_placement::DokployId,
+    };
+
+    let Some(url) = fixture_url() else { return };
+    let created = post(
+        &url,
+        "project.create",
+        serde_json::json!({ "name": "stack-probe" }),
+    )
+    .await;
+    let project_id = created["project"]["projectId"].as_str().unwrap().to_owned();
+    let environment =
+        DokployId::parse(created["environment"]["environmentId"].as_str().unwrap()).unwrap();
+    let key = fixture_key();
+    let client = client();
+    let service = client
+        .create_compose(
+            &url,
+            &key,
+            &NewCompose {
+                environment_id: &environment,
+                server_id: None,
+                name: "sd-stack-probe",
+                description: "Synthetic Supabase stack probe",
+                compose_file: COMPOSE_FILE,
+            },
+        )
+        .await
+        .unwrap();
+    let compose = service.compose_id.clone();
+    let secrets = StackSecrets::generate().unwrap();
+    let env = stack_env(&secrets, "http://stack-probe.example.test").unwrap();
+    client
+        .configure_compose(&url, &key, &compose, COMPOSE_FILE, &env)
+        .await
+        .unwrap();
+    for file in STACK_FILES {
+        client
+            .create_file_mount(&url, &key, &compose, file.path, file.content)
+            .await
+            .unwrap();
+    }
+    client
+        .create_compose_domain(
+            &url,
+            &key,
+            &compose,
+            &NewComposeDomain {
+                host: "stack-probe.example.test",
+                service_name: GATEWAY_SERVICE,
+                port: GATEWAY_PORT,
+                https: false,
+            },
+        )
+        .await
+        .unwrap();
+    client
+        .deploy_compose(&url, &key, &compose, "sd stack probe 1")
+        .await
+        .unwrap();
+    let mut status = None;
+    for _ in 0..600 {
+        let deployments = client.deployments(&url, &key, &compose).await.unwrap();
+        status = deployments
+            .iter()
+            .find(|d| d.title.as_deref() == Some("sd stack probe 1"))
+            .map(|d| d.status);
+        if status.is_some_and(DeploymentStatus::is_finished) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    eprintln!("app name: {}", service.app_name);
+    if std::env::var_os("SUPABASE_DASHBOARD_TEST_KEEP_STACK").is_none() {
+        post(
+            &url,
+            "compose.delete",
+            serde_json::json!({ "composeId": compose.as_str(), "deleteVolumes": true }),
+        )
+        .await;
+        post(
+            &url,
+            "project.remove",
+            serde_json::json!({ "projectId": project_id }),
+        )
+        .await;
+    }
+    assert_eq!(status, Some(DeploymentStatus::Done));
+}

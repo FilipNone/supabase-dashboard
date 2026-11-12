@@ -45,7 +45,7 @@ The compose calls are in `crates/adapters/src/dokploy/compose.rs`. They are call
 - Creating a service, a mount, a domain, or a deployment is not idempotent: each repeated request makes another one, and Dokploy has no idempotency key. These requests are sent once and never retried, and a job looks the object up first.
 - Dokploy appends `-` and six random characters to the requested `appName`, so the name on disk is known only from the answer. A job finds its service again by its exact `name` in its environment. `compose.search` matches names as case-insensitive substrings and treats `%` and `_` as wildcards, so the dashboard's names use only lowercase letters, digits, and `-`, and the comparison is repeated on the dashboard's side. The search lists only services the key's member can access.
 - `compose.one`, `compose.update`, `compose.delete`, and the mount calls answer with the service's variables, compose file, or file contents in plain text. The adapter reads only the IDs and names it needs from those answers. Anyone with a Dokploy key that can see a stack's service can read its secrets this way.
-- Dokploy writes the variables to a `.env` file next to the compose file and escapes every `$` except at the start of `${`, so a value containing `${` would be expanded by Docker Compose. The adapter refuses such variables before sending them. The variables only fill `${…}` references in the compose file; a container receives nothing the compose file does not pass to it.
+- Dokploy writes the variables to a `.env` file next to the compose file, each value in double quotes, and escapes every `$` except at the start of `${`, so a value containing `${` would be expanded by Docker Compose. The adapter refuses such variables before sending them. The variables only fill `${…}` references in the compose file; a container receives nothing the compose file does not pass to it.
 - A file mount is written to the server at once, at `/etc/dokploy/compose/<appName>/files/<filePath>`, and the compose file refers to it as `../files/<filePath>`. Dokploy requires `mountPath` even though compose services ignore it. Paths outside the files folder are refused by both Dokploy and the adapter.
 - `compose.deploy` queues the deployment and returns no ID. Its row in `deployment.allByCompose` appears only once a worker starts it (status `running`, then `done`, `error`, or `cancelled`), and deployments run one at a time. The adapter therefore sends a title unique to the job and finds the deployment by it. `errorMessage` stayed empty on failed compose deployments; the reason is only in the deployment log.
 - Domains become proxy labels when Dokploy deploys, so a domain added or removed after a deployment takes effect at the next one. `domain.create` answers every error with 400, including an unknown service, and checks neither `serviceName` nor the certificate type, so the adapter always sends both.
@@ -68,6 +68,18 @@ These are the calls the M4 roadmap items need, with their required inputs in v0.
 | `compose.delete` | POST | `composeId`, `deleteVolumes` | Remove a stack, keeping or destroying its volumes |
 | `domain.delete` | POST | `domainId` | Remove a domain |
 | `user.get` | GET | none | The key's user |
+
+## The provisioned stack
+
+The stack the dashboard provisions is pinned in `crates/application/stack`: a compose file adapted from upstream's `docker/docker-compose.yml` and the files it mounts, built into the server by `crates/application/src/stack_template.rs`. Image tags are the ones the Supabase fixture runs against. Compared with upstream:
+
+- No service publishes a port or sets a container name. Dokploy routes the stack's domain to the Envoy gateway on port 8000, and two stacks can run on one server.
+- Postgres data, Postgres's custom config, Storage files, and Studio's saved snippets live in named volumes, which Docker prefixes with the service's `appName`.
+- Kong, the logs pipeline (vector and analytics), the pooler, and image transformations are left out, so the database is reached only from inside the stack and Studio's log pages are off.
+- Only the legacy anon and service role keys are set up. Upstream leaves Envoy's asymmetric key variables empty in that mode, which turns two RBAC rules (Realtime and GraphQL) into a match on an empty `apikey` header; the pinned stack sets them to the legacy keys instead, so those rules match only real keys and sb_ key translation stays off.
+- Sign-ups are closed and new users are confirmed without an email, because a new stack has no mail server. Users are added from Studio until the stack's Auth settings change.
+
+The variables are `POSTGRES_PASSWORD`, `JWT_SECRET`, `ANON_KEY`, `SERVICE_ROLE_KEY`, `DASHBOARD_USERNAME`, `DASHBOARD_PASSWORD`, `REALTIME_DB_ENC_KEY`, `SECRET_KEY_BASE`, `PG_META_CRYPTO_KEY`, `SUPABASE_PUBLIC_URL`, and `SITE_URL`. Unit tests check that the compose file reads exactly these, that every mounted file is shipped and every shipped file mounted, that no service has a port or container name, and that the upstream files are byte for byte the fixture's copies. An opt-in fixture test deploys the stack through Dokploy; on 2026-11-13 every service came up healthy, and from inside the stack's network the gateway answered Auth's health check with the anon key, REST and Storage with the service role key, and Studio with the login, and refused requests without a key, as the Supabase fixture's Envoy does.
 
 ## Connecting
 
@@ -178,7 +190,12 @@ SUPABASE_DASHBOARD_TEST_DOKPLOY_URL=http://127.0.0.1:54340 \
 SUPABASE_DASHBOARD_TEST_DOKPLOY_URL=http://127.0.0.1:54340 \
 SUPABASE_DASHBOARD_TEST_DATABASE_URL=postgres://... \
   cargo test -p supabase-dashboard-server dokploy
+# Deploy the pinned Supabase stack (pulls about ten images; opt-in):
+SUPABASE_DASHBOARD_TEST_DOKPLOY_URL=http://127.0.0.1:54340 \
+  cargo test -p supabase-dashboard-adapters --test dokploy_fixture -- --ignored
 docker compose -f tests/fixtures/dokploy/docker-compose.yml down -v
 ```
+
+The stack test deletes the stack and its volumes afterwards unless `SUPABASE_DASHBOARD_TEST_KEEP_STACK` is set. Dokploy leaves the stack's network behind either way.
 
 `setup.sh` signs up the fixture's admin with the synthetic login in `fixture.env` (the first account becomes Dokploy's owner), creates an API key without a rate limit through `user.createApiKey`, and writes it to `tests/fixtures/dokploy/api-key`, which git ignores. Running it again reuses a key that still works. The first run pulls about 1 GB of images inside the container. Dokploy's UI and API listen on `127.0.0.1:54340`.
