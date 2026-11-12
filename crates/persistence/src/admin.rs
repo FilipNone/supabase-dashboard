@@ -3,6 +3,7 @@
 
 use supabase_dashboard_domain::{
     admin::{AdminOrganizationSummary, AdminProjectSummary, RegisteredResources},
+    connection::{HealthDigest, HealthReport, ServiceCheck},
     organization::OrganizationName,
     project::{ProjectName, ProjectUrl},
 };
@@ -41,6 +42,8 @@ impl Database {
             name: String,
             api_url: String,
             created_at: OffsetDateTime,
+            checked_at: Option<OffsetDateTime>,
+            checks: Option<String>,
         }
         let fetch = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
         let org_rows: Vec<OrgRow> = sqlx::query_as(
@@ -57,8 +60,9 @@ impl Database {
         .map_err(query_err)?;
         let project_rows: Vec<ProjectRow> = sqlx::query_as(
             "SELECT p.id, p.organization_id, o.name AS organization_name, p.name, p.api_url, \
-                    p.created_at \
+                    p.created_at, h.checked_at, h.checks::text AS checks \
              FROM projects p JOIN organizations o ON o.id = p.organization_id \
+             LEFT JOIN project_health_reports h ON h.project_id = p.id \
              ORDER BY p.created_at, p.id LIMIT $1",
         )
         .bind(fetch)
@@ -84,10 +88,23 @@ impl Database {
                 })
             })
             .collect::<Result<_, PersistenceError>>()?;
+        let now = OffsetDateTime::now_utc();
         let projects = project_rows
             .into_iter()
             .map(|row| {
+                let health = match (row.checked_at, row.checks) {
+                    (Some(checked_at), Some(checks)) => {
+                        let checks: Vec<ServiceCheck> =
+                            serde_json::from_str(&checks).map_err(|_| {
+                                PersistenceError::InvalidRow("project_health_reports.checks")
+                            })?;
+                        let report = HealthReport { checked_at, checks };
+                        Some(HealthDigest::new(row.id, &report, now))
+                    }
+                    _ => None,
+                };
                 Ok(AdminProjectSummary {
+                    health,
                     organization_name: organization_name(&row.organization_name)?,
                     name: ProjectName::parse(&row.name)
                         .map_err(|_| PersistenceError::InvalidRow("projects.name"))?,

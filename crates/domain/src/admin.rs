@@ -9,6 +9,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
+    connection::HealthDigest,
     organization::OrganizationName,
     project::{ProjectName, ProjectUrl},
 };
@@ -33,6 +34,8 @@ pub struct AdminProjectSummary {
     pub name: ProjectName,
     pub api_url: ProjectUrl,
     pub created_at: OffsetDateTime,
+    /// The last saved check in short; `None` when never checked.
+    pub health: Option<HealthDigest>,
 }
 
 /// Every organization and project of the installation, oldest first, each

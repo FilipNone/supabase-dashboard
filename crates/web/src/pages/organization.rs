@@ -197,7 +197,7 @@ pub fn OrganizationProjectsPage() -> impl IntoView {
 
 /// The last check of one project on its card: an overall badge, when it
 /// ran, and whether it is old. Nothing here is a live status.
-fn health_badges(digest: Option<&HealthDigest>) -> impl IntoView + use<> {
+pub(crate) fn health_badges(digest: Option<&HealthDigest>) -> impl IntoView + use<> {
     let Some(digest) = digest else {
         return view! {
             <span class="card-badges">

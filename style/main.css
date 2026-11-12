@@ -365,6 +365,7 @@ code { font-family: var(--font-mono); font-size: var(--text-sm); }
 .card-cover:focus-visible { outline: none; }
 .card-cover:focus-visible::after { outline: 2px solid var(--color-focus); outline-offset: 2px; }
 .card-badges { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.health-cell { display: grid; gap: var(--space-1); justify-items: start; min-width: 10rem; }
 .card-badges .badge + .badge { margin-left: 0; }
 .card-aside { position: relative; z-index: 1; color: var(--color-text-muted); font-size: var(--text-sm); }
 .card-aside:hover { color: var(--color-text); }

@@ -16,6 +16,7 @@ use crate::{
     components::dialog::{ConfirmDialog, DialogCancel},
     components::page::{PageHeader, StatePanel, StateTone},
     error::AppError,
+    pages::organization::health_badges,
     server_fns::{AdminSetAccountDisabled, admin_list_accounts, admin_list_resources},
 };
 
@@ -107,6 +108,38 @@ fn RegisteredResources() -> impl IntoView {
     }
 }
 
+/// One sentence on the listed projects' last checks, so failures stand out
+/// without reading every row.
+fn health_summary(list: &[AdminProjectSummary]) -> String {
+    let failing = list
+        .iter()
+        .filter(|p| p.health.as_ref().is_some_and(|h| !h.failing.is_empty()))
+        .count();
+    let unknown = list
+        .iter()
+        .filter(|p| p.health.as_ref().is_none_or(|h| h.stale))
+        .count();
+    let projects = |n: usize| if n == 1 { "project" } else { "projects" };
+    match (failing, unknown) {
+        (0, 0) => "No listed project failed its last check.".to_owned(),
+        (failing, 0) => format!(
+            "{failing} {} failed {} last check.",
+            projects(failing),
+            if failing == 1 { "its" } else { "their" }
+        ),
+        (0, unknown) => format!(
+            "No checked project failed its last check; {unknown} {} never checked or last checked over a day ago.",
+            if unknown == 1 { "was" } else { "were" }
+        ),
+        (failing, unknown) => format!(
+            "{failing} {} failed {} last check; {unknown} {} never checked or last checked over a day ago.",
+            projects(failing),
+            if failing == 1 { "its" } else { "their" },
+            if unknown == 1 { "was" } else { "were" }
+        ),
+    }
+}
+
 fn truncation_note(truncated: bool, what: &'static str) -> Option<impl IntoView> {
     truncated.then(|| {
         view! {
@@ -174,9 +207,11 @@ fn ProjectTable(list: Vec<AdminProjectSummary>, truncated: bool) -> impl IntoVie
         }
         .into_any();
     }
+    let summary = health_summary(&list);
     let rows = list
         .into_iter()
         .map(|project| {
+            let health = health_badges(project.health.as_ref());
             let transport = if project.api_url.is_encrypted() {
                 view! { <span class="badge badge-ok">"HTTPS"</span> }.into_any()
             } else {
@@ -187,12 +222,14 @@ fn ProjectTable(list: Vec<AdminProjectSummary>, truncated: bool) -> impl IntoVie
                     <td>{project.name.as_str().to_owned()}</td>
                     <td>{project.organization_name.as_str().to_owned()}</td>
                     <td><span class="url-text">{project.api_url.as_str().to_owned()}</span> {transport}</td>
+                    <td><div class="health-cell">{health}</div></td>
                     <td class="nowrap">{project.created_at.date().to_string()}</td>
                 </tr>
             }
         })
         .collect_view();
     view! {
+        <p class="section-text" role="status">{summary}</p>
         <div class="table-wrap">
             <table class="data-table">
                 <caption class="visually-hidden">"Registered projects"</caption>
@@ -201,6 +238,7 @@ fn ProjectTable(list: Vec<AdminProjectSummary>, truncated: bool) -> impl IntoVie
                         <th scope="col">"Name"</th>
                         <th scope="col">"Organization"</th>
                         <th scope="col">"API URL"</th>
+                        <th scope="col">"Last check"</th>
                         <th scope="col">"Registered (UTC)"</th>
                     </tr>
                 </thead>
@@ -286,5 +324,61 @@ fn AccountTable(
                 <tbody>{rows}</tbody>
             </table>
         </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use supabase_dashboard_domain::{
+        connection::{HealthDigest, StackService},
+        organization::OrganizationName,
+        project::{ProjectName, ProjectUrl},
+    };
+    use time::OffsetDateTime;
+    use uuid::Uuid;
+
+    use super::*;
+
+    fn project(health: Option<(Vec<StackService>, bool)>) -> AdminProjectSummary {
+        let id = Uuid::nil();
+        AdminProjectSummary {
+            id,
+            organization_id: id,
+            organization_name: OrganizationName::parse("Acme").unwrap(),
+            name: ProjectName::parse("Prod").unwrap(),
+            api_url: ProjectUrl::parse("https://supabase.example.test").unwrap(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            health: health.map(|(failing, stale)| HealthDigest {
+                project_id: id,
+                checked_at: OffsetDateTime::UNIX_EPOCH,
+                failing,
+                not_checked: Vec::new(),
+                stale,
+            }),
+        }
+    }
+
+    #[test]
+    fn the_summary_counts_failing_and_unknown_projects() {
+        let healthy = project(Some((Vec::new(), false)));
+        let failing = project(Some((vec![StackService::Auth], false)));
+        let stale_failing = project(Some((vec![StackService::Rest], true)));
+        let never = project(None);
+        assert_eq!(
+            health_summary(std::slice::from_ref(&healthy)),
+            "No listed project failed its last check."
+        );
+        assert_eq!(
+            health_summary(&[healthy, failing.clone()]),
+            "1 project failed its last check."
+        );
+        assert_eq!(
+            health_summary(std::slice::from_ref(&never)),
+            "No checked project failed its last check; 1 was never checked or last checked over a day ago."
+        );
+        assert_eq!(
+            health_summary(&[failing, stale_failing, never]),
+            "2 projects failed their last check; 2 were never checked or last checked over a day ago."
+        );
     }
 }

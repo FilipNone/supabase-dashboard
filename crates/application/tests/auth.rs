@@ -13,10 +13,14 @@ use supabase_dashboard_application::{
     },
     throttle::ThrottleConfig,
 };
+use supabase_dashboard_domain::connection::{
+    HealthReport, ServiceCheck, ServiceStatus, StackService,
+};
 use supabase_dashboard_persistence::{
     Database,
     accounts::SetDisabledOutcome,
     audit::{AuditEvent, AuditOutcome},
+    connections::HistoryRetention,
 };
 
 // Shares the scratch-database helper with the persistence tests.
@@ -649,21 +653,44 @@ async fn only_installation_admins_list_registered_resources() {
     .execute(db.pool())
     .await
     .unwrap();
+    let mut ids = Vec::new();
     for (name, url) in [
         ("Prod", "https://supabase.example.test"),
         ("Lab", "http://10.0.0.5:8000"),
     ] {
+        let id = uuid::Uuid::now_v7();
         sqlx::query(
             "INSERT INTO projects (id, organization_id, name, api_url) VALUES ($1, $2, $3, $4)",
         )
-        .bind(uuid::Uuid::now_v7())
+        .bind(id)
         .bind(org)
         .bind(name)
         .bind(url)
         .execute(db.pool())
         .await
         .unwrap();
+        ids.push(id);
     }
+    // Prod's last check found Auth refusing its key; Lab was never checked.
+    let report = HealthReport {
+        checked_at: time::OffsetDateTime::now_utc(),
+        checks: vec![ServiceCheck {
+            service: StackService::Auth,
+            status: ServiceStatus::KeyRejected { http_status: 401 },
+            version: None,
+            latency_ms: Some(3),
+        }],
+    };
+    db.save_health_report(
+        ids[0],
+        &report,
+        HistoryRetention {
+            max_age_days: 7,
+            max_entries: 10,
+        },
+    )
+    .await
+    .unwrap();
 
     assert!(matches!(
         auth.admin_list_resources(&bob, ctx()).await,
@@ -689,6 +716,10 @@ async fn only_installation_admins_list_registered_resources() {
             .all(|p| p.organization_name.as_str() == "Bob Co")
     );
     assert!(!listed.projects[1].api_url.is_encrypted());
+    let prod = listed.projects[0].health.as_ref().unwrap();
+    assert_eq!(prod.failing, vec![StackService::Auth]);
+    assert!(!prod.stale);
+    assert!(listed.projects[1].health.is_none());
 
     db.close().await;
     scratch.drop().await;
