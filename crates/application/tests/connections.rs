@@ -22,7 +22,7 @@ use supabase_dashboard_domain::{
     authz::OrgRole,
     connection::{
         ApiKeyError, CredentialKind, CredentialState, HEALTH_HISTORY_MAX_ENTRIES,
-        HEALTH_HISTORY_PAGE, SavedCredential, ServiceCheck, ServiceStatus, SkipReason,
+        HEALTH_HISTORY_PAGE, HealthHour, SavedCredential, ServiceCheck, ServiceStatus, SkipReason,
         StackService, UnreachableReason, check_studio_login,
     },
     project::ProjectUrl,
@@ -887,6 +887,24 @@ async fn health_history_is_kept_for_members_within_its_limits() {
     let before = f.connections.health_history(&owner, id).await.unwrap();
     assert_eq!(before.total, u32::from(HEALTH_HISTORY_MAX_ENTRIES) + 6);
     assert_eq!(before.recent.len(), usize::from(HEALTH_HISTORY_PAGE));
+    // The hourly counts cover the same kept entries, oldest hour first,
+    // each starting on the hour and none after the read.
+    let sum = |pick: fn(&HealthHour) -> u32| before.hours.iter().map(pick).sum::<u32>();
+    assert_eq!(sum(|h| h.checks), before.total);
+    assert_eq!(sum(|h| h.failing), before.with_failures);
+    assert!(before.hours.windows(2).all(|w| w[0].hour < w[1].hour));
+    assert!(
+        before
+            .hours
+            .iter()
+            .all(|h| { h.hour.minute() == 0 && h.hour.second() == 0 && h.hour.nanosecond() == 0 })
+    );
+    assert!(before.hours.iter().all(|h| h.hour <= before.read_at));
+    assert!(
+        before.hours.len() >= 17 && before.hours.len() <= 19,
+        "{}",
+        before.hours.len()
+    );
 
     sqlx::query("UPDATE project_health_reports SET checked_at = now() - interval '1 hour'")
         .execute(f.db.pool())

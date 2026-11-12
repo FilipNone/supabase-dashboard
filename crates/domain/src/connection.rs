@@ -512,6 +512,22 @@ pub struct HealthHistory {
     pub with_failures: u32,
     /// The oldest kept check, if any.
     pub since: Option<OffsetDateTime>,
+    /// Kept checks counted per UTC hour, oldest first. Hours without a
+    /// check are left out.
+    pub hours: Vec<HealthHour>,
+    /// When the history was read, so the view can tell hours with no check
+    /// from hours that have not happened yet.
+    pub read_at: OffsetDateTime,
+}
+
+/// The checks saved within one UTC hour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthHour {
+    /// The start of the hour.
+    pub hour: OffsetDateTime,
+    pub checks: u32,
+    /// Checks that found at least one failing service.
+    pub failing: u32,
 }
 
 /// A project's last check in short, for its card on the organization

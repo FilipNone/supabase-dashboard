@@ -26,7 +26,10 @@ use supabase_dashboard_domain::{
 use crate::{
     components::page::{StatePanel, StateTone},
     error::AppError,
-    pages::account::{utc_minutes, utc_seconds},
+    pages::{
+        account::{utc_minutes, utc_seconds},
+        health_chart::health_chart,
+    },
     server_fns::{
         CheckProjectHealth, RemoveProjectCredential, ReplaceProjectCredential, ReplaceStudioLogin,
         get_project_credentials, get_project_health, get_project_health_history,
@@ -126,6 +129,7 @@ fn history_view(history: HealthHistory) -> impl IntoView {
             utc_minutes(since),
         ),
     };
+    let chart = (history.total > 0).then(|| health_chart(history.hours, history.read_at));
     let table = (!history.recent.is_empty()).then(|| {
         let rows = history.recent.into_iter().map(history_row).collect_view();
         view! {
@@ -146,6 +150,7 @@ fn history_view(history: HealthHistory) -> impl IntoView {
     view! {
         <h3 class="subsection-title">"Recent checks"</h3>
         <p class="section-text">{summary}</p>
+        {chart}
         {table}
     }
 }

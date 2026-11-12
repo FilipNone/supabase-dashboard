@@ -1,5 +1,6 @@
 pub mod account;
 pub mod admin;
+mod health_chart;
 pub mod invite;
 pub mod not_found;
 pub mod organization;

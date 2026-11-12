@@ -17,7 +17,7 @@ use supabase_dashboard_domain::{
     connection::{
         ApiKeyError, CredentialKind, CredentialOverview, CredentialState, CredentialStatus,
         HEALTH_CHECK_COOLDOWN_SECS, HEALTH_HISTORY_MAX_ENTRIES, HEALTH_HISTORY_PAGE,
-        HEALTH_HISTORY_RETENTION_DAYS, HealthDigest, HealthHistory, HealthHistoryEntry,
+        HEALTH_HISTORY_RETENTION_DAYS, HealthDigest, HealthHistory, HealthHistoryEntry, HealthHour,
         HealthReport, KeyExpiry, SavedCredential, ServiceCheck, ServiceStatus, SkipReason,
         StackService, check_api_key,
     },
@@ -384,6 +384,16 @@ impl ConnectionService {
             total: u32::try_from(stored.total).unwrap_or(u32::MAX),
             with_failures: u32::try_from(stored.with_failures).unwrap_or(u32::MAX),
             since: stored.since,
+            hours: stored
+                .hours
+                .into_iter()
+                .map(|(hour, checks, failing)| HealthHour {
+                    hour,
+                    checks: u32::try_from(checks).unwrap_or(u32::MAX),
+                    failing: u32::try_from(failing).unwrap_or(u32::MAX),
+                })
+                .collect(),
+            read_at: stored.read_at,
         })
     }
 

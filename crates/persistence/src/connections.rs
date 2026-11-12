@@ -31,6 +31,12 @@ pub struct StoredHealthHistory {
     pub total: i64,
     pub with_failures: i64,
     pub since: Option<OffsetDateTime>,
+    /// Kept checks counted per UTC hour, oldest first: the hour's start,
+    /// all checks, and checks with a failing service. Hours without a
+    /// check are left out.
+    pub hours: Vec<(OffsetDateTime, i64, i64)>,
+    /// The database's clock when the history was read.
+    pub read_at: OffsetDateTime,
 }
 
 /// One encrypted key as stored.
@@ -376,8 +382,13 @@ impl Database {
         retention: HistoryRetention,
         limit: u16,
     ) -> Result<StoredHealthHistory, PersistenceError> {
-        let (total, with_failures, since): (i64, i64, Option<OffsetDateTime>) = sqlx::query_as(
-            "SELECT count(*), count(*) FILTER (WHERE failing), min(checked_at) \
+        let (total, with_failures, since, read_at): (
+            i64,
+            i64,
+            Option<OffsetDateTime>,
+            OffsetDateTime,
+        ) = sqlx::query_as(
+            "SELECT count(*), count(*) FILTER (WHERE failing), min(checked_at), now() \
              FROM project_health_history \
              WHERE project_id = $1 AND checked_at >= now() - make_interval(days => $2)",
         )
@@ -397,6 +408,19 @@ impl Database {
         .fetch_all(&self.pool)
         .await
         .map_err(query_err)?;
+        // At most 24 rows per kept day, so the result stays small.
+        let hours: Vec<(OffsetDateTime, i64, i64)> = sqlx::query_as(
+            "SELECT date_trunc('hour', checked_at, 'UTC') AS hour, count(*), \
+                    count(*) FILTER (WHERE failing) \
+             FROM project_health_history \
+             WHERE project_id = $1 AND checked_at >= now() - make_interval(days => $2) \
+             GROUP BY hour ORDER BY hour",
+        )
+        .bind(project_id)
+        .bind(i32::from(retention.max_age_days))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(query_err)?;
         let recent = rows
             .into_iter()
             .map(|(checked_at, checks)| {
@@ -410,6 +434,8 @@ impl Database {
             total,
             with_failures,
             since,
+            hours,
+            read_at,
         })
     }
 
