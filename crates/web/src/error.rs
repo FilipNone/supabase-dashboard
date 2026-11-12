@@ -76,6 +76,7 @@ mod server {
         connections::ConnectionError,
         organizations::OrganizationError,
         projects::ProjectError,
+        studio_access::StudioAccessError,
     };
 
     use super::AppError;
@@ -162,6 +163,19 @@ mod server {
                 }
                 ConnectionError::Internal(err) => {
                     tracing::error!(error = %err, "project connection operation failed");
+                    Self::Unavailable
+                }
+            }
+        }
+    }
+
+    impl From<StudioAccessError> for AppError {
+        fn from(err: StudioAccessError) -> Self {
+            match err {
+                StudioAccessError::NotFound => Self::NotFound,
+                StudioAccessError::Forbidden => Self::Forbidden,
+                StudioAccessError::Internal(err) => {
+                    tracing::error!(error = %err, "Studio access log could not be read");
                     Self::Unavailable
                 }
             }

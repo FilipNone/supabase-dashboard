@@ -19,6 +19,7 @@ use supabase_dashboard_domain::{
     invitation::{InvitationCode, InvitationPreview, InvitationSummary, IssuedInvitation},
     organization::{MemberSummary, OrganizationSummary},
     project::ProjectSummary,
+    studio_access::StudioAccessLog,
 };
 use uuid::Uuid;
 
@@ -85,6 +86,7 @@ mod org_context {
         connections::ConnectionService,
         organizations::OrganizationService,
         projects::ProjectService,
+        studio_access::StudioAccessService,
     };
 
     use crate::error::AppError;
@@ -117,6 +119,13 @@ mod org_context {
     pub fn projects() -> Result<Arc<ProjectService>, AppError> {
         use_context::<Arc<ProjectService>>().ok_or_else(|| {
             tracing::error!("project service is not configured");
+            AppError::Unavailable
+        })
+    }
+
+    pub fn studio_access() -> Result<Arc<StudioAccessService>, AppError> {
+        use_context::<Arc<StudioAccessService>>().ok_or_else(|| {
+            tracing::error!("Studio access log service is not configured");
             AppError::Unavailable
         })
     }
@@ -284,6 +293,14 @@ pub async fn get_project_health_history(id: Uuid) -> Result<HealthHistory, AppEr
     Ok(org_context::connections()?
         .health_history(&session, id)
         .await?)
+}
+
+/// The newest requests members sent through the project's Studio host,
+/// for owners and admins.
+#[server]
+pub async fn get_studio_access_log(id: Uuid) -> Result<StudioAccessLog, AppError> {
+    let session = org_context::session()?;
+    Ok(org_context::studio_access()?.read(&session, id).await?)
 }
 
 /// The last check of each project in an organization, in short. Projects

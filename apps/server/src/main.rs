@@ -28,6 +28,7 @@ use supabase_dashboard_application::{
     projects::ProjectService,
     secrets::{CredentialCipher, KeyError},
     studio::StudioService,
+    studio_access::{StudioAccessRecorder, StudioAccessService},
 };
 use supabase_dashboard_persistence::{Database, PersistenceError};
 use tokio::net::TcpListener;
@@ -222,12 +223,19 @@ async fn run() -> Result<(), StartupError> {
                 example = %hosts.origin(uuid::Uuid::nil()),
                 "Studio access is enabled"
             );
-            Some(Arc::new(StudioGateway::new(
+            let gateway = StudioGateway::new(
                 hosts.clone(),
                 Arc::new(service),
                 proxy,
                 public_url.origin().ascii_serialization(),
-            )))
+            );
+            Some(Arc::new(match config.studio_access_log_days {
+                Some(days) => {
+                    tracing::info!(retention_days = days, "Studio requests are logged");
+                    gateway.with_access_log(StudioAccessRecorder::start(db.clone()))
+                }
+                None => gateway,
+            }))
         }
         _ => {
             tracing::warn!(
@@ -236,6 +244,14 @@ async fn run() -> Result<(), StartupError> {
             None
         }
     };
+
+    // Pruning runs even with the log off, so turning it off also clears
+    // what it recorded before.
+    let studio_access = Arc::new(StudioAccessService::new(
+        db.clone(),
+        config.studio_access_log_days,
+    ));
+    tokio::spawn(prune_studio_access(Arc::clone(&studio_access)));
 
     let connections = Arc::new(ConnectionService::new(db.clone(), cipher, probe));
     match config.health_check_interval {
@@ -261,6 +277,7 @@ async fn run() -> Result<(), StartupError> {
         organizations: Arc::new(OrganizationService::new(db.clone())),
         projects: Arc::new(ProjectService::new(db.clone())),
         connections,
+        studio_access,
         cookie: CookieSettings::new(secure_cookie, config.session_lifetime.as_secs()),
         expected_origin: config
             .public_url
@@ -306,6 +323,19 @@ async fn prune_sessions(auth: Arc<AuthService>) {
             Ok(0) => {}
             Ok(count) => tracing::info!(count, "pruned expired sessions"),
             Err(err) => tracing::warn!(error = %err, "could not prune sessions"),
+        }
+    }
+}
+
+/// Deletes Studio access log entries past their retention once an hour.
+async fn prune_studio_access(log: Arc<StudioAccessService>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(3600));
+    loop {
+        interval.tick().await;
+        match log.prune().await {
+            Ok(0) => {}
+            Ok(count) => tracing::info!(count, "pruned Studio access log entries"),
+            Err(err) => tracing::warn!(error = %err, "could not prune the Studio access log"),
         }
     }
 }

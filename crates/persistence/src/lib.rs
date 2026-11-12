@@ -12,6 +12,7 @@ pub mod organizations;
 pub mod projects;
 pub mod sessions;
 pub mod studio;
+pub mod studio_access;
 
 use std::time::Duration;
 

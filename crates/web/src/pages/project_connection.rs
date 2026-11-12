@@ -15,6 +15,7 @@ use supabase_dashboard_domain::{
         StackService,
     },
     project::ProjectSummary,
+    studio_access::{STUDIO_ACCESS_PAGE, StudioAccessEntry, StudioAccessLog},
 };
 
 use crate::{
@@ -24,6 +25,7 @@ use crate::{
     server_fns::{
         CheckProjectHealth, RemoveProjectCredential, ReplaceProjectCredential, ReplaceStudioLogin,
         get_project_credentials, get_project_health, get_project_health_history,
+        get_studio_access_log,
     },
 };
 
@@ -549,5 +551,106 @@ pub fn StudioLoginPanel(project: ProjectSummary) -> impl IntoView {
                 <p class="field-hint">"Only owners and administrators can change the Studio login."</p>
             })}
         </section>
+    }
+}
+
+/// Requests members sent through the project's Studio host, newest first.
+/// Only shown to roles that may read it; the server checks again.
+#[component]
+pub fn StudioAccessPanel(project: ProjectSummary) -> impl IntoView {
+    let id = project.id;
+    let reload = RwSignal::new(0_u32);
+    let log = Resource::new(move || reload.get(), move |_| get_studio_access_log(id));
+    view! {
+        <section class="panel" aria-labelledby="studio-log-title">
+            <div class="section-header">
+                <h2 class="section-title" id="studio-log-title">"Studio access log"</h2>
+                <button type="button" class="button" on:click=move |_| reload.update(|n| *n = n.wrapping_add(1))>
+                    "Refresh"
+                </button>
+            </div>
+            <Transition fallback=|| view! { <p class="loading" role="status">"Loading the access log…"</p> }>
+                {move || log.get().map(|result| match result {
+                    Ok(StudioAccessLog::Off) => view! {
+                        <p class="section-text">
+                            "This installation does not record Studio requests. The server's operator can turn the log on with "
+                            <code>"SUPABASE_DASHBOARD_STUDIO_ACCESS_LOG_DAYS"</code>"."
+                        </p>
+                    }
+                    .into_any(),
+                    Ok(StudioAccessLog::On { retention_days, entries }) => {
+                        access_log_view(retention_days, entries).into_any()
+                    }
+                    Err(err) => view! {
+                        <StatePanel
+                            tone=StateTone::Error
+                            title="Access log unavailable".to_string()
+                            detail=err.to_string()
+                        />
+                    }
+                    .into_any(),
+                })}
+            </Transition>
+        </section>
+    }
+}
+
+fn access_log_view(retention_days: u16, entries: Vec<StudioAccessEntry>) -> impl IntoView {
+    let days = if retention_days == 1 { "day" } else { "days" };
+    if entries.is_empty() {
+        return view! {
+            <p class="section-text">
+                {format!("No Studio requests in the last {retention_days} {days}.")}
+            </p>
+        }
+        .into_any();
+    }
+    let rows = entries.into_iter().map(access_row).collect_view();
+    view! {
+        <p class="section-text">
+            {format!(
+                "The newest {STUDIO_ACCESS_PAGE} requests at most, from the last {retention_days} {days}. \
+                 Only the method, path, and status are kept; query strings, SQL, and data are not."
+            )}
+        </p>
+        <div class="table-wrap" role="region" aria-label="Studio requests" tabindex="0">
+            <table class="data-table">
+                <caption class="visually-hidden">"Studio requests, newest first"</caption>
+                <thead>
+                    <tr>
+                        <th scope="col">"Time (UTC)"</th>
+                        <th scope="col">"Member"</th>
+                        <th scope="col">"Request"</th>
+                        <th scope="col">"Status"</th>
+                    </tr>
+                </thead>
+                <tbody>{rows}</tbody>
+            </table>
+        </div>
+    }
+    .into_any()
+}
+
+fn access_row(entry: StudioAccessEntry) -> impl IntoView {
+    let member = match entry.member {
+        Some(member) => view! {
+            <span>{member.display_name}</span>
+            <span class="field-hint status-detail">{member.email}</span>
+        }
+        .into_any(),
+        None => view! { <span class="field-hint">"Deleted account"</span> }.into_any(),
+    };
+    let class = if entry.status < 400 {
+        "badge badge-ok"
+    } else {
+        "badge badge-error"
+    };
+    view! {
+        <tr>
+            <td class="nowrap">{utc_seconds(entry.at)}</td>
+            <td>{member}</td>
+            <td><code class="request-path">{format!("{} {}", entry.method, entry.path)}</code></td>
+            <td><span class=class>{entry.status}</span></td>
+        </tr>
     }
 }

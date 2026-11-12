@@ -4,6 +4,7 @@
 use std::{fmt, time::Duration};
 
 use secrecy::SecretString;
+use supabase_dashboard_domain::studio_access::STUDIO_ACCESS_MAX_RETENTION_DAYS;
 use supabase_dashboard_persistence::DatabaseSettings;
 
 use crate::studio_host::StudioHosts;
@@ -56,6 +57,9 @@ pub struct Config {
     /// How old a project's last check may get before the server checks it
     /// again on its own. `None` turns the server's own checks off.
     pub health_check_interval: Option<Duration>,
+    /// Days to keep the Studio access log. `None` (the default) records
+    /// nothing.
+    pub studio_access_log_days: Option<u16>,
 }
 
 #[derive(Debug, Clone)]
@@ -194,6 +198,19 @@ impl Config {
                 }
                 mins => Some(secs(mins * 60)),
             };
+        let studio_access_log_days = match bounded(
+            &get,
+            "STUDIO_ACCESS_LOG_DAYS",
+            0,
+            0,
+            u64::from(STUDIO_ACCESS_MAX_RETENTION_DAYS),
+        )? {
+            0 => None,
+            days => Some(
+                u16::try_from(days)
+                    .map_err(|_| invalid("STUDIO_ACCESS_LOG_DAYS", "is out of range"))?,
+            ),
+        };
 
         Ok(Self {
             environment,
@@ -213,6 +230,7 @@ impl Config {
                 .map_err(|_| invalid("STUDIO_MAX_BODY_BYTES", "does not fit in memory size"))?,
             studio_request_timeout,
             health_check_interval,
+            studio_access_log_days,
         })
     }
 }
@@ -361,6 +379,22 @@ mod tests {
         for bad in ["1", "4", "1441", "soon"] {
             assert!(
                 load(&[dev.0, dev.1, ("HEALTH_CHECK_INTERVAL_MINS", bad)]).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_studio_access_log_is_off_unless_given_a_retention() {
+        let dev = (("ENV", "development"), DB);
+        assert_eq!(load(&[dev.0, dev.1]).unwrap().studio_access_log_days, None);
+        let on = load(&[dev.0, dev.1, ("STUDIO_ACCESS_LOG_DAYS", "30")]).unwrap();
+        assert_eq!(on.studio_access_log_days, Some(30));
+        let off = load(&[dev.0, dev.1, ("STUDIO_ACCESS_LOG_DAYS", "0")]).unwrap();
+        assert_eq!(off.studio_access_log_days, None);
+        for bad in ["91", "-1", "week"] {
+            assert!(
+                load(&[dev.0, dev.1, ("STUDIO_ACCESS_LOG_DAYS", bad)]).is_err(),
                 "{bad}"
             );
         }

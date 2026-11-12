@@ -44,6 +44,7 @@ pub fn router(state: AppState, limits: &HttpLimits) -> Router {
     let organizations = state.organizations.clone();
     let projects = state.projects.clone();
     let connections = state.connections.clone();
+    let studio_access = state.studio_access.clone();
     let auth = state.auth.clone();
     let leptos_options = state.leptos_options.clone();
     let x_request_id = HeaderName::from_static("x-request-id");
@@ -78,6 +79,7 @@ pub fn router(state: AppState, limits: &HttpLimits) -> Router {
                 provide_context(organizations.clone());
                 provide_context(projects.clone());
                 provide_context(connections.clone());
+                provide_context(studio_access.clone());
                 provide_context(auth.clone());
             },
             move || shell(leptos_options.clone()),
@@ -170,6 +172,7 @@ mod tests {
         connections::ConnectionService,
         organizations::OrganizationService,
         projects::ProjectService,
+        studio_access::{StudioAccessRecorder, StudioAccessService},
     };
     use supabase_dashboard_persistence::{Database, DatabaseSettings};
     use supabase_dashboard_web::{
@@ -178,8 +181,8 @@ mod tests {
             AdminListAccounts, AdminSetAccountDisabled, ChangePassword, CheckProjectHealth,
             CreateInvitation, CreateOrganization, GetCurrentAccount, GetInstallationHealth,
             GetOrganization, GetProject, GetProjectCredentials, GetProjectHealth,
-            ListOrganizations, ListProjects, ListSessions, PreviewInvitation, RegisterProject,
-            RemoveProjectCredential, RenameOrganization, ReplaceProjectCredential,
+            GetStudioAccessLog, ListOrganizations, ListProjects, ListSessions, PreviewInvitation,
+            RegisterProject, RemoveProjectCredential, RenameOrganization, ReplaceProjectCredential,
             ReplaceStudioLogin, RevokeSession, SignUpWithInvitation, UnregisterProject,
             UpdateProfile,
         },
@@ -203,6 +206,7 @@ mod tests {
         let auth = AuthService::new(db.clone(), AuthConfig::default())
             .await
             .unwrap();
+        let studio_access = Arc::new(StudioAccessService::new(db.clone(), None));
         let state = AppState {
             leptos_options: LeptosOptions::builder()
                 .output_name("supabase-dashboard")
@@ -222,6 +226,7 @@ mod tests {
             cookie: CookieSettings::new(false, 3600),
             expected_origin: None,
             studio: None,
+            studio_access,
         };
         router(state, &test_limits())
     }
@@ -967,7 +972,8 @@ mod tests {
             })
             .unwrap(),
             ORIGIN.to_owned(),
-        );
+        )
+        .with_access_log(StudioAccessRecorder::start(db.clone()));
         let state = AppState {
             leptos_options: LeptosOptions::builder()
                 .output_name("supabase-dashboard")
@@ -995,6 +1001,7 @@ mod tests {
             cookie: CookieSettings::new(false, 3600),
             expected_origin: None,
             studio: Some(Arc::new(gateway)),
+            studio_access: Arc::new(StudioAccessService::new(db.clone(), Some(7))),
         };
         let router = router(state, &test_limits());
         (router, hosts)
@@ -1249,6 +1256,34 @@ mod tests {
         .await;
         assert_eq!(parts.status, StatusCode::SEE_OTHER);
         assert!(location(&parts).starts_with(&format!("{ORIGIN}{}", launch(other))));
+
+        // The access log records the request without its query string, for
+        // owners and admins only.
+        let _ = send(
+            &router,
+            studio_get(
+                &main_host,
+                "/project/default/sql?q=select-secret",
+                Some(&cookies),
+            ),
+        )
+        .await;
+        let mut log = String::new();
+        for _ in 0..50 {
+            let (parts, body) = call(GetStudioAccessLog::PATH, format!("id={main}"), &alice).await;
+            assert_eq!(parts.status, StatusCode::OK, "{body}");
+            log = body;
+            if log.contains("/project/default/sql") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(log.contains(r#""path":"/project/default""#), "{log}");
+        assert!(log.contains(r#""path":"/project/default/sql""#), "{log}");
+        assert!(!log.contains("select-secret"), "{log}");
+        assert!(log.contains("Alice"), "{log}");
+        let (parts, _) = call(GetStudioAccessLog::PATH, format!("id={main}"), &bob).await;
+        assert_eq!(parts.status, StatusCode::FORBIDDEN);
 
         // A write from another origin is refused, even with the cookie.
         let forged = Request::post("/api/platform/pg-meta/default/query")

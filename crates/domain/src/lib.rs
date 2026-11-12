@@ -11,4 +11,5 @@ pub mod health;
 pub mod invitation;
 pub mod organization;
 pub mod project;
+pub mod studio_access;
 pub mod theme;

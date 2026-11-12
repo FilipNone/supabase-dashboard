@@ -12,12 +12,14 @@ use supabase_dashboard_application::{
     projects::{ProjectService, Registration},
     secrets::CredentialCipher,
     studio::{STUDIO_HOME, StudioError, StudioService},
+    studio_access::{StudioAccessError, StudioAccessRecorder, StudioAccessService},
 };
 use supabase_dashboard_domain::{
     account::{DisplayName, Email},
     authz::OrgRole,
     connection::{CredentialKind, ServiceCheck, ServiceStatus, StackService, check_studio_login},
     project::ProjectUrl,
+    studio_access::{NewStudioAccess, StudioAccessLog, loggable_path},
 };
 use supabase_dashboard_persistence::{Database, accounts::AccountRecord};
 use uuid::Uuid;
@@ -380,4 +382,106 @@ async fn access_ends_with_the_session_role_membership_and_login() {
         .await
         .unwrap();
     assert_eq!(left, 0);
+}
+
+#[tokio::test]
+async fn studio_requests_are_logged_for_owners_and_admins_to_read() {
+    let Some(scratch) = ScratchDb::create("studio_access_log").await else {
+        return;
+    };
+    let f = setup(&scratch).await;
+    let owner = account(&f.db, "Owner").await;
+    let (org, id) = project(&f, &owner, "Acme").await;
+    let admin = account(&f.db, "Admin").await;
+    let developer = account(&f.db, "Developer").await;
+    let outsider = account(&f.db, "Outsider").await;
+    add_member(&f.db, org, &admin, OrgRole::Admin).await;
+    add_member(&f.db, org, &developer, OrgRole::Developer).await;
+    let (_, other) = project(&f, &outsider, "Globex").await;
+
+    let recorder = StudioAccessRecorder::start(f.db.clone());
+    let at = time::OffsetDateTime::now_utc();
+    for (project_id, who, path, status) in [
+        (
+            id,
+            &developer,
+            "/api/platform/pg-meta/default/query?key=abc",
+            200,
+        ),
+        (id, &developer, "/project/default/editor", 200),
+        (other, &outsider, "/project/default", 200),
+        (Uuid::now_v7(), &developer, "/unknown-project", 200),
+    ] {
+        recorder.record(NewStudioAccess {
+            project_id,
+            account_id: who.account.id,
+            at,
+            method: "GET".to_owned(),
+            path: loggable_path(path),
+            status,
+        });
+    }
+    let log = StudioAccessService::new(f.db.clone(), Some(7));
+    let entries = {
+        let mut waited = 0;
+        loop {
+            let StudioAccessLog::On {
+                entries,
+                retention_days,
+            } = log.read(&owner, id).await.unwrap()
+            else {
+                panic!("the log is on");
+            };
+            assert_eq!(retention_days, 7);
+            if entries.len() == 2 || waited > 50 {
+                break entries;
+            }
+            waited += 1;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    assert_eq!(entries.len(), 2, "{entries:?}");
+    assert!(
+        entries
+            .iter()
+            .all(|e| e.member.as_ref().unwrap().display_name == "Developer")
+    );
+    let paths: Vec<_> = entries.iter().map(|e| e.path.as_str()).collect();
+    assert!(
+        paths.contains(&"/api/platform/pg-meta/default/query"),
+        "{paths:?}"
+    );
+    assert!(!paths.iter().any(|p| p.contains("key=")));
+    assert_eq!(recorder.dropped(), 0);
+    // The entry for a project that does not exist was dropped.
+    let total: i64 = sqlx::query_scalar("SELECT count(*) FROM studio_access_log")
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(total, 3);
+
+    assert!(log.read(&admin, id).await.is_ok());
+    assert!(matches!(
+        log.read(&developer, id).await,
+        Err(StudioAccessError::Forbidden)
+    ));
+    assert!(matches!(
+        log.read(&outsider, id).await,
+        Err(StudioAccessError::NotFound)
+    ));
+
+    // Entries past the retention period go; with the log off, all go.
+    sqlx::query(
+        "INSERT INTO studio_access_log (project_id, account_id, at, method, path, status) \
+         VALUES ($1, $2, now() - interval '8 days', 'GET', '/old', 200)",
+    )
+    .bind(id)
+    .bind(developer.account.id)
+    .execute(f.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(log.prune().await.unwrap(), 1);
+    let off = StudioAccessService::new(f.db.clone(), None);
+    assert_eq!(off.read(&owner, id).await.unwrap(), StudioAccessLog::Off);
+    assert_eq!(off.prune().await.unwrap(), 3);
 }

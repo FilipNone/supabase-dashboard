@@ -23,7 +23,7 @@ use crate::{
         page::{PageHeader, StatePanel, StateTone},
     },
     error::AppError,
-    pages::project_connection::{ApiKeysPanel, HealthPanel, StudioLoginPanel},
+    pages::project_connection::{ApiKeysPanel, HealthPanel, StudioAccessPanel, StudioLoginPanel},
     server_fns::{
         ChangeProjectUrl, RegisterProject, RenameProject, UnregisterProject, get_organization,
         get_project, get_project_credentials,
@@ -461,6 +461,7 @@ pub fn ProjectSettingsPage() -> impl IntoView {
         {move || loaded_project(ctx).map(|project| {
             let can_rename = project.role.allows(Permission::ProjectUpdate);
             let can_unregister = project.role.allows(Permission::ProjectUnregister);
+            let can_read_log = project.role.allows(Permission::AuditRead);
             let id = project.id.to_string();
             let name = project.name.as_str().to_owned();
             let danger_zone = can_unregister.then(|| unregister_section(unregister, id.clone(), name.clone()));
@@ -494,6 +495,7 @@ pub fn ProjectSettingsPage() -> impl IntoView {
                 {url_zone}
                 <StudioLoginPanel project=project.clone()/>
                 <ApiKeysPanel project=project.clone()/>
+                {can_read_log.then(|| view! { <StudioAccessPanel project=project.clone()/> })}
                 {danger_zone}
             }
         })}

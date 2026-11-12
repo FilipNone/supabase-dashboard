@@ -25,7 +25,9 @@ use supabase_dashboard_adapters::studio_proxy::{ProxyBody, ProxyRequest, StudioP
 use supabase_dashboard_application::{
     auth::CurrentSession,
     studio::{STUDIO_SESSION_LIFETIME, StudioError, StudioService},
+    studio_access::StudioAccessRecorder,
 };
+use supabase_dashboard_domain::studio_access::{NewStudioAccess, loggable_path};
 use uuid::Uuid;
 
 use crate::{
@@ -45,6 +47,8 @@ pub struct StudioGateway {
     pub cookie: CookieSettings,
     /// The dashboard's public origin, where members are sent to sign in.
     pub dashboard_origin: String,
+    /// Where forwarded requests are recorded, when the access log is on.
+    pub access_log: Option<Arc<StudioAccessRecorder>>,
 }
 
 impl StudioGateway {
@@ -61,7 +65,15 @@ impl StudioGateway {
             proxy,
             cookie,
             dashboard_origin,
+            access_log: None,
         }
+    }
+
+    /// Records every request that passes the Studio session check.
+    #[must_use]
+    pub fn with_access_log(mut self, recorder: Arc<StudioAccessRecorder>) -> Self {
+        self.access_log = Some(recorder);
+        self
     }
 
     fn launch_url(&self, project_id: Uuid, path: Option<&str>) -> String {
@@ -266,6 +278,15 @@ async fn forward(
         .uri
         .path_and_query()
         .map_or_else(|| "/".to_owned(), |pq| pq.as_str().to_owned());
+    // Kept before the request moves on: the method and the path without
+    // its query, nothing else.
+    let logged = gateway.access_log.as_ref().map(|recorder| {
+        (
+            Arc::clone(recorder),
+            parts.method.as_str().chars().take(16).collect::<String>(),
+            loggable_path(&path_and_query),
+        )
+    });
     let body = if matches!(parts.method, Method::GET | Method::HEAD) {
         ProxyBody::empty()
     } else {
@@ -277,7 +298,7 @@ async fn forward(
         headers: parts.headers,
         body,
     };
-    match gateway
+    let response = match gateway
         .proxy
         .forward(&upstream.api_url, &upstream.login, site, proxied)
         .await
@@ -290,7 +311,18 @@ async fn forward(
                 "The project's Studio did not answer. Check the project's health in the dashboard.",
             )
         }
+    };
+    if let Some((recorder, method, path)) = logged {
+        recorder.record(NewStudioAccess {
+            project_id,
+            account_id: upstream.account_id,
+            at: time::OffsetDateTime::now_utc(),
+            method,
+            path,
+            status: response.status().as_u16(),
+        });
     }
+    response
 }
 
 /// Without a usable Studio session: page loads go back through the

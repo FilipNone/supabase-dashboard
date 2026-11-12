@@ -80,6 +80,7 @@ All settings are environment variables. Invalid values stop the server at startu
 | `SUPABASE_DASHBOARD_STUDIO_MAX_BODY_BYTES` | 52428800 | 1 KiB to 1 GiB; request body limit on Studio hosts |
 | `SUPABASE_DASHBOARD_STUDIO_REQUEST_TIMEOUT_SECS` | 300 | 10 to 3600; how long a Studio request may take, including Studio's own wait for long SQL queries. Slower requests get 504 |
 | `SUPABASE_DASHBOARD_HEALTH_CHECK_INTERVAL_MINS` | 15 | 0, or 5 to 1440. The server checks a project again on its own once its last check is older than this; 0 turns the server's own checks off, leaving only "Check now" |
+| `SUPABASE_DASHBOARD_STUDIO_ACCESS_LOG_DAYS` | 0 | 0 (off) to 90. Days to keep the Studio access log; see "Studio access log" below |
 | `SUPABASE_DASHBOARD_ALLOW_LOOPBACK_TARGETS` | `false` | `true` lets service checks connect to `127.0.0.0/8` and `::1`, for a stack on the same machine. Logged as a warning at startup |
 | `RUST_LOG` | `info,tower_http=info,sqlx=warn` | Standard `tracing` filter |
 | `LEPTOS_SITE_ADDR` | `127.0.0.1:3000` | Listen address |
@@ -98,6 +99,13 @@ The server logs a short key ID at startup, never the key. Each stored API key is
 ### Service checks
 
 The project overview's "Check now" button asks the stack's API gateway for `/auth/v1/health`, `/storage/v1/version`, and `/realtime/v1/api/ping` (with the anon key), `/rest/v1/` (with the service role key), and `/` (Studio's route, once without a login and once with the stored one). Only those paths under the registered API URL are requested. Saving a Studio login requests `/` the same way before storing it. The client refuses loopback (unless allowed above), link-local, multicast, and cloud metadata addresses, checks every address a host name resolves to, does not follow redirects, ignores proxy environment variables, and gives up after 5 seconds to connect or 10 seconds in total. HTTPS uses the Mozilla root store bundled with the binary; stacks behind a private certificate authority are not supported yet. A project can be checked once every 10 seconds. Besides the button, the server checks projects itself: once a minute it takes up to 20 projects that were never checked or whose last check is older than `SUPABASE_DASHBOARD_HEALTH_CHECK_INTERVAL_MINS`, oldest first, and checks up to 4 at a time with the same requests. Every saved result is also added to the project's history, which the overview summarizes under "Recent checks". Saving a result deletes that project's entries older than 7 days and any beyond its newest 1000; entries older than 7 days are hidden right away, even before the next save deletes them. Unregistering a project deletes its history. With several server processes on one database, each runs these checks, so a project may be checked more than once per interval.
+
+
+### Studio access log
+
+With `SUPABASE_DASHBOARD_STUDIO_ACCESS_LOG_DAYS` set, every request that passes the Studio session check on a Studio host is recorded: the time, the member, the method, the path without its query string (cut to 512 bytes), and the status Studio's gateway answered with, or the dashboard's own status when the gateway could not be reached. Bodies, query strings, and headers are never recorded, because Studio sends SQL and table data in them. Requests refused before the session check (no cookie, expired session, cross-origin writes) are not in this log.
+
+Requests are queued in memory (4096 entries) and written in batches by a background task, so the log never delays Studio. When the queue is full or a write fails, entries are dropped and the server logs a warning; the log is a record, not a guarantee. Owners and admins of the project's organization read the newest 100 entries on the project's Settings page. Once an hour the server deletes entries older than the retention; with the setting at 0 it deletes all of them. Unregistering a project deletes its entries.
 
 ## Endpoints
 
