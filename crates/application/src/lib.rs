@@ -13,6 +13,7 @@ pub mod organizations;
 pub mod password;
 pub mod projects;
 pub mod secrets;
+pub mod stack_secrets;
 pub mod studio;
 pub mod studio_access;
 pub mod throttle;

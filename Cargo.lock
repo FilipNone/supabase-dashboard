@@ -3116,6 +3116,7 @@ dependencies = [
  "argon2",
  "base64 0.22.1",
  "getrandom 0.4.3",
+ "hmac",
  "secrecy",
  "serde",
  "serde_json",
