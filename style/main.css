@@ -338,6 +338,10 @@ code { font-family: var(--font-mono); font-size: var(--text-sm); }
 .form-warning p { margin: 0; }
 .panel-warning { border-color: var(--color-error-text); }
 .panel-warning p { margin: 0; }
+.setup-steps { display: grid; gap: var(--space-3); margin: var(--space-3) 0; padding-left: var(--space-6); }
+.setup-steps li { display: grid; gap: var(--space-1); }
+.setup-step-title { font-weight: 600; }
+.setup-step-title .badge { font-weight: 400; }
 .page-notice { margin-bottom: var(--space-6); }
 .input[readonly] { background: var(--color-surface-raised); color: var(--color-text-muted); }
 .button:focus-visible, .card-link:focus-visible, .tab:focus-visible {

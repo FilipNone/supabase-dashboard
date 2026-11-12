@@ -1212,15 +1212,19 @@ mod tests {
         let (main, other) = (ids[0], ids[1]);
         let launch = |id: uuid::Uuid| format!("/dashboard/project/{id}");
 
-        // Until a Studio login is saved, the project page warns every
-        // member, and only those who can save it get the link.
+        // Until the keys and the Studio login are saved, the project page
+        // lists what is missing to every member, and only those who can
+        // save them get the links.
         let page = format!("/dashboard/org/{acme_id}/projects/{main}");
         let (_, body) = send(&router, get_with_cookie(&page, &alice)).await;
-        assert!(body.contains("No Studio login saved"), "{body}");
+        assert!(body.contains("Finish connecting this project"), "{body}");
+        assert!(body.contains("0 of 3 saved."));
         assert!(body.contains("Save the Studio login in Settings"));
+        assert!(body.contains("/settings#studio-login"));
         let (_, body) = send(&router, get_with_cookie(&page, &bob)).await;
-        assert!(body.contains("No Studio login saved"));
-        assert!(body.contains("An owner or admin can save it."));
+        assert!(body.contains("Finish connecting this project"));
+        assert!(!body.contains("Save the Studio login in Settings"));
+        assert!(body.contains("An owner or admin can save them."));
 
         // Without a saved login, the member is sent to the project page.
         let (parts, _) = send(&router, get_with_cookie(&launch(main), &alice)).await;
@@ -1241,7 +1245,8 @@ mod tests {
         // The project page offers Studio to the owner, explains a refusal
         // with a fixed text, and offers nothing to a viewer.
         let (_, body) = send(&router, get_with_cookie(&page, &alice)).await;
-        assert!(!body.contains("No Studio login saved"));
+        assert!(body.contains("1 of 3 saved."), "{body}");
+        assert!(!body.contains("Save the Studio login in Settings"));
         assert!(
             body.contains(&format!(r#"href="{}" rel="external""#, launch(main))),
             "{body}"

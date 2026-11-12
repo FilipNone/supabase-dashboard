@@ -391,7 +391,7 @@ pub fn ApiKeysPanel(project: ProjectSummary) -> impl IntoView {
     );
 
     view! {
-        <section class="panel" aria-labelledby="api-keys-title">
+        <section class="panel" id="api-keys" aria-labelledby="api-keys-title">
             <h2 class="section-title" id="api-keys-title">"API keys"</h2>
             <p class="section-text">
                 "Keys from the stack's configuration that the dashboard uses to check and manage it. They are encrypted on the dashboard server and never shown again after you save them. The service role key bypasses row-level security; it is used only by the server."
@@ -679,7 +679,7 @@ pub fn StudioLoginPanel(project: ProjectSummary) -> impl IntoView {
     };
 
     view! {
-        <section class="panel" aria-labelledby="studio-login-title">
+        <section class="panel" id="studio-login" aria-labelledby="studio-login-title">
             <h2 class="section-title" id="studio-login-title">"Studio access"</h2>
             <p class="section-text">
                 "The stack's gateway protects Studio with a user name and password. The dashboard keeps them encrypted on the server and adds them when a member opens Studio, so members never see them. Anyone who opens Studio can run any SQL and read the stack's keys; owners, admins, and developers can open it, viewers cannot."

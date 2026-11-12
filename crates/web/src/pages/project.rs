@@ -332,11 +332,41 @@ fn studio_access_note(project: &ProjectSummary) -> &'static str {
     }
 }
 
-/// Shown until the gateway's Studio login is stored and readable. Without it
-/// nobody can open Studio here, and whoever knows the stack's own Studio
-/// password can still open it directly.
+/// Why the dashboard needs each stored value, for the setup checklist.
+fn setup_purpose(kind: CredentialKind) -> &'static str {
+    match kind {
+        CredentialKind::AnonKey => {
+            "Checks Auth, Storage, Realtime, and Edge Functions through the gateway."
+        }
+        CredentialKind::ServiceRoleKey => {
+            "Checks the REST API. It bypasses row-level security and stays on the dashboard server."
+        }
+        CredentialKind::StudioLogin => {
+            "Lets members open Studio here. Until the gateway's Studio password is one only the \
+             dashboard knows, anyone who has it can open Studio directly, without the \
+             dashboard's roles or audit log."
+        }
+    }
+}
+
+/// The badge for one checklist step, or `None` once the value is stored
+/// and readable.
+fn setup_state(state: &CredentialState) -> Option<(&'static str, &'static str)> {
+    match state {
+        CredentialState::Set { .. } => None,
+        CredentialState::NotSet => Some(("badge badge-muted", "Not saved")),
+        CredentialState::Unreadable { .. } => {
+            Some(("badge badge-error", "Unreadable, enter it again"))
+        }
+    }
+}
+
+/// Shown on the overview until the anon key, the service role key, and the
+/// Studio login are all stored and readable, so a newly registered project
+/// says what it still needs. Every member sees it; only those who may
+/// replace credentials get the links.
 #[component]
-fn StudioLoginWarning(project: ProjectSummary) -> impl IntoView {
+fn SetupChecklist(project: ProjectSummary) -> impl IntoView {
     let id = project.id;
     let settings = format!("{}/settings", project_path(project.organization_id, id));
     let can_save = project.role.allows(Permission::ProjectCredentialsReplace);
@@ -344,30 +374,74 @@ fn StudioLoginWarning(project: ProjectSummary) -> impl IntoView {
     view! {
         <Transition fallback=|| ()>
             {move || {
-                let missing = overview.get().and_then(Result::ok).is_some_and(|overview| {
-                    !overview.credentials.iter().any(|c| {
-                        c.kind == CredentialKind::StudioLogin
-                            && matches!(c.state, CredentialState::Set { .. })
+                let overview = overview.get().and_then(Result::ok)?;
+                let missing: Vec<(CredentialKind, (&'static str, &'static str))> = CredentialKind::ALL
+                    .into_iter()
+                    .filter_map(|kind| {
+                        let state = overview
+                            .credentials
+                            .iter()
+                            .find(|c| c.kind == kind)
+                            .map_or(&CredentialState::NotSet, |c| &c.state);
+                        setup_state(state).map(|badge| (kind, badge))
                     })
+                    .collect();
+                if missing.is_empty() {
+                    return None;
+                }
+                let saved = CredentialKind::ALL.len() - missing.len();
+                let summary = format!(
+                    "{saved} of {} saved. Until the rest are saved, the checks that need them are skipped{}.",
+                    CredentialKind::ALL.len(),
+                    if missing.iter().any(|(kind, _)| *kind == CredentialKind::StudioLogin) {
+                        " and nobody can open Studio through the dashboard"
+                    } else {
+                        ""
+                    }
+                );
+                let steps = missing
+                    .into_iter()
+                    .map(|(kind, (class, label))| {
+                        let anchor = if kind == CredentialKind::StudioLogin { "studio-login" } else { "api-keys" };
+                        let link = can_save.then(|| {
+                            let href = format!("{settings}#{anchor}");
+                            let text = match kind {
+                                CredentialKind::AnonKey => "Save the anon key in Settings",
+                                CredentialKind::ServiceRoleKey => "Save the service role key in Settings",
+                                CredentialKind::StudioLogin => "Save the Studio login in Settings",
+                            };
+                            view! { <a href=href>{text}</a> }
+                        });
+                        view! {
+                            <li>
+                                <span class="setup-step-title">
+                                    {kind.label()} " " <span class=class>{label}</span>
+                                </span>
+                                <span class="field-hint">
+                                    {setup_purpose(kind)}
+                                    {format!(" From {} in the stack's configuration.", kind.env_name())}
+                                </span>
+                                {link}
+                            </li>
+                        }
+                    })
+                    .collect_view();
+                let blocked = (!overview.storage_available).then(|| view! {
+                    <p class="form-error" role="alert">
+                        "This dashboard server has no encryption key configured, so nothing can be saved yet. Set SUPABASE_DASHBOARD_SECRET_KEY_FILE and restart it."
+                    </p>
                 });
-                let settings = settings.clone();
-                missing.then(|| view! {
-                    <section class="panel panel-warning" aria-labelledby="studio-login-warning-title">
-                        <h2 class="section-title" id="studio-login-warning-title">"No Studio login saved"</h2>
-                        <p class="field-hint">
-                            "Nobody can open this project's Studio through the dashboard yet. Until the \
-                             gateway's Studio password is changed to one only the dashboard knows, anyone \
-                             who has it can open Studio directly, without the dashboard's roles or audit log."
-                        </p>
-                        {if can_save {
-                            view! {
-                                <p><a href=settings>"Save the Studio login in Settings"</a></p>
-                            }.into_any()
-                        } else {
-                            view! {
-                                <p class="field-hint">"An owner or admin can save it."</p>
-                            }.into_any()
-                        }}
+                let who = (!can_save).then(|| view! {
+                    <p class="field-hint">"An owner or admin can save them."</p>
+                });
+                Some(view! {
+                    <section class="panel panel-warning" aria-labelledby="setup-title">
+                        <h2 class="section-title" id="setup-title">"Finish connecting this project"</h2>
+                        <p>{summary}</p>
+                        {blocked}
+                        <ul class="setup-steps">{steps}</ul>
+                        {who}
+                        <p class="field-hint">"Then run Check now under Service health to confirm the keys work."</p>
                     </section>
                 })
             }}
@@ -418,7 +492,7 @@ pub fn ProjectOverviewPage() -> impl IntoView {
                         </div>
                     </dl>
                 </section>
-                <StudioLoginWarning project=project.clone()/>
+                <SetupChecklist project=project.clone()/>
                 <HealthPanel project=project.clone()/>
             }
         })}
