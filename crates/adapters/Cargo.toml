@@ -36,6 +36,9 @@ x509-parser = { version = "0.18", default-features = false }
 
 [dev-dependencies]
 axum.workspace = true
+# Signs an expired key with the fixture's JWT secret.
+base64 = "0.22"
+hmac = "0.13"
 futures-util = { version = "0.3", default-features = false }
 http-body-util = "0.1"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }

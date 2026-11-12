@@ -110,6 +110,54 @@ async fn fixture_gateway_reports_auth_and_rest() {
     );
 }
 
+/// A key signed with the stack's own JWT secret whose `exp` has passed.
+fn expired_key(role: &str) -> SecretString {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use hmac::{Hmac, KeyInit, Mac};
+
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"HS256","typ":"JWT"}"#);
+    let claims = URL_SAFE_NO_PAD.encode(format!(
+        r#"{{"role":"{role}","iss":"supabase","iat":{},"exp":{}}}"#,
+        now - 7200,
+        now - 3600
+    ));
+    let signed = format!("{header}.{claims}");
+    let mut mac =
+        Hmac::<sha2::Sha256>::new_from_slice(fixture_value("JWT_SECRET").as_bytes()).unwrap();
+    mac.update(signed.as_bytes());
+    let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    SecretString::from(format!("{signed}.{signature}"))
+}
+
+#[tokio::test]
+async fn fixture_gateway_rejects_expired_keys() {
+    let Some(url) = fixture_url() else { return };
+    let probe = GatewayProbe::new(GatewaySettings {
+        policy: loopback(),
+        ..GatewaySettings::default()
+    })
+    .unwrap();
+
+    // Correctly signed but expired: rejected, not healthy or unreachable.
+    let anon = expired_key("anon");
+    assert_eq!(
+        probe
+            .check(&url, StackService::Auth, &anon, None)
+            .await
+            .status,
+        ServiceStatus::KeyRejected { http_status: 401 }
+    );
+    let service = expired_key("service_role");
+    assert_eq!(
+        probe
+            .check(&url, StackService::Rest, &service, None)
+            .await
+            .status,
+        ServiceStatus::KeyRejected { http_status: 401 }
+    );
+}
+
 #[tokio::test]
 async fn fixture_gateway_reports_storage_and_realtime() {
     let Some(url) = fixture_url() else { return };
