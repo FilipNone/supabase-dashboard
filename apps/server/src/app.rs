@@ -70,6 +70,7 @@ pub fn router(state: AppState, limits: &HttpLimits) -> Router {
         .route("/auth/sign-in", post(session::sign_in))
         .route("/auth/sign-out", post(session::sign_out))
         .route("/dashboard/project/{project_id}", get(studio::launch))
+        .route(studio::TLS_ASK_PATH, get(studio::tls_ask))
         .route(
             "/dashboard/project/{project_id}/studio-access.csv",
             get(access_export::studio_access_csv_download),
@@ -1312,6 +1313,32 @@ mod tests {
         }
         let (main, other) = (ids[0], ids[1]);
         let launch = |id: uuid::Uuid| format!("/dashboard/project/{id}");
+
+        // A reverse proxy asks, without a session, before it gets a
+        // certificate on demand. Only a registered project's Studio host,
+        // as a bare name, is allowed.
+        let ask = |domain: String| {
+            send(
+                &router,
+                get(&format!("{}?domain={domain}", crate::studio::TLS_ASK_PATH)),
+            )
+        };
+        let (parts, _) = ask(format!("{}.studio.localhost", main.simple())).await;
+        assert_eq!(parts.status, StatusCode::OK);
+        for refused in [
+            format!("{}.studio.localhost", uuid::Uuid::from_u128(7).simple()),
+            format!("{}.studio.localhost:3000", main.simple()),
+            format!("{}.studio.localhost.", main.simple()),
+            format!("{main}.studio.localhost"),
+            "studio.localhost".to_owned(),
+            "localhost".to_owned(),
+            "example.com".to_owned(),
+        ] {
+            let (parts, _) = ask(refused.clone()).await;
+            assert_eq!(parts.status, StatusCode::NOT_FOUND, "{refused}");
+        }
+        let (parts, _) = send(&router, get(crate::studio::TLS_ASK_PATH)).await;
+        assert!(parts.status.is_client_error());
 
         // Until the keys and the Studio login are saved, the project page
         // lists what is missing to every member, and only those who can

@@ -177,6 +177,15 @@ impl StudioService {
         Ok((token, path))
     }
 
+    /// Whether a reverse proxy may obtain a TLS certificate for this
+    /// project's Studio host: the project is registered. No session is
+    /// involved, because the proxy asks during the TLS handshake. The answer
+    /// tells only whether a random project ID exists, and the deployment
+    /// keeps the endpoint that asks this off the public internet.
+    pub async fn certificate_allowed(&self, project_id: Uuid) -> Result<bool, StudioError> {
+        Ok(self.db.project_exists(project_id).await?)
+    }
+
     /// Checks a Studio session for one request. Every check reads the
     /// current state, so revocation takes effect on the next request.
     pub async fn authorize(

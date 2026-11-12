@@ -121,9 +121,10 @@ Requests are queued in memory (4096 entries) and written in batches by a backgro
 - `POST /auth/sign-out`: revokes the session and clears the cookie.
 - `/dashboard/organizations` and `/dashboard/status`: the UI shell. Organizations is an empty state for now.
 - `GET /dashboard/project/:project_id[?path=/project/default/...]`: opens the project's Studio. Members whose role allows `StudioOpen` (owner, admin, developer) get a 303 redirect to the project's Studio host with a one-time code valid for 60 seconds. Others are sent to the project page with `?studio=forbidden`, `?studio=not_configured` (no Studio login saved), or `?studio=disabled` (no Studio domain configured).
+- `GET /tls/ask?domain=<name>`: for a reverse proxy that obtains certificates on demand (Caddy's `on_demand_tls`). 200 when `<name>` is the Studio host of a registered project, written without a port or trailing dot; 404 for every other name and when Studio access is off; 503 when the metadata database does not answer. It needs no session, so keep it off the public site (`deploy/Caddyfile` does).
 - `GET /__dashboard/handoff?code=` on a Studio host: redeems the code, sets the Studio cookie, and redirects to the requested Studio path or `/project/default`. A used or expired code shows a page with a link to start again.
 
-Everything except `/healthz`, `/readyz`, `/favicon.svg`, `/pkg/*`, the sign-in page, and the two `/auth/` form endpoints requires a session. Pages redirect to sign-in, with `?next=` naming the page when it is under `/dashboard/`, so the operator returns there afterwards; `/api/*` and other `/auth/*` paths answer `401` with the JSON error envelope. Signed-in responses are sent with `Cache-Control: no-store`.
+Everything except `/healthz`, `/readyz`, `/tls/ask`, `/favicon.svg`, `/pkg/*`, the sign-in page, and the two `/auth/` form endpoints requires a session. Pages redirect to sign-in, with `?next=` naming the page when it is under `/dashboard/`, so the operator returns there afterwards; `/api/*` and other `/auth/*` paths answer `401` with the JSON error envelope. Signed-in responses are sent with `Cache-Control: no-store`.
 
 The session cookie is `__Host-sd-session` with `Secure` when the public URL is HTTPS, and `sd-session` otherwise (local HTTP development). It is HttpOnly and SameSite=Lax. The database stores only a SHA-256 hash of the token.
 

@@ -1,6 +1,29 @@
 # Used by `docker compose --profile caddy up -d`. Caddy obtains and renews a
 # certificate for SUPABASE_DASHBOARD_DOMAIN and forwards to the dashboard.
+#
+# Studio hosts (SUPABASE_DASHBOARD_STUDIO_DOMAIN set): Caddy obtains a
+# certificate for a project's Studio host the first time someone opens it,
+# after asking the dashboard whether that host belongs to a registered
+# project. Unknown names get no certificate. This needs a wildcard DNS
+# record for the Studio domain but no DNS provider plugin. Without the
+# setting, the Studio site below answers no name and Caddy obtains nothing
+# for it.
+{
+	on_demand_tls {
+		ask http://dashboard:3000/tls/ask
+	}
+}
+
 {$SUPABASE_DASHBOARD_DOMAIN} {
 	encode zstd gzip
+	# The question above is for Caddy only.
+	respond /tls/ask 404
+	reverse_proxy dashboard:3000
+}
+
+*.{$SUPABASE_DASHBOARD_STUDIO_DOMAIN:studio.invalid} {
+	tls {
+		on_demand
+	}
 	reverse_proxy dashboard:3000
 }

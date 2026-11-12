@@ -105,9 +105,12 @@ enum Access {
 
 fn classify(path: &str) -> Access {
     match path {
-        "/healthz" | "/readyz" | "/favicon.svg" | "/auth/sign-in" | "/auth/sign-out" => {
-            Access::Public
-        }
+        "/healthz"
+        | "/readyz"
+        | "/favicon.svg"
+        | "/auth/sign-in"
+        | "/auth/sign-out"
+        | crate::studio::TLS_ASK_PATH => Access::Public,
         SIGN_IN_PATH => Access::SignInPage,
         INVITE_PATH | INVITE_PREVIEW_PATH | INVITE_SIGN_UP_PATH => Access::Optional,
         _ if path.starts_with("/pkg/") => Access::Public,
@@ -338,6 +341,8 @@ mod tests {
     #[test]
     fn classification_denies_by_default() {
         assert_eq!(classify("/healthz"), Access::Public);
+        assert_eq!(classify(crate::studio::TLS_ASK_PATH), Access::Public);
+        assert_eq!(classify("/tls/ask/other"), Access::Page);
         assert_eq!(classify("/pkg/supabase-dashboard.wasm"), Access::Public);
         assert_eq!(classify(SIGN_IN_PATH), Access::SignInPage);
         assert_eq!(classify("/api/get_installation_health"), Access::Api);

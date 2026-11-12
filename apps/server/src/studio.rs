@@ -140,6 +140,41 @@ pub struct LaunchQuery {
     path: Option<String>,
 }
 
+/// The path a reverse proxy asks before it obtains a certificate on demand
+/// for a Studio host (Caddy's `on_demand_tls { ask ... }`).
+pub const TLS_ASK_PATH: &str = "/tls/ask";
+
+#[derive(Deserialize)]
+pub struct TlsAsk {
+    domain: String,
+}
+
+/// `GET /tls/ask?domain=<name>`: 200 when `name` is the Studio host of a
+/// registered project, 404 for any other name, and 503 when the metadata
+/// database cannot answer. The proxy refuses the certificate on anything
+/// but a 2xx. Public, because the proxy has no session; the bundled
+/// Caddyfile keeps it off the dashboard's public site.
+pub async fn tls_ask(State(state): State<AppState>, Query(ask): Query<TlsAsk>) -> Response {
+    let Some(gateway) = state.studio.as_ref() else {
+        return plain(StatusCode::NOT_FOUND, "Not found.");
+    };
+    // A name with a port or trailing dot is not what a TLS client sends.
+    if ask.domain.contains(':') || ask.domain.ends_with('.') {
+        return plain(StatusCode::NOT_FOUND, "Not found.");
+    }
+    let HostRoute::Studio(project_id) = gateway.hosts.route(&ask.domain) else {
+        return plain(StatusCode::NOT_FOUND, "Not found.");
+    };
+    match gateway.service.certificate_allowed(project_id).await {
+        Ok(true) => plain(StatusCode::OK, "Allowed."),
+        Ok(false) => plain(StatusCode::NOT_FOUND, "Not found."),
+        Err(err) => {
+            tracing::warn!(error = %err, "could not answer a certificate request");
+            plain(StatusCode::SERVICE_UNAVAILABLE, "Try again later.")
+        }
+    }
+}
+
 /// `GET /dashboard/project/:project_id`: starts opening Studio. Refusals
 /// that the member can act on go back to the project's page with a fixed
 /// reason; an unknown project and one in another organization look the

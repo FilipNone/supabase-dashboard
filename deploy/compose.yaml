@@ -62,6 +62,8 @@ services:
       - dashboard
     environment:
       SUPABASE_DASHBOARD_DOMAIN: ${SUPABASE_DASHBOARD_DOMAIN:-}
+      # `studio.invalid` stands for "no Studio hosts"; nothing is obtained for it.
+      SUPABASE_DASHBOARD_STUDIO_DOMAIN: ${SUPABASE_DASHBOARD_STUDIO_DOMAIN:-studio.invalid}
     ports:
       - "80:80"
       - "443:443"

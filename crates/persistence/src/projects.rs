@@ -218,6 +218,15 @@ impl Database {
         .transpose()
     }
 
+    /// Whether a project with this ID is registered, in any organization.
+    pub async fn project_exists(&self, project_id: Uuid) -> Result<bool, PersistenceError> {
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM projects WHERE id = $1)")
+            .bind(project_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(query_err)
+    }
+
     /// Renames a project. Returns `false` when it does not exist.
     pub async fn rename_project(
         &self,
