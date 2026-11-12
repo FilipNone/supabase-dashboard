@@ -7,6 +7,7 @@
 pub mod auth;
 pub mod connections;
 pub mod key_claims;
+pub mod key_rotation;
 pub mod organizations;
 pub mod password;
 pub mod projects;

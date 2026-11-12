@@ -73,6 +73,13 @@ struct CredentialRow {
     updated_at: OffsetDateTime,
 }
 
+#[derive(sqlx::FromRow)]
+struct ProjectCredentialRow {
+    project_id: Uuid,
+    #[sqlx(flatten)]
+    row: CredentialRow,
+}
+
 impl Database {
     /// Every stored key of a project.
     pub async fn list_credentials(
@@ -165,6 +172,89 @@ impl Database {
         insert_audit_event(&mut *tx, audit).await?;
         tx.commit().await.map_err(query_err)?;
         Ok(true)
+    }
+
+    /// How many stored keys each encryption key ID holds.
+    pub async fn count_credentials_by_key(&self) -> Result<Vec<(String, i64)>, PersistenceError> {
+        sqlx::query_as(
+            "SELECT key_id, count(*) FROM project_credentials GROUP BY key_id ORDER BY key_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(query_err)
+    }
+
+    /// Up to `limit` stored keys that are not sealed under `key_id`, in
+    /// project and kind order, starting after `after`. Paging by position
+    /// lets a caller skip rows it cannot reseal without seeing them again.
+    pub async fn list_credentials_not_under(
+        &self,
+        key_id: &str,
+        after: Option<(Uuid, CredentialKind)>,
+        limit: i64,
+    ) -> Result<Vec<(Uuid, StoredCredential)>, PersistenceError> {
+        let (after_project, after_kind) = match after {
+            Some((project, kind)) => (Some(project), Some(kind.as_str())),
+            None => (None, None),
+        };
+        let rows: Vec<ProjectCredentialRow> = sqlx::query_as(
+            "SELECT project_id, kind, key_id, nonce, ciphertext, updated_at \
+             FROM project_credentials \
+             WHERE key_id <> $1 AND ($2::uuid IS NULL OR (project_id, kind) > ($2, $3)) \
+             ORDER BY project_id, kind LIMIT $4",
+        )
+        .bind(key_id)
+        .bind(after_project)
+        .bind(after_kind)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(query_err)?;
+        rows.into_iter()
+            .map(|ProjectCredentialRow { project_id, row }| {
+                Ok((
+                    project_id,
+                    StoredCredential {
+                        kind: CredentialKind::parse(&row.kind)
+                            .ok_or(PersistenceError::InvalidRow("project_credentials.kind"))?,
+                        key_id: row.key_id,
+                        nonce: row.nonce,
+                        ciphertext: row.ciphertext,
+                        updated_at: row.updated_at,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// Replaces a stored key's ciphertext with the same value sealed under
+    /// another key. Only applies while the row still holds `old_nonce`, so
+    /// a key replaced in the meantime is left alone. Who set the key and
+    /// when stay as they were. Returns whether the row was changed.
+    pub async fn reseal_credential(
+        &self,
+        project_id: Uuid,
+        kind: CredentialKind,
+        old_nonce: &[u8],
+        key_id: &str,
+        nonce: &[u8],
+        ciphertext: &[u8],
+    ) -> Result<bool, PersistenceError> {
+        let updated = sqlx::query(
+            "UPDATE project_credentials SET key_id = $4, nonce = $5, ciphertext = $6 \
+             WHERE project_id = $1 AND kind = $2 AND nonce = $3",
+        )
+        .bind(project_id)
+        .bind(kind.as_str())
+        .bind(old_nonce)
+        .bind(key_id)
+        .bind(nonce)
+        .bind(ciphertext)
+        .execute(&self.pool)
+        .await
+        .map_err(query_err)?
+        .rows_affected();
+        Ok(updated == 1)
     }
 
     /// The latest check of a project, if one was saved.

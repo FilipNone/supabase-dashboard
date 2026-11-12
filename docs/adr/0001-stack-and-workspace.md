@@ -52,12 +52,12 @@ Boundary rules:
 Implemented in M2 for project API keys (`crates/application/src/secrets.rs`):
 
 - Each credential is encrypted with AES-256-GCM from the RustCrypto `aes-gcm` crate (0.11), with a random 96-bit nonce per value from the operating system. The associated data names the project and the key slot, so a ciphertext moved to another row fails to decrypt.
-- The key comes from the deployment (`SUPABASE_DASHBOARD_SECRET_KEY_FILE` or `SUPABASE_DASHBOARD_SECRET_KEY`), never from the metadata database. Each row records a key ID (a truncated SHA-256 of the key under a fixed label), so rows sealed under another key are reported as unreadable instead of failing as errors. Rotation by re-encrypting rows is not built yet.
+- The key comes from the deployment (`SUPABASE_DASHBOARD_SECRET_KEY_FILE` or `SUPABASE_DASHBOARD_SECRET_KEY`), never from the metadata database. Each row records a key ID (a truncated SHA-256 of the key under a fixed label), so rows sealed under another key are reported as unreadable instead of failing as errors. Rotation: retired keys go in `SUPABASE_DASHBOARD_PREVIOUS_SECRET_KEYS_FILE` and only decrypt, and the `rotate-secret-key` server command reseals every row under the current key. Each row is replaced only if its nonce is unchanged, so a value replaced during the run is not overwritten.
 - Losing the key makes stored credentials unrecoverable; operators then re-enter them. Backups of the metadata database are useless to an attacker without the key, and the key must be backed up separately.
 
 ## Outbound HTTP
 
-Stack checks use reqwest 0.13 with rustls and the `ring` provider, the same provider SQLx already pulls in, and the Mozilla roots from `webpki-roots`. This avoids building `aws-lc-rs` (reqwest's default) for the arm64 image. The cost is that the operating system's certificate store is not consulted, so stacks behind a private CA are not supported yet. A custom DNS resolver applies the address policy in `crates/adapters/src/net.rs` to every resolved address, and address literals are checked before a request is sent. Redirects and environment proxies are disabled.
+Stack checks use reqwest 0.13 with rustls and the `ring` provider, the same provider SQLx already pulls in, and the Mozilla roots from `webpki-roots`. This avoids building `aws-lc-rs` (reqwest's default) for the arm64 image. The operating system's certificate store is not consulted. Stacks behind a private CA are reached by listing its certificates in `SUPABASE_DASHBOARD_EXTRA_CA_FILE`, which adds them to the bundled roots. A custom DNS resolver applies the address policy in `crates/adapters/src/net.rs` to every resolved address, and address literals are checked before a request is sent. Redirects and environment proxies are disabled.
 
 ## Metadata backup and recovery requirements
 

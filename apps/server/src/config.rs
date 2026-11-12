@@ -48,6 +48,9 @@ pub struct Config {
     /// A PEM file of certificate authorities trusted, in addition to the
     /// bundled Mozilla roots, for project checks and Studio traffic.
     pub extra_ca_file: Option<std::path::PathBuf>,
+    /// File of retired credential encryption keys, one per line, kept so
+    /// values sealed under them can still be read and resealed.
+    pub previous_secret_keys_file: Option<std::path::PathBuf>,
     /// Where each project's Studio is served. Without it, Studio cannot be
     /// opened through the dashboard.
     pub studio_hosts: Option<StudioHosts>,
@@ -158,6 +161,12 @@ impl Config {
             (None, Some(key)) => Some(SecretKeySource::Inline(SecretString::from(key))),
             (None, None) => None,
         };
+        if secret_key.is_none() && get("PREVIOUS_SECRET_KEYS_FILE").is_some() {
+            return Err(invalid(
+                "PREVIOUS_SECRET_KEYS_FILE",
+                "previous keys need a current key; set SUPABASE_DASHBOARD_SECRET_KEY_FILE too",
+            ));
+        }
         let allow_loopback_targets = match get("ALLOW_LOOPBACK_TARGETS").as_deref() {
             None | Some("false") => false,
             Some("true") => true,
@@ -229,6 +238,7 @@ impl Config {
             secret_key,
             allow_loopback_targets,
             extra_ca_file: get("EXTRA_CA_FILE").map(Into::into),
+            previous_secret_keys_file: get("PREVIOUS_SECRET_KEYS_FILE").map(Into::into),
             studio_hosts,
             studio_max_body_bytes: usize::try_from(studio_max_body_bytes)
                 .map_err(|_| invalid("STUDIO_MAX_BODY_BYTES", "does not fit in memory size"))?,
@@ -462,6 +472,35 @@ mod tests {
         ])
         .unwrap_err();
         assert!(!err.to_string().contains("c2VjcmV0"));
+    }
+
+    #[test]
+    fn previous_keys_need_a_current_key() {
+        let dev = ("ENV", "development");
+        assert!(
+            load(&[DB, dev])
+                .unwrap()
+                .previous_secret_keys_file
+                .is_none()
+        );
+        let config = load(&[
+            DB,
+            dev,
+            ("SECRET_KEY_FILE", "/run/secrets/key"),
+            ("PREVIOUS_SECRET_KEYS_FILE", "/run/secrets/old-keys"),
+        ])
+        .unwrap();
+        assert_eq!(
+            config.previous_secret_keys_file,
+            Some("/run/secrets/old-keys".into())
+        );
+        let err = load(&[
+            DB,
+            dev,
+            ("PREVIOUS_SECRET_KEYS_FILE", "/run/secrets/old-keys"),
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("need a current key"));
     }
 
     #[test]

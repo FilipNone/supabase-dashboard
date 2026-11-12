@@ -25,6 +25,7 @@ use supabase_dashboard_adapters::{
 use supabase_dashboard_application::{
     auth::{AuthConfig, AuthError, AuthService, BootstrapError, PasswordResetError},
     connections::{ConnectionService, ScheduledChecks},
+    key_rotation::{RotationError, key_usage, reseal_credentials},
     organizations::OrganizationService,
     projects::ProjectService,
     secrets::{CredentialCipher, KeyError},
@@ -76,6 +77,20 @@ enum StartupError {
     },
     #[error("SUPABASE_DASHBOARD_SECRET_KEY(_FILE) is invalid: {0}")]
     SecretKey(#[from] KeyError),
+    #[error("could not read SUPABASE_DASHBOARD_PREVIOUS_SECRET_KEYS_FILE {path}: {source}")]
+    PreviousKeysFile {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
+    #[error("SUPABASE_DASHBOARD_PREVIOUS_SECRET_KEYS_FILE {path} is invalid: {reason}")]
+    PreviousKeys {
+        path: std::path::PathBuf,
+        reason: String,
+    },
+    #[error("no credential encryption key is configured; set SUPABASE_DASHBOARD_SECRET_KEY_FILE")]
+    NoSecretKey,
+    #[error("could not reseal stored credentials: {0}")]
+    Rotation(#[from] RotationError),
     #[error("could not set up project connections: {0}")]
     Gateway(#[from] GatewayError),
     #[error("could not read SUPABASE_DASHBOARD_EXTRA_CA_FILE {path}: {source}")]
@@ -123,6 +138,7 @@ async fn main() -> ExitCode {
         Ok(cli::Command::Serve) => run().await,
         Ok(cli::Command::CreateOwner { email, name }) => create_owner(&email, &name).await,
         Ok(cli::Command::ResetPassword { email }) => reset_password(&email).await,
+        Ok(cli::Command::RotateSecretKey) => rotate_secret_key().await,
         Ok(cli::Command::Help) => {
             println!("{}", cli::USAGE);
             Ok(())
@@ -206,7 +222,94 @@ fn credential_cipher(config: &Config) -> Result<Option<CredentialCipher>, Startu
                 source,
             })?,
     };
-    Ok(Some(CredentialCipher::from_base64(&encoded)?))
+    let mut cipher = CredentialCipher::from_base64(&encoded)?;
+    if let Some(path) = &config.previous_secret_keys_file {
+        let read_err = |source| StartupError::PreviousKeysFile {
+            path: path.clone(),
+            source,
+        };
+        let invalid = |reason: &str| StartupError::PreviousKeys {
+            path: path.clone(),
+            reason: reason.to_owned(),
+        };
+        let len = std::fs::metadata(path).map_err(read_err)?.len();
+        if len > MAX_PREVIOUS_KEYS_FILE_BYTES {
+            return Err(invalid("the file is larger than 64 KiB"));
+        }
+        let text = std::fs::read_to_string(path)
+            .map(secrecy::SecretString::from)
+            .map_err(read_err)?;
+        // The error names the format, never the line, which may be a key.
+        let added = cipher
+            .add_previous_keys(&text)
+            .map_err(|err| invalid(&err.to_string()))?;
+        tracing::info!(
+            count = added,
+            previous_key_ids = ?cipher.previous_key_ids().collect::<Vec<_>>(),
+            "previous credential encryption keys loaded for reading only"
+        );
+    }
+    Ok(Some(cipher))
+}
+
+/// Largest previous-keys file read; a line per key is about 45 bytes.
+const MAX_PREVIOUS_KEYS_FILE_BYTES: u64 = 64 * 1024;
+
+/// Warns when stored values are under a key other than the current one.
+async fn report_key_usage(db: &Database, cipher: &CredentialCipher) -> Result<(), StartupError> {
+    let usage = key_usage(db, cipher).await?;
+    if usage.previous > 0 {
+        tracing::warn!(
+            count = usage.previous,
+            "stored project credentials are still under a previous encryption key; \
+             run `supabase-dashboard-server rotate-secret-key`"
+        );
+    }
+    if usage.unknown > 0 {
+        tracing::warn!(
+            count = usage.unknown,
+            "stored project credentials are under an encryption key this server does not have; \
+             they cannot be used until they are entered again"
+        );
+    }
+    Ok(())
+}
+
+async fn rotate_secret_key() -> Result<(), StartupError> {
+    let config = Config::from_env()?;
+    telemetry::init(config.log_format)?;
+    let cipher = credential_cipher(&config)?.ok_or(StartupError::NoSecretKey)?;
+    let db = Database::connect(&config.database).await?;
+    db.migrate().await?;
+    let summary = reseal_credentials(&db, &cipher).await?;
+    let usage = key_usage(&db, &cipher).await?;
+    db.close().await;
+    println!(
+        "Resealed {} stored credential(s) under key {}.",
+        summary.resealed,
+        cipher.key_id()
+    );
+    if summary.changed_meanwhile > 0 {
+        println!(
+            "{} credential(s) were replaced while this ran and already use the current key or \
+             will on the next run.",
+            summary.changed_meanwhile
+        );
+    }
+    if summary.unreadable > 0 {
+        println!(
+            "{} credential(s) are under a key this server does not have and were left as they \
+             are. Enter them again on each project's settings page.",
+            summary.unreadable
+        );
+    }
+    if usage.previous == 0 {
+        println!(
+            "No stored credential needs a previous key now. Remove the old keys from \
+             SUPABASE_DASHBOARD_PREVIOUS_SECRET_KEYS_FILE and restart the server."
+        );
+    }
+    Ok(())
 }
 
 async fn run() -> Result<(), StartupError> {
@@ -231,7 +334,8 @@ async fn run() -> Result<(), StartupError> {
     let cipher = credential_cipher(&config)?;
     match &cipher {
         Some(cipher) => {
-            tracing::info!(key_id = cipher.key_id(), "credential encryption key loaded")
+            tracing::info!(key_id = cipher.key_id(), "credential encryption key loaded");
+            report_key_usage(&db, cipher).await?;
         }
         None => tracing::warn!(
             "no credential encryption key is configured; project API keys cannot be stored \

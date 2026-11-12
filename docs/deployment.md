@@ -134,9 +134,36 @@ The project page warns every member until a Studio login is saved.
 | Logs | `docker compose logs -f dashboard` |
 | Stop (keeps data) | `docker compose down` |
 | Reset a forgotten password | `docker compose exec dashboard supabase-dashboard-server reset-password --email you@example.com` |
+| Move stored keys to a new encryption key | `docker compose exec dashboard supabase-dashboard-server rotate-secret-key` (see below) |
 | Back up the metadata database | `docker compose exec -T db pg_dump -U dashboard -Fc dashboard > dashboard-$(date +%F).dump` |
 
 `reset-password` signs the account out everywhere. Keep backups outside the server and treat them as secrets: they contain session hashes, password hashes, audit records, and the encrypted API keys of registered stacks. Keep `secret.key` in a different place from the dumps.
+
+### Replacing the encryption key
+
+The dashboard can read stored keys under an old encryption key while it moves them to a new one, so the stacks stay reachable during the change. Run these steps in the directory that holds `compose.yaml`:
+
+1. Keep the old key as a previous key, then write a new one:
+
+   ```sh
+   sudo cp -p secret.key previous.keys
+   openssl rand -base64 32 | sudo tee secret.key > /dev/null
+   ```
+
+   `cp -p` keeps the owner and mode that step 3 of Install set, and `tee` writes into the existing file, so `secret.key` keeps them too.
+
+2. In `compose.yaml`, give the dashboard the previous keys. Add `SUPABASE_DASHBOARD_PREVIOUS_SECRET_KEYS_FILE: /run/secrets/previous_secret_keys` to its `environment`, `- previous_secret_keys` to its `secrets`, and at the end of the file, under the top-level `secrets`:
+
+   ```yaml
+     previous_secret_keys:
+       file: ./previous.keys
+   ```
+
+3. Restart with `docker compose up -d`. The log names the new key's ID and warns that stored keys are still under a previous key.
+4. Run `docker compose exec dashboard supabase-dashboard-server rotate-secret-key`. It reseals every stored key under the new key, without changing who set each one or when, and is audited as `credentials.reseal`. It can run while people use the dashboard, and running it again is harmless.
+5. When it prints that no stored credential needs a previous key, remove the lines from step 2, delete `previous.keys`, and restart.
+
+Backups taken before the change still need the old key. Store a copy of it with those backups until they expire. A key listed in neither setting cannot be recovered: the command reports how many stored keys it could not read, and those have to be entered again on each project's settings page.
 
 To restore a backup into an empty database:
 

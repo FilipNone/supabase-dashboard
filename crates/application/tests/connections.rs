@@ -12,6 +12,7 @@ use supabase_dashboard_application::{
     connections::{
         ConnectionError, ConnectionService, ProbeFuture, ScheduledChecks, ScheduledRun, StackProbe,
     },
+    key_rotation::{KeyUsage, RotationSummary, key_usage, reseal_credentials},
     organizations::OrganizationService,
     projects::{ProjectService, Registration},
     secrets::CredentialCipher,
@@ -27,6 +28,7 @@ use supabase_dashboard_domain::{
     project::ProjectUrl,
 };
 use supabase_dashboard_persistence::{Database, accounts::AccountRecord};
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 #[path = "../../persistence/tests/common/mod.rs"]
@@ -484,6 +486,134 @@ async fn keys_from_another_server_key_are_reported_unreadable() {
         .remove_credential(&owner, id, CredentialKind::AnonKey, ctx())
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn rotating_the_key_reseals_stored_values() {
+    let Some(scratch) = ScratchDb::create("conn_reseal").await else {
+        return;
+    };
+    let f = setup(&scratch, Some(KEY_A)).await;
+    let owner = account(&f.db, "Owner").await;
+    let (_, id) = project(&f, &owner, "Acme").await;
+    for (kind, value) in [
+        (CredentialKind::AnonKey, ANON),
+        (CredentialKind::ServiceRoleKey, SERVICE),
+    ] {
+        f.connections
+            .replace_credential(&owner, id, kind, &SecretString::from(value), ctx())
+            .await
+            .unwrap();
+    }
+    let before: (OffsetDateTime, Uuid) = sqlx::query_as(
+        "SELECT updated_at, updated_by FROM project_credentials WHERE project_id = $1 AND kind = 'anon_key'",
+    )
+    .bind(id)
+    .fetch_one(f.db.pool())
+    .await
+    .unwrap();
+    // A value under a key nobody has any more, on another project.
+    let (_, lost) = project(&f, &owner, "Beta").await;
+    sqlx::query(
+        "INSERT INTO project_credentials (project_id, kind, key_id, nonce, ciphertext) \
+         VALUES ($1, 'anon_key', 'ffffffffffffffff', $2, $3)",
+    )
+    .bind(lost)
+    .bind(vec![0u8; 12])
+    .bind(vec![1u8; 32])
+    .execute(f.db.pool())
+    .await
+    .unwrap();
+
+    // The new key is current and the old one is kept for reading.
+    let mut rotated = cipher(KEY_B);
+    assert_eq!(
+        rotated
+            .add_previous_keys(&SecretString::from(KEY_A))
+            .unwrap(),
+        1
+    );
+    let probe = Arc::new(FakeProbe::default());
+    let during = ConnectionService::new(f.db.clone(), Some(rotated.clone()), probe.clone());
+    let overview = during.credentials(&owner, id).await.unwrap();
+    assert!(matches!(
+        state(&overview, CredentialKind::AnonKey),
+        CredentialState::Set { .. }
+    ));
+    assert_eq!(
+        key_usage(&f.db, &rotated).await.unwrap(),
+        KeyUsage {
+            current: 0,
+            previous: 2,
+            unknown: 1
+        }
+    );
+
+    assert_eq!(
+        reseal_credentials(&f.db, &rotated).await.unwrap(),
+        RotationSummary {
+            resealed: 2,
+            unreadable: 1,
+            changed_meanwhile: 0
+        }
+    );
+    assert_eq!(
+        key_usage(&f.db, &rotated).await.unwrap(),
+        KeyUsage {
+            current: 2,
+            previous: 0,
+            unknown: 1
+        }
+    );
+    // Who set the key and when are unchanged.
+    let after: (OffsetDateTime, Uuid) = sqlx::query_as(
+        "SELECT updated_at, updated_by FROM project_credentials WHERE project_id = $1 AND kind = 'anon_key'",
+    )
+    .bind(id)
+    .fetch_one(f.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(after, before);
+
+    // The new key alone now opens both values.
+    let probe = Arc::new(FakeProbe::default());
+    let new_only = ConnectionService::new(f.db.clone(), Some(cipher(KEY_B)), probe.clone());
+    new_only.check_now(&owner, id).await.unwrap();
+    let used: Vec<String> = probe
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, key)| key.clone())
+        .collect();
+    assert!(used.iter().any(|k| k == ANON));
+    assert!(used.iter().any(|k| k == SERVICE));
+
+    // A second run has nothing left to move and leaves the lost value.
+    assert_eq!(
+        reseal_credentials(&f.db, &rotated).await.unwrap(),
+        RotationSummary {
+            resealed: 0,
+            unreadable: 1,
+            changed_meanwhile: 0
+        }
+    );
+    assert_eq!(audit_count(&f.db, "credentials.reseal", "success").await, 2);
+
+    // A row replaced since it was read is not overwritten.
+    assert!(
+        !f.db
+            .reseal_credential(
+                id,
+                CredentialKind::AnonKey,
+                b"stale nonce!",
+                rotated.key_id(),
+                &[0u8; 12],
+                &[0u8; 16],
+            )
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]

@@ -9,6 +9,9 @@
 //! `reset-password` is the recovery path for a forgotten password. It needs
 //! the same server and database access as `create-owner`, reads the new
 //! password the same way, and signs the account out everywhere.
+//!
+//! `rotate-secret-key` seals every stored project credential that is under
+//! a previous encryption key again under the current one.
 
 use std::io::{BufRead, IsTerminal, Read};
 
@@ -21,12 +24,19 @@ Usage:
                                             Create the first operator account
   supabase-dashboard-server reset-password --email <email>
                                             Set a new password for an account
+  supabase-dashboard-server rotate-secret-key
+                                            Move stored project credentials to
+                                            the current encryption key
   supabase-dashboard-server help            Show this message
 
 Both commands read the password from the terminal, or from the first line
 of standard input when input is piped. create-owner refuses to run once
 any account exists. reset-password signs the account out of every session;
-it does not re-enable a disabled account.";
+it does not re-enable a disabled account.
+
+rotate-secret-key reads the old keys from SUPABASE_DASHBOARD_PREVIOUS_SECRET_KEYS_FILE
+and can run while the server is up. Values under a key that is in neither
+setting are reported and left as they are.";
 
 /// Longest password line accepted from standard input.
 const MAX_PASSWORD_LINE: u64 = 4096;
@@ -36,6 +46,7 @@ pub enum Command {
     Serve,
     CreateOwner { email: String, name: String },
     ResetPassword { email: String },
+    RotateSecretKey,
     Help,
 }
 
@@ -78,6 +89,11 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
                 email: email.ok_or("--email is required")?,
             })
         }
+        Some("rotate-secret-key") => match args.next() {
+            None => Ok(Command::RotateSecretKey),
+            // Do not echo the argument: it may be a pasted key.
+            Some(_) => Err("rotate-secret-key takes no options".to_owned()),
+        },
         Some(other) => Err(format!("unknown command `{other}`")),
     }
 }
@@ -172,6 +188,17 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(err.contains("unknown option") && !err.contains("hunter2"));
+    }
+
+    #[test]
+    fn rotate_secret_key_takes_no_options() {
+        assert_eq!(
+            parse(args(&["rotate-secret-key"])),
+            Ok(Command::RotateSecretKey)
+        );
+        // Keys come from files, never from arguments.
+        let err = parse(args(&["rotate-secret-key", "AAECAwQF"])).unwrap_err();
+        assert!(err.contains("takes no options") && !err.contains("AAECAwQF"));
     }
 
     #[test]

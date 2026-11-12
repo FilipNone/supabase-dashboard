@@ -9,6 +9,11 @@
 //! The metadata database stores the key's ID next to each ciphertext. A row
 //! written under a different key is reported as unreadable rather than
 //! treated as corrupt.
+//!
+//! Rotation: the deployment supplies a new current key and keeps the old
+//! ones as previous keys. Previous keys only decrypt; every new value is
+//! sealed under the current key. `reseal` moves a value written under a
+//! previous key to the current one, after which the old key can go.
 
 use std::fmt;
 
@@ -50,28 +55,17 @@ pub struct Sealed {
     pub ciphertext: Vec<u8>,
 }
 
-/// The deployment's credential encryption key.
+/// One AES key and its ID.
 #[derive(Clone)]
-pub struct CredentialCipher {
+struct Key {
     cipher: Aes256Gcm,
     key_id: String,
 }
 
-// Never print key material.
-impl fmt::Debug for CredentialCipher {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CredentialCipher")
-            .field("key_id", &self.key_id)
-            .finish_non_exhaustive()
-    }
-}
-
-impl CredentialCipher {
-    /// Builds the cipher from a base64-encoded 32-byte key, as written by
-    /// `openssl rand -base64 32`. Surrounding whitespace is ignored.
-    pub fn from_base64(encoded: &SecretString) -> Result<Self, KeyError> {
+impl Key {
+    fn from_base64(encoded: &str) -> Result<Self, KeyError> {
         let bytes = STANDARD
-            .decode(encoded.expose_secret().trim())
+            .decode(encoded.trim())
             .map_err(|_| KeyError::InvalidFormat)?;
         if bytes.len() != KEY_LEN {
             return Err(KeyError::InvalidFormat);
@@ -86,9 +80,75 @@ impl CredentialCipher {
         let key_id = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
         Ok(Self { cipher, key_id })
     }
+}
 
+/// The deployment's credential encryption key, and any previous keys kept
+/// for reading values that have not been resealed yet.
+#[derive(Clone)]
+pub struct CredentialCipher {
+    current: Key,
+    previous: Vec<Key>,
+}
+
+// Never print key material.
+impl fmt::Debug for CredentialCipher {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CredentialCipher")
+            .field("key_id", &self.current.key_id)
+            .field(
+                "previous_key_ids",
+                &self.previous.iter().map(|k| &k.key_id).collect::<Vec<_>>(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl CredentialCipher {
+    /// Builds the cipher from a base64-encoded 32-byte key, as written by
+    /// `openssl rand -base64 32`. Surrounding whitespace is ignored.
+    pub fn from_base64(encoded: &SecretString) -> Result<Self, KeyError> {
+        Ok(Self {
+            current: Key::from_base64(encoded.expose_secret())?,
+            previous: Vec::new(),
+        })
+    }
+
+    /// Adds decrypt-only keys from text holding one base64 key per line.
+    /// Blank lines and lines starting with `#` are skipped. A line equal to
+    /// the current key, or repeating an earlier one, is ignored. Returns
+    /// how many keys were added.
+    pub fn add_previous_keys(&mut self, text: &SecretString) -> Result<usize, KeyError> {
+        // Parse every line before adding any, so a bad line changes nothing.
+        let keys = text
+            .expose_secret()
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(Key::from_base64)
+            .collect::<Result<Vec<_>, _>>()?;
+        let before = self.previous.len();
+        for key in keys {
+            if !self.can_open(&key.key_id) {
+                self.previous.push(key);
+            }
+        }
+        Ok(self.previous.len() - before)
+    }
+
+    /// The ID of the key new values are sealed under.
     pub fn key_id(&self) -> &str {
-        &self.key_id
+        &self.current.key_id
+    }
+
+    /// IDs of the decrypt-only keys.
+    pub fn previous_key_ids(&self) -> impl Iterator<Item = &str> {
+        self.previous.iter().map(|k| k.key_id.as_str())
+    }
+
+    fn key(&self, key_id: &str) -> Option<&Key> {
+        std::iter::once(&self.current)
+            .chain(&self.previous)
+            .find(|k| k.key_id == key_id)
     }
 
     pub fn seal(
@@ -102,6 +162,7 @@ impl CredentialCipher {
         let nonce = Nonce::<Aes256Gcm>::from(nonce_bytes);
         let aad = associated_data(project_id, kind);
         let ciphertext = self
+            .current
             .cipher
             .encrypt(
                 &nonce,
@@ -113,15 +174,32 @@ impl CredentialCipher {
             // Only possible for inputs far beyond the accepted key length.
             .map_err(|_| CipherError::Undecryptable)?;
         Ok(Sealed {
-            key_id: self.key_id.clone(),
+            key_id: self.current.key_id.clone(),
             nonce: nonce_bytes.to_vec(),
             ciphertext,
         })
     }
 
-    /// Whether a stored value was written under this key.
+    /// Whether a stored value was written under the current key or a
+    /// previous one.
     pub fn can_open(&self, key_id: &str) -> bool {
-        key_id == self.key_id
+        self.key(key_id).is_some()
+    }
+
+    /// Opens a value sealed under a previous key and seals it again under
+    /// the current one, bound to the same project and kind. Returns `None`
+    /// when the value is already under the current key.
+    pub fn reseal(
+        &self,
+        project_id: Uuid,
+        kind: CredentialKind,
+        sealed: &Sealed,
+    ) -> Result<Option<Sealed>, CipherError> {
+        if sealed.key_id == self.current.key_id {
+            return Ok(None);
+        }
+        let value = self.open(project_id, kind, sealed)?;
+        self.seal(project_id, kind, &value).map(Some)
     }
 
     pub fn open(
@@ -130,9 +208,7 @@ impl CredentialCipher {
         kind: CredentialKind,
         sealed: &Sealed,
     ) -> Result<SecretString, CipherError> {
-        if !self.can_open(&sealed.key_id) {
-            return Err(CipherError::Undecryptable);
-        }
+        let key = self.key(&sealed.key_id).ok_or(CipherError::Undecryptable)?;
         let nonce_bytes: [u8; NONCE_LEN] = sealed
             .nonce
             .as_slice()
@@ -140,7 +216,7 @@ impl CredentialCipher {
             .map_err(|_| CipherError::Undecryptable)?;
         let nonce = Nonce::<Aes256Gcm>::from(nonce_bytes);
         let aad = associated_data(project_id, kind);
-        let plaintext = self
+        let plaintext = key
             .cipher
             .decrypt(
                 &nonce,
@@ -269,8 +345,76 @@ mod tests {
 
     #[test]
     fn debug_output_hides_the_key() {
-        let printed = format!("{:?}", cipher(KEY_A));
+        let mut c = cipher(KEY_A);
+        c.add_previous_keys(&SecretString::from(KEY_B)).unwrap();
+        let printed = format!("{c:?}");
         assert!(!printed.contains(KEY_A));
+        assert!(!printed.contains(KEY_B));
         assert!(printed.contains("key_id"));
+    }
+
+    #[test]
+    fn previous_keys_open_and_reseal_old_values() {
+        let old = cipher(KEY_A);
+        let project = Uuid::from_u128(7);
+        let value = SecretString::from("service role");
+        let sealed = old
+            .seal(project, CredentialKind::ServiceRoleKey, &value)
+            .unwrap();
+
+        let mut rotated = cipher(KEY_B);
+        assert!(!rotated.can_open(&sealed.key_id));
+        let added = rotated
+            .add_previous_keys(&SecretString::from(format!(
+                "# retired 2026-11\n\n{KEY_A}\n{KEY_A}\n{KEY_B}\n"
+            )))
+            .unwrap();
+        assert_eq!(added, 1, "duplicates and the current key are skipped");
+        assert_eq!(
+            rotated.previous_key_ids().collect::<Vec<_>>(),
+            [old.key_id()]
+        );
+        assert!(rotated.can_open(&sealed.key_id));
+        let opened = rotated
+            .open(project, CredentialKind::ServiceRoleKey, &sealed)
+            .unwrap();
+        assert_eq!(opened.expose_secret(), "service role");
+
+        let resealed = rotated
+            .reseal(project, CredentialKind::ServiceRoleKey, &sealed)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resealed.key_id, rotated.key_id());
+        // The new key alone opens the resealed value.
+        assert_eq!(
+            cipher(KEY_B)
+                .open(project, CredentialKind::ServiceRoleKey, &resealed)
+                .unwrap()
+                .expose_secret(),
+            "service role"
+        );
+        // Already current: nothing to do.
+        assert!(
+            rotated
+                .reseal(project, CredentialKind::ServiceRoleKey, &resealed)
+                .unwrap()
+                .is_none()
+        );
+        // Resealing keeps the binding to project and kind.
+        assert!(
+            rotated
+                .reseal(Uuid::from_u128(8), CredentialKind::ServiceRoleKey, &sealed)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_bad_previous_key_is_refused() {
+        let mut c = cipher(KEY_A);
+        assert_eq!(
+            c.add_previous_keys(&SecretString::from(format!("{KEY_B}\nnot a key\n"))),
+            Err(KeyError::InvalidFormat)
+        );
+        assert_eq!(c.previous_key_ids().count(), 0);
     }
 }
