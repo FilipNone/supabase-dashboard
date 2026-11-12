@@ -416,7 +416,7 @@ fn missing_function_name(body: &[u8]) -> bool {
 
 /// Maps a request error to a fixed reason. The error itself may name
 /// addresses, so it is logged at debug level only and never returned.
-fn classify(err: &reqwest::Error) -> UnreachableReason {
+pub(crate) fn classify(err: &reqwest::Error) -> UnreachableReason {
     tracing::debug!(error = %err, "service check request failed");
     if chain_has::<DestinationNotAllowed>(err) {
         UnreachableReason::DestinationNotAllowed

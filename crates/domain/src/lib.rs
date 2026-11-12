@@ -8,6 +8,7 @@ pub mod admin;
 pub mod authority;
 pub mod authz;
 pub mod connection;
+pub mod dokploy;
 pub mod health;
 pub mod invitation;
 pub mod organization;

@@ -1,0 +1,38 @@
+# Disposable Dokploy for the provider tests.
+#
+# Dokploy runs on Docker Swarm. Its installer turns the host's Docker into a
+# swarm manager, so this fixture runs it inside a Docker-in-Docker container
+# instead: the swarm, Dokploy's Postgres, and Dokploy live in that
+# container's own Docker, and `down -v` discards all of it. Dokploy's
+# Traefik is not started until something is deployed through it. The inner
+# services are created by `setup.sh` with the commands of Dokploy's
+# installer (https://dokploy.com/install.sh) as of 2026-11-12, pinned to the
+# versions below.
+#
+#   docker compose -f tests/fixtures/dokploy/docker-compose.yml up -d --wait
+#   tests/fixtures/dokploy/setup.sh
+#
+# The outer container is privileged, as Docker-in-Docker requires. Ports bind
+# to 127.0.0.1 only.
+name: sd-dokploy
+
+services:
+  docker:
+    image: docker:28.5.0-dind
+    privileged: true
+    environment:
+      # Plain TCP stays inside the container; the socket is what setup uses.
+      DOCKER_TLS_CERTDIR: ""
+    ports:
+      # Dokploy's web UI and API.
+      - "127.0.0.1:54340:3000"
+    volumes:
+      - docker-data:/var/lib/docker
+    healthcheck:
+      test: ["CMD", "docker", "info"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  docker-data:

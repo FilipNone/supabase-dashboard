@@ -33,3 +33,6 @@ Thumbs.db
 
 # Agent worktrees
 /.claude/worktrees/
+
+# Key the Dokploy fixture creates for the tests
+/tests/fixtures/dokploy/api-key

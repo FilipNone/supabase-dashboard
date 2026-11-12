@@ -146,3 +146,30 @@ jobs:
       - name: Tear down
         if: always()
         run: docker compose -p sd-fixture down -v
+
+  dokploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Dokploy runs in a swarm inside a Docker-in-Docker container, so the
+      # runner's own Docker stays out of swarm mode.
+      - name: Start disposable Dokploy fixture
+        run: |
+          docker compose -f tests/fixtures/dokploy/docker-compose.yml up -d --wait --wait-timeout 120
+          tests/fixtures/dokploy/setup.sh
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Dokploy client tests against the fixture
+        env:
+          SUPABASE_DASHBOARD_TEST_DOKPLOY_URL: http://127.0.0.1:54340
+        run: cargo test -p supabase-dashboard-adapters --locked --test dokploy_fixture
+      - name: Show logs on failure
+        if: failure()
+        run: |
+          docker compose -f tests/fixtures/dokploy/docker-compose.yml exec -T docker \
+            docker service logs --tail 100 dokploy || true
+          docker compose -f tests/fixtures/dokploy/docker-compose.yml logs --no-color --tail 50
+      - name: Tear down
+        if: always()
+        run: docker compose -f tests/fixtures/dokploy/docker-compose.yml down -v
