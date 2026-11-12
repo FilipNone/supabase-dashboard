@@ -28,8 +28,29 @@ The client in `crates/adapters/src/dokploy.rs` uses the same connection rules as
 | `project.all` | GET | none | Every project and environment the key can see, for choosing where stacks go; the services nested in each environment are ignored |
 | `server.all` | GET | none | Dokploy's remote servers; only active deploy servers are kept, and only their ID and name are read |
 | `environment.create` | POST | `name`, `projectId` | Create an environment for stacks, sent once and never retried |
+| `compose.search` | GET | `name`, `environmentId`, `limit` | Find a provisioning job's service by its exact name before creating it |
+| `compose.create` | POST | `name`, `appName`, `environmentId`, `serverId` (remote server only), `sourceType: raw`, `composeFile` | Create a stack's compose service |
+| `compose.update` | POST | `composeId`, `sourceType: raw`, `composeFile`, `env`, `isolatedDeployment: true` | Set a stack's compose file and variables |
+| `mounts.listByServiceId` | GET | `serviceId`, `serviceType: compose` | A service's file mounts |
+| `mounts.create` | POST | `type: file`, `serviceType: compose`, `serviceId`, `filePath`, `mountPath`, `content` | Write a file the compose file mounts |
+| `mounts.update` | POST | `mountId`, `content` | Replace a mounted file |
+| `compose.deploy` | POST | `composeId`, `title` | Queue a deployment |
+| `deployment.allByCompose` | GET | `composeId` | Poll a service's deployments |
+| `domain.create` | POST | `host`, `composeId`, `domainType: compose`, `serviceName`, `port`, `https`, `certificateType`, `path` | Route a host to one service of a stack |
 
 Every list is read with a 4 MiB body bound and at most 10,000 entries. An entry that does not parse, a service type other than application or compose, an ID outside `[A-Za-z0-9_-]{1,64}`, and an empty or overlong host are skipped one at a time, so one odd entry does not hide the rest.
+
+The compose calls are in `crates/adapters/src/dokploy/compose.rs`. They are called by nothing yet; the provisioning job will use them. What they rely on, checked on the fixture with Dokploy v0.31.1:
+
+- Creating a service, a mount, a domain, or a deployment is not idempotent: each repeated request makes another one, and Dokploy has no idempotency key. These requests are sent once and never retried, and a job looks the object up first.
+- Dokploy appends `-` and six random characters to the requested `appName`, so the name on disk is known only from the answer. A job finds its service again by its exact `name` in its environment. `compose.search` matches names as case-insensitive substrings and treats `%` and `_` as wildcards, so the dashboard's names use only lowercase letters, digits, and `-`, and the comparison is repeated on the dashboard's side. The search lists only services the key's member can access.
+- `compose.one`, `compose.update`, `compose.delete`, and the mount calls answer with the service's variables, compose file, or file contents in plain text. The adapter reads only the IDs and names it needs from those answers. Anyone with a Dokploy key that can see a stack's service can read its secrets this way.
+- Dokploy writes the variables to a `.env` file next to the compose file and escapes every `$` except at the start of `${`, so a value containing `${` would be expanded by Docker Compose. The adapter refuses such variables before sending them. The variables only fill `${…}` references in the compose file; a container receives nothing the compose file does not pass to it.
+- A file mount is written to the server at once, at `/etc/dokploy/compose/<appName>/files/<filePath>`, and the compose file refers to it as `../files/<filePath>`. Dokploy requires `mountPath` even though compose services ignore it. Paths outside the files folder are refused by both Dokploy and the adapter.
+- `compose.deploy` queues the deployment and returns no ID. Its row in `deployment.allByCompose` appears only once a worker starts it (status `running`, then `done`, `error`, or `cancelled`), and deployments run one at a time. The adapter therefore sends a title unique to the job and finds the deployment by it. `errorMessage` stayed empty on failed compose deployments; the reason is only in the deployment log.
+- Domains become proxy labels when Dokploy deploys, so a domain added or removed after a deployment takes effect at the next one. `domain.create` answers every error with 400, including an unknown service, and checks neither `serviceName` nor the certificate type, so the adapter always sends both.
+- Dokploy answers 401 for a server ID the key may not use, not only for a refused key. The adapter reports both as a refused key; the job checks the target against `server.all` first.
+- With `isolatedDeployment`, Dokploy puts the stack's services on their own network named after the `appName`. `compose.delete` leaves that network behind.
 
 ### Planned
 
@@ -39,18 +60,12 @@ These are the calls the M4 roadmap items need, with their required inputs in v0.
 | --- | --- | --- | --- |
 | `project.one` | GET | `projectId` | One project's environments and services |
 | `environment.one` | GET | `environmentId` | Environment details |
-| `compose.search` | GET | none (`q`, `name`, `appName`, `projectId`, `environmentId`, `limit`, `offset`) | Find existing Supabase stacks; look up a job's service before creating it |
 | `compose.move` | POST | `composeId`, `targetEnvironmentId` | Not planned for the dashboard; the browser check uses it to move a service and show the Moved state |
-| `compose.create` | POST | `name`, `environmentId` | Create a stack's compose service |
-| `compose.one` | GET | `composeId` | Read a stack's service, variables, and status |
-| `compose.update` | POST | `composeId` | Set the compose file and variables |
-| `compose.deploy` | POST | `composeId` | First deployment |
+| `compose.search` | GET | `q`, `environmentId` | Find existing Supabase stacks to adopt |
+| `compose.one` | GET | `composeId` | Read a stack's service and status |
 | `compose.redeploy` | POST | `composeId` | Redeploy |
 | `compose.stop`, `compose.start` | POST | `composeId` | Stop and start |
 | `compose.delete` | POST | `composeId`, `deleteVolumes` | Remove a stack, keeping or destroying its volumes |
-| `deployment.allByCompose` | GET | `composeId` | Poll deployments |
-| `domain.create` | POST | `host` (with `composeId`, `serviceName`, `port`) | Stack and Studio domains |
-| `domain.byComposeId` | GET | `composeId` | A service's domains |
 | `domain.delete` | POST | `domainId` | Remove a domain |
 | `user.get` | GET | none | The key's user |
 

@@ -237,3 +237,132 @@ async fn fixture_dokploy_lists_environments_and_servers_and_creates_an_environme
     )
     .await;
 }
+
+/// The calls a provisioning job makes, end to end on the fixture: a raw
+/// compose service with a variable and a mounted file, a domain, and a
+/// real deployment of a small public image.
+#[tokio::test]
+async fn fixture_dokploy_creates_configures_and_deploys_a_compose_service() {
+    use std::time::Duration;
+    use supabase_dashboard_domain::{
+        dokploy_compose::{DeploymentStatus, NewCompose, NewComposeDomain},
+        dokploy_placement::DokployId,
+    };
+
+    let Some(url) = fixture_url() else { return };
+    let created = post(
+        &url,
+        "project.create",
+        serde_json::json!({ "name": "compose-probe" }),
+    )
+    .await;
+    let project_id = created["project"]["projectId"].as_str().unwrap().to_owned();
+    let environment =
+        DokployId::parse(created["environment"]["environmentId"].as_str().unwrap()).unwrap();
+    let key = fixture_key();
+    let client = client();
+    let name = "sd-compose-probe";
+    let compose_file = "services:\n  whoami:\n    image: traefik/whoami:v1.10.3\n    \
+                        environment:\n      GREETING: ${GREETING}\n    \
+                        volumes:\n      - ../files/probe/hello.txt:/hello.txt:ro\n";
+
+    assert!(
+        client
+            .find_compose(&url, &key, &environment, name)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let service = client
+        .create_compose(
+            &url,
+            &key,
+            &NewCompose {
+                environment_id: &environment,
+                server_id: None,
+                name,
+                description: "Synthetic compose probe",
+                compose_file,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(service.app_name.starts_with("sd-compose-probe-"));
+    // Found again by name, as a job resumed after a lost answer would.
+    let found = client
+        .find_compose(&url, &key, &environment, name)
+        .await
+        .unwrap();
+    assert_eq!(found, vec![service.clone()]);
+
+    let compose = service.compose_id.clone();
+    client
+        .configure_compose(
+            &url,
+            &key,
+            &compose,
+            compose_file,
+            &SecretString::from("GREETING=hello-synthetic\n"),
+        )
+        .await
+        .unwrap();
+    let mount = client
+        .create_file_mount(&url, &key, &compose, "probe/hello.txt", "first\n")
+        .await
+        .unwrap();
+    client
+        .update_file_mount(&url, &key, &mount.mount_id, "second\n")
+        .await
+        .unwrap();
+    let mounts = client.file_mounts(&url, &key, &compose).await.unwrap();
+    assert_eq!(mounts.len(), 1);
+    assert_eq!(mounts[0].content, "second\n");
+
+    let domain = client
+        .create_compose_domain(
+            &url,
+            &key,
+            &compose,
+            &NewComposeDomain {
+                host: "probe.example.test",
+                service_name: "whoami",
+                port: 80,
+                https: false,
+            },
+        )
+        .await
+        .unwrap();
+    let domains = client.compose_domains(&url, &key, &compose).await.unwrap();
+    assert_eq!(domains, vec![domain]);
+
+    client
+        .deploy_compose(&url, &key, &compose, "sd compose probe 1")
+        .await
+        .unwrap();
+    let mut status = None;
+    for _ in 0..120 {
+        let deployments = client.deployments(&url, &key, &compose).await.unwrap();
+        status = deployments
+            .iter()
+            .find(|d| d.title.as_deref() == Some("sd compose probe 1"))
+            .map(|d| d.status);
+        if status.is_some_and(DeploymentStatus::is_finished) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert_eq!(status, Some(DeploymentStatus::Done));
+
+    post(
+        &url,
+        "compose.delete",
+        serde_json::json!({ "composeId": compose.as_str(), "deleteVolumes": true }),
+    )
+    .await;
+    post(
+        &url,
+        "project.remove",
+        serde_json::json!({ "projectId": project_id }),
+    )
+    .await;
+}

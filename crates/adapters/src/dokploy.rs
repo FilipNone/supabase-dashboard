@@ -40,6 +40,16 @@ use crate::{
     tls::{Clients, ExtraRoots},
 };
 
+mod compose;
+
+/// What a call sends: GET input as flat query parameters, which is how
+/// Dokploy reads it, or a JSON body.
+#[derive(Clone, Copy)]
+enum Input<'a> {
+    Get(&'a [(&'a str, &'a str)]),
+    Post(&'a serde_json::Value),
+}
+
 /// Largest body read from a small Dokploy answer, such as the version.
 const MAX_SMALL_BODY_BYTES: usize = 4 * 1024;
 
@@ -253,11 +263,10 @@ impl DokployClient {
         let body = serde_json::json!({ "name": name, "projectId": project_id.as_str() });
         let answer = self
             .send(
-                Method::POST,
                 url,
                 "environment.create",
                 key,
-                Some(&body),
+                Input::Post(&body),
                 MAX_SMALL_BODY_BYTES,
             )
             .await?;
@@ -276,22 +285,29 @@ impl DokployClient {
         key: &SecretString,
         max_body_bytes: usize,
     ) -> Result<Vec<u8>, DokployError> {
-        self.send(Method::GET, base, call, key, None, max_body_bytes)
+        self.send(base, call, key, Input::Get(&[]), max_body_bytes)
             .await
     }
 
     async fn send(
         &self,
-        method: Method,
         base: &DokployUrl,
         call: &str,
         key: &SecretString,
-        body: Option<&serde_json::Value>,
+        input: Input<'_>,
         max_body_bytes: usize,
     ) -> Result<Vec<u8>, DokployError> {
+        let (method, query, body) = match input {
+            Input::Get(query) => (Method::GET, query, None),
+            Input::Post(body) => (Method::POST, &[][..], Some(body)),
+        };
         let unreachable = DokployError::Unreachable;
-        let url = reqwest::Url::parse(&base.api(call))
+        let mut url = reqwest::Url::parse(&base.api(call))
             .map_err(|_| unreachable(UnreachableReason::InvalidResponse))?;
+        // Dokploy reads GET input from flat query parameters.
+        if !query.is_empty() {
+            url.query_pairs_mut().extend_pairs(query);
+        }
         // The enrolled URL's clients only ever see requests built from it.
         let (clients, policy) = match &self.enrolled {
             Some(enrolled) if enrolled.url == *base => (&enrolled.clients, enrolled.policy),

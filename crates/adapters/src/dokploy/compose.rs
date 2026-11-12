@@ -1,0 +1,453 @@
+//! Dokploy calls for a provisioned stack's compose service, checked
+//! against Dokploy v0.31.1 (see `docs/dokploy.md`).
+//!
+//! Creating a service, a file mount, a domain, or a deployment is not
+//! idempotent in Dokploy: a repeated request makes a second one. Each is
+//! sent once and never retried here; callers look the object up first.
+//!
+//! Several answers carry the service's variables, compose file, or file
+//! contents in plain text. Only the fields named below are read; the rest
+//! of the body is dropped with the buffer and never logged.
+
+use secrecy::{ExposeSecret, SecretString};
+use serde::Deserialize;
+use supabase_dashboard_domain::{
+    dokploy::{DokployError, DokployUrl},
+    dokploy_compose::{
+        ComposeDomain, ComposeService, DeploymentInfo, DeploymentStatus, FileMount, NewCompose,
+        NewComposeDomain, is_dashboard_compose_name, is_file_mount_path,
+    },
+    dokploy_placement::DokployId,
+};
+
+use super::{DokployClient, Input, MAX_LIST_BODY_BYTES, MAX_SMALL_BODY_BYTES, parse_list};
+
+/// Most search results asked for at once, Dokploy's own limit.
+const SEARCH_LIMIT: &str = "100";
+
+impl DokployClient {
+    /// Compose services named exactly `name` in `environment_id`, among
+    /// those the key's member can see (`compose.search`). Dokploy matches
+    /// names as substrings, so the exact comparison happens here.
+    pub async fn find_compose(
+        &self,
+        url: &DokployUrl,
+        key: &SecretString,
+        environment_id: &DokployId,
+        name: &str,
+    ) -> Result<Vec<ComposeService>, DokployError> {
+        // Only names without search wildcards are looked up.
+        if !is_dashboard_compose_name(name) {
+            return Err(DokployError::InvalidResponse);
+        }
+        let body = self
+            .send(
+                url,
+                "compose.search",
+                key,
+                Input::Get(&[
+                    ("name", name),
+                    ("environmentId", environment_id.as_str()),
+                    ("limit", SEARCH_LIMIT),
+                ]),
+                MAX_LIST_BODY_BYTES,
+            )
+            .await?;
+        let page: RawSearchPage =
+            serde_json::from_slice(&body).map_err(|_| DokployError::InvalidResponse)?;
+        Ok(page
+            .items
+            .into_iter()
+            .filter_map(|item| serde_json::from_value::<RawCompose>(item).ok())
+            .filter_map(RawCompose::into_service)
+            .filter(|service| service.name == name && service.environment_id == *environment_id)
+            .collect())
+    }
+
+    /// Creates a compose service with a raw compose file
+    /// (`compose.create`). Not idempotent; see the module documentation.
+    pub async fn create_compose(
+        &self,
+        url: &DokployUrl,
+        key: &SecretString,
+        new: &NewCompose<'_>,
+    ) -> Result<ComposeService, DokployError> {
+        if !is_dashboard_compose_name(new.name) {
+            return Err(DokployError::InvalidResponse);
+        }
+        let mut body = serde_json::json!({
+            "name": new.name,
+            "appName": new.name,
+            "description": new.description,
+            "environmentId": new.environment_id.as_str(),
+            "composeType": "docker-compose",
+            "sourceType": "raw",
+            "composeFile": new.compose_file,
+        });
+        if let Some(server) = new.server_id {
+            body["serverId"] = server.as_str().into();
+        }
+        let answer = self
+            .send(
+                url,
+                "compose.create",
+                key,
+                Input::Post(&body),
+                MAX_LIST_BODY_BYTES,
+            )
+            .await?;
+        let created: RawCompose =
+            serde_json::from_slice(&answer).map_err(|_| DokployError::InvalidResponse)?;
+        let service = created
+            .into_service()
+            .ok_or(DokployError::InvalidResponse)?;
+        if service.name != new.name || service.environment_id != *new.environment_id {
+            return Err(DokployError::InvalidResponse);
+        }
+        Ok(service)
+    }
+
+    /// Sets the compose file and variables of `compose_id`, with isolated
+    /// deployment on (`compose.update`). Repeating it sets the same values.
+    /// `env` is dotenv text and must not contain `${`, which Dokploy leaves
+    /// unescaped.
+    pub async fn configure_compose(
+        &self,
+        url: &DokployUrl,
+        key: &SecretString,
+        compose_id: &DokployId,
+        compose_file: &str,
+        env: &SecretString,
+    ) -> Result<(), DokployError> {
+        if env.expose_secret().contains("${") {
+            return Err(DokployError::InvalidResponse);
+        }
+        let body = serde_json::json!({
+            "composeId": compose_id.as_str(),
+            "sourceType": "raw",
+            "composeFile": compose_file,
+            "env": env.expose_secret(),
+            "isolatedDeployment": true,
+        });
+        let answer = self
+            .send(
+                url,
+                "compose.update",
+                key,
+                Input::Post(&body),
+                MAX_LIST_BODY_BYTES,
+            )
+            .await?;
+        let updated: RawComposeId =
+            serde_json::from_slice(&answer).map_err(|_| DokployError::InvalidResponse)?;
+        if updated.compose_id != compose_id.as_str() {
+            return Err(DokployError::InvalidResponse);
+        }
+        Ok(())
+    }
+
+    /// The file mounts of `compose_id` (`mounts.listByServiceId`).
+    pub async fn file_mounts(
+        &self,
+        url: &DokployUrl,
+        key: &SecretString,
+        compose_id: &DokployId,
+    ) -> Result<Vec<FileMount>, DokployError> {
+        let body = self
+            .send(
+                url,
+                "mounts.listByServiceId",
+                key,
+                Input::Get(&[
+                    ("serviceId", compose_id.as_str()),
+                    ("serviceType", "compose"),
+                ]),
+                MAX_LIST_BODY_BYTES,
+            )
+            .await?;
+        Ok(parse_list::<RawMount>(&body)?
+            .into_iter()
+            .filter_map(RawMount::into_file)
+            .collect())
+    }
+
+    /// Adds a file Dokploy writes at once, next to the compose file
+    /// (`mounts.create`). Not idempotent.
+    pub async fn create_file_mount(
+        &self,
+        url: &DokployUrl,
+        key: &SecretString,
+        compose_id: &DokployId,
+        file_path: &str,
+        content: &str,
+    ) -> Result<FileMount, DokployError> {
+        if !is_file_mount_path(file_path) {
+            return Err(DokployError::InvalidResponse);
+        }
+        let body = serde_json::json!({
+            "type": "file",
+            "serviceType": "compose",
+            "serviceId": compose_id.as_str(),
+            "filePath": file_path,
+            // Required by Dokploy, unused for compose services: the compose
+            // file says where the file goes.
+            "mountPath": format!("/{file_path}"),
+            "content": content,
+        });
+        let answer = self
+            .send(
+                url,
+                "mounts.create",
+                key,
+                Input::Post(&body),
+                MAX_LIST_BODY_BYTES,
+            )
+            .await?;
+        let mount: RawMount =
+            serde_json::from_slice(&answer).map_err(|_| DokployError::InvalidResponse)?;
+        mount
+            .into_file()
+            .filter(|mount| mount.file_path == file_path)
+            .ok_or(DokployError::InvalidResponse)
+    }
+
+    /// Replaces a file mount's content (`mounts.update`). Dokploy answers
+    /// with the mount as it was before, so the answer is not read.
+    pub async fn update_file_mount(
+        &self,
+        url: &DokployUrl,
+        key: &SecretString,
+        mount_id: &DokployId,
+        content: &str,
+    ) -> Result<(), DokployError> {
+        let body = serde_json::json!({ "mountId": mount_id.as_str(), "content": content });
+        self.send(
+            url,
+            "mounts.update",
+            key,
+            Input::Post(&body),
+            MAX_LIST_BODY_BYTES,
+        )
+        .await
+        .map(drop)
+    }
+
+    /// Queues a deployment titled `title` (`compose.deploy`). Dokploy
+    /// returns no deployment ID; find it in [`Self::deployments`] by its
+    /// title, which should be unique. Not idempotent: every call queues
+    /// another deployment.
+    pub async fn deploy_compose(
+        &self,
+        url: &DokployUrl,
+        key: &SecretString,
+        compose_id: &DokployId,
+        title: &str,
+    ) -> Result<(), DokployError> {
+        let body = serde_json::json!({ "composeId": compose_id.as_str(), "title": title });
+        let answer = self
+            .send(
+                url,
+                "compose.deploy",
+                key,
+                Input::Post(&body),
+                MAX_SMALL_BODY_BYTES,
+            )
+            .await?;
+        let queued: RawQueued =
+            serde_json::from_slice(&answer).map_err(|_| DokployError::InvalidResponse)?;
+        if queued.success && queued.compose_id.as_deref() == Some(compose_id.as_str()) {
+            Ok(())
+        } else {
+            Err(DokployError::InvalidResponse)
+        }
+    }
+
+    /// The deployments of `compose_id` that have started, newest first
+    /// (`deployment.allByCompose`).
+    pub async fn deployments(
+        &self,
+        url: &DokployUrl,
+        key: &SecretString,
+        compose_id: &DokployId,
+    ) -> Result<Vec<DeploymentInfo>, DokployError> {
+        let body = self
+            .send(
+                url,
+                "deployment.allByCompose",
+                key,
+                Input::Get(&[("composeId", compose_id.as_str())]),
+                MAX_LIST_BODY_BYTES,
+            )
+            .await?;
+        Ok(parse_list::<RawDeployment>(&body)?
+            .into_iter()
+            .filter_map(RawDeployment::into_info)
+            .collect())
+    }
+
+    /// The domains of `compose_id` (`domain.byComposeId`).
+    pub async fn compose_domains(
+        &self,
+        url: &DokployUrl,
+        key: &SecretString,
+        compose_id: &DokployId,
+    ) -> Result<Vec<ComposeDomain>, DokployError> {
+        let body = self
+            .send(
+                url,
+                "domain.byComposeId",
+                key,
+                Input::Get(&[("composeId", compose_id.as_str())]),
+                MAX_LIST_BODY_BYTES,
+            )
+            .await?;
+        Ok(parse_list::<RawDomainRow>(&body)?
+            .into_iter()
+            .filter_map(RawDomainRow::into_domain)
+            .collect())
+    }
+
+    /// Routes `domain.host` to one service of `compose_id`
+    /// (`domain.create`). It takes effect at the next deployment. Not
+    /// idempotent.
+    pub async fn create_compose_domain(
+        &self,
+        url: &DokployUrl,
+        key: &SecretString,
+        compose_id: &DokployId,
+        domain: &NewComposeDomain<'_>,
+    ) -> Result<ComposeDomain, DokployError> {
+        // Dokploy checks neither the service name nor the certificate when
+        // HTTPS is on, so both are always sent.
+        let body = serde_json::json!({
+            "host": domain.host,
+            "composeId": compose_id.as_str(),
+            "domainType": "compose",
+            "serviceName": domain.service_name,
+            "port": domain.port,
+            "https": domain.https,
+            "certificateType": if domain.https { "letsencrypt" } else { "none" },
+            "path": "/",
+        });
+        let answer = self
+            .send(
+                url,
+                "domain.create",
+                key,
+                Input::Post(&body),
+                MAX_SMALL_BODY_BYTES,
+            )
+            .await?;
+        let row: RawDomainRow =
+            serde_json::from_slice(&answer).map_err(|_| DokployError::InvalidResponse)?;
+        row.into_domain()
+            .filter(|created| created.host == domain.host)
+            .ok_or(DokployError::InvalidResponse)
+    }
+}
+
+#[derive(Deserialize)]
+struct RawSearchPage {
+    items: Vec<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawCompose {
+    compose_id: String,
+    name: String,
+    app_name: String,
+    environment_id: String,
+}
+
+impl RawCompose {
+    fn into_service(self) -> Option<ComposeService> {
+        Some(ComposeService {
+            compose_id: DokployId::parse(&self.compose_id).ok()?,
+            environment_id: DokployId::parse(&self.environment_id).ok()?,
+            name: bounded(self.name)?,
+            app_name: bounded(self.app_name)?,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawComposeId {
+    compose_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawMount {
+    mount_id: String,
+    #[serde(rename = "type")]
+    kind: String,
+    file_path: Option<String>,
+    content: Option<String>,
+}
+
+impl RawMount {
+    fn into_file(self) -> Option<FileMount> {
+        if self.kind != "file" {
+            return None;
+        }
+        Some(FileMount {
+            mount_id: DokployId::parse(&self.mount_id).ok()?,
+            file_path: self.file_path?,
+            content: self.content.unwrap_or_default(),
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawQueued {
+    success: bool,
+    compose_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawDeployment {
+    deployment_id: String,
+    title: Option<String>,
+    status: String,
+}
+
+impl RawDeployment {
+    fn into_info(self) -> Option<DeploymentInfo> {
+        Some(DeploymentInfo {
+            deployment_id: DokployId::parse(&self.deployment_id).ok()?,
+            title: self.title.and_then(bounded),
+            status: DeploymentStatus::parse(&self.status)?,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawDomainRow {
+    domain_id: String,
+    host: String,
+    service_name: Option<String>,
+    port: Option<u16>,
+    https: bool,
+}
+
+impl RawDomainRow {
+    fn into_domain(self) -> Option<ComposeDomain> {
+        Some(ComposeDomain {
+            domain_id: DokployId::parse(&self.domain_id).ok()?,
+            host: bounded(self.host)?,
+            service_name: self.service_name.and_then(bounded),
+            port: self.port?,
+            https: self.https,
+        })
+    }
+}
+
+/// A name or title of at most 256 characters.
+fn bounded(value: String) -> Option<String> {
+    (value.chars().count() <= 256).then_some(value)
+}
