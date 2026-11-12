@@ -133,7 +133,7 @@ Self-hosted Studio has the project's data and service pages. These items cover w
 
 - [ ] Change supported stack settings that self-hosted Studio cannot change (for example Auth providers, SMTP, and JWT expiry, which are environment variables) through the deployment provider, with a preview, validation, the restart they need, and an audit event. This builds on the M4 configuration item.
 - [ ] Deploy Edge Functions through the deployment provider where it supports it; self-hosted Studio reads functions from the stack's files.
-- [ ] Keep a bounded health history per project with a stated retention, and show stale or failing projects on the organization page.
+- [ ] Keep a bounded health history per project with a stated retention, and show stale or failing projects on the organization page. (Started: each project card on the organization page shows its last saved check: healthy, how many services failed (and which), how many were skipped for a missing key, or never checked, with the check's time and an "Over a day old" badge after 24 hours. It is read from the one saved report per project; there is no history yet, and checks still run only when a member asks.)
 - [ ] Optional Studio access log: method, path, status, member, and time for each request through the Studio gateway, never bodies or query values, with a retention limit.
 - [ ] Expand the administrator dashboard with failed jobs and per-project health summaries.
 

@@ -11,7 +11,7 @@ use supabase_dashboard_domain::{
     account::{AccountSummary, AdminAccountSummary, SessionSummary},
     admin::RegisteredResources,
     authz::OrgRole,
-    connection::{CredentialKind, CredentialOverview, HealthReport, SavedCredential},
+    connection::{CredentialKind, CredentialOverview, HealthDigest, HealthReport, SavedCredential},
     health::InstallationHealth,
     invitation::{InvitationCode, InvitationPreview, InvitationSummary, IssuedInvitation},
     organization::{MemberSummary, OrganizationSummary},
@@ -271,6 +271,16 @@ pub async fn get_project_health(id: Uuid) -> Result<Option<HealthReport>, AppErr
 pub async fn check_project_health(id: Uuid) -> Result<HealthReport, AppError> {
     let session = org_context::session()?;
     Ok(org_context::connections()?.check_now(&session, id).await?)
+}
+
+/// The last check of each project in an organization, in short. Projects
+/// never checked are left out.
+#[server]
+pub async fn list_project_health(organization_id: Uuid) -> Result<Vec<HealthDigest>, AppError> {
+    let session = org_context::session()?;
+    Ok(org_context::connections()?
+        .health_digests(&session, organization_id)
+        .await?)
 }
 
 /// Projects registered in an organization.

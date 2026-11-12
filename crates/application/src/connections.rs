@@ -16,10 +16,10 @@ use supabase_dashboard_domain::{
     authz::Permission,
     connection::{
         ApiKeyError, CredentialKind, CredentialOverview, CredentialState, CredentialStatus,
-        HEALTH_CHECK_COOLDOWN_SECS, HealthReport, SavedCredential, ServiceCheck, ServiceStatus,
-        SkipReason, StackService, check_api_key,
+        HEALTH_CHECK_COOLDOWN_SECS, HealthDigest, HealthReport, SavedCredential, ServiceCheck,
+        ServiceStatus, SkipReason, StackService, check_api_key,
     },
-    project::ProjectUrl,
+    project::{MAX_PROJECTS_PER_ORGANIZATION, ProjectUrl},
 };
 use supabase_dashboard_persistence::{
     Database, PersistenceError,
@@ -297,6 +297,32 @@ impl ConnectionService {
         self.access(current, project_id, Permission::ProjectRead)
             .await?;
         Ok(self.db.find_health_report(project_id).await?)
+    }
+
+    /// The last saved check of each project in an organization, in short,
+    /// for the project cards. Any member may read them; projects never
+    /// checked are left out.
+    pub async fn health_digests(
+        &self,
+        current: &CurrentSession,
+        organization_id: Uuid,
+    ) -> Result<Vec<HealthDigest>, ConnectionError> {
+        let membership = self
+            .db
+            .find_membership(organization_id, current.account.id)
+            .await?
+            .ok_or(ConnectionError::NotFound)?;
+        if !membership.role.allows(Permission::ProjectRead) {
+            return Err(ConnectionError::Forbidden);
+        }
+        let now = OffsetDateTime::now_utc();
+        Ok(self
+            .db
+            .list_health_reports(organization_id, MAX_PROJECTS_PER_ORGANIZATION)
+            .await?
+            .into_iter()
+            .map(|(project_id, report)| HealthDigest::new(project_id, &report, now))
+            .collect())
     }
 
     /// Checks every service now, saves the result, and returns it. Any

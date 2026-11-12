@@ -643,3 +643,73 @@ async fn studio_logins_are_tried_before_they_are_saved() {
             .all(|t| !t.contains(STUDIO_PASSWORD) && !t.contains("a-wrong-studio-password"))
     );
 }
+
+#[tokio::test]
+async fn health_digests_cover_one_organization_for_its_members() {
+    let Some(scratch) = ScratchDb::create("conn_digests").await else {
+        return;
+    };
+    let f = setup(&scratch, Some(KEY_A)).await;
+    let owner = account(&f.db, "Owner").await;
+    let viewer = account(&f.db, "Viewer").await;
+    let outsider = account(&f.db, "Outsider").await;
+    let (org, id) = project(&f, &owner, "Acme").await;
+    add_member(&f.db, org, &viewer, OrgRole::Viewer).await;
+    let (other_org, other_id) = project(&f, &outsider, "Globex").await;
+    let unchecked = f
+        .projects
+        .register(
+            &owner,
+            org,
+            Registration {
+                name: "Staging",
+                api_url: "https://staging.example.test",
+                allow_unencrypted: false,
+            },
+            ctx(),
+        )
+        .await
+        .unwrap()
+        .id;
+
+    // Only the anon key is stored: Auth, Storage, and Realtime are checked
+    // with it, REST falls back to it, and Studio has no login.
+    f.connections
+        .replace_credential(
+            &owner,
+            id,
+            CredentialKind::AnonKey,
+            &SecretString::from(ANON),
+            ctx(),
+        )
+        .await
+        .unwrap();
+    f.connections.check_now(&owner, id).await.unwrap();
+    f.connections.check_now(&outsider, other_id).await.unwrap();
+
+    let digests = f.connections.health_digests(&viewer, org).await.unwrap();
+    assert_eq!(digests.len(), 1, "{digests:?}");
+    let digest = &digests[0];
+    assert_eq!(digest.project_id, id);
+    assert!(digest.failing.is_empty());
+    assert_eq!(digest.not_checked, vec![StackService::Studio]);
+    assert!(!digest.stale);
+    assert!(digests.iter().all(|d| d.project_id != unchecked));
+
+    // A day later the same check is stale.
+    sqlx::query("UPDATE project_health_reports SET checked_at = now() - interval '25 hours'")
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    assert!(f.connections.health_digests(&owner, org).await.unwrap()[0].stale);
+
+    // Members of one organization learn nothing about another's projects.
+    assert!(matches!(
+        f.connections.health_digests(&outsider, org).await,
+        Err(ConnectionError::NotFound)
+    ));
+    assert!(matches!(
+        f.connections.health_digests(&viewer, other_org).await,
+        Err(ConnectionError::NotFound)
+    ));
+}

@@ -12,6 +12,7 @@ use leptos_router::{
 };
 use supabase_dashboard_domain::{
     authz::{OrgRole, Permission},
+    connection::HealthDigest,
     invitation::{InvitationSummary, IssuedInvitation},
     organization::{MemberSummary, ORGANIZATION_NAME_MAX_CHARS, OrganizationSummary},
     project::ProjectSummary,
@@ -26,10 +27,13 @@ use crate::{
         page::{StatePanel, StateTone},
     },
     error::AppError,
-    pages::project::{project_entry, project_path},
+    pages::{
+        account::utc_minutes,
+        project::{project_entry, project_path},
+    },
     server_fns::{
         ChangeMemberRole, CreateInvitation, RemoveMember, RenameOrganization, RevokeInvitation,
-        get_organization, list_invitations, list_members, list_projects,
+        get_organization, list_invitations, list_members, list_project_health, list_projects,
     },
 };
 
@@ -133,6 +137,15 @@ pub fn OrganizationProjectsPage() -> impl IntoView {
             }
         },
     );
+    let health = Resource::new(
+        move || ctx.id.get(),
+        |id| async move {
+            match id {
+                Some(id) => list_project_health(id).await,
+                None => Err(AppError::NotFound),
+            }
+        },
+    );
     let can_register =
         move || loaded_org(ctx).is_some_and(|org| org.role.allows(Permission::ProjectRegister));
     let new_href = move || ctx.id.get().map(|id| format!("/dashboard/new/{id}"));
@@ -161,7 +174,12 @@ pub fn OrganizationProjectsPage() -> impl IntoView {
                         }
                         .into_any()
                     }
-                    Ok(list) => view! { <ProjectGrid list/> }.into_any(),
+                    Ok(list) => {
+                        // Cards still render when health cannot be read;
+                        // the notice says so instead of showing guesses.
+                        let health = health.get().map(|result| result.map_err(|err| err.to_string()));
+                        view! { <ProjectGrid list health/> }.into_any()
+                    }
                     Err(err) => view! {
                         <StatePanel
                             tone=StateTone::Error
@@ -177,9 +195,68 @@ pub fn OrganizationProjectsPage() -> impl IntoView {
     .into_any()
 }
 
-#[component]
-fn ProjectGrid(list: Vec<ProjectSummary>) -> impl IntoView {
+/// The last check of one project on its card: an overall badge, when it
+/// ran, and whether it is old. Nothing here is a live status.
+fn health_badges(digest: Option<&HealthDigest>) -> impl IntoView + use<> {
+    let Some(digest) = digest else {
+        return view! {
+            <span class="card-badges">
+                <span class="badge badge-muted">"Never checked"</span>
+            </span>
+        }
+        .into_any();
+    };
+    let plural = |n: usize| if n == 1 { "service" } else { "services" };
+    let (class, label) = if !digest.failing.is_empty() {
+        let n = digest.failing.len();
+        ("badge badge-error", format!("{n} {} failing", plural(n)))
+    } else if !digest.not_checked.is_empty() {
+        let n = digest.not_checked.len();
+        (
+            "badge badge-muted",
+            format!("{n} {} not checked", plural(n)),
+        )
+    } else {
+        ("badge badge-ok", "Healthy".to_owned())
+    };
+    let failing = (!digest.failing.is_empty()).then(|| {
+        let names: Vec<&str> = digest.failing.iter().map(|s| s.label()).collect();
+        view! { <span class="card-meta">{format!("Failing: {}", names.join(", "))}</span> }
+    });
+    let stale = digest
+        .stale
+        .then(|| view! { <span class="badge badge-muted">"Over a day old"</span> });
     view! {
+        <span class="card-badges">
+            <span class=class>{label}</span>
+            {stale}
+        </span>
+        {failing}
+        <span class="card-meta">{format!("Last check {} UTC", utc_minutes(digest.checked_at))}</span>
+    }
+    .into_any()
+}
+
+#[component]
+fn ProjectGrid(
+    list: Vec<ProjectSummary>,
+    /// `None` while loading, `Some(Err)` when health could not be read.
+    health: Option<Result<Vec<HealthDigest>, String>>,
+) -> impl IntoView {
+    let notice = match &health {
+        Some(Err(message)) => Some(view! {
+            <p class="form-error page-notice" role="alert">
+                {format!("Service health could not be loaded: {message}")}
+            </p>
+        }),
+        _ => None,
+    };
+    let digests = match health {
+        Some(Ok(digests)) => Some(digests),
+        _ => None,
+    };
+    view! {
+        {notice}
         <ul class="card-grid" aria-label="Projects">
             {list
                 .into_iter()
@@ -194,6 +271,9 @@ fn ProjectGrid(list: Vec<ProjectSummary>) -> impl IntoView {
                             "Status and settings"
                         </a>
                     });
+                    let health = digests.as_ref().map(|digests| {
+                        health_badges(digests.iter().find(|d| d.project_id == project.id))
+                    });
                     view! {
                         <li>
                             <div class="card-link card-stack project-card">
@@ -203,6 +283,7 @@ fn ProjectGrid(list: Vec<ProjectSummary>) -> impl IntoView {
                                 </a>
                                 <span class="card-meta url-text">{project.api_url.as_str().to_owned()}</span>
                                 {insecure}
+                                {health}
                                 {status}
                             </div>
                         </li>

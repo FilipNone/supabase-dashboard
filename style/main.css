@@ -364,6 +364,8 @@ code { font-family: var(--font-mono); font-size: var(--text-sm); }
 .card-cover::after { content: ""; position: absolute; inset: 0; border-radius: inherit; }
 .card-cover:focus-visible { outline: none; }
 .card-cover:focus-visible::after { outline: 2px solid var(--color-focus); outline-offset: 2px; }
+.card-badges { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.card-badges .badge + .badge { margin-left: 0; }
 .card-aside { position: relative; z-index: 1; color: var(--color-text-muted); font-size: var(--text-sm); }
 .card-aside:hover { color: var(--color-text); }
 

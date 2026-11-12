@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 /// Upper bound on a stored API key. Legacy keys are JWTs of a few hundred
 /// bytes; the newer `sb_` keys are shorter.
@@ -14,6 +15,10 @@ pub const API_KEY_MAX_LEN: usize = 4096;
 /// Minimum seconds between two checks of the same project, so the check
 /// button cannot be used to flood a stack with requests.
 pub const HEALTH_CHECK_COOLDOWN_SECS: i64 = 10;
+
+/// Age after which a saved check is shown as stale. Checks run only when a
+/// member asks for one, so an old result says little about the stack now.
+pub const HEALTH_STALE_AFTER_SECS: i64 = 24 * 60 * 60;
 
 /// An API key the dashboard can store for a project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -336,6 +341,46 @@ pub struct HealthReport {
     pub checks: Vec<ServiceCheck>,
 }
 
+/// A project's last check in short, for its card on the organization
+/// page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthDigest {
+    pub project_id: Uuid,
+    pub checked_at: OffsetDateTime,
+    /// Services that refused the key, answered with an error, could not be
+    /// reached, or serve Studio without a password.
+    pub failing: Vec<StackService>,
+    /// Services skipped because a key or login is missing or unreadable.
+    pub not_checked: Vec<StackService>,
+    /// Whether the check was older than [`HEALTH_STALE_AFTER_SECS`] when
+    /// the digest was made.
+    pub stale: bool,
+}
+
+impl HealthDigest {
+    pub fn new(project_id: Uuid, report: &HealthReport, now: OffsetDateTime) -> Self {
+        let mut failing = Vec::new();
+        let mut not_checked = Vec::new();
+        for check in &report.checks {
+            match check.status {
+                ServiceStatus::Healthy => {}
+                ServiceStatus::NotChecked { .. } => not_checked.push(check.service),
+                ServiceStatus::KeyRejected { .. }
+                | ServiceStatus::Unhealthy { .. }
+                | ServiceStatus::Unreachable { .. }
+                | ServiceStatus::Unprotected { .. } => failing.push(check.service),
+            }
+        }
+        Self {
+            project_id,
+            checked_at: report.checked_at,
+            failing,
+            not_checked,
+            stale: (now - report.checked_at).whole_seconds() > HEALTH_STALE_AFTER_SECS,
+        }
+    }
+}
+
 /// What the dashboard learned about a key when it saved it.
 ///
 /// API keys are stored without contacting the stack; the next health check
@@ -358,6 +403,59 @@ pub enum SavedCredential {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn digests_sort_services_by_outcome_and_age() {
+        let checked_at = OffsetDateTime::UNIX_EPOCH + time::Duration::days(20_000);
+        let check = |service, status| ServiceCheck {
+            service,
+            status,
+            version: None,
+            latency_ms: None,
+        };
+        let report = HealthReport {
+            checked_at,
+            checks: vec![
+                check(StackService::Auth, ServiceStatus::Healthy),
+                check(
+                    StackService::Rest,
+                    ServiceStatus::KeyRejected { http_status: 401 },
+                ),
+                check(
+                    StackService::Storage,
+                    ServiceStatus::Unhealthy { http_status: 404 },
+                ),
+                check(
+                    StackService::Realtime,
+                    ServiceStatus::NotChecked {
+                        reason: SkipReason::MissingKey,
+                    },
+                ),
+                check(
+                    StackService::Studio,
+                    ServiceStatus::Unprotected { http_status: 200 },
+                ),
+            ],
+        };
+        let id = Uuid::nil();
+        let fresh = HealthDigest::new(id, &report, checked_at + time::Duration::hours(24));
+        assert_eq!(
+            fresh.failing,
+            vec![
+                StackService::Rest,
+                StackService::Storage,
+                StackService::Studio
+            ]
+        );
+        assert_eq!(fresh.not_checked, vec![StackService::Realtime]);
+        assert!(!fresh.stale);
+        let old = HealthDigest::new(
+            id,
+            &report,
+            checked_at + time::Duration::hours(24) + time::Duration::seconds(1),
+        );
+        assert!(old.stale);
+    }
 
     #[test]
     fn credential_kinds_round_trip() {

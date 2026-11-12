@@ -168,6 +168,34 @@ impl Database {
         .transpose()
     }
 
+    /// The saved checks of an organization's projects, at most `limit` of
+    /// them. Projects never checked have no entry.
+    pub async fn list_health_reports(
+        &self,
+        organization_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<(Uuid, HealthReport)>, PersistenceError> {
+        let rows: Vec<(Uuid, OffsetDateTime, String)> = sqlx::query_as(
+            "SELECT h.project_id, h.checked_at, h.checks::text \
+             FROM project_health_reports h JOIN projects p ON p.id = h.project_id \
+             WHERE p.organization_id = $1 \
+             ORDER BY h.project_id \
+             LIMIT $2",
+        )
+        .bind(organization_id)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(query_err)?;
+        rows.into_iter()
+            .map(|(project_id, checked_at, checks)| {
+                let checks: Vec<ServiceCheck> = serde_json::from_str(&checks)
+                    .map_err(|_| PersistenceError::InvalidRow("project_health_reports.checks"))?;
+                Ok((project_id, HealthReport { checked_at, checks }))
+            })
+            .collect()
+    }
+
     /// Replaces the saved check of a project. Does nothing when the project
     /// was unregistered while the check ran.
     pub async fn save_health_report(
