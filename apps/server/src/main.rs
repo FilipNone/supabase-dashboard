@@ -17,6 +17,7 @@ mod telemetry;
 
 use std::{process::ExitCode, sync::Arc, time::Duration};
 
+use secrecy::ExposeSecret;
 use supabase_dashboard_adapters::{
     dokploy::{DokployClient, DokploySettings},
     gateway::{GatewayError, GatewayProbe, GatewaySettings},
@@ -27,7 +28,7 @@ use supabase_dashboard_adapters::{
 use supabase_dashboard_application::{
     auth::{AuthConfig, AuthError, AuthService, BootstrapError, PasswordResetError},
     connections::{ConnectionService, ScheduledChecks},
-    dokploy::DokployService,
+    dokploy::{DokployCredentials, DokployService},
     key_rotation::{RotationError, key_usage, reseal_credentials},
     organizations::OrganizationService,
     projects::ProjectService,
@@ -35,6 +36,7 @@ use supabase_dashboard_application::{
     studio::StudioService,
     studio_access::{StudioAccessRecorder, StudioAccessService},
 };
+use supabase_dashboard_domain::dokploy::check_dokploy_key;
 use supabase_dashboard_persistence::{Database, PersistenceError};
 use tokio::net::TcpListener;
 
@@ -96,6 +98,16 @@ enum StartupError {
     Rotation(#[from] RotationError),
     #[error("could not set up project connections: {0}")]
     Gateway(#[from] GatewayError),
+    #[error("could not read SUPABASE_DASHBOARD_DOKPLOY_API_KEY_FILE {path}: {source}")]
+    DokployKeyFile {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
+    #[error("SUPABASE_DASHBOARD_DOKPLOY_API_KEY_FILE {path} is invalid: {reason}")]
+    DokployKey {
+        path: std::path::PathBuf,
+        reason: String,
+    },
     #[error("could not read SUPABASE_DASHBOARD_EXTRA_CA_FILE {path}: {source}")]
     ExtraCaFile {
         path: std::path::PathBuf,
@@ -106,6 +118,38 @@ enum StartupError {
         path: std::path::PathBuf,
         source: ExtraRootsError,
     },
+}
+
+/// Reads the Dokploy key the deployment supplies, if any. The file holds
+/// the key alone; surrounding whitespace, such as a final newline, is
+/// ignored. Its size is checked before reading, and nothing from the file
+/// appears in an error.
+fn deployment_dokploy(config: &Config) -> Result<Option<DokployCredentials>, StartupError> {
+    let Some(supplied) = &config.dokploy else {
+        return Ok(None);
+    };
+    let path = &supplied.key_file;
+    let read_err = |source| StartupError::DokployKeyFile {
+        path: path.clone(),
+        source,
+    };
+    let invalid = |reason: String| StartupError::DokployKey {
+        path: path.clone(),
+        reason,
+    };
+    let len = std::fs::metadata(path).map_err(read_err)?.len();
+    if len > MAX_DOKPLOY_KEY_FILE_BYTES {
+        return Err(invalid(format!(
+            "the file is larger than {MAX_DOKPLOY_KEY_FILE_BYTES} bytes"
+        )));
+    }
+    let raw = secrecy::SecretString::from(std::fs::read_to_string(path).map_err(read_err)?);
+    let key =
+        check_dokploy_key(raw.expose_secret().trim()).map_err(|err| invalid(err.to_string()))?;
+    Ok(Some(DokployCredentials {
+        url: supplied.url.clone(),
+        key: secrecy::SecretString::from(key.to_owned()),
+    }))
 }
 
 /// Loads the extra certificate authorities, if a file is configured. The
@@ -257,6 +301,12 @@ fn credential_cipher(config: &Config) -> Result<Option<CredentialCipher>, Startu
 
 /// Largest previous-keys file read; a line per key is about 45 bytes.
 const MAX_PREVIOUS_KEYS_FILE_BYTES: u64 = 64 * 1024;
+
+/// Room for the longest accepted Dokploy key and a final newline.
+const MAX_DOKPLOY_KEY_FILE_BYTES: u64 = 4096;
+
+/// Longest pause between attempts to reach Dokploy at startup.
+const MAX_DOKPLOY_RETRY_PAUSE: Duration = Duration::from_secs(300);
 
 /// Warns when stored values are under a key other than the current one.
 async fn report_key_usage(db: &Database, cipher: &CredentialCipher) -> Result<(), StartupError> {
@@ -415,7 +465,10 @@ async fn run() -> Result<(), StartupError> {
         DokployService::new(db.clone(), cipher.clone(), dokploy_client)
             .with_public_host(config.public_url.as_ref().and_then(url::Url::host_str)),
     );
-    tokio::spawn(report_dokploy_placement(Arc::clone(&dokploy)));
+    tokio::spawn(start_dokploy(
+        Arc::clone(&dokploy),
+        deployment_dokploy(&config)?,
+    ));
     let connections = Arc::new(ConnectionService::new(db.clone(), cipher, probe));
     match config.health_check_interval {
         Some(interval) => {
@@ -489,6 +542,39 @@ async fn prune_sessions(auth: Arc<AuthService>) {
             Err(err) => tracing::warn!(error = %err, "could not prune sessions"),
         }
     }
+}
+
+/// Applies the Dokploy connection the deployment supplies, then reports
+/// the dashboard's placement. Runs in the background, so an unreachable
+/// Dokploy never delays startup; it is tried again, with growing pauses,
+/// until it answers. A refused key, an unsupported version, or a
+/// conflicting connection is reported once and not retried.
+async fn start_dokploy(dokploy: Arc<DokployService>, supplied: Option<DokployCredentials>) {
+    use supabase_dashboard_application::dokploy::{DokployServiceError, is_transient};
+
+    let mut pause = Duration::from_secs(5);
+    loop {
+        match dokploy.apply_deployment_connection(supplied.as_ref()).await {
+            Ok(_) => break,
+            Err(DokployServiceError::Dokploy(err)) if is_transient(&err) => {
+                tracing::warn!(
+                    error = %err,
+                    retry_in_secs = pause.as_secs(),
+                    "could not apply the Dokploy connection from SUPABASE_DASHBOARD_DOKPLOY_URL"
+                );
+                tokio::time::sleep(pause).await;
+                pause = (pause * 2).min(MAX_DOKPLOY_RETRY_PAUSE);
+            }
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    "could not apply the Dokploy connection from SUPABASE_DASHBOARD_DOKPLOY_URL"
+                );
+                break;
+            }
+        }
+    }
+    report_dokploy_placement(dokploy).await;
 }
 
 /// Reports at startup whether the dashboard's confirmed Dokploy service is

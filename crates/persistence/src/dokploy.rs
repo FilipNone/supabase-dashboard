@@ -48,6 +48,14 @@ pub struct StoredDokployConnection {
     pub connected_by: Option<DisplayName>,
     pub key_replaced_at: Option<OffsetDateTime>,
     pub key_replaced_by: Option<DisplayName>,
+    /// The deployment supplies this connection; administrators cannot
+    /// replace or remove it.
+    pub from_deployment: bool,
+    /// The server connected it from the deployment's configuration.
+    pub connected_by_deployment: bool,
+    /// The server last replaced the key from the deployment's
+    /// configuration.
+    pub key_replaced_by_deployment: bool,
 }
 
 pub struct NewDokployConnection<'a> {
@@ -56,7 +64,8 @@ pub struct NewDokployConnection<'a> {
     pub nonce: &'a [u8],
     pub ciphertext: &'a [u8],
     pub version: &'a str,
-    pub connected_by: Uuid,
+    /// `None` when the deployment supplies the connection.
+    pub connected_by: Option<Uuid>,
 }
 
 pub struct ReplacedDokployKey<'a> {
@@ -67,7 +76,10 @@ pub struct ReplacedDokployKey<'a> {
     pub nonce: &'a [u8],
     pub ciphertext: &'a [u8],
     pub version: &'a str,
-    pub replaced_by: Uuid,
+    /// `None` when the deployment supplies the key. An administrator's
+    /// replacement writes nothing while the deployment supplies the
+    /// connection.
+    pub replaced_by: Option<Uuid>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -82,6 +94,9 @@ struct ConnectionRow {
     connected_by_name: Option<String>,
     key_replaced_at: Option<OffsetDateTime>,
     key_replaced_by_name: Option<String>,
+    from_deployment: bool,
+    connected_by_deployment: bool,
+    key_replaced_by_deployment: bool,
 }
 
 fn display_name(raw: Option<String>) -> Result<Option<DisplayName>, PersistenceError> {
@@ -99,7 +114,9 @@ impl Database {
         let row: Option<ConnectionRow> = sqlx::query_as(
             "SELECT d.url, d.key_id, d.nonce, d.ciphertext, d.version, d.verified_at, \
                     d.connected_at, c.display_name AS connected_by_name, \
-                    d.key_replaced_at, r.display_name AS key_replaced_by_name \
+                    d.key_replaced_at, r.display_name AS key_replaced_by_name, \
+                    d.from_deployment, d.connected_by_deployment, \
+                    d.key_replaced_by_deployment \
              FROM dokploy_connection d \
              LEFT JOIN accounts c ON c.id = d.connected_by \
              LEFT JOIN accounts r ON r.id = d.key_replaced_by",
@@ -121,6 +138,9 @@ impl Database {
                 verified_at: row.verified_at,
                 connected_at: row.connected_at,
                 key_replaced_at: row.key_replaced_at,
+                from_deployment: row.from_deployment,
+                connected_by_deployment: row.connected_by_deployment,
+                key_replaced_by_deployment: row.key_replaced_by_deployment,
             })
         })
         .transpose()
@@ -136,8 +156,9 @@ impl Database {
         let mut tx = self.pool.begin().await.map_err(query_err)?;
         let inserted = sqlx::query(
             "INSERT INTO dokploy_connection \
-                 (url, key_id, nonce, ciphertext, version, connected_by) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
+                 (url, key_id, nonce, ciphertext, version, connected_by, \
+                  from_deployment, connected_by_deployment) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $7) \
              ON CONFLICT (singleton) DO NOTHING",
         )
         .bind(connection.url)
@@ -146,6 +167,7 @@ impl Database {
         .bind(connection.ciphertext)
         .bind(connection.version)
         .bind(connection.connected_by)
+        .bind(connection.connected_by.is_none())
         .execute(&mut *tx)
         .await
         .map_err(query_err)?
@@ -170,8 +192,9 @@ impl Database {
         let updated = sqlx::query(
             "UPDATE dokploy_connection SET key_id = $2, nonce = $3, ciphertext = $4, \
                  version = $5, verified_at = now(), key_replaced_by = $6, \
-                 key_replaced_at = now() \
-             WHERE url = $1",
+                 key_replaced_at = now(), key_replaced_by_deployment = $7, \
+                 from_deployment = $7 \
+             WHERE url = $1 AND (NOT from_deployment OR $7)",
         )
         .bind(replacement.url)
         .bind(replacement.key_id)
@@ -179,6 +202,7 @@ impl Database {
         .bind(replacement.ciphertext)
         .bind(replacement.version)
         .bind(replacement.replaced_by)
+        .bind(replacement.replaced_by.is_none())
         .execute(&mut *tx)
         .await
         .map_err(query_err)?
@@ -192,23 +216,85 @@ impl Database {
     }
 
     /// Deletes the stored connection and records `audit`. Returns the URL
-    /// it pointed to, or `None`, writing nothing, when none was stored.
+    /// it pointed to, or `None`, writing nothing, when none was stored or
+    /// the deployment supplies it.
     pub async fn delete_dokploy_connection(
         &self,
         audit: &AuditEvent<'_>,
     ) -> Result<Option<String>, PersistenceError> {
         let mut tx = self.pool.begin().await.map_err(query_err)?;
-        let url: Option<String> =
-            sqlx::query_scalar("DELETE FROM dokploy_connection RETURNING url")
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(query_err)?;
+        let url: Option<String> = sqlx::query_scalar(
+            "DELETE FROM dokploy_connection WHERE NOT from_deployment RETURNING url",
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(query_err)?;
         if url.is_none() {
             return Ok(None);
         }
         insert_audit_event(&mut *tx, audit).await?;
         tx.commit().await.map_err(query_err)?;
         Ok(url)
+    }
+
+    /// Replaces the stored connection, which pointed to `old_url`, with one
+    /// the deployment supplies, and records `audit`. The dashboard's
+    /// placement in Dokploy goes with the old connection. Returns `false`,
+    /// writing nothing, when the stored connection is no longer the one the
+    /// deployment supplied for `old_url`.
+    pub async fn replace_deployment_dokploy_connection(
+        &self,
+        old_url: &str,
+        connection: &NewDokployConnection<'_>,
+        audit: &AuditEvent<'_>,
+    ) -> Result<bool, PersistenceError> {
+        let mut tx = self.pool.begin().await.map_err(query_err)?;
+        let deleted =
+            sqlx::query("DELETE FROM dokploy_connection WHERE url = $1 AND from_deployment")
+                .bind(old_url)
+                .execute(&mut *tx)
+                .await
+                .map_err(query_err)?
+                .rows_affected();
+        if deleted == 0 {
+            return Ok(false);
+        }
+        sqlx::query(
+            "INSERT INTO dokploy_connection \
+                 (url, key_id, nonce, ciphertext, version, connected_by, \
+                  from_deployment, connected_by_deployment) \
+             VALUES ($1, $2, $3, $4, $5, NULL, TRUE, TRUE)",
+        )
+        .bind(connection.url)
+        .bind(connection.key_id)
+        .bind(connection.nonce)
+        .bind(connection.ciphertext)
+        .bind(connection.version)
+        .execute(&mut *tx)
+        .await
+        .map_err(query_err)?;
+        insert_audit_event(&mut *tx, audit).await?;
+        tx.commit().await.map_err(query_err)?;
+        Ok(true)
+    }
+
+    /// Marks the stored connection to `url` as supplied by the deployment,
+    /// or no longer supplied. Returns `false` when no connection to `url`
+    /// is stored.
+    pub async fn set_dokploy_from_deployment(
+        &self,
+        url: &str,
+        from_deployment: bool,
+    ) -> Result<bool, PersistenceError> {
+        let updated =
+            sqlx::query("UPDATE dokploy_connection SET from_deployment = $2 WHERE url = $1")
+                .bind(url)
+                .bind(from_deployment)
+                .execute(&self.pool)
+                .await
+                .map_err(query_err)?
+                .rows_affected();
+        Ok(updated > 0)
     }
 
     /// The stored Dokploy key with its URL, when it is not sealed under

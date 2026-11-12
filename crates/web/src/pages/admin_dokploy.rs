@@ -8,7 +8,9 @@
 
 use leptos::{form::ActionForm, prelude::*};
 use supabase_dashboard_domain::{
-    dokploy::{DOKPLOY_KEY_MAX_LEN, DokployChange, DokployConnectionSummary, DokployOverview},
+    dokploy::{
+        ChangedBy, DOKPLOY_KEY_MAX_LEN, DokployChange, DokployConnectionSummary, DokployOverview,
+    },
     project::PROJECT_URL_MAX_LEN,
 };
 
@@ -26,6 +28,8 @@ fn feedback<T>(value: Option<Result<T, AppError>>, ok: &'static str) -> Option<A
         Err(err) => view! { <p class="form-error" role="alert">{err.to_string()}</p> }.into_any(),
     })
 }
+
+const DEPLOYMENT_HINT: &str = "The URL and key come from SUPABASE_DASHBOARD_DOKPLOY_URL and SUPABASE_DASHBOARD_DOKPLOY_API_KEY_FILE. Change them there and restart the dashboard to replace the key or point it at another Dokploy.";
 
 const KEY_ADVICE: &str = "Create the key as a Dokploy member made for this dashboard rather than as your own account, so it can be revoked without affecting anyone's access. Leave its rate limit off: a limited key is refused once the limit is reached. Dokploy does not tell the dashboard when the key in use expires, so note its expiry date if you set one.";
 
@@ -176,10 +180,11 @@ fn not_connected_view(storage_available: bool, actions: Actions) -> AnyView {
 }
 
 fn change_text(change: &DokployChange) -> String {
-    let by = change
-        .by
-        .as_ref()
-        .map_or("a deleted account", |name| name.as_str());
+    let by = match &change.by {
+        ChangedBy::Account(name) => name.as_str(),
+        ChangedBy::DeletedAccount => "a deleted account",
+        ChangedBy::Deployment => "the server's configuration",
+    };
     format!("{} (UTC) by {by}", utc_minutes(change.at))
 }
 
@@ -195,6 +200,7 @@ fn connected_view(
         replace_form,
     } = actions;
     let failed = move || matches!(replace.value().get(), Some(Err(_)));
+    let from_deployment = connection.from_deployment;
     let transport = if connection.url.is_encrypted() {
         view! { <span class="badge badge-ok">"HTTPS"</span> }.into_any()
     } else {
@@ -237,6 +243,16 @@ fn connected_view(
                 <dd>{change_text(&connection.connected)}</dd>
             </div>
             {replaced}
+            {from_deployment.then(|| view! {
+                <div>
+                    <dt>"Managed by"</dt>
+                    <dd>
+                        <span class="badge badge-muted">"Server configuration"</span>
+                        " "
+                        <span class="field-hint">{DEPLOYMENT_HINT}</span>
+                    </dd>
+                </div>
+            })}
             <div>
                 <dt>"Key last checked"</dt>
                 <dd>{format!("{} (UTC)", utc_minutes(connection.verified_at))}</dd>
@@ -247,7 +263,9 @@ fn connected_view(
     // Dokploy can be asked only with a key this server can read.
     let placement =
         (storage_available && connection.key_readable).then(|| view! { <DokployPlacementPanel/> });
-    let replace_form_view = storage_available.then(|| {
+    // The deployment's configuration owns a connection it supplies.
+    let manageable = !from_deployment;
+    let replace_form_view = (storage_available && manageable).then(|| {
         view! {
             <h3 class="subsection-title">"Replace the API key"</h3>
             <ActionForm action=replace node_ref=replace_form attr:class="stacked-form">
@@ -282,11 +300,20 @@ fn connected_view(
             view! { <p class="form-ok" role="status">"Connected. Dokploy accepted the key."</p> }
         })
     };
+    let remove_view =
+        manageable.then(|| remove_section(connection.url.as_str().to_owned(), remove));
     view! {
         {connected}
         {details}
         {placement}
         {replace_form_view}
+        {remove_view}
+    }
+    .into_any()
+}
+
+fn remove_section(url: String, remove: ServerAction<DisconnectDokploy>) -> AnyView {
+    view! {
         <h3 class="subsection-title">"Remove the connection"</h3>
         <p class="field-hint">
             "Deletes the dashboard's record of this connection and its stored key. Nothing in Dokploy changes; revoke the key in Dokploy as well if it is no longer needed."
@@ -296,7 +323,7 @@ fn connected_view(
                 <ActionForm action=remove attr:class="dialog-form">
                     <p>
                         "The dashboard forgets "
-                        <span class="url-text">{connection.url.as_str().to_owned()}</span>
+                        <span class="url-text">{url}</span>
                         " and its key. Projects and services in Dokploy are not touched, and the key stays valid in Dokploy until you revoke it there."
                     </p>
                     <div class="dialog-actions">
@@ -326,13 +353,23 @@ mod tests {
         assert_eq!(
             change_text(&DokployChange {
                 at,
-                by: Some(DisplayName::parse("Alice").unwrap()),
+                by: ChangedBy::Account(DisplayName::parse("Alice").unwrap()),
             }),
             "1970-01-01 00:00 (UTC) by Alice"
         );
         assert_eq!(
-            change_text(&DokployChange { at, by: None }),
+            change_text(&DokployChange {
+                at,
+                by: ChangedBy::DeletedAccount
+            }),
             "1970-01-01 00:00 (UTC) by a deleted account"
+        );
+        assert_eq!(
+            change_text(&DokployChange {
+                at,
+                by: ChangedBy::Deployment
+            }),
+            "1970-01-01 00:00 (UTC) by the server's configuration"
         );
     }
 }

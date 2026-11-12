@@ -75,6 +75,23 @@ Audit events, with target type `dokploy` and Dokploy's host name as the target (
 
 Denied attempts have no target, since nothing is read before the role check.
 
+### Supplied by the deployment
+
+The deployment can supply the connection instead, with `SUPABASE_DASHBOARD_DOKPLOY_URL` and `SUPABASE_DASHBOARD_DOKPLOY_API_KEY_FILE`, a file holding the key alone such as a Docker secret. Both are needed, and so is an encryption key; otherwise the server refuses to start. The file is read once at startup.
+
+After starting, the server copies the connection into its stored one, in the background so an unreachable Dokploy does not delay startup:
+
+- Nothing stored: the key is checked with Dokploy as on the page, then stored encrypted.
+- The same URL stored: a different key is checked and replaces the stored one; the same key changes nothing and calls nobody. A connection an administrator made at that URL is taken over, and who connected it stays on record.
+- Another URL, supplied by the deployment before: the new URL and key are checked and replace the connection. The dashboard's confirmed placement goes with it, since it belonged to the other Dokploy.
+- Another URL that an administrator connected: nothing changes, and the server logs an error asking for that connection to be removed on the page. The next start applies the deployment's connection.
+
+When Dokploy cannot be reached, or answers with a server error, the server tries again with growing pauses of up to five minutes. A refused key or an unsupported version is logged as an error and not retried.
+
+While the deployment supplies the connection, the page shows it as managed by the server configuration and offers no way to replace or remove it, and the server refuses both. Changes the server makes this way are audited as `dokploy.connect` and `dokploy.key_replace` without an actor, and so are a refused key and an unsupported version; an unreachable Dokploy is not audited, since it is retried. When the deployment stops supplying a connection, the stored one stays and administrators can replace or remove it again.
+
+A Dokploy on the same host still needs `SUPABASE_DASHBOARD_ALLOW_LOOPBACK_TARGETS=true`, as on the page.
+
 ### Where the dashboard runs
 
 Once Dokploy is connected, the Dokploy section also shows which Dokploy service the dashboard itself runs as. New stacks will go into that service's project and environment by default, so the placement is chosen once by an installation administrator and then stored.

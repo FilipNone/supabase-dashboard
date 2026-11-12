@@ -195,6 +195,8 @@ mod server {
                 | DokployServiceError::AlreadyConnected
                 | DokployServiceError::NotConnected
                 | DokployServiceError::ServiceNotVisible
+                | DokployServiceError::FromDeployment
+                | DokployServiceError::DeploymentConflict { .. }
                 | DokployServiceError::Url(_)
                 | DokployServiceError::Key(_)
                 | DokployServiceError::Dokploy(_) => Self::Rejected(sentence(&err.to_string())),

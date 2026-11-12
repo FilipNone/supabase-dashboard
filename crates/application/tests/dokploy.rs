@@ -10,7 +10,8 @@ use secrecy::{ExposeSecret, SecretString};
 use supabase_dashboard_application::{
     auth::{CurrentSession, RequestContext},
     dokploy::{
-        ConnectFuture, DokployConnector, DokployService, DokployServiceError, InventoryFuture,
+        ConnectFuture, DeploymentConnection, DokployConnector, DokployCredentials, DokployService,
+        DokployServiceError, InventoryFuture,
     },
     key_rotation::{KeyUsage, RotationSummary, key_usage, reseal_credentials},
     secrets::CredentialCipher,
@@ -18,7 +19,10 @@ use supabase_dashboard_application::{
 use supabase_dashboard_domain::{
     account::{DisplayName, Email},
     connection::UnreachableReason,
-    dokploy::{DokployError, DokployKeyError, DokployUrl, DokployVersion, TESTED_DOKPLOY_VERSION},
+    dokploy::{
+        ChangedBy, DokployError, DokployKeyError, DokployUrl, DokployVersion,
+        TESTED_DOKPLOY_VERSION,
+    },
     dokploy_placement::{
         DokployDomainInfo, DokployId, DokployInventory, DokployServiceInfo, DokployServiceKind,
         DokployServiceRef, PlacementLookup, PlacementStatus,
@@ -327,7 +331,9 @@ async fn a_key_is_stored_encrypted_only_after_dokploy_accepts_it() {
     let connection = overview.connection.clone().unwrap();
     assert_eq!(connection.url.as_str(), URL);
     assert_eq!(connection.version, TESTED_DOKPLOY_VERSION);
-    assert_eq!(connection.connected.by.unwrap().as_str(), "Admin");
+    assert!(
+        matches!(&connection.connected.by, ChangedBy::Account(name) if name.as_str() == "Admin")
+    );
     assert_eq!(connection.key_replaced, None);
     assert!(connection.key_readable);
     assert_eq!(f.service.overview(&admin, ctx()).await.unwrap(), overview);
@@ -468,9 +474,11 @@ async fn replacing_the_key_checks_the_new_one_first() {
         .await
         .unwrap();
     let connection = overview.connection.unwrap();
-    assert_eq!(connection.connected.by.unwrap().as_str(), "Admin");
+    assert!(
+        matches!(&connection.connected.by, ChangedBy::Account(name) if name.as_str() == "Admin")
+    );
     let replaced = connection.key_replaced.unwrap();
-    assert_eq!(replaced.by.unwrap().as_str(), "Carol");
+    assert!(matches!(&replaced.by, ChangedBy::Account(name) if name.as_str() == "Carol"));
     assert!(connection.verified_at >= connection.connected.at);
     let stored = f.service.credentials().await.unwrap().unwrap();
     assert_eq!(stored.key.expose_secret(), NEW_KEY);
@@ -949,6 +957,263 @@ async fn removing_the_connection_removes_the_placement() {
     f.service.remove(&admin, ctx()).await.unwrap();
     assert_eq!(placement_rows(&f.db).await, 0);
     assert_eq!(f.service.placement_status().await.unwrap(), None);
+
+    f.db.close().await;
+    scratch.drop().await;
+}
+
+fn supplied(url: &str, key: &str) -> DokployCredentials {
+    DokployCredentials {
+        url: DokployUrl::parse(url).unwrap(),
+        key: secret(key),
+    }
+}
+
+#[tokio::test]
+async fn the_deployment_supplies_the_connection_and_owns_it() {
+    let Some(scratch) = ScratchDb::create("dokploy_deployment").await else {
+        return;
+    };
+    let f = setup(&scratch, Some(KEY_A)).await;
+    let admin = account(&f.db, "Admin", true).await;
+
+    // Nothing supplied and nothing stored: nothing happens.
+    assert_eq!(
+        f.service.apply_deployment_connection(None).await.unwrap(),
+        DeploymentConnection::NotSupplied
+    );
+    assert!(f.fake.calls().is_empty());
+
+    // An unreachable Dokploy stores nothing and is not audited, since the
+    // server tries again.
+    f.fake
+        .fail_with(Some(DokployError::Unreachable(UnreachableReason::Timeout)));
+    let first = supplied(URL, DOKPLOY_KEY);
+    assert!(matches!(
+        f.service.apply_deployment_connection(Some(&first)).await,
+        Err(DokployServiceError::Dokploy(DokployError::Unreachable(_)))
+    ));
+    assert_eq!(stored_rows(&f.db).await, 0);
+    assert!(audits(&f.db, "dokploy.connect", "failure").await.is_empty());
+
+    // Once Dokploy answers, the connection is stored without an actor.
+    f.fake.fail_with(None);
+    assert_eq!(
+        f.service
+            .apply_deployment_connection(Some(&first))
+            .await
+            .unwrap(),
+        DeploymentConnection::Connected
+    );
+    assert_eq!(
+        audits(&f.db, "dokploy.connect", "success").await,
+        vec![(None, Some("dokploy".to_owned()), Some(HOST.to_owned()))]
+    );
+    let connection = f
+        .service
+        .overview(&admin, ctx())
+        .await
+        .unwrap()
+        .connection
+        .unwrap();
+    assert!(connection.from_deployment);
+    assert_eq!(connection.connected.by, ChangedBy::Deployment);
+    assert_eq!(
+        f.service
+            .credentials()
+            .await
+            .unwrap()
+            .unwrap()
+            .key
+            .expose_secret(),
+        DOKPLOY_KEY
+    );
+
+    // Administrators cannot replace or remove it, and Dokploy is not called.
+    let calls = f.fake.calls().len();
+    assert!(matches!(
+        f.service.replace_key(&admin, &secret(NEW_KEY), ctx()).await,
+        Err(DokployServiceError::FromDeployment)
+    ));
+    assert!(matches!(
+        f.service.remove(&admin, ctx()).await,
+        Err(DokployServiceError::FromDeployment)
+    ));
+    assert_eq!(f.fake.calls().len(), calls);
+    assert_eq!(stored_rows(&f.db).await, 1);
+
+    // The same connection at the next start changes nothing and calls
+    // nobody.
+    assert_eq!(
+        f.service
+            .apply_deployment_connection(Some(&first))
+            .await
+            .unwrap(),
+        DeploymentConnection::Unchanged
+    );
+    assert_eq!(f.fake.calls().len(), calls);
+
+    // A refused key is audited and leaves the stored one.
+    f.fake.fail_with(Some(DokployError::KeyRejected));
+    assert!(matches!(
+        f.service
+            .apply_deployment_connection(Some(&supplied(URL, NEW_KEY)))
+            .await,
+        Err(DokployServiceError::Dokploy(DokployError::KeyRejected))
+    ));
+    assert_eq!(
+        audits(&f.db, "dokploy.key_replace", "failure").await,
+        vec![(None, Some("dokploy".to_owned()), Some(HOST.to_owned()))]
+    );
+    assert_eq!(
+        f.service
+            .credentials()
+            .await
+            .unwrap()
+            .unwrap()
+            .key
+            .expose_secret(),
+        DOKPLOY_KEY
+    );
+
+    // A new key replaces the stored one once Dokploy accepts it.
+    f.fake.fail_with(None);
+    assert_eq!(
+        f.service
+            .apply_deployment_connection(Some(&supplied(URL, NEW_KEY)))
+            .await
+            .unwrap(),
+        DeploymentConnection::KeyReplaced
+    );
+    let connection = f
+        .service
+        .overview(&admin, ctx())
+        .await
+        .unwrap()
+        .connection
+        .unwrap();
+    assert_eq!(connection.key_replaced.unwrap().by, ChangedBy::Deployment);
+    assert_eq!(
+        f.service
+            .credentials()
+            .await
+            .unwrap()
+            .unwrap()
+            .key
+            .expose_secret(),
+        NEW_KEY
+    );
+
+    // Another URL replaces the connection, and the placement with it.
+    let dashboard = dokploy_service(DokployServiceKind::Compose, "dash", "prod");
+    f.fake.show(DokployInventory {
+        services: vec![dashboard],
+        domains: Vec::new(),
+    });
+    f.service
+        .confirm_placement(&admin, "compose", "dash", ctx())
+        .await
+        .unwrap();
+    assert_eq!(
+        f.service
+            .apply_deployment_connection(Some(&supplied(
+                "https://dokploy-2.example.test",
+                DOKPLOY_KEY
+            )))
+            .await
+            .unwrap(),
+        DeploymentConnection::Connected
+    );
+    assert_eq!(placement_rows(&f.db).await, 0);
+    let credentials = f.service.credentials().await.unwrap().unwrap();
+    assert_eq!(credentials.url.as_str(), "https://dokploy-2.example.test");
+    assert_eq!(credentials.key.expose_secret(), DOKPLOY_KEY);
+
+    // When the deployment stops supplying it, administrators own it again.
+    assert_eq!(
+        f.service.apply_deployment_connection(None).await.unwrap(),
+        DeploymentConnection::Released
+    );
+    assert!(
+        !f.service
+            .overview(&admin, ctx())
+            .await
+            .unwrap()
+            .connection
+            .unwrap()
+            .from_deployment
+    );
+    f.service.remove(&admin, ctx()).await.unwrap();
+    assert_eq!(stored_rows(&f.db).await, 0);
+
+    let audit_text = all_audit_text(&f.db).await;
+    assert!(!audit_text.contains(DOKPLOY_KEY) && !audit_text.contains(NEW_KEY));
+
+    f.db.close().await;
+    scratch.drop().await;
+}
+
+#[tokio::test]
+async fn a_connection_an_admin_made_is_taken_over_only_at_the_same_url() {
+    let Some(scratch) = ScratchDb::create("dokploy_deployment_admin").await else {
+        return;
+    };
+    let f = setup(&scratch, Some(KEY_A)).await;
+    let admin = account(&f.db, "Admin", true).await;
+    f.service
+        .connect(&admin, URL, &secret(DOKPLOY_KEY), ctx())
+        .await
+        .unwrap();
+
+    // Another URL is refused, and nothing changes or is sent.
+    let calls = f.fake.calls().len();
+    let other = supplied("https://dokploy-2.example.test", NEW_KEY);
+    assert!(matches!(
+        f.service.apply_deployment_connection(Some(&other)).await,
+        Err(DokployServiceError::DeploymentConflict { stored_host }) if stored_host == HOST
+    ));
+    assert_eq!(f.fake.calls().len(), calls);
+    let connection = f
+        .service
+        .overview(&admin, ctx())
+        .await
+        .unwrap()
+        .connection
+        .unwrap();
+    assert!(!connection.from_deployment);
+    assert_eq!(connection.url.as_str(), URL);
+
+    // The same URL and key are taken over without calling Dokploy; who
+    // connected it stays.
+    assert_eq!(
+        f.service
+            .apply_deployment_connection(Some(&supplied(URL, DOKPLOY_KEY)))
+            .await
+            .unwrap(),
+        DeploymentConnection::Unchanged
+    );
+    assert_eq!(f.fake.calls().len(), calls);
+    let connection = f
+        .service
+        .overview(&admin, ctx())
+        .await
+        .unwrap()
+        .connection
+        .unwrap();
+    assert!(connection.from_deployment);
+    assert!(
+        matches!(&connection.connected.by, ChangedBy::Account(name) if name.as_str() == "Admin")
+    );
+
+    // Without an encryption key, the deployment's connection cannot be
+    // stored.
+    let no_cipher = DokployService::new(f.db.clone(), None, f.fake.clone());
+    assert!(matches!(
+        no_cipher
+            .apply_deployment_connection(Some(&supplied(URL, DOKPLOY_KEY)))
+            .await,
+        Err(DokployServiceError::StorageUnavailable)
+    ));
 
     f.db.close().await;
     scratch.drop().await;

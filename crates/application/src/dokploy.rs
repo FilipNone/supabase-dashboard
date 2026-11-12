@@ -18,8 +18,8 @@ use std::{future::Future, pin::Pin, sync::Arc};
 use secrecy::SecretString;
 use supabase_dashboard_domain::{
     dokploy::{
-        DokployChange, DokployConnectionSummary, DokployError, DokployKeyError, DokployOverview,
-        DokployUrl, DokployVersion, InvalidDokployUrl, check_dokploy_key,
+        ChangedBy, DokployChange, DokployConnectionSummary, DokployError, DokployKeyError,
+        DokployOverview, DokployUrl, DokployVersion, InvalidDokployUrl, check_dokploy_key,
     },
     dokploy_placement::{
         ConfirmedPlacement, DokployId, DokployInventory, DokployPlacement, DokployServiceKind,
@@ -77,6 +77,19 @@ pub enum DokployServiceError {
     AlreadyConnected,
     #[error("Dokploy is not connected")]
     NotConnected,
+    #[error(
+        "this Dokploy connection comes from the server's configuration \
+         (SUPABASE_DASHBOARD_DOKPLOY_URL and SUPABASE_DASHBOARD_DOKPLOY_API_KEY_FILE); change it \
+         there and restart the dashboard"
+    )]
+    FromDeployment,
+    /// The deployment supplies a URL other than the one an administrator
+    /// connected. Neither is changed.
+    #[error(
+        "Dokploy is already connected to {stored_host} from the administrator page; remove that \
+         connection to use the one in SUPABASE_DASHBOARD_DOKPLOY_URL"
+    )]
+    DeploymentConflict { stored_host: String },
     #[error(
         "Dokploy does not show that service to the stored key; it may have been deleted, or the \
          key's member cannot access it"
@@ -189,7 +202,7 @@ impl DokployService {
                     nonce: &sealed.nonce,
                     ciphertext: &sealed.ciphertext,
                     version: &version_text,
-                    connected_by: current.account.id,
+                    connected_by: Some(current.account.id),
                 },
                 &event(current, action, Some(&url), AuditOutcome::Success, ctx),
             )
@@ -221,6 +234,9 @@ impl DokployService {
             .find_dokploy_connection()
             .await?
             .ok_or(DokployServiceError::NotConnected)?;
+        if stored.from_deployment {
+            return Err(DokployServiceError::FromDeployment);
+        }
         let url = stored_url(&stored)?;
         let version = self.try_key(current, action, &url, &key, ctx).await?;
         let sealed = cipher.seal_dokploy_key(url.as_str(), &key)?;
@@ -234,15 +250,18 @@ impl DokployService {
                     nonce: &sealed.nonce,
                     ciphertext: &sealed.ciphertext,
                     version: &version_text,
-                    replaced_by: current.account.id,
+                    replaced_by: Some(current.account.id),
                 },
                 &event(current, action, Some(&url), AuditOutcome::Success, ctx),
             )
             .await?;
-        // Removed, or removed and connected elsewhere, while Dokploy was
-        // being called.
+        // Removed, connected elsewhere, or taken over by the deployment
+        // while Dokploy was being called.
         if !replaced {
-            return Err(DokployServiceError::NotConnected);
+            return Err(match self.db.find_dokploy_connection().await? {
+                Some(stored) if stored.from_deployment => DokployServiceError::FromDeployment,
+                _ => DokployServiceError::NotConnected,
+            });
         }
         tracing::info!(dokploy_host = %url.host(), version = %version, "Dokploy key replaced");
         self.current_overview().await
@@ -262,6 +281,9 @@ impl DokployService {
         let Some(stored) = self.db.find_dokploy_connection().await? else {
             return Err(DokployServiceError::NotConnected);
         };
+        if stored.from_deployment {
+            return Err(DokployServiceError::FromDeployment);
+        }
         let url = DokployUrl::parse(&stored.url).ok();
         let removed = self
             .db
@@ -274,10 +296,175 @@ impl DokployService {
             ))
             .await?;
         if removed.is_none() {
-            return Err(DokployServiceError::NotConnected);
+            return Err(match self.db.find_dokploy_connection().await? {
+                Some(stored) if stored.from_deployment => DokployServiceError::FromDeployment,
+                _ => DokployServiceError::NotConnected,
+            });
         }
         tracing::info!("Dokploy connection removed");
         Ok(())
+    }
+
+    /// Applies the connection the deployment supplies, or releases one it
+    /// no longer supplies, when the server starts. There is no operator, so
+    /// changes are audited without an actor.
+    ///
+    /// - Nothing stored: the key is checked with Dokploy and stored.
+    /// - The same URL stored: a different key is checked and replaces the
+    ///   stored one. A connection an administrator made is taken over.
+    /// - Another URL, supplied by the deployment before: the new URL and key
+    ///   are checked and replace the connection, and the placement with it.
+    /// - Another URL an administrator connected: refused, nothing changes.
+    ///
+    /// Only a refused key or an unsupported version is audited as a
+    /// failure. An unreachable Dokploy is not, since the caller retries.
+    pub async fn apply_deployment_connection(
+        &self,
+        supplied: Option<&DokployCredentials>,
+    ) -> Result<DeploymentConnection, DokployServiceError> {
+        let stored = self.db.find_dokploy_connection().await?;
+        let Some(supplied) = supplied else {
+            return match stored {
+                Some(stored) if stored.from_deployment => {
+                    self.db
+                        .set_dokploy_from_deployment(&stored.url, false)
+                        .await?;
+                    tracing::info!(
+                        "the deployment no longer supplies the Dokploy connection; \
+                         administrators can now replace or remove it"
+                    );
+                    Ok(DeploymentConnection::Released)
+                }
+                _ => Ok(DeploymentConnection::NotSupplied),
+            };
+        };
+        let cipher = self
+            .cipher
+            .as_ref()
+            .ok_or(DokployServiceError::StorageUnavailable)?;
+        let key = checked_key(&supplied.key)?;
+        let url = &supplied.url;
+        let Some(stored) = stored else {
+            let version = self
+                .try_deployment_key("dokploy.connect", url, &key)
+                .await?;
+            let sealed = cipher.seal_dokploy_key(url.as_str(), &key)?;
+            let version_text = version.to_string();
+            let inserted = self
+                .db
+                .insert_dokploy_connection(
+                    &NewDokployConnection {
+                        url: url.as_str(),
+                        key_id: &sealed.key_id,
+                        nonce: &sealed.nonce,
+                        ciphertext: &sealed.ciphertext,
+                        version: &version_text,
+                        connected_by: None,
+                    },
+                    &deployment_event("dokploy.connect", url, AuditOutcome::Success),
+                )
+                .await?;
+            if !inserted {
+                // An administrator connected meanwhile; the next start
+                // applies the deployment's connection over it.
+                return Err(DokployServiceError::AlreadyConnected);
+            }
+            tracing::info!(dokploy_host = %url.host(), version = %version, "Dokploy connected from the deployment's configuration");
+            return Ok(DeploymentConnection::Connected);
+        };
+        if stored.url != url.as_str() {
+            if !stored.from_deployment {
+                return Err(DokployServiceError::DeploymentConflict {
+                    stored_host: stored_url(&stored)?.host(),
+                });
+            }
+            let version = self
+                .try_deployment_key("dokploy.connect", url, &key)
+                .await?;
+            let sealed = cipher.seal_dokploy_key(url.as_str(), &key)?;
+            let version_text = version.to_string();
+            let replaced = self
+                .db
+                .replace_deployment_dokploy_connection(
+                    &stored.url,
+                    &NewDokployConnection {
+                        url: url.as_str(),
+                        key_id: &sealed.key_id,
+                        nonce: &sealed.nonce,
+                        ciphertext: &sealed.ciphertext,
+                        version: &version_text,
+                        connected_by: None,
+                    },
+                    &deployment_event("dokploy.connect", url, AuditOutcome::Success),
+                )
+                .await?;
+            if !replaced {
+                return Err(DokployServiceError::NotConnected);
+            }
+            tracing::info!(dokploy_host = %url.host(), version = %version, "Dokploy connection replaced from the deployment's configuration");
+            return Ok(DeploymentConnection::Connected);
+        }
+        let same_key = cipher
+            .open_dokploy_key(url.as_str(), &sealed(&stored))
+            .is_ok_and(|current| {
+                use secrecy::ExposeSecret;
+                current.expose_secret() == key.expose_secret()
+            });
+        if same_key {
+            if !stored.from_deployment {
+                self.db
+                    .set_dokploy_from_deployment(url.as_str(), true)
+                    .await?;
+                tracing::info!(
+                    "the Dokploy connection now comes from the deployment's configuration"
+                );
+            }
+            return Ok(DeploymentConnection::Unchanged);
+        }
+        let version = self
+            .try_deployment_key("dokploy.key_replace", url, &key)
+            .await?;
+        let sealed = cipher.seal_dokploy_key(url.as_str(), &key)?;
+        let version_text = version.to_string();
+        let replaced = self
+            .db
+            .replace_dokploy_key(
+                &ReplacedDokployKey {
+                    url: url.as_str(),
+                    key_id: &sealed.key_id,
+                    nonce: &sealed.nonce,
+                    ciphertext: &sealed.ciphertext,
+                    version: &version_text,
+                    replaced_by: None,
+                },
+                &deployment_event("dokploy.key_replace", url, AuditOutcome::Success),
+            )
+            .await?;
+        if !replaced {
+            return Err(DokployServiceError::NotConnected);
+        }
+        tracing::info!(dokploy_host = %url.host(), version = %version, "Dokploy key replaced from the deployment's configuration");
+        Ok(DeploymentConnection::KeyReplaced)
+    }
+
+    /// Checks a key the deployment supplies. A refused key or an
+    /// unsupported version is audited; an unreachable Dokploy is not.
+    async fn try_deployment_key(
+        &self,
+        action: &'static str,
+        url: &DokployUrl,
+        key: &SecretString,
+    ) -> Result<DokployVersion, DokployServiceError> {
+        match self.connector.connect(url, key).await {
+            Ok(version) => Ok(version),
+            Err(err) => {
+                if !is_transient(&err) {
+                    self.audit_best_effort(&deployment_event(action, url, AuditOutcome::Failure))
+                        .await;
+                }
+                Err(err.into())
+            }
+        }
     }
 
     /// The stored URL and key, for the server's own calls to Dokploy. No
@@ -527,13 +714,20 @@ impl DokployService {
             verified_at: stored.verified_at,
             connected: DokployChange {
                 at: stored.connected_at,
-                by: stored.connected_by.clone(),
+                by: ChangedBy::from_stored(
+                    stored.connected_by.clone(),
+                    stored.connected_by_deployment,
+                ),
             },
             key_replaced: stored.key_replaced_at.map(|at| DokployChange {
                 at,
-                by: stored.key_replaced_by.clone(),
+                by: ChangedBy::from_stored(
+                    stored.key_replaced_by.clone(),
+                    stored.key_replaced_by_deployment,
+                ),
             }),
             key_readable,
+            from_deployment: stored.from_deployment,
         })
     }
 
@@ -627,6 +821,52 @@ fn placement_from_row(
         confirmed_at: row.confirmed_at,
         confirmed_by: row.confirmed_by()?,
     })
+}
+
+/// What applying the deployment's Dokploy connection did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeploymentConnection {
+    /// The deployment supplies no connection, and none it supplied is
+    /// stored.
+    NotSupplied,
+    /// The stored connection was supplied by the deployment, which no longer
+    /// supplies one; administrators can manage it again.
+    Released,
+    /// Stored as supplied, possibly replacing an earlier supplied URL.
+    Connected,
+    /// The stored key was replaced with the supplied one.
+    KeyReplaced,
+    /// The stored connection already matched.
+    Unchanged,
+}
+
+/// Whether trying again later may succeed: Dokploy was unreachable or
+/// answered with an error of its own. A refused key or an unsupported
+/// version stays refused until the configuration changes.
+#[must_use]
+pub fn is_transient(err: &DokployError) -> bool {
+    match err {
+        DokployError::Unreachable(_) | DokployError::InvalidResponse => true,
+        DokployError::Http(status) => *status >= 500 || *status == 429,
+        DokployError::KeyRejected | DokployError::UnsupportedVersion { .. } => false,
+    }
+}
+
+/// An audit event for a change the server made from the deployment's
+/// configuration, with no actor.
+fn deployment_event(
+    action: &'static str,
+    url: &DokployUrl,
+    outcome: AuditOutcome,
+) -> AuditEvent<'static> {
+    AuditEvent {
+        actor_account_id: None,
+        action,
+        target_type: Some("dokploy"),
+        target_id: Some(truncate(&url.host(), AUDIT_TARGET_MAX_CHARS).to_owned()),
+        outcome,
+        request_id: None,
+    }
 }
 
 /// An audit event naming a Dokploy service by kind and ID, such as

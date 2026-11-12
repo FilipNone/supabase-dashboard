@@ -4,7 +4,9 @@
 use std::{fmt, time::Duration};
 
 use secrecy::SecretString;
-use supabase_dashboard_domain::studio_access::STUDIO_ACCESS_MAX_RETENTION_DAYS;
+use supabase_dashboard_domain::{
+    dokploy::DokployUrl, studio_access::STUDIO_ACCESS_MAX_RETENTION_DAYS,
+};
 use supabase_dashboard_persistence::DatabaseSettings;
 
 use crate::studio_host::StudioHosts;
@@ -66,6 +68,17 @@ pub struct Config {
     /// Days to keep the Studio access log. `None` (the default) records
     /// nothing.
     pub studio_access_log_days: Option<u16>,
+    /// A Dokploy connection the deployment supplies. The server stores it
+    /// at startup, and administrators cannot replace or remove it.
+    pub dokploy: Option<DeploymentDokploy>,
+}
+
+/// `SUPABASE_DASHBOARD_DOKPLOY_URL` and the file holding the API key.
+#[derive(Debug, Clone)]
+pub struct DeploymentDokploy {
+    pub url: DokployUrl,
+    /// Read once at startup, like the credential encryption key file.
+    pub key_file: std::path::PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -224,6 +237,33 @@ impl Config {
             ),
         };
 
+        let dokploy = match (get("DOKPLOY_URL"), get("DOKPLOY_API_KEY_FILE")) {
+            (None, None) => None,
+            (Some(_), None) => {
+                return Err(invalid(
+                    "DOKPLOY_URL",
+                    "needs SUPABASE_DASHBOARD_DOKPLOY_API_KEY_FILE with the API key",
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(invalid(
+                    "DOKPLOY_API_KEY_FILE",
+                    "needs SUPABASE_DASHBOARD_DOKPLOY_URL",
+                ));
+            }
+            (Some(_), Some(_)) if secret_key.is_none() => {
+                return Err(invalid(
+                    "DOKPLOY_URL",
+                    "the Dokploy key is stored encrypted, so it needs a credential encryption \
+                     key; set SUPABASE_DASHBOARD_SECRET_KEY_FILE too",
+                ));
+            }
+            (Some(url), Some(key_file)) => Some(DeploymentDokploy {
+                url: DokployUrl::parse(&url).map_err(|e| invalid("DOKPLOY_URL", e))?,
+                key_file: key_file.into(),
+            }),
+        };
+
         Ok(Self {
             environment,
             public_url,
@@ -245,6 +285,7 @@ impl Config {
             studio_request_timeout,
             health_check_interval,
             studio_access_log_days,
+            dokploy,
         })
     }
 }
@@ -550,6 +591,35 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("STUDIO_DOMAIN"), "{err}");
         assert!(load(&[DB, dev, ("STUDIO_REQUEST_TIMEOUT_SECS", "1")]).is_err());
+    }
+
+    #[test]
+    fn a_dokploy_connection_needs_a_url_a_key_file_and_an_encryption_key() {
+        let dev = ("ENV", "development");
+        assert!(load(&[DB, dev]).unwrap().dokploy.is_none());
+
+        let key = ("SECRET_KEY_FILE", "/run/secrets/key");
+        let url = ("DOKPLOY_URL", "https://dokploy.example.test/");
+        let file = ("DOKPLOY_API_KEY_FILE", "/run/secrets/dokploy");
+        let dokploy = load(&[DB, dev, key, url, file]).unwrap().dokploy.unwrap();
+        assert_eq!(dokploy.url.as_str(), "https://dokploy.example.test");
+        assert_eq!(
+            dokploy.key_file,
+            std::path::PathBuf::from("/run/secrets/dokploy")
+        );
+
+        let refused =
+            |pairs: &[(&str, &str)]| matches!(load(pairs), Err(ConfigError::Invalid { .. }));
+        assert!(refused(&[DB, dev, key, url]));
+        assert!(refused(&[DB, dev, key, file]));
+        assert!(refused(&[DB, dev, url, file]));
+        assert!(refused(&[
+            DB,
+            dev,
+            key,
+            file,
+            ("DOKPLOY_URL", "ftp://dokploy.example.test")
+        ]));
     }
 
     #[test]

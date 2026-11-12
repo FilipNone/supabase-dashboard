@@ -84,6 +84,8 @@ All settings are environment variables. Invalid values stop the server at startu
 | `SUPABASE_DASHBOARD_STUDIO_ACCESS_LOG_DAYS` | 0 | 0 (off) to 90. Days to keep the Studio access log; see "Studio access log" below |
 | `SUPABASE_DASHBOARD_ALLOW_LOOPBACK_TARGETS` | `false` | `true` lets service checks connect to `127.0.0.0/8` and `::1`, for a stack on the same machine. Logged as a warning at startup |
 | `SUPABASE_DASHBOARD_EXTRA_CA_FILE` | unset | Path to a PEM file of certificate authorities to trust for service checks and Studio traffic, on top of the bundled Mozilla roots, for every project. Authorities for one project are stored on that project's settings page. Up to 1 MiB; it may hold only `CERTIFICATE` blocks. The server refuses to start if the file is missing, empty, or holds anything else, and logs how many it loaded |
+| `SUPABASE_DASHBOARD_DOKPLOY_URL` | unset | Dokploy's address, as an administrator would enter it on the administrator page. Needs `SUPABASE_DASHBOARD_DOKPLOY_API_KEY_FILE` and an encryption key. See "Supplied by the deployment" in [docs/dokploy.md](dokploy.md) |
+| `SUPABASE_DASHBOARD_DOKPLOY_API_KEY_FILE` | unset | Path to a file holding the Dokploy API key alone (surrounding whitespace is ignored, at most 4 KiB). Read once at startup; the server refuses to start if it is missing or the key is malformed. Needs `SUPABASE_DASHBOARD_DOKPLOY_URL` |
 | `RUST_LOG` | `info,tower_http=info,sqlx=warn` | Standard `tracing` filter |
 | `LEPTOS_SITE_ADDR` | `127.0.0.1:3000` | Listen address |
 

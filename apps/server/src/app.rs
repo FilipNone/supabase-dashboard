@@ -2556,7 +2556,7 @@ mod tests {
             body.contains(r#""version":{"major":0,"minor":31,"patch":1}"#),
             "{body}"
         );
-        assert!(body.contains(r#""by":"Alice""#), "{body}");
+        assert!(body.contains(r#""by":{"Account":"Alice"}"#), "{body}");
         let (parts, page) = send(&router, get_with_cookie("/dashboard/admin", &alice)).await;
         assert_eq!(parts.status, StatusCode::OK);
         assert!(!leaks(&page), "the admin page contains the key");

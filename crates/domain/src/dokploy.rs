@@ -177,12 +177,33 @@ pub fn check_dokploy_key(raw: &str) -> Result<&str, DokployKeyError> {
     Ok(value)
 }
 
-/// Who did something to the stored connection, and when. `by` is `None`
-/// once that account has been deleted.
+/// Who did something to the stored connection, and when.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DokployChange {
     pub at: OffsetDateTime,
-    pub by: Option<DisplayName>,
+    pub by: ChangedBy,
+}
+
+/// Who made a change to the stored connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChangedBy {
+    Account(DisplayName),
+    /// The account has been deleted since.
+    DeletedAccount,
+    /// The server, from the deployment's configuration.
+    Deployment,
+}
+
+impl ChangedBy {
+    /// From the stored account name and deployment flag.
+    #[must_use]
+    pub fn from_stored(account: Option<DisplayName>, by_deployment: bool) -> Self {
+        match (account, by_deployment) {
+            (Some(name), _) => Self::Account(name),
+            (None, true) => Self::Deployment,
+            (None, false) => Self::DeletedAccount,
+        }
+    }
 }
 
 /// The installation's Dokploy connection as the administrator page shows
@@ -202,6 +223,9 @@ pub struct DokployConnectionSummary {
     /// Whether this server can decrypt the stored key. `false` when it was
     /// written under an encryption key this server does not have.
     pub key_readable: bool,
+    /// The deployment supplies the URL and key, so they cannot be replaced
+    /// or removed from the administrator page.
+    pub from_deployment: bool,
 }
 
 /// What the administrator page's Dokploy section shows.
