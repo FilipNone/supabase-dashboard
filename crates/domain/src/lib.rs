@@ -13,6 +13,7 @@ pub mod dokploy_placement;
 pub mod dokploy_target;
 pub mod health;
 pub mod invitation;
+pub mod job;
 pub mod organization;
 pub mod project;
 pub mod studio_access;

@@ -10,6 +10,7 @@ pub mod connections;
 pub mod dokploy;
 pub mod dokploy_targets;
 pub mod invitations;
+pub mod jobs;
 pub mod organizations;
 pub mod projects;
 pub mod sessions;

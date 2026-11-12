@@ -7,6 +7,7 @@
 pub mod auth;
 pub mod connections;
 pub mod dokploy;
+pub mod jobs;
 pub mod key_claims;
 pub mod key_rotation;
 pub mod organizations;
