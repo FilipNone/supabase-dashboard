@@ -1,4 +1,5 @@
-//! Encrypted API keys and the latest service check of each project.
+//! Encrypted API keys and the service checks of each project: the latest
+//! one, and a bounded history.
 //!
 //! This module stores ciphertext it cannot read. Encryption and decryption
 //! happen in the application layer, which also decides who may call these
@@ -13,6 +14,24 @@ use crate::{
     audit::{AuditEvent, insert_audit_event},
     organizations::query_err,
 };
+
+/// How many past checks to keep for each project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryRetention {
+    pub max_age_days: u16,
+    /// At least one: the check just saved is always kept.
+    pub max_entries: u16,
+}
+
+/// A project's kept checks as read back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredHealthHistory {
+    /// Newest first.
+    pub recent: Vec<HealthReport>,
+    pub total: i64,
+    pub with_failures: i64,
+    pub since: Option<OffsetDateTime>,
+}
 
 /// One encrypted key as stored.
 #[derive(Clone, PartialEq, Eq)]
@@ -196,15 +215,19 @@ impl Database {
             .collect()
     }
 
-    /// Replaces the saved check of a project. Does nothing when the project
-    /// was unregistered while the check ran.
+    /// Saves a check as the project's latest and adds it to its history,
+    /// then deletes history entries beyond `retention`. Does nothing when
+    /// the project was unregistered while the check ran.
     pub async fn save_health_report(
         &self,
         project_id: Uuid,
         report: &HealthReport,
+        retention: HistoryRetention,
     ) -> Result<(), PersistenceError> {
         let checks = serde_json::to_string(&report.checks)
             .map_err(|_| PersistenceError::InvalidRow("project_health_reports.checks"))?;
+        let failing = !report.failing().is_empty();
+        let mut tx = self.pool.begin().await.map_err(query_err)?;
         sqlx::query(
             "INSERT INTO project_health_reports (project_id, checked_at, checks) \
              SELECT id, $2, $3::jsonb FROM projects WHERE id = $1 \
@@ -213,11 +236,91 @@ impl Database {
         )
         .bind(project_id)
         .bind(report.checked_at)
-        .bind(checks)
-        .execute(&self.pool)
+        .bind(&checks)
+        .execute(&mut *tx)
         .await
         .map_err(query_err)?;
-        Ok(())
+        sqlx::query(
+            "INSERT INTO project_health_history (project_id, checked_at, failing, checks) \
+             SELECT id, $2, $3, $4::jsonb FROM projects WHERE id = $1 \
+             ON CONFLICT (project_id, checked_at) DO NOTHING",
+        )
+        .bind(project_id)
+        .bind(report.checked_at)
+        .bind(failing)
+        .bind(&checks)
+        .execute(&mut *tx)
+        .await
+        .map_err(query_err)?;
+        sqlx::query(
+            "DELETE FROM project_health_history \
+             WHERE project_id = $1 AND checked_at < now() - make_interval(days => $2)",
+        )
+        .bind(project_id)
+        .bind(i32::from(retention.max_age_days))
+        .execute(&mut *tx)
+        .await
+        .map_err(query_err)?;
+        // With fewer entries than the cap the subquery is NULL and nothing
+        // is deleted.
+        sqlx::query(
+            "DELETE FROM project_health_history \
+             WHERE project_id = $1 AND checked_at < ( \
+                 SELECT checked_at FROM project_health_history WHERE project_id = $1 \
+                 ORDER BY checked_at DESC OFFSET $2 LIMIT 1)",
+        )
+        .bind(project_id)
+        .bind(i64::from(retention.max_entries.max(1)) - 1)
+        .execute(&mut *tx)
+        .await
+        .map_err(query_err)?;
+        tx.commit().await.map_err(query_err)
+    }
+
+    /// The project's kept checks within `retention`: counts over all of
+    /// them and the newest `limit` in full. Entries past their age are left
+    /// out even before the next save deletes them.
+    pub async fn health_history(
+        &self,
+        project_id: Uuid,
+        retention: HistoryRetention,
+        limit: u16,
+    ) -> Result<StoredHealthHistory, PersistenceError> {
+        let (total, with_failures, since): (i64, i64, Option<OffsetDateTime>) = sqlx::query_as(
+            "SELECT count(*), count(*) FILTER (WHERE failing), min(checked_at) \
+             FROM project_health_history \
+             WHERE project_id = $1 AND checked_at >= now() - make_interval(days => $2)",
+        )
+        .bind(project_id)
+        .bind(i32::from(retention.max_age_days))
+        .fetch_one(&self.pool)
+        .await
+        .map_err(query_err)?;
+        let rows: Vec<(OffsetDateTime, String)> = sqlx::query_as(
+            "SELECT checked_at, checks::text FROM project_health_history \
+             WHERE project_id = $1 AND checked_at >= now() - make_interval(days => $2) \
+             ORDER BY checked_at DESC LIMIT $3",
+        )
+        .bind(project_id)
+        .bind(i32::from(retention.max_age_days))
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(query_err)?;
+        let recent = rows
+            .into_iter()
+            .map(|(checked_at, checks)| {
+                let checks: Vec<ServiceCheck> = serde_json::from_str(&checks)
+                    .map_err(|_| PersistenceError::InvalidRow("project_health_history.checks"))?;
+                Ok(HealthReport { checked_at, checks })
+            })
+            .collect::<Result<_, PersistenceError>>()?;
+        Ok(StoredHealthHistory {
+            recent,
+            total,
+            with_failures,
+            since,
+        })
     }
 
     /// When the project was last checked, used for the check cooldown.

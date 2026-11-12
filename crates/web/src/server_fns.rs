@@ -11,7 +11,10 @@ use supabase_dashboard_domain::{
     account::{AccountSummary, AdminAccountSummary, SessionSummary},
     admin::RegisteredResources,
     authz::OrgRole,
-    connection::{CredentialKind, CredentialOverview, HealthDigest, HealthReport, SavedCredential},
+    connection::{
+        CredentialKind, CredentialOverview, HealthDigest, HealthHistory, HealthReport,
+        SavedCredential,
+    },
     health::InstallationHealth,
     invitation::{InvitationCode, InvitationPreview, InvitationSummary, IssuedInvitation},
     organization::{MemberSummary, OrganizationSummary},
@@ -271,6 +274,16 @@ pub async fn get_project_health(id: Uuid) -> Result<Option<HealthReport>, AppErr
 pub async fn check_project_health(id: Uuid) -> Result<HealthReport, AppError> {
     let session = org_context::session()?;
     Ok(org_context::connections()?.check_now(&session, id).await?)
+}
+
+/// A project's kept checks: the newest in short, and counts over the
+/// retention period.
+#[server]
+pub async fn get_project_health_history(id: Uuid) -> Result<HealthHistory, AppError> {
+    let session = org_context::session()?;
+    Ok(org_context::connections()?
+        .health_history(&session, id)
+        .await?)
 }
 
 /// The last check of each project in an organization, in short. Projects

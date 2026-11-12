@@ -9,8 +9,10 @@ use leptos::{form::ActionForm, prelude::*};
 use supabase_dashboard_domain::{
     connection::{
         API_KEY_MAX_LEN, CredentialKind, CredentialOverview, CredentialState, CredentialStatus,
-        HealthReport, STUDIO_PASSWORD_MAX_LEN, STUDIO_PASSWORD_MIN_LEN, STUDIO_USERNAME_MAX_LEN,
-        SavedCredential, ServiceCheck, ServiceStatus, SkipReason, StackService,
+        HEALTH_HISTORY_MAX_ENTRIES, HEALTH_HISTORY_RETENTION_DAYS, HealthHistory,
+        HealthHistoryEntry, HealthReport, STUDIO_PASSWORD_MAX_LEN, STUDIO_PASSWORD_MIN_LEN,
+        STUDIO_USERNAME_MAX_LEN, SavedCredential, ServiceCheck, ServiceStatus, SkipReason,
+        StackService,
     },
     project::ProjectSummary,
 };
@@ -21,7 +23,7 @@ use crate::{
     pages::account::utc_minutes,
     server_fns::{
         CheckProjectHealth, RemoveProjectCredential, ReplaceProjectCredential, ReplaceStudioLogin,
-        get_project_credentials, get_project_health,
+        get_project_credentials, get_project_health, get_project_health_history,
     },
 };
 
@@ -41,6 +43,10 @@ pub fn HealthPanel(project: ProjectSummary) -> impl IntoView {
     let report = Resource::new(
         move || check.version().get(),
         move |_| get_project_health(id),
+    );
+    let history = Resource::new(
+        move || check.version().get(),
+        move |_| get_project_health_history(id),
     );
 
     view! {
@@ -78,7 +84,90 @@ pub fn HealthPanel(project: ProjectSummary) -> impl IntoView {
                     .into_any(),
                 })}
             </Transition>
+            <Transition fallback=|| ()>
+                {move || history.get().map(|result| match result {
+                    Ok(history) => history_view(history).into_any(),
+                    Err(err) => view! {
+                        <p class="form-error" role="alert">
+                            {format!("Past checks could not be loaded. {err}")}
+                        </p>
+                    }
+                    .into_any(),
+                })}
+            </Transition>
         </section>
+    }
+}
+
+/// Past checks: counts over the retention period and the newest few.
+fn history_view(history: HealthHistory) -> impl IntoView {
+    let kept = format!(
+        "Checks are kept for {HEALTH_HISTORY_RETENTION_DAYS} days, at most \
+         {HEALTH_HISTORY_MAX_ENTRIES} per project."
+    );
+    let summary = match history.since {
+        None => format!("No checks in the last {HEALTH_HISTORY_RETENTION_DAYS} days. {kept}"),
+        Some(since) => format!(
+            "{} of {} {} since {} (UTC) found a failing service. {kept}",
+            history.with_failures,
+            history.total,
+            if history.total == 1 {
+                "check"
+            } else {
+                "checks"
+            },
+            utc_minutes(since),
+        ),
+    };
+    let table = (!history.recent.is_empty()).then(|| {
+        let rows = history.recent.into_iter().map(history_row).collect_view();
+        view! {
+            <div class="table-wrap">
+                <table class="data-table">
+                    <caption class="visually-hidden">"Recent checks, newest first"</caption>
+                    <thead>
+                        <tr>
+                            <th scope="col">"Checked (UTC)"</th>
+                            <th scope="col">"Result"</th>
+                        </tr>
+                    </thead>
+                    <tbody>{rows}</tbody>
+                </table>
+            </div>
+        }
+    });
+    view! {
+        <h3 class="subsection-title">"Recent checks"</h3>
+        <p class="section-text">{summary}</p>
+        {table}
+    }
+}
+
+fn history_row(entry: HealthHistoryEntry) -> impl IntoView {
+    let names = |services: &[StackService]| {
+        services
+            .iter()
+            .map(|service| service.label())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let (class, label) = if entry.failing.is_empty() {
+        ("badge badge-ok", "No failures")
+    } else {
+        ("badge badge-error", "Failing")
+    };
+    let failing = (!entry.failing.is_empty()).then(|| names(&entry.failing));
+    let skipped = (!entry.not_checked.is_empty())
+        .then(|| format!("Not checked: {}", names(&entry.not_checked)));
+    view! {
+        <tr>
+            <td class="nowrap">{utc_minutes(entry.checked_at)}</td>
+            <td>
+                <span class=class>{label}</span>
+                {failing.map(|text| view! { <span class="status-detail">{text}</span> })}
+                {skipped.map(|text| view! { <span class="field-hint status-detail">{text}</span> })}
+            </td>
+        </tr>
     }
 }
 

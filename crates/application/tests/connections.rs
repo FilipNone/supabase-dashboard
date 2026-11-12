@@ -20,8 +20,9 @@ use supabase_dashboard_domain::{
     account::{DisplayName, Email},
     authz::OrgRole,
     connection::{
-        ApiKeyError, CredentialKind, CredentialState, SavedCredential, ServiceCheck, ServiceStatus,
-        SkipReason, StackService, UnreachableReason, check_studio_login,
+        ApiKeyError, CredentialKind, CredentialState, HEALTH_HISTORY_MAX_ENTRIES,
+        HEALTH_HISTORY_PAGE, SavedCredential, ServiceCheck, ServiceStatus, SkipReason,
+        StackService, UnreachableReason, check_studio_login,
     },
     project::ProjectUrl,
 };
@@ -712,6 +713,84 @@ async fn health_digests_cover_one_organization_for_its_members() {
     ));
     assert!(matches!(
         f.connections.health_digests(&viewer, other_org).await,
+        Err(ConnectionError::NotFound)
+    ));
+}
+
+#[tokio::test]
+async fn health_history_is_kept_for_members_within_its_limits() {
+    let Some(scratch) = ScratchDb::create("conn_history").await else {
+        return;
+    };
+    let f = setup(&scratch, Some(KEY_A)).await;
+    let owner = account(&f.db, "Owner").await;
+    let viewer = account(&f.db, "Viewer").await;
+    let outsider = account(&f.db, "Outsider").await;
+    let (org, id) = project(&f, &owner, "Acme").await;
+    add_member(&f.db, org, &viewer, OrgRole::Viewer).await;
+    let (_, other_id) = project(&f, &outsider, "Globex").await;
+
+    let empty = f.connections.health_history(&viewer, id).await.unwrap();
+    assert_eq!((empty.total, empty.recent.len(), empty.since), (0, 0, None));
+
+    // No key or login yet: every service is skipped, and nothing failed.
+    f.connections.check_now(&owner, id).await.unwrap();
+    f.connections.check_now(&outsider, other_id).await.unwrap();
+    let one = f.connections.health_history(&viewer, id).await.unwrap();
+    assert_eq!((one.total, one.with_failures), (1, 0), "{one:?}");
+    assert!(one.recent[0].failing.is_empty());
+    assert!(one.recent[0].not_checked.contains(&StackService::Auth));
+
+    // An entry past the retention period is hidden at once, and more
+    // entries than the cap are trimmed when the next check is saved.
+    sqlx::query(
+        "INSERT INTO project_health_history (project_id, checked_at, failing, checks) \
+         SELECT $1, now() - make_interval(mins => g), g % 2 = 0, '[]'::jsonb \
+         FROM generate_series(1, $2) g \
+         UNION ALL SELECT $1, now() - interval '8 days', true, '[]'::jsonb",
+    )
+    .bind(id)
+    .bind(i32::from(HEALTH_HISTORY_MAX_ENTRIES) + 5)
+    .execute(f.db.pool())
+    .await
+    .unwrap();
+    let before = f.connections.health_history(&owner, id).await.unwrap();
+    assert_eq!(before.total, u32::from(HEALTH_HISTORY_MAX_ENTRIES) + 6);
+    assert_eq!(before.recent.len(), usize::from(HEALTH_HISTORY_PAGE));
+
+    sqlx::query("UPDATE project_health_reports SET checked_at = now() - interval '1 hour'")
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    let latest = f.connections.check_now(&owner, id).await.unwrap();
+    let kept: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM project_health_history WHERE project_id = $1")
+            .bind(id)
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(kept, i64::from(HEALTH_HISTORY_MAX_ENTRIES));
+    let after = f.connections.health_history(&owner, id).await.unwrap();
+    assert_eq!(after.total, u32::from(HEALTH_HISTORY_MAX_ENTRIES));
+    let newest = after.recent[0].checked_at;
+    assert!((newest - latest.checked_at).abs() < time::Duration::milliseconds(1));
+    assert!(
+        after
+            .recent
+            .windows(2)
+            .all(|w| w[0].checked_at > w[1].checked_at)
+    );
+
+    // The other organization's history is untouched and out of reach.
+    let other: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM project_health_history WHERE project_id = $1")
+            .bind(other_id)
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(other, 1);
+    assert!(matches!(
+        f.connections.health_history(&outsider, id).await,
         Err(ConnectionError::NotFound)
     ));
 }

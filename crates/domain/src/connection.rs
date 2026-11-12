@@ -16,9 +16,21 @@ pub const API_KEY_MAX_LEN: usize = 4096;
 /// button cannot be used to flood a stack with requests.
 pub const HEALTH_CHECK_COOLDOWN_SECS: i64 = 10;
 
-/// Age after which a saved check is shown as stale. Checks run only when a
-/// member asks for one, so an old result says little about the stack now.
+/// Age after which a saved check is shown as stale. The server checks
+/// projects on its own unless that is turned off, so a check this old
+/// usually means scheduled checks are off or keep failing to run.
 pub const HEALTH_STALE_AFTER_SECS: i64 = 24 * 60 * 60;
+
+/// How long a project's past checks are kept. Older entries are deleted
+/// when a new check is saved.
+pub const HEALTH_HISTORY_RETENTION_DAYS: u16 = 7;
+
+/// The most past checks kept for one project, whatever their age. Checks
+/// every 15 minutes come to 672 a week, which leaves room for manual ones.
+pub const HEALTH_HISTORY_MAX_ENTRIES: u16 = 1000;
+
+/// How many past checks the project overview lists, newest first.
+pub const HEALTH_HISTORY_PAGE: u16 = 20;
 
 /// An API key the dashboard can store for a project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -341,6 +353,67 @@ pub struct HealthReport {
     pub checks: Vec<ServiceCheck>,
 }
 
+impl HealthReport {
+    /// Services that refused the key, answered with an error, could not be
+    /// reached, or serve Studio without a password.
+    pub fn failing(&self) -> Vec<StackService> {
+        self.services(|status| {
+            matches!(
+                status,
+                ServiceStatus::KeyRejected { .. }
+                    | ServiceStatus::Unhealthy { .. }
+                    | ServiceStatus::Unreachable { .. }
+                    | ServiceStatus::Unprotected { .. }
+            )
+        })
+    }
+
+    /// Services skipped because a key or login is missing or unreadable.
+    pub fn not_checked(&self) -> Vec<StackService> {
+        self.services(|status| matches!(status, ServiceStatus::NotChecked { .. }))
+    }
+
+    fn services(&self, pick: impl Fn(&ServiceStatus) -> bool) -> Vec<StackService> {
+        self.checks
+            .iter()
+            .filter(|check| pick(&check.status))
+            .map(|check| check.service)
+            .collect()
+    }
+}
+
+/// One past check in short.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthHistoryEntry {
+    pub checked_at: OffsetDateTime,
+    pub failing: Vec<StackService>,
+    pub not_checked: Vec<StackService>,
+}
+
+impl From<&HealthReport> for HealthHistoryEntry {
+    fn from(report: &HealthReport) -> Self {
+        Self {
+            checked_at: report.checked_at,
+            failing: report.failing(),
+            not_checked: report.not_checked(),
+        }
+    }
+}
+
+/// A project's kept checks: the newest few, and counts over everything
+/// kept.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthHistory {
+    /// Newest first, at most [`HEALTH_HISTORY_PAGE`].
+    pub recent: Vec<HealthHistoryEntry>,
+    /// Every kept check, at most [`HEALTH_HISTORY_MAX_ENTRIES`].
+    pub total: u32,
+    /// Kept checks that found at least one failing service.
+    pub with_failures: u32,
+    /// The oldest kept check, if any.
+    pub since: Option<OffsetDateTime>,
+}
+
 /// A project's last check in short, for its card on the organization
 /// page.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -359,23 +432,11 @@ pub struct HealthDigest {
 
 impl HealthDigest {
     pub fn new(project_id: Uuid, report: &HealthReport, now: OffsetDateTime) -> Self {
-        let mut failing = Vec::new();
-        let mut not_checked = Vec::new();
-        for check in &report.checks {
-            match check.status {
-                ServiceStatus::Healthy => {}
-                ServiceStatus::NotChecked { .. } => not_checked.push(check.service),
-                ServiceStatus::KeyRejected { .. }
-                | ServiceStatus::Unhealthy { .. }
-                | ServiceStatus::Unreachable { .. }
-                | ServiceStatus::Unprotected { .. } => failing.push(check.service),
-            }
-        }
         Self {
             project_id,
             checked_at: report.checked_at,
-            failing,
-            not_checked,
+            failing: report.failing(),
+            not_checked: report.not_checked(),
             stale: (now - report.checked_at).whole_seconds() > HEALTH_STALE_AFTER_SECS,
         }
     }

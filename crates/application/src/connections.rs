@@ -16,15 +16,17 @@ use supabase_dashboard_domain::{
     authz::Permission,
     connection::{
         ApiKeyError, CredentialKind, CredentialOverview, CredentialState, CredentialStatus,
-        HEALTH_CHECK_COOLDOWN_SECS, HealthDigest, HealthReport, SavedCredential, ServiceCheck,
-        ServiceStatus, SkipReason, StackService, check_api_key,
+        HEALTH_CHECK_COOLDOWN_SECS, HEALTH_HISTORY_MAX_ENTRIES, HEALTH_HISTORY_PAGE,
+        HEALTH_HISTORY_RETENTION_DAYS, HealthDigest, HealthHistory, HealthHistoryEntry,
+        HealthReport, SavedCredential, ServiceCheck, ServiceStatus, SkipReason, StackService,
+        check_api_key,
     },
     project::{MAX_PROJECTS_PER_ORGANIZATION, ProjectUrl},
 };
 use supabase_dashboard_persistence::{
     Database, PersistenceError,
     audit::AuditOutcome,
-    connections::{NewCredential, StoredCredential},
+    connections::{HistoryRetention, NewCredential, StoredCredential},
     projects::{ProjectAccess, ProjectRecord},
 };
 use time::OffsetDateTime;
@@ -34,6 +36,12 @@ use crate::{
     auth::{CurrentSession, RequestContext},
     organizations::event,
     secrets::{CipherError, CredentialCipher, Sealed},
+};
+
+/// How long past checks are kept, as the server applies it.
+const RETENTION: HistoryRetention = HistoryRetention {
+    max_age_days: HEALTH_HISTORY_RETENTION_DAYS,
+    max_entries: HEALTH_HISTORY_MAX_ENTRIES,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -338,6 +346,27 @@ impl ConnectionService {
         Ok(self.db.find_health_report(project_id).await?)
     }
 
+    /// The project's kept checks: the newest few in short and counts over
+    /// the retention period. Any member may read them.
+    pub async fn health_history(
+        &self,
+        current: &CurrentSession,
+        project_id: Uuid,
+    ) -> Result<HealthHistory, ConnectionError> {
+        self.access(current, project_id, Permission::ProjectRead)
+            .await?;
+        let stored = self
+            .db
+            .health_history(project_id, RETENTION, HEALTH_HISTORY_PAGE)
+            .await?;
+        Ok(HealthHistory {
+            recent: stored.recent.iter().map(HealthHistoryEntry::from).collect(),
+            total: u32::try_from(stored.total).unwrap_or(u32::MAX),
+            with_failures: u32::try_from(stored.with_failures).unwrap_or(u32::MAX),
+            since: stored.since,
+        })
+    }
+
     /// The last saved check of each project in an organization, in short,
     /// for the project cards. Any member may read them; projects never
     /// checked are left out.
@@ -387,7 +416,9 @@ impl ConnectionService {
             return Err(ConnectionError::CheckInProgress);
         };
         let report = self.run_check(&access.project).await?;
-        self.db.save_health_report(project_id, &report).await?;
+        self.db
+            .save_health_report(project_id, &report, RETENTION)
+            .await?;
         tracing::info!(project_id = %project_id, "project services checked");
         Ok(report)
     }
@@ -432,7 +463,9 @@ impl ConnectionService {
             return Ok(false);
         };
         let report = self.run_check(project).await?;
-        self.db.save_health_report(project.id, &report).await?;
+        self.db
+            .save_health_report(project.id, &report, RETENTION)
+            .await?;
         Ok(true)
     }
 
