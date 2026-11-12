@@ -14,7 +14,7 @@ use supabase_dashboard_domain::{
         HEALTH_HISTORY_MAX_ENTRIES, HEALTH_HISTORY_RETENTION_DAYS, HealthHistory,
         HealthHistoryEntry, HealthReport, KeyExpiry, STUDIO_PASSWORD_MAX_LEN,
         STUDIO_PASSWORD_MIN_LEN, STUDIO_USERNAME_MAX_LEN, SavedCredential, ServiceCheck,
-        ServiceStatus, SkipReason, StackService, VersionSupport,
+        ServiceStatus, SkipReason, StackService, UnreachableReason, VersionSupport,
     },
     project::ProjectSummary,
     studio_access::{
@@ -340,7 +340,13 @@ fn describe(
         ServiceStatus::Unhealthy { http_status } => (
             "badge badge-error",
             format!("Error (HTTP {http_status})"),
-            None,
+            match http_status {
+                502..=504 => Some(
+                    "The gateway answered, but the service behind it did not. It may be stopped, restarting, or failing; its container logs say which.",
+                ),
+                500..=599 => Some("The service failed while answering. Its logs say why."),
+                _ => None,
+            },
         ),
         ServiceStatus::NotRouted { http_status } => (
             "badge badge-error",
@@ -352,7 +358,15 @@ fn describe(
         ServiceStatus::Unreachable { reason } => (
             "badge badge-error",
             "Unreachable".into(),
-            Some(reason.message()),
+            Some(match reason {
+                UnreachableReason::Tls => {
+                    "The TLS handshake failed or the certificate is not trusted. If the gateway's certificate comes from a private authority, store that authority under Settings."
+                }
+                UnreachableReason::Dns => {
+                    "The host name could not be resolved from the dashboard server. Check the API URL and the server's DNS."
+                }
+                other => other.message(),
+            }),
         ),
         ServiceStatus::NotChecked { reason } => (
             "badge badge-muted",
@@ -1003,7 +1017,32 @@ fn access_row(entry: StudioAccessEntry) -> impl IntoView {
 
 #[cfg(test)]
 mod tests {
-    use super::grouped;
+    use super::{ServiceStatus, StackService, UnreachableReason, describe, grouped};
+
+    #[test]
+    fn failures_say_where_to_look_next() {
+        let hint = |status| describe(StackService::Auth, &status).2;
+        assert!(
+            hint(ServiceStatus::Unhealthy { http_status: 503 })
+                .is_some_and(|h| h.contains("container logs"))
+        );
+        assert!(
+            hint(ServiceStatus::Unhealthy { http_status: 500 }).is_some_and(|h| h.contains("logs"))
+        );
+        assert_eq!(hint(ServiceStatus::Unhealthy { http_status: 418 }), None);
+        assert!(
+            hint(ServiceStatus::Unreachable {
+                reason: UnreachableReason::Tls
+            })
+            .is_some_and(|h| h.contains("private authority"))
+        );
+        assert_eq!(
+            hint(ServiceStatus::Unreachable {
+                reason: UnreachableReason::Timeout
+            }),
+            Some(UnreachableReason::Timeout.message())
+        );
+    }
 
     #[test]
     fn numbers_are_grouped_by_thousands() {
