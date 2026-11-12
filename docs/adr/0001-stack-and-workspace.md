@@ -57,7 +57,7 @@ Implemented in M2 for project API keys (`crates/application/src/secrets.rs`):
 
 ## Outbound HTTP
 
-Stack checks use reqwest 0.13 with rustls and the `ring` provider, the same provider SQLx already pulls in, and the Mozilla roots from `webpki-roots`. This avoids building `aws-lc-rs` (reqwest's default) for the arm64 image. The operating system's certificate store is not consulted. Stacks behind a private CA are reached by listing its certificates in `SUPABASE_DASHBOARD_EXTRA_CA_FILE`, which adds them to the bundled roots. A custom DNS resolver applies the address policy in `crates/adapters/src/net.rs` to every resolved address, and address literals are checked before a request is sent. Redirects and environment proxies are disabled.
+Stack checks use reqwest 0.13 with rustls and the `ring` provider, the same provider SQLx already pulls in, and the Mozilla roots from `webpki-roots`. This avoids building `aws-lc-rs` (reqwest's default) for the arm64 image. The operating system's certificate store is not consulted. Stacks behind a private CA are reached by listing its certificates in `SUPABASE_DASHBOARD_EXTRA_CA_FILE`, which adds them to the bundled roots, or by storing them with one project, which adds them for that project's connections only (one cached client per distinct bundle). A custom DNS resolver applies the address policy in `crates/adapters/src/net.rs` to every resolved address, and address literals are checked before a request is sent. Redirects and environment proxies are disabled.
 
 ## Metadata backup and recovery requirements
 

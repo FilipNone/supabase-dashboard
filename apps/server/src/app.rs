@@ -184,9 +184,10 @@ mod tests {
         server_fns::{
             AdminListAccounts, AdminSetAccountDisabled, ChangePassword, CheckProjectHealth,
             CreateInvitation, CreateOrganization, GetCurrentAccount, GetInstallationHealth,
-            GetOrganization, GetProject, GetProjectCredentials, GetProjectHealth,
-            GetStudioAccessLog, ListOrganizations, ListProjects, ListSessions, PreviewInvitation,
-            RegisterProject, RemoveProjectCredential, RenameOrganization, ReplaceProjectCredential,
+            GetOrganization, GetProject, GetProjectAuthorities, GetProjectCredentials,
+            GetProjectHealth, GetStudioAccessLog, ListOrganizations, ListProjects, ListSessions,
+            PreviewInvitation, RegisterProject, RemoveProjectAuthorities, RemoveProjectCredential,
+            RenameOrganization, ReplaceProjectAuthorities, ReplaceProjectCredential,
             ReplaceStudioLogin, RevokeSession, SignUpWithInvitation, UnregisterProject,
             UpdateProfile,
         },
@@ -1037,6 +1038,58 @@ mod tests {
         )
         .await;
         assert!(!body.contains(r#""state":"set""#), "{body}");
+
+        // Certificate authorities: the settings page has the section, and a
+        // private key pasted by mistake is refused, not stored, and not
+        // echoed back.
+        assert!(bodies[3].contains("Certificate authorities"));
+        assert!(bodies[3].contains(r#"name="pem""#));
+        let pasted_key =
+            "-----BEGIN PRIVATE KEY-----\nc2VjcmV0LWtleS1tYXJrZXI=\n-----END PRIVATE KEY-----\n";
+        let (_, body) = call(
+            ReplaceProjectAuthorities::PATH,
+            format!(
+                "id={project_id}&pem={}",
+                pasted_key
+                    .replace(' ', "%20")
+                    .replace('\n', "%0A")
+                    .replace('=', "%3D")
+            ),
+            &alice,
+        )
+        .await;
+        assert!(body.contains("Only certificates are accepted"), "{body}");
+        assert!(!body.contains("c2VjcmV0LWtleS1tYXJrZXI"), "{body}");
+        let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM project_authorities")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(stored, 0);
+        let (parts, body) = call(
+            GetProjectAuthorities::PATH,
+            format!("id={project_id}"),
+            &alice,
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        assert_eq!(body, "null");
+        let (_, body) = call(
+            RemoveProjectAuthorities::PATH,
+            format!("id={project_id}"),
+            &alice,
+        )
+        .await;
+        assert!(
+            body.contains("No certificate authorities are stored"),
+            "{body}"
+        );
+        let (_, body) = call(
+            GetProjectAuthorities::PATH,
+            format!("id={project_id}"),
+            &bob,
+        )
+        .await;
+        assert!(body.contains("NotFound"), "{body}");
 
         db.close().await;
         scratch.drop().await;

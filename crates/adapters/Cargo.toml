@@ -22,6 +22,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Fingerprints of the certificates a project trusts, shown to operators.
+sha2 = "0.11"
 thiserror.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["net", "time"] }

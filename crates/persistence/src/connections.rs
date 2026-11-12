@@ -156,6 +156,78 @@ impl Database {
         Ok(true)
     }
 
+    /// The project's stored certificate bundle and when it was saved.
+    pub async fn find_project_authorities(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Option<(String, OffsetDateTime)>, PersistenceError> {
+        sqlx::query_as("SELECT pem, updated_at FROM project_authorities WHERE project_id = $1")
+            .bind(project_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(query_err)
+    }
+
+    /// Stores or replaces the project's certificate bundle and records
+    /// `audit` with it. Returns when it was saved, or `None` when the
+    /// project no longer exists.
+    pub async fn upsert_project_authorities(
+        &self,
+        project_id: Uuid,
+        pem: &str,
+        updated_by: Uuid,
+        audit: &AuditEvent<'_>,
+    ) -> Result<Option<OffsetDateTime>, PersistenceError> {
+        let mut tx = self.pool.begin().await.map_err(query_err)?;
+        let exists: Option<i32> =
+            sqlx::query_scalar("SELECT 1 FROM projects WHERE id = $1 FOR UPDATE")
+                .bind(project_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(query_err)?;
+        if exists.is_none() {
+            return Ok(None);
+        }
+        let updated_at: OffsetDateTime = sqlx::query_scalar(
+            "INSERT INTO project_authorities (project_id, pem, updated_by, updated_at) \
+             VALUES ($1, $2, $3, now()) \
+             ON CONFLICT (project_id) DO UPDATE SET \
+             pem = EXCLUDED.pem, updated_by = EXCLUDED.updated_by, updated_at = now() \
+             RETURNING updated_at",
+        )
+        .bind(project_id)
+        .bind(pem)
+        .bind(updated_by)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(query_err)?;
+        insert_audit_event(&mut *tx, audit).await?;
+        tx.commit().await.map_err(query_err)?;
+        Ok(Some(updated_at))
+    }
+
+    /// Deletes the project's certificate bundle. Returns `false` when none
+    /// was stored.
+    pub async fn delete_project_authorities(
+        &self,
+        project_id: Uuid,
+        audit: &AuditEvent<'_>,
+    ) -> Result<bool, PersistenceError> {
+        let mut tx = self.pool.begin().await.map_err(query_err)?;
+        let deleted = sqlx::query("DELETE FROM project_authorities WHERE project_id = $1")
+            .bind(project_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(query_err)?
+            .rows_affected();
+        if deleted == 0 {
+            return Ok(false);
+        }
+        insert_audit_event(&mut *tx, audit).await?;
+        tx.commit().await.map_err(query_err)?;
+        Ok(true)
+    }
+
     /// Deletes one key. Returns `false` when none was stored.
     pub async fn delete_credential(
         &self,

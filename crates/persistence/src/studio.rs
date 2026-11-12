@@ -24,6 +24,8 @@ pub struct StudioGrant {
     pub role: OrgRole,
     pub api_url: ProjectUrl,
     pub login: StoredCredential,
+    /// The project's own certificate bundle, if one is stored.
+    pub authorities: Option<String>,
 }
 
 impl Database {
@@ -130,10 +132,11 @@ impl Database {
             nonce: Vec<u8>,
             ciphertext: Vec<u8>,
             updated_at: time::OffsetDateTime,
+            pem: Option<String>,
         }
         let row: Option<Row> = sqlx::query_as(
             "SELECT s.id AS session_id, a.id AS account_id, m.role, p.api_url, \
-                    c.key_id, c.nonce, c.ciphertext, c.updated_at \
+                    c.key_id, c.nonce, c.ciphertext, c.updated_at, pa.pem \
              FROM studio_sessions ss \
              JOIN sessions s ON s.id = ss.session_id \
              JOIN accounts a ON a.id = s.account_id \
@@ -141,6 +144,7 @@ impl Database {
              JOIN organization_members m \
                ON m.organization_id = p.organization_id AND m.account_id = a.id \
              JOIN project_credentials c ON c.project_id = p.id AND c.kind = $3 \
+             LEFT JOIN project_authorities pa ON pa.project_id = p.id \
              WHERE ss.token_hash = $1 AND ss.project_id = $2 AND ss.expires_at > now() \
                AND s.revoked_at IS NULL AND s.expires_at > now() \
                AND s.last_seen_at > now() - make_interval(secs => $4) \
@@ -176,6 +180,7 @@ impl Database {
                 ciphertext: row.ciphertext,
                 updated_at: row.updated_at,
             },
+            authorities: row.pem,
         }))
     }
 }

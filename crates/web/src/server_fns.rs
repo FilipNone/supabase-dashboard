@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use supabase_dashboard_domain::{
     account::{AccountSummary, AdminAccountSummary, SessionSummary},
     admin::RegisteredResources,
+    authority::ProjectTrust,
     authz::OrgRole,
     connection::{
         CredentialKind, CredentialOverview, HealthDigest, HealthHistory, HealthReport,
@@ -266,6 +267,36 @@ pub async fn remove_project_credential(id: Uuid, kind: CredentialKind) -> Result
     let audit = org_context::AuditContext::current();
     Ok(org_context::connections()?
         .remove_credential(&session, id, kind, audit.get())
+        .await?)
+}
+
+/// The private certificate authorities stored for a project, summarized.
+#[server]
+pub async fn get_project_authorities(id: Uuid) -> Result<Option<ProjectTrust>, AppError> {
+    let session = org_context::session()?;
+    Ok(org_context::connections()?
+        .authorities(&session, id)
+        .await?)
+}
+
+/// Stores or replaces the PEM certificates a project's gateway is checked
+/// against, in addition to the shared roots.
+#[server]
+pub async fn replace_project_authorities(id: Uuid, pem: String) -> Result<ProjectTrust, AppError> {
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    Ok(org_context::connections()?
+        .replace_authorities(&session, id, &pem, audit.get())
+        .await?)
+}
+
+/// Deletes a project's stored certificate authorities.
+#[server]
+pub async fn remove_project_authorities(id: Uuid) -> Result<(), AppError> {
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    Ok(org_context::connections()?
+        .remove_authorities(&session, id, audit.get())
         .await?)
 }
 

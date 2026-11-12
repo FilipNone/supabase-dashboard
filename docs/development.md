@@ -83,7 +83,7 @@ All settings are environment variables. Invalid values stop the server at startu
 | `SUPABASE_DASHBOARD_HEALTH_CHECK_INTERVAL_MINS` | 15 | 0, or 5 to 1440. The server checks a project again on its own once its last check is older than this; 0 turns the server's own checks off, leaving only "Check now" |
 | `SUPABASE_DASHBOARD_STUDIO_ACCESS_LOG_DAYS` | 0 | 0 (off) to 90. Days to keep the Studio access log; see "Studio access log" below |
 | `SUPABASE_DASHBOARD_ALLOW_LOOPBACK_TARGETS` | `false` | `true` lets service checks connect to `127.0.0.0/8` and `::1`, for a stack on the same machine. Logged as a warning at startup |
-| `SUPABASE_DASHBOARD_EXTRA_CA_FILE` | unset | Path to a PEM file of certificate authorities to trust for service checks and Studio traffic, on top of the bundled Mozilla roots. Up to 1 MiB; it may hold only `CERTIFICATE` blocks. The server refuses to start if the file is missing, empty, or holds anything else, and logs how many it loaded |
+| `SUPABASE_DASHBOARD_EXTRA_CA_FILE` | unset | Path to a PEM file of certificate authorities to trust for service checks and Studio traffic, on top of the bundled Mozilla roots, for every project. Authorities for one project are stored on that project's settings page. Up to 1 MiB; it may hold only `CERTIFICATE` blocks. The server refuses to start if the file is missing, empty, or holds anything else, and logs how many it loaded |
 | `RUST_LOG` | `info,tower_http=info,sqlx=warn` | Standard `tracing` filter |
 | `LEPTOS_SITE_ADDR` | `127.0.0.1:3000` | Listen address |
 

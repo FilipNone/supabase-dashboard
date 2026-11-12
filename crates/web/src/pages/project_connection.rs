@@ -565,7 +565,7 @@ fn state_badge(state: &CredentialState) -> (&'static str, String, bool) {
 
 /// The key's own expiry claim. The gateway passes an expired key on, and
 /// the services behind it then refuse it.
-fn expiry_badge(expiry: KeyExpiry) -> (&'static str, String) {
+pub(crate) fn expiry_badge(expiry: KeyExpiry) -> (&'static str, String) {
     let date = expiry.at.to_offset(time::UtcOffset::UTC).date();
     if expiry.expired {
         ("badge badge-error", format!("Expired {date}"))

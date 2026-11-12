@@ -72,15 +72,15 @@ async fn fixture_gateway_reports_auth_and_rest() {
     let anon = SecretString::from(fixture_value("ANON_KEY"));
     let service = SecretString::from(fixture_value("SERVICE_ROLE_KEY"));
 
-    let auth = probe.check(&url, StackService::Auth, &anon).await;
+    let auth = probe.check(&url, StackService::Auth, &anon, None).await;
     assert_eq!(auth.status, ServiceStatus::Healthy);
     assert_eq!(auth.version.as_deref(), Some("v2.197.0"));
 
     // Upstream limits the PostgREST root to the service role.
-    let rest = probe.check(&url, StackService::Rest, &service).await;
+    let rest = probe.check(&url, StackService::Rest, &service, None).await;
     assert_eq!(rest.status, ServiceStatus::Healthy);
     assert_eq!(rest.version.as_deref(), Some("14.18"));
-    let rest_anon = probe.check(&url, StackService::Rest, &anon).await;
+    let rest_anon = probe.check(&url, StackService::Rest, &anon, None).await;
     assert_eq!(
         rest_anon.status,
         ServiceStatus::KeyRejected { http_status: 403 }
@@ -88,7 +88,10 @@ async fn fixture_gateway_reports_auth_and_rest() {
 
     let wrong = SecretString::from("not-a-key");
     assert_eq!(
-        probe.check(&url, StackService::Auth, &wrong).await.status,
+        probe
+            .check(&url, StackService::Auth, &wrong, None)
+            .await
+            .status,
         ServiceStatus::KeyRejected { http_status: 401 }
     );
 }
@@ -103,11 +106,11 @@ async fn fixture_gateway_reports_storage_and_realtime() {
     .unwrap();
     let anon = SecretString::from(fixture_value("ANON_KEY"));
 
-    let storage = probe.check(&url, StackService::Storage, &anon).await;
+    let storage = probe.check(&url, StackService::Storage, &anon, None).await;
     assert_eq!(storage.status, ServiceStatus::Healthy);
     assert_eq!(storage.version.as_deref(), Some("1.89.12"));
 
-    let realtime = probe.check(&url, StackService::Realtime, &anon).await;
+    let realtime = probe.check(&url, StackService::Realtime, &anon, None).await;
     assert_eq!(realtime.status, ServiceStatus::Healthy);
     assert_eq!(realtime.version, None);
 
@@ -116,7 +119,7 @@ async fn fixture_gateway_reports_storage_and_realtime() {
     let wrong = SecretString::from("not-a-key");
     assert_eq!(
         probe
-            .check(&url, StackService::Realtime, &wrong)
+            .check(&url, StackService::Realtime, &wrong, None)
             .await
             .status,
         ServiceStatus::KeyRejected { http_status: 401 }
@@ -139,6 +142,7 @@ async fn fixture_gateway_reports_edge_functions() {
                 &url,
                 StackService::Functions,
                 &SecretString::from(fixture_value(key)),
+                None,
             )
             .await;
         assert_eq!(check.status, ServiceStatus::Healthy, "{key}");
@@ -149,7 +153,8 @@ async fn fixture_gateway_reports_edge_functions() {
             .check(
                 &url,
                 StackService::Functions,
-                &SecretString::from("not-a-key")
+                &SecretString::from("not-a-key"),
+                None
             )
             .await
             .status,
@@ -166,12 +171,15 @@ async fn fixture_studio_route_needs_the_login() {
     })
     .unwrap();
     let studio = probe
-        .check(&url, StackService::Studio, &studio_login())
+        .check(&url, StackService::Studio, &studio_login(), None)
         .await;
     assert_eq!(studio.status, ServiceStatus::Healthy);
     let wrong = SecretString::from("supabase:notthefixturepassword0123");
     assert_eq!(
-        probe.check(&url, StackService::Studio, &wrong).await.status,
+        probe
+            .check(&url, StackService::Studio, &wrong, None)
+            .await
+            .status,
         ServiceStatus::KeyRejected { http_status: 401 }
     );
 }
@@ -201,7 +209,13 @@ async fn fixture_studio_is_reached_through_the_proxy() {
     // Studio's root redirects to its project page; the gateway's own
     // address never reaches the browser.
     let response = proxy
-        .forward(&url, &studio_login(), site, get("/", HeaderMap::new()))
+        .forward(
+            &url,
+            &studio_login(),
+            None,
+            site,
+            get("/", HeaderMap::new()),
+        )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
@@ -218,6 +232,7 @@ async fn fixture_studio_is_reached_through_the_proxy() {
         .forward(
             &url,
             &studio_login(),
+            None,
             site,
             get("/project/default", headers),
         )
@@ -235,6 +250,7 @@ async fn fixture_studio_is_reached_through_the_proxy() {
         .forward(
             &url,
             &studio_login(),
+            None,
             site,
             get("/api/platform/profile", HeaderMap::new()),
         )
@@ -251,6 +267,7 @@ async fn fixture_studio_is_reached_through_the_proxy() {
         .forward(
             &url,
             &SecretString::from("supabase:notthefixturepassword0123"),
+            None,
             site,
             get("/project/default", HeaderMap::new()),
         )

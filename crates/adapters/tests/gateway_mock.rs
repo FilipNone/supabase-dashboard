@@ -145,7 +145,7 @@ async fn healthy_services_report_status_and_version() {
     let url = serve(gateway()).await;
     let probe = probe(loopback());
     let key = SecretString::from(GOOD_KEY);
-    let auth = probe.check(&url, StackService::Auth, &key).await;
+    let auth = probe.check(&url, StackService::Auth, &key, None).await;
     assert_eq!(auth.status, ServiceStatus::Healthy);
     assert_eq!(auth.version.as_deref(), Some("v2.197.0"));
     assert!(auth.latency_ms.is_some());
@@ -153,14 +153,14 @@ async fn healthy_services_report_status_and_version() {
         auth.certificate_expires_at, None,
         "plain HTTP has no certificate"
     );
-    let rest = probe.check(&url, StackService::Rest, &key).await;
+    let rest = probe.check(&url, StackService::Rest, &key, None).await;
     assert_eq!(rest.status, ServiceStatus::Healthy);
-    let storage = probe.check(&url, StackService::Storage, &key).await;
+    let storage = probe.check(&url, StackService::Storage, &key, None).await;
     assert_eq!(storage.status, ServiceStatus::Healthy);
     assert_eq!(storage.version.as_deref(), Some("1.89.12"));
-    let realtime = probe.check(&url, StackService::Realtime, &key).await;
+    let realtime = probe.check(&url, StackService::Realtime, &key, None).await;
     assert_eq!(realtime.status, ServiceStatus::Healthy);
-    let functions = probe.check(&url, StackService::Functions, &key).await;
+    let functions = probe.check(&url, StackService::Functions, &key, None).await;
     assert_eq!(functions.status, ServiceStatus::Healthy);
     assert!(functions.latency_ms.is_some());
 }
@@ -179,7 +179,7 @@ async fn an_older_functions_router_counts_as_healthy() {
     let url = serve(old(r#"{"msg":"missing function name in request"}"#)).await;
     assert_eq!(
         probe
-            .check(&url, StackService::Functions, &key)
+            .check(&url, StackService::Functions, &key, None)
             .await
             .status,
         ServiceStatus::Healthy
@@ -187,7 +187,7 @@ async fn an_older_functions_router_counts_as_healthy() {
     let url = serve(old(r#"{"msg":"something else"}"#)).await;
     assert_eq!(
         probe
-            .check(&url, StackService::Functions, &key)
+            .check(&url, StackService::Functions, &key, None)
             .await
             .status,
         ServiceStatus::Unhealthy { http_status: 400 }
@@ -207,7 +207,7 @@ async fn services_without_a_route_are_reported_as_not_found() {
         StackService::Functions,
     ] {
         assert_eq!(
-            probe.check(&url, service, &key).await.status,
+            probe.check(&url, service, &key, None).await.status,
             ServiceStatus::Unhealthy { http_status: 404 },
             "{service:?}"
         );
@@ -226,13 +226,16 @@ async fn services_that_reach_the_studio_login_have_no_route() {
         StackService::Functions,
     ] {
         assert_eq!(
-            probe.check(&url, service, &key).await.status,
+            probe.check(&url, service, &key, None).await.status,
             ServiceStatus::NotRouted { http_status: 401 },
             "{service:?}"
         );
     }
     assert_eq!(
-        probe.check(&url, StackService::Auth, &key).await.status,
+        probe
+            .check(&url, StackService::Auth, &key, None)
+            .await
+            .status,
         ServiceStatus::Healthy
     );
 }
@@ -243,20 +246,29 @@ async fn rejected_keys_are_reported() {
     let probe = probe(loopback());
     let key = SecretString::from("wrong");
     assert_eq!(
-        probe.check(&url, StackService::Auth, &key).await.status,
-        ServiceStatus::KeyRejected { http_status: 401 }
-    );
-    assert_eq!(
-        probe.check(&url, StackService::Rest, &key).await.status,
-        ServiceStatus::KeyRejected { http_status: 403 }
-    );
-    assert_eq!(
-        probe.check(&url, StackService::Realtime, &key).await.status,
+        probe
+            .check(&url, StackService::Auth, &key, None)
+            .await
+            .status,
         ServiceStatus::KeyRejected { http_status: 401 }
     );
     assert_eq!(
         probe
-            .check(&url, StackService::Functions, &key)
+            .check(&url, StackService::Rest, &key, None)
+            .await
+            .status,
+        ServiceStatus::KeyRejected { http_status: 403 }
+    );
+    assert_eq!(
+        probe
+            .check(&url, StackService::Realtime, &key, None)
+            .await
+            .status,
+        ServiceStatus::KeyRejected { http_status: 401 }
+    );
+    assert_eq!(
+        probe
+            .check(&url, StackService::Functions, &key, None)
             .await
             .status,
         ServiceStatus::KeyRejected { http_status: 401 }
@@ -267,7 +279,12 @@ async fn rejected_keys_are_reported() {
 async fn loopback_is_refused_without_opt_in() {
     let url = serve(gateway()).await;
     let check = probe(TargetPolicy::default())
-        .check(&url, StackService::Auth, &SecretString::from(GOOD_KEY))
+        .check(
+            &url,
+            StackService::Auth,
+            &SecretString::from(GOOD_KEY),
+            None,
+        )
         .await;
     assert_eq!(
         check.status,
@@ -283,7 +300,12 @@ async fn names_resolving_to_loopback_are_refused() {
     let port = url.as_str().rsplit(':').next().unwrap();
     let by_name = ProjectUrl::parse(&format!("http://localhost:{port}")).unwrap();
     let check = probe(TargetPolicy::default())
-        .check(&by_name, StackService::Auth, &SecretString::from(GOOD_KEY))
+        .check(
+            &by_name,
+            StackService::Auth,
+            &SecretString::from(GOOD_KEY),
+            None,
+        )
         .await;
     assert_eq!(
         check.status,
@@ -294,7 +316,12 @@ async fn names_resolving_to_loopback_are_refused() {
     // With loopback allowed, the same name works, so the refusal above came
     // from the policy and not from the name.
     let ok = probe(loopback())
-        .check(&by_name, StackService::Auth, &SecretString::from(GOOD_KEY))
+        .check(
+            &by_name,
+            StackService::Auth,
+            &SecretString::from(GOOD_KEY),
+            None,
+        )
         .await;
     assert_eq!(ok.status, ServiceStatus::Healthy);
 }
@@ -303,7 +330,12 @@ async fn names_resolving_to_loopback_are_refused() {
 async fn metadata_addresses_are_never_contacted() {
     let url = ProjectUrl::parse("http://169.254.169.254").unwrap();
     let check = probe(loopback())
-        .check(&url, StackService::Auth, &SecretString::from(GOOD_KEY))
+        .check(
+            &url,
+            StackService::Auth,
+            &SecretString::from(GOOD_KEY),
+            None,
+        )
         .await;
     assert_eq!(
         check.status,
@@ -321,7 +353,12 @@ async fn redirects_are_not_followed() {
     ))
     .await;
     let check = probe(loopback())
-        .check(&url, StackService::Auth, &SecretString::from(GOOD_KEY))
+        .check(
+            &url,
+            StackService::Auth,
+            &SecretString::from(GOOD_KEY),
+            None,
+        )
         .await;
     assert_eq!(check.status, ServiceStatus::Unhealthy { http_status: 307 });
 }
@@ -337,7 +374,12 @@ async fn slow_services_time_out() {
     ))
     .await;
     let check = probe(loopback())
-        .check(&url, StackService::Auth, &SecretString::from(GOOD_KEY))
+        .check(
+            &url,
+            StackService::Auth,
+            &SecretString::from(GOOD_KEY),
+            None,
+        )
         .await;
     assert_eq!(
         check.status,
@@ -353,7 +395,12 @@ async fn oversized_health_bodies_are_refused() {
         serve(Router::new().route("/auth/v1/health", get(|| async { "x".repeat(200 * 1024) })))
             .await;
     let check = probe(loopback())
-        .check(&url, StackService::Auth, &SecretString::from(GOOD_KEY))
+        .check(
+            &url,
+            StackService::Auth,
+            &SecretString::from(GOOD_KEY),
+            None,
+        )
         .await;
     assert_eq!(
         check.status,
@@ -370,7 +417,12 @@ async fn closed_ports_are_connection_failures() {
     drop(listener);
     let url = ProjectUrl::parse(&format!("http://{addr}")).unwrap();
     let check = probe(loopback())
-        .check(&url, StackService::Rest, &SecretString::from(GOOD_KEY))
+        .check(
+            &url,
+            StackService::Rest,
+            &SecretString::from(GOOD_KEY),
+            None,
+        )
         .await;
     assert_eq!(
         check.status,
@@ -387,7 +439,12 @@ async fn untrusted_certificates_fail_as_tls_errors() {
     let url = serve(gateway()).await;
     let https = ProjectUrl::parse(&url.as_str().replacen("http://", "https://", 1)).unwrap();
     let check = probe(loopback())
-        .check(&https, StackService::Auth, &SecretString::from(GOOD_KEY))
+        .check(
+            &https,
+            StackService::Auth,
+            &SecretString::from(GOOD_KEY),
+            None,
+        )
         .await;
     assert!(
         matches!(
@@ -429,16 +486,16 @@ async fn studio_login_is_checked_and_an_open_studio_is_reported() {
     let probe = probe(loopback());
 
     let url = serve(studio_gateway(true)).await;
-    let check = probe.check(&url, StackService::Studio, &good).await;
+    let check = probe.check(&url, StackService::Studio, &good, None).await;
     assert_eq!(check.status, ServiceStatus::Healthy);
-    let check = probe.check(&url, StackService::Studio, &bad).await;
+    let check = probe.check(&url, StackService::Studio, &bad, None).await;
     assert_eq!(
         check.status,
         ServiceStatus::KeyRejected { http_status: 401 }
     );
 
     let url = serve(studio_gateway(false)).await;
-    let check = probe.check(&url, StackService::Studio, &good).await;
+    let check = probe.check(&url, StackService::Studio, &good, None).await;
     assert_eq!(
         check.status,
         ServiceStatus::Unprotected { http_status: 307 }

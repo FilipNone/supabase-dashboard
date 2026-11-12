@@ -16,6 +16,7 @@ use supabase_dashboard_application::{
 };
 use supabase_dashboard_domain::{
     account::{DisplayName, Email},
+    authority::{AuthorityError, AuthorityInfo, ProjectAuthorities},
     authz::{OrgRole, Permission},
     connection::{CredentialKind, ServiceCheck, ServiceStatus, StackService, check_studio_login},
     project::ProjectUrl,
@@ -53,6 +54,7 @@ impl StackProbe for AcceptingProbe {
         _: &'a ProjectUrl,
         service: StackService,
         _: &'a SecretString,
+        _: Option<&'a ProjectAuthorities>,
     ) -> ProbeFuture<'a> {
         assert_eq!(
             service,
@@ -68,6 +70,10 @@ impl StackProbe for AcceptingProbe {
                 certificate_expires_at: None,
             }
         })
+    }
+
+    fn read_authorities(&self, _: &str) -> Result<Vec<AuthorityInfo>, AuthorityError> {
+        Err(AuthorityError::Empty)
     }
 }
 

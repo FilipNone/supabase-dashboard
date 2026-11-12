@@ -517,3 +517,10 @@ td { vertical-align: middle; }
 .health-table { font-size: var(--text-sm); }
 .health-table summary { cursor: pointer; color: var(--color-text-muted); }
 .health-table .table-wrap { margin-top: var(--space-2); }
+
+/* Certificate authorities on a project's settings page. */
+.textarea { height: auto; min-height: 8rem; padding: var(--space-2) var(--space-3); font-family: var(--font-mono); font-size: var(--text-sm); resize: vertical; }
+.authority-list { list-style: none; margin: 0 0 var(--space-4); padding: 0; display: grid; gap: var(--space-3); }
+.authority-list li { border: 1px solid var(--color-border); border-radius: var(--radius-md); padding: var(--space-3); }
+.authority-subject { margin: 0; overflow-wrap: anywhere; }
+.authority-fingerprint { margin: var(--space-1) 0 0; color: var(--color-text-muted); overflow-wrap: anywhere; }

@@ -19,6 +19,7 @@ use supabase_dashboard_application::{
 };
 use supabase_dashboard_domain::{
     account::{DisplayName, Email},
+    authority::{AuthorityError, AuthorityInfo, ProjectAuthorities},
     authz::{OrgRole, Permission},
     connection::{
         ApiKeyError, CredentialKind, CredentialState, HEALTH_HISTORY_MAX_ENTRIES,
@@ -53,13 +54,19 @@ fn cipher(key: &str) -> CredentialCipher {
     CredentialCipher::from_base64(&SecretString::from(key)).unwrap()
 }
 
-/// Records which key each service was checked with. Reports healthy,
-/// except for Studio when `studio` holds another answer.
+/// Records which key each service was checked with, and which bundle it
+/// trusted. Reports healthy, except for Studio when `studio` holds another
+/// answer.
 #[derive(Default)]
 struct FakeProbe {
     calls: Mutex<Vec<(StackService, String)>>,
+    bundles: Mutex<Vec<Option<String>>>,
     studio: Mutex<Option<ServiceStatus>>,
 }
+
+/// A stand-in for a PEM bundle: the fake probe accepts text made of these
+/// lines, one certificate per line.
+const FAKE_CERT: &str = "-----BEGIN CERTIFICATE----- fake";
 
 impl StackProbe for FakeProbe {
     fn check<'a>(
@@ -67,11 +74,16 @@ impl StackProbe for FakeProbe {
         _api_url: &'a ProjectUrl,
         service: StackService,
         key: &'a SecretString,
+        authorities: Option<&'a ProjectAuthorities>,
     ) -> ProbeFuture<'a> {
         self.calls
             .lock()
             .unwrap()
             .push((service, key.expose_secret().to_owned()));
+        self.bundles
+            .lock()
+            .unwrap()
+            .push(authorities.map(|a| a.as_str().to_owned()));
         let status = match service {
             StackService::Studio => self.studio.lock().unwrap().clone(),
             _ => None,
@@ -86,6 +98,20 @@ impl StackProbe for FakeProbe {
                 certificate_expires_at: None,
             }
         })
+    }
+
+    fn read_authorities(&self, pem: &str) -> Result<Vec<AuthorityInfo>, AuthorityError> {
+        if pem.lines().any(|line| line != FAKE_CERT) {
+            return Err(AuthorityError::NotACertificate);
+        }
+        Ok(pem
+            .lines()
+            .map(|_| AuthorityInfo {
+                subject: "CN=Test CA".into(),
+                not_after: OffsetDateTime::UNIX_EPOCH + time::Duration::days(30_000),
+                sha256: "AB:CD".into(),
+            })
+            .collect())
     }
 }
 
@@ -1314,4 +1340,172 @@ async fn jwt_keys_are_checked_for_role_and_expiry() {
             ..
         } if expiry.expired && expiry.days_left == 0
     ));
+}
+
+#[tokio::test]
+async fn project_authorities_are_kept_per_project_and_used_by_its_checks() {
+    let Some(scratch) = ScratchDb::create("conn_authorities").await else {
+        return;
+    };
+    let f = setup(&scratch, Some(KEY_A)).await;
+    let owner = account(&f.db, "Owner").await;
+    let admin = account(&f.db, "Admin").await;
+    let developer = account(&f.db, "Developer").await;
+    let viewer = account(&f.db, "Viewer").await;
+    let outsider = account(&f.db, "Outsider").await;
+    let (org, id) = project(&f, &owner, "Acme").await;
+    let (_, other) = project(&f, &owner, "Other").await;
+    add_member(&f.db, org, &admin, OrgRole::Admin).await;
+    add_member(&f.db, org, &developer, OrgRole::Developer).await;
+    add_member(&f.db, org, &viewer, OrgRole::Viewer).await;
+    let bundle = format!("{FAKE_CERT}\n{FAKE_CERT}");
+
+    // Nothing stored yet; any member may read that.
+    assert_eq!(f.connections.authorities(&viewer, id).await.unwrap(), None);
+    assert!(matches!(
+        f.connections.authorities(&outsider, id).await,
+        Err(ConnectionError::NotFound)
+    ));
+
+    // Developers and viewers cannot change it, and the refusal is audited.
+    for who in [&developer, &viewer] {
+        assert!(matches!(
+            f.connections
+                .replace_authorities(who, id, &bundle, ctx())
+                .await,
+            Err(ConnectionError::Forbidden)
+        ));
+        assert_eq!(
+            denied_by(&f.db, "project.authorities.replace", who).await,
+            1
+        );
+    }
+
+    // Refused input is not stored.
+    for (input, err) in [
+        ("   ", AuthorityError::Empty),
+        (
+            "-----BEGIN PRIVATE KEY-----",
+            AuthorityError::NotACertificate,
+        ),
+    ] {
+        assert!(matches!(
+            f.connections.replace_authorities(&admin, id, input, ctx()).await,
+            Err(ConnectionError::Authority(e)) if e == err
+        ));
+    }
+    assert_eq!(f.connections.authorities(&owner, id).await.unwrap(), None);
+
+    // Stored trimmed, summarized, and readable by every member.
+    let saved = f
+        .connections
+        .replace_authorities(&admin, id, &format!("\n{bundle}\n\n"), ctx())
+        .await
+        .unwrap();
+    assert_eq!(saved.authorities.len(), 2);
+    let read = f
+        .connections
+        .authorities(&viewer, id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.authorities, saved.authorities);
+    assert_eq!(read.updated_at, saved.updated_at);
+    assert_eq!(
+        audit_count(&f.db, "project.authorities.replace", "success").await,
+        1
+    );
+
+    // Checks of this project trust the bundle; checks of the other one do not.
+    for kind in [CredentialKind::AnonKey, CredentialKind::ServiceRoleKey] {
+        let value = if kind == CredentialKind::AnonKey {
+            ANON
+        } else {
+            SERVICE
+        };
+        for project in [id, other] {
+            f.connections
+                .replace_credential(&owner, project, kind, &SecretString::from(value), ctx())
+                .await
+                .unwrap();
+        }
+    }
+    f.connections.check_now(&viewer, id).await.unwrap();
+    let bundles: Vec<_> = f.probe.bundles.lock().unwrap().drain(..).collect();
+    assert_eq!(bundles.len(), 5, "every service with a key is checked");
+    assert!(
+        bundles
+            .iter()
+            .all(|b| b.as_deref() == Some(bundle.as_str()))
+    );
+    f.connections.check_now(&owner, other).await.unwrap();
+    assert!(
+        f.probe
+            .bundles
+            .lock()
+            .unwrap()
+            .drain(..)
+            .all(|b| b.is_none())
+    );
+
+    // Saving a Studio login tries it with the project's bundle too.
+    let login = SecretString::from(check_studio_login("supabase", STUDIO_PASSWORD).unwrap());
+    f.connections
+        .replace_credential(&owner, id, CredentialKind::StudioLogin, &login, ctx())
+        .await
+        .unwrap();
+    assert_eq!(
+        f.probe
+            .bundles
+            .lock()
+            .unwrap()
+            .drain(..)
+            .collect::<Vec<_>>(),
+        vec![Some(bundle.clone())]
+    );
+
+    // Removing it: developers cannot; owners can, once.
+    assert!(matches!(
+        f.connections
+            .remove_authorities(&developer, id, ctx())
+            .await,
+        Err(ConnectionError::Forbidden)
+    ));
+    f.connections
+        .remove_authorities(&owner, id, ctx())
+        .await
+        .unwrap();
+    assert!(matches!(
+        f.connections.remove_authorities(&owner, id, ctx()).await,
+        Err(ConnectionError::NoAuthorities)
+    ));
+    assert_eq!(f.connections.authorities(&owner, id).await.unwrap(), None);
+    assert_eq!(
+        audit_count(&f.db, "project.authorities.remove", "success").await,
+        1
+    );
+
+    // A stored bundle the adapter can no longer read lists nothing, and
+    // unregistering the project deletes it.
+    sqlx::query("INSERT INTO project_authorities (project_id, pem) VALUES ($1, 'garbage')")
+        .bind(id)
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    let unreadable = f
+        .connections
+        .authorities(&owner, id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(unreadable.authorities.is_empty());
+    f.projects
+        .unregister(&owner, id, "Production", ctx())
+        .await
+        .unwrap();
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM project_authorities")
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
 }

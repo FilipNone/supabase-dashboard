@@ -9,7 +9,7 @@
 //! followed, and the connection goes through the same address policy as
 //! the service checks.
 
-use std::{error::Error as StdError, time::Duration};
+use std::{error::Error as StdError, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use http::{
@@ -18,12 +18,14 @@ use http::{
 };
 use reqwest::{Client, redirect};
 use secrecy::{ExposeSecret, SecretString};
-use supabase_dashboard_domain::{connection::split_studio_login, project::ProjectUrl};
+use supabase_dashboard_domain::{
+    authority::ProjectAuthorities, connection::split_studio_login, project::ProjectUrl,
+};
 
 use crate::{
     gateway::{GatewayError, refused_literal},
     net::{DestinationNotAllowed, NameNotResolved, PolicyResolver, TargetPolicy, chain_has},
-    tls::{self, ExtraRoots},
+    tls::{Clients, ExtraRoots},
 };
 
 /// The body of a response from Studio, streamed to the browser.
@@ -112,38 +114,38 @@ pub struct StudioSite<'a> {
 
 #[derive(Clone)]
 pub struct StudioProxy {
-    client: Client,
+    clients: Arc<Clients>,
     policy: TargetPolicy,
 }
 
 impl StudioProxy {
     pub fn new(settings: StudioProxySettings) -> Result<Self, GatewayError> {
-        let client = Client::builder()
-            .tls_backend_preconfigured(
-                tls::client_config(&settings.extra_roots).map_err(GatewayError::Tls)?,
-            )
-            .dns_resolver(PolicyResolver {
-                policy: settings.policy,
-            })
-            .redirect(redirect::Policy::none())
-            .no_proxy()
-            .connect_timeout(settings.connect_timeout)
-            .read_timeout(settings.read_timeout)
-            .pool_idle_timeout(Duration::from_secs(90))
-            .build()
-            .map_err(GatewayError::Client)?;
+        let policy = settings.policy;
+        let clients = Clients::new(settings.extra_roots, move |config| {
+            Client::builder()
+                .tls_backend_preconfigured(config)
+                .dns_resolver(PolicyResolver { policy })
+                .redirect(redirect::Policy::none())
+                .no_proxy()
+                .connect_timeout(settings.connect_timeout)
+                .read_timeout(settings.read_timeout)
+                .pool_idle_timeout(Duration::from_secs(90))
+                .build()
+        })?;
         Ok(Self {
-            client,
-            policy: settings.policy,
+            clients: Arc::new(clients),
+            policy,
         })
     }
 
     /// Sends `request` to the Studio route of the gateway at `api_url`,
-    /// signed in with `login` (`username:password`).
+    /// signed in with `login` (`username:password`), trusting the
+    /// project's own `authorities` in addition to the shared roots.
     pub async fn forward(
         &self,
         api_url: &ProjectUrl,
         login: &SecretString,
+        authorities: Option<&ProjectAuthorities>,
         site: StudioSite<'_>,
         request: ProxyRequest,
     ) -> Result<Response<UpstreamBody>, ProxyError> {
@@ -154,9 +156,9 @@ impl StudioProxy {
         }
         let (username, password) =
             split_studio_login(login.expose_secret()).ok_or(ProxyError::InvalidRequest)?;
+        let client = self.clients.get(authorities).map_err(|_| ProxyError::Tls)?;
         let headers = request_headers(&request.headers, site);
-        let response = self
-            .client
+        let response = client
             .request(request.method, url)
             .headers(headers)
             .basic_auth(username, Some(password))

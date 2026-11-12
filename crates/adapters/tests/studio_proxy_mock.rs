@@ -146,6 +146,7 @@ async fn requests_reach_studio_with_the_stored_login_only() {
         .forward(
             &url,
             &login,
+            None,
             SITE,
             request(
                 Method::POST,
@@ -174,6 +175,7 @@ async fn a_wrong_login_gets_the_gateway_refusal() {
         .forward(
             &url,
             &SecretString::from("supabase:not-the-password-at-all"),
+            None,
             SITE,
             request(
                 Method::GET,
@@ -200,6 +202,7 @@ async fn redirects_are_passed_back_not_followed() {
         .forward(
             &url,
             &SecretString::from(LOGIN),
+            None,
             SITE,
             request(Method::GET, "/", HeaderMap::new(), ProxyBody::empty()),
         )
@@ -222,6 +225,7 @@ async fn loopback_gateways_are_refused_by_default() {
         .forward(
             &url,
             &SecretString::from(LOGIN),
+            None,
             SITE,
             request(Method::GET, "/", HeaderMap::new(), ProxyBody::empty()),
         )
@@ -240,6 +244,7 @@ async fn closed_ports_are_reported_as_connect_failures() {
         .forward(
             &url,
             &SecretString::from(LOGIN),
+            None,
             SITE,
             request(Method::GET, "/", HeaderMap::new(), ProxyBody::empty()),
         )

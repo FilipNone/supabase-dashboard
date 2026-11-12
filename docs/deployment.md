@@ -97,6 +97,8 @@ To check a stack that runs on the same server, register it by an address the con
 
 If a stack's gateway uses a certificate from a private certificate authority, mount the authority's certificate into the container read-only and point `SUPABASE_DASHBOARD_EXTRA_CA_FILE` at it, for example `/run/secrets/stacks-ca.pem`. Only the public certificate belongs there, never the authority's key. Restart the dashboard after changing the file; it is read once at startup.
 
+That file is trusted for every project. To trust an authority for one project only, an owner or admin pastes its certificate into the Certificate authorities section of that project's settings page instead. The dashboard stores it with the project (public certificates only, at most 8 and 64 KiB), lists each certificate's subject, expiry, and SHA-256 fingerprint, and uses it for that project's health checks, the Studio login check, and Studio traffic. Saving and removing it are audited. A change applies to the next request without a restart.
+
 ## Studio access
 
 Members open a project's Studio through the dashboard, which serves each project's Studio on its own host under `SUPABASE_DASHBOARD_STUDIO_DOMAIN` (see `docs/adr/0002-studio-access.md`). To turn it on:

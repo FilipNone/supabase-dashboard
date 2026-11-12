@@ -17,6 +17,7 @@ use reqwest::{
 use secrecy::{ExposeSecret, SecretString};
 use supabase_dashboard_application::connections::{ProbeFuture, StackProbe};
 use supabase_dashboard_domain::{
+    authority::{AuthorityError, AuthorityInfo, ProjectAuthorities},
     connection::{
         ServiceCheck, ServiceStatus, StackService, UnreachableReason, sanitize_version,
         split_studio_login,
@@ -28,7 +29,7 @@ use tokio::time::Instant;
 
 use crate::{
     net::{DestinationNotAllowed, NameNotResolved, PolicyResolver, TargetPolicy, chain_has},
-    tls::{self, ExtraRoots},
+    tls::{self, Clients, ExtraRoots},
 };
 
 /// Largest response body read from a health endpoint.
@@ -65,32 +66,30 @@ pub enum GatewayError {
 /// Checks services behind a stack's API gateway.
 #[derive(Clone)]
 pub struct GatewayProbe {
-    client: Client,
+    clients: Arc<Clients>,
     policy: TargetPolicy,
 }
 
 impl GatewayProbe {
     pub fn new(settings: GatewaySettings) -> Result<Self, GatewayError> {
-        let client = Client::builder()
-            .tls_backend_preconfigured(
-                tls::client_config(&settings.extra_roots).map_err(GatewayError::Tls)?,
-            )
-            .dns_resolver(PolicyResolver {
-                policy: settings.policy,
-            })
-            .redirect(redirect::Policy::none())
-            // Gives each response the server's certificate, for its expiry.
-            .tls_info(true)
-            .no_proxy()
-            .connect_timeout(settings.connect_timeout)
-            .timeout(settings.request_timeout)
-            .pool_idle_timeout(Duration::from_secs(30))
-            .user_agent(concat!("supabase-dashboard/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(GatewayError::Client)?;
+        let policy = settings.policy;
+        let clients = Clients::new(settings.extra_roots, move |config| {
+            Client::builder()
+                .tls_backend_preconfigured(config)
+                .dns_resolver(PolicyResolver { policy })
+                .redirect(redirect::Policy::none())
+                // Gives each response the server's certificate, for its expiry.
+                .tls_info(true)
+                .no_proxy()
+                .connect_timeout(settings.connect_timeout)
+                .timeout(settings.request_timeout)
+                .pool_idle_timeout(Duration::from_secs(30))
+                .user_agent(concat!("supabase-dashboard/", env!("CARGO_PKG_VERSION")))
+                .build()
+        })?;
         Ok(Self {
-            client,
-            policy: settings.policy,
+            clients: Arc::new(clients),
+            policy,
         })
     }
 
@@ -103,6 +102,7 @@ impl GatewayProbe {
         api_url: &ProjectUrl,
         service: StackService,
         key: &SecretString,
+        authorities: Option<&ProjectAuthorities>,
     ) -> ServiceCheck {
         let unreachable = |reason| ServiceCheck {
             service,
@@ -117,8 +117,13 @@ impl GatewayProbe {
         if refused_literal(&url, self.policy) {
             return unreachable(UnreachableReason::DestinationNotAllowed);
         }
+        // A stored bundle that no longer parses trusts nothing extra, so
+        // the connection fails as a TLS problem rather than half-trusted.
+        let Ok(client) = self.clients.get(authorities) else {
+            return unreachable(UnreachableReason::Tls);
+        };
         if service == StackService::Studio {
-            return self.check_studio(url, key).await;
+            return check_studio(&client, url, key).await;
         }
         let mut headers = HeaderMap::new();
         let Ok(mut apikey) = HeaderValue::from_str(key.expose_secret()) else {
@@ -140,7 +145,7 @@ impl GatewayProbe {
         headers.insert(ACCEPT, HeaderValue::from_static(accept(service)));
 
         let started = Instant::now();
-        let response = match self.client.get(url).headers(headers).send().await {
+        let response = match client.get(url).headers(headers).send().await {
             Ok(response) => response,
             Err(err) => return unreachable(classify(&err)),
         };
@@ -191,76 +196,73 @@ impl GatewayProbe {
     }
 }
 
-impl GatewayProbe {
-    /// Studio's route must refuse a request without the login and accept
-    /// one with it. Studio answers `/` with a redirect to its project page,
-    /// so a redirect counts as success; it is not followed.
-    async fn check_studio(&self, url: reqwest::Url, login: &SecretString) -> ServiceCheck {
-        let service = StackService::Studio;
-        let done = |status, latency_ms, certificate_expires_at| ServiceCheck {
-            service,
-            status,
-            version: None,
-            latency_ms,
-            certificate_expires_at,
-        };
-        let Some((username, password)) = split_studio_login(login.expose_secret()) else {
+/// Studio's route must refuse a request without the login and accept
+/// one with it. Studio answers `/` with a redirect to its project page,
+/// so a redirect counts as success; it is not followed.
+async fn check_studio(client: &Client, url: reqwest::Url, login: &SecretString) -> ServiceCheck {
+    let service = StackService::Studio;
+    let done = |status, latency_ms, certificate_expires_at| ServiceCheck {
+        service,
+        status,
+        version: None,
+        latency_ms,
+        certificate_expires_at,
+    };
+    let Some((username, password)) = split_studio_login(login.expose_secret()) else {
+        return done(
+            ServiceStatus::Unreachable {
+                reason: UnreachableReason::InvalidResponse,
+            },
+            None,
+            None,
+        );
+    };
+    let open = match client.get(url.clone()).send().await {
+        Ok(response) => response.status(),
+        Err(err) => {
             return done(
                 ServiceStatus::Unreachable {
-                    reason: UnreachableReason::InvalidResponse,
+                    reason: classify(&err),
                 },
                 None,
                 None,
             );
-        };
-        let open = match self.client.get(url.clone()).send().await {
-            Ok(response) => response.status(),
-            Err(err) => {
-                return done(
-                    ServiceStatus::Unreachable {
-                        reason: classify(&err),
-                    },
-                    None,
-                    None,
-                );
-            }
-        };
-        if open.is_success() || open.is_redirection() {
+        }
+    };
+    if open.is_success() || open.is_redirection() {
+        return done(
+            ServiceStatus::Unprotected {
+                http_status: open.as_u16(),
+            },
+            None,
+            None,
+        );
+    }
+    let started = Instant::now();
+    let response = match client
+        .get(url)
+        .basic_auth(username, Some(password))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => {
             return done(
-                ServiceStatus::Unprotected {
-                    http_status: open.as_u16(),
+                ServiceStatus::Unreachable {
+                    reason: classify(&err),
                 },
                 None,
                 None,
             );
         }
-        let started = Instant::now();
-        let response = match self
-            .client
-            .get(url)
-            .basic_auth(username, Some(password))
-            .send()
-            .await
-        {
-            Ok(response) => response,
-            Err(err) => {
-                return done(
-                    ServiceStatus::Unreachable {
-                        reason: classify(&err),
-                    },
-                    None,
-                    None,
-                );
-            }
-        };
-        let latency_ms = u32::try_from(started.elapsed().as_millis()).ok();
-        let expires_at = certificate_expiry(&response);
-        let status = response.status();
-        if status.is_success() || status.is_redirection() {
-            done(ServiceStatus::Healthy, latency_ms, expires_at)
-        } else {
-            done(status_failure(status), latency_ms, expires_at)
-        }
+    };
+    let latency_ms = u32::try_from(started.elapsed().as_millis()).ok();
+    let expires_at = certificate_expiry(&response);
+    let status = response.status();
+    if status.is_success() || status.is_redirection() {
+        done(ServiceStatus::Healthy, latency_ms, expires_at)
+    } else {
+        done(status_failure(status), latency_ms, expires_at)
     }
 }
 
@@ -270,8 +272,13 @@ impl StackProbe for GatewayProbe {
         api_url: &'a ProjectUrl,
         service: StackService,
         key: &'a SecretString,
+        authorities: Option<&'a ProjectAuthorities>,
     ) -> ProbeFuture<'a> {
-        Box::pin(self.check_service(api_url, service, key))
+        Box::pin(self.check_service(api_url, service, key, authorities))
+    }
+
+    fn read_authorities(&self, pem: &str) -> Result<Vec<AuthorityInfo>, AuthorityError> {
+        tls::read_authorities(pem).map(|(_, infos)| infos)
     }
 }
 

@@ -12,7 +12,8 @@ use std::time::Duration;
 
 use secrecy::SecretString;
 use supabase_dashboard_domain::{
-    authz::Permission, connection::CredentialKind, project::ProjectUrl,
+    authority::ProjectAuthorities, authz::Permission, connection::CredentialKind,
+    project::ProjectUrl,
 };
 use supabase_dashboard_persistence::{Database, PersistenceError, audit::AuditOutcome};
 use uuid::Uuid;
@@ -65,6 +66,8 @@ pub struct StudioUpstream {
     pub api_url: ProjectUrl,
     pub login: SecretString,
     pub account_id: Uuid,
+    /// The project's own certificate authorities, if any are stored.
+    pub authorities: Option<ProjectAuthorities>,
 }
 
 /// Accepts a Studio path to return to: an absolute path on the Studio host,
@@ -206,6 +209,10 @@ impl StudioService {
             api_url: grant.api_url,
             login,
             account_id: grant.account_id,
+            authorities: grant
+                .authorities
+                .as_deref()
+                .map(ProjectAuthorities::from_stored),
         })
     }
 }

@@ -12,10 +12,11 @@ use secrecy::SecretString;
 use supabase_dashboard_adapters::{
     gateway::{GatewayProbe, GatewaySettings},
     net::TargetPolicy,
-    tls::ExtraRoots,
+    tls::{ExtraRoots, read_authorities},
 };
 use supabase_dashboard_application::connections::StackProbe;
 use supabase_dashboard_domain::{
+    authority::ProjectAuthorities,
     connection::{ServiceStatus, StackService, UnreachableReason},
     project::ProjectUrl,
 };
@@ -100,7 +101,7 @@ async fn a_private_authority_is_trusted_only_when_configured() {
     let key = SecretString::from("anon");
 
     let check = probe(ExtraRoots::default())
-        .check(&url, StackService::Auth, &key)
+        .check(&url, StackService::Auth, &key, None)
         .await;
     assert_eq!(
         check.status,
@@ -111,7 +112,9 @@ async fn a_private_authority_is_trusted_only_when_configured() {
 
     let roots = ExtraRoots::from_pem(pki.ca_pem.as_bytes()).unwrap();
     assert_eq!(roots.len(), 1);
-    let check = probe(roots).check(&url, StackService::Auth, &key).await;
+    let check = probe(roots)
+        .check(&url, StackService::Auth, &key, None)
+        .await;
     assert_eq!(check.status, ServiceStatus::Healthy);
     assert_eq!(check.version.as_deref(), Some("v2.197.0"));
     // 2031-05-06 00:00:00 UTC, the server certificate's notAfter.
@@ -122,7 +125,9 @@ async fn a_private_authority_is_trusted_only_when_configured() {
 
     // Another authority does not vouch for this server.
     let other = ExtraRoots::from_pem(private_pki().ca_pem.as_bytes()).unwrap();
-    let check = probe(other).check(&url, StackService::Auth, &key).await;
+    let check = probe(other)
+        .check(&url, StackService::Auth, &key, None)
+        .await;
     assert_eq!(
         check.status,
         ServiceStatus::Unreachable {
@@ -199,14 +204,111 @@ async fn the_studio_proxy_trusts_the_same_authorities() {
     };
 
     let refused = proxy(ExtraRoots::default())
-        .forward(&url, &login, site, request())
+        .forward(&url, &login, None, site, request())
         .await;
     assert!(matches!(refused, Err(ProxyError::Tls)), "{refused:?}");
 
     let roots = ExtraRoots::from_pem(pki.ca_pem.as_bytes()).unwrap();
     let response = proxy(roots)
-        .forward(&url, &login, site, request())
+        .forward(&url, &login, None, site, request())
         .await
         .unwrap();
     assert_eq!(response.status(), 200);
+
+    // A project's own authority works without the deployment-wide file,
+    // for that project's requests only.
+    let own = ProjectAuthorities::from_stored(&pki.ca_pem);
+    let proxy = proxy(ExtraRoots::default());
+    let response = proxy
+        .forward(&url, &login, Some(&own), site, request())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let refused = proxy.forward(&url, &login, None, site, request()).await;
+    assert!(matches!(refused, Err(ProxyError::Tls)), "{refused:?}");
+}
+
+#[tokio::test]
+async fn a_project_authority_is_trusted_for_that_project_only() {
+    let pki = private_pki();
+    let url = serve_tls(&pki).await;
+    let key = SecretString::from("anon");
+    let probe = probe(ExtraRoots::default());
+    let tls_failure = ServiceStatus::Unreachable {
+        reason: UnreachableReason::Tls,
+    };
+
+    let own = ProjectAuthorities::from_stored(&pki.ca_pem);
+    let check = probe
+        .check(&url, StackService::Auth, &key, Some(&own))
+        .await;
+    assert_eq!(check.status, ServiceStatus::Healthy);
+    // The cached client is reused for the same bundle.
+    let again = ProjectAuthorities::from_stored(&pki.ca_pem);
+    let check = probe
+        .check(&url, StackService::Auth, &key, Some(&again))
+        .await;
+    assert_eq!(check.status, ServiceStatus::Healthy);
+
+    // A project without the bundle, or with another authority's, does not
+    // trust this server.
+    let check = probe.check(&url, StackService::Auth, &key, None).await;
+    assert_eq!(check.status, tls_failure);
+    let other = ProjectAuthorities::from_stored(&private_pki().ca_pem);
+    let check = probe
+        .check(&url, StackService::Auth, &key, Some(&other))
+        .await;
+    assert_eq!(check.status, tls_failure);
+
+    // A stored bundle that no longer parses trusts nothing extra.
+    let broken = ProjectAuthorities::from_stored("garbage");
+    let check = probe
+        .check(&url, StackService::Auth, &key, Some(&broken))
+        .await;
+    assert_eq!(check.status, tls_failure);
+}
+
+#[test]
+fn project_bundles_are_summarized_and_bounded() {
+    use supabase_dashboard_domain::authority::{AuthorityError, MAX_PROJECT_AUTHORITIES};
+
+    let ca_key = KeyPair::generate().unwrap();
+    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "Synthetic Test CA");
+    params.not_after = rcgen::date_time_ymd(2030, 1, 2);
+    let ca = params.self_signed(&ca_key).unwrap();
+
+    let (roots, infos) = read_authorities(&ca.pem()).unwrap();
+    assert_eq!(roots.len(), 1);
+    assert_eq!(infos.len(), 1);
+    assert_eq!(infos[0].subject, "CN=Synthetic Test CA");
+    // 2030-01-02 00:00:00 UTC.
+    assert_eq!(infos[0].not_after.unix_timestamp(), 1_893_542_400);
+    let fingerprint = &infos[0].sha256;
+    assert_eq!(fingerprint.len(), 32 * 3 - 1);
+    assert!(
+        fingerprint
+            .split(':')
+            .all(|byte| byte.len() == 2 && byte.chars().all(|c| matches!(c, '0'..='9' | 'A'..='F')))
+    );
+
+    let too_many = vec![ca.pem(); MAX_PROJECT_AUTHORITIES + 1].join("\n");
+    assert_eq!(
+        read_authorities(&too_many).unwrap_err(),
+        AuthorityError::TooMany
+    );
+    let with_key = format!("{}\n{}", ca.pem(), ca_key.serialize_pem());
+    assert_eq!(
+        read_authorities(&with_key).unwrap_err(),
+        AuthorityError::NotACertificate
+    );
+    assert_eq!(read_authorities("").unwrap_err(), AuthorityError::Empty);
+    let broken = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+    assert_eq!(
+        read_authorities(broken).unwrap_err(),
+        AuthorityError::Unusable { index: 1 }
+    );
 }

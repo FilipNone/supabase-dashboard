@@ -13,6 +13,9 @@ use std::{
 
 use secrecy::SecretString;
 use supabase_dashboard_domain::{
+    authority::{
+        AuthorityError, AuthorityInfo, ProjectAuthorities, ProjectTrust, check_bundle_size,
+    },
     authz::Permission,
     connection::{
         ApiKeyError, CredentialKind, CredentialOverview, CredentialState, CredentialStatus,
@@ -76,6 +79,10 @@ pub enum ConnectionError {
          saved; check DASHBOARD_USERNAME and DASHBOARD_PASSWORD on the stack"
     )]
     StudioLoginRejected { http_status: u16 },
+    #[error("no certificate authorities are stored for the project")]
+    NoAuthorities,
+    #[error(transparent)]
+    Authority(#[from] AuthorityError),
     #[error(transparent)]
     Input(#[from] ApiKeyError),
     #[error(transparent)]
@@ -89,13 +96,23 @@ pub type ProbeFuture<'a> = Pin<Box<dyn Future<Output = ServiceCheck> + Send + 'a
 /// Checks one service of a stack. Implementations must enforce the
 /// outbound network policy, never follow redirects, and bound time and
 /// response size. They report failures as statuses, never as error text.
+///
+/// `authorities` is the project's own certificate bundle, trusted for this
+/// check only, in addition to the roots every project trusts.
 pub trait StackProbe: Send + Sync {
     fn check<'a>(
         &'a self,
         api_url: &'a ProjectUrl,
         service: StackService,
         key: &'a SecretString,
+        authorities: Option<&'a ProjectAuthorities>,
     ) -> ProbeFuture<'a>;
+
+    /// Reads a pasted certificate bundle the way [`Self::check`] would use
+    /// it, and summarizes each certificate. Refuses anything that is not a
+    /// usable CA certificate, so nothing is stored that checks would
+    /// later ignore or trust in part.
+    fn read_authorities(&self, pem: &str) -> Result<Vec<AuthorityInfo>, AuthorityError>;
 }
 
 /// Which stored key a service check uses. The least privileged key that
@@ -271,9 +288,15 @@ impl ConnectionService {
             SecretString::from(value)
         };
         let saved = if kind == CredentialKind::StudioLogin {
+            let authorities = self.stored_authorities(project_id).await?;
             let check = self
                 .probe
-                .check(&access.project.api_url, StackService::Studio, &value)
+                .check(
+                    &access.project.api_url,
+                    StackService::Studio,
+                    &value,
+                    authorities.as_ref(),
+                )
                 .await;
             match check.status {
                 ServiceStatus::Healthy => SavedCredential::Confirmed,
@@ -354,6 +377,111 @@ impl ConnectionService {
         } else {
             Err(ConnectionError::NotStored)
         }
+    }
+
+    /// The project's own certificate authorities, summarized. Any member
+    /// may read them: certificates are public. `None` when none are
+    /// stored. A stored bundle the adapter can no longer read comes back
+    /// with no authorities listed.
+    pub async fn authorities(
+        &self,
+        current: &CurrentSession,
+        project_id: Uuid,
+    ) -> Result<Option<ProjectTrust>, ConnectionError> {
+        self.access(current, project_id, Permission::ProjectRead)
+            .await?;
+        let Some((pem, updated_at)) = self.db.find_project_authorities(project_id).await? else {
+            return Ok(None);
+        };
+        let authorities = self.probe.read_authorities(&pem).unwrap_or_else(|err| {
+            tracing::warn!(project_id = %project_id, error = %err, "stored certificate authorities cannot be read");
+            Vec::new()
+        });
+        Ok(Some(ProjectTrust {
+            authorities,
+            updated_at,
+            read_at: OffsetDateTime::now_utc(),
+        }))
+    }
+
+    /// Stores the project's certificate bundle, replacing any previous
+    /// one. Limited to the roles that replace keys, and audited. Nothing is
+    /// sent to the stack; the next check uses the new bundle.
+    pub async fn replace_authorities(
+        &self,
+        current: &CurrentSession,
+        project_id: Uuid,
+        pem: &str,
+        ctx: RequestContext<'_>,
+    ) -> Result<ProjectTrust, ConnectionError> {
+        let action = "project.authorities.replace";
+        self.audited_access(current, project_id, action, ctx)
+            .await?;
+        let pem = check_bundle_size(pem)?;
+        let authorities = self.probe.read_authorities(pem)?;
+        let updated_at = self
+            .db
+            .upsert_project_authorities(
+                project_id,
+                pem,
+                current.account.id,
+                &event(
+                    current,
+                    action,
+                    ("project", project_id.to_string()),
+                    AuditOutcome::Success,
+                    ctx,
+                ),
+            )
+            .await?
+            .ok_or(ConnectionError::NotFound)?;
+        Ok(ProjectTrust {
+            authorities,
+            updated_at,
+            read_at: OffsetDateTime::now_utc(),
+        })
+    }
+
+    /// Deletes the project's certificate bundle. Later checks trust only
+    /// the roots every project trusts.
+    pub async fn remove_authorities(
+        &self,
+        current: &CurrentSession,
+        project_id: Uuid,
+        ctx: RequestContext<'_>,
+    ) -> Result<(), ConnectionError> {
+        let action = "project.authorities.remove";
+        self.audited_access(current, project_id, action, ctx)
+            .await?;
+        let deleted = self
+            .db
+            .delete_project_authorities(
+                project_id,
+                &event(
+                    current,
+                    action,
+                    ("project", project_id.to_string()),
+                    AuditOutcome::Success,
+                    ctx,
+                ),
+            )
+            .await?;
+        if deleted {
+            Ok(())
+        } else {
+            Err(ConnectionError::NoAuthorities)
+        }
+    }
+
+    async fn stored_authorities(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Option<ProjectAuthorities>, ConnectionError> {
+        Ok(self
+            .db
+            .find_project_authorities(project_id)
+            .await?
+            .map(|(pem, _)| ProjectAuthorities::from_stored(&pem)))
     }
 
     /// The last saved check, if any. It may be old; the caller shows when
@@ -507,10 +635,15 @@ impl ConnectionService {
 
     async fn run_check(&self, project: &ProjectRecord) -> Result<HealthReport, ConnectionError> {
         let stored = self.db.list_credentials(project.id).await?;
+        let authorities = self.stored_authorities(project.id).await?;
         let mut checks = Vec::with_capacity(StackService::ALL.len());
         for service in StackService::ALL {
             let check = match self.pick_key(project.id, service, &stored) {
-                Ok(key) => self.probe.check(&project.api_url, service, &key).await,
+                Ok(key) => {
+                    self.probe
+                        .check(&project.api_url, service, &key, authorities.as_ref())
+                        .await
+                }
                 Err(reason) => ServiceCheck {
                     service,
                     status: ServiceStatus::NotChecked { reason },

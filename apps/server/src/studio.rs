@@ -300,7 +300,13 @@ async fn forward(
     };
     let response = match gateway
         .proxy
-        .forward(&upstream.api_url, &upstream.login, site, proxied)
+        .forward(
+            &upstream.api_url,
+            &upstream.login,
+            upstream.authorities.as_ref(),
+            site,
+            proxied,
+        )
         .await
     {
         Ok(response) => response.map(Body::new),

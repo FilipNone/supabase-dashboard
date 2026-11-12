@@ -7,5 +7,6 @@ pub mod organization;
 pub mod organizations;
 pub mod project;
 pub mod project_connection;
+mod project_trust;
 pub mod sign_in;
 pub mod status;

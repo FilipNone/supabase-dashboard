@@ -3093,6 +3093,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "supabase-dashboard-application",
  "supabase-dashboard-domain",
  "thiserror 2.0.21",
