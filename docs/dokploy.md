@@ -23,6 +23,10 @@ The client in `crates/adapters/src/dokploy.rs` uses the same connection rules as
 | Call | Method | Input | Used for |
 | --- | --- | --- | --- |
 | `settings.getDokployVersion` | GET | none | Read the version before anything else; the answer is a JSON string such as `"v0.31.1"` |
+| `overview.services` | GET | none | Every service the key can see, with its type, project, environment, and server |
+| `overview.domains` | GET | none | Every domain the key can see, with its host, whether it is enabled, whether it is a preview domain, and the service it routes to |
+
+Both lists are read with a 4 MiB body bound and at most 10,000 entries. An entry that does not parse, a service type other than application or compose, an ID outside `[A-Za-z0-9_-]{1,64}`, and an empty or overlong host are skipped one at a time, so one odd entry does not hide the rest.
 
 ### Planned
 
@@ -35,7 +39,8 @@ These are the calls the M4 roadmap items need, with their required inputs in v0.
 | `environment.create` | POST | `name`, `projectId` | New environment for stacks |
 | `environment.one` | GET | `environmentId` | Environment details |
 | `server.all` | GET | none | Servers Dokploy manages |
-| `compose.search` | GET | none (`q`, `name`, `appName`, `projectId`, `environmentId`, `limit`, `offset`) | Find the dashboard's own service and existing Supabase stacks; look up a job's service before creating it |
+| `compose.search` | GET | none (`q`, `name`, `appName`, `projectId`, `environmentId`, `limit`, `offset`) | Find existing Supabase stacks; look up a job's service before creating it |
+| `compose.move` | POST | `composeId`, `targetEnvironmentId` | Not planned for the dashboard; the browser check uses it to move a service and show the Moved state |
 | `compose.create` | POST | `name`, `environmentId` | Create a stack's compose service |
 | `compose.one` | GET | `composeId` | Read a stack's service, variables, and status |
 | `compose.update` | POST | `composeId` | Set the compose file and variables |
@@ -69,6 +74,26 @@ Audit events, with target type `dokploy` and Dokploy's host name as the target (
 | `dokploy.view` | Denied only |
 
 Denied attempts have no target, since nothing is read before the role check.
+
+### Where the dashboard runs
+
+Once Dokploy is connected, the Dokploy section also shows which Dokploy service the dashboard itself runs as. New stacks will go into that service's project and environment by default, so the placement is chosen once by an installation administrator and then stored.
+
+- **Detection.** Each time the section loads, the server reads `overview.services` and `overview.domains` and looks for enabled, non-preview domains whose host is the host of `SUPABASE_DASHBOARD_PUBLIC_URL` (compared without case or a trailing dot). A domain counts only when the key can also see the service it routes to. One match is offered with a "Confirm this service" button, and the full list stays one step away behind "Choose another service". With no match or several, the admin picks from every application and compose service the key can see, with the matches listed first. Without `SUPABASE_DASHBOARD_PUBLIC_URL` there is nothing to match, and the page says so.
+- **Confirmation.** Nothing is used until an admin confirms a service. Confirming reads the services again and refuses one the key cannot see. The dashboard stores the service's type and ID, its project and environment IDs and names, who confirmed it, and when. "Forget this placement" deletes that record. Removing the Dokploy connection removes the placement with it; replacing the key does not.
+- **Status.** A stored placement is checked against Dokploy's current lists and shown as Current, Domain differs (the service is where it was, but no longer has the public host as a domain), Moved (the service is now in another project or environment, with a button to confirm it there), or Not found (the key cannot see it any more). When Dokploy cannot be reached, the page says that instead and keeps the stored placement.
+- **Startup.** After it starts, the server checks a stored placement once and logs a warning when it is anything but Current, for example `The service has moved in Dokploy: it is now in project "Infra", environment "staging". Confirm the new placement to use it.`
+
+The key's Dokploy member needs access to the dashboard's own service and permission to read services and domains. With fewer rights, the dashboard's domain does not show and the page explains why.
+
+Audit events for the placement have target type `dokploy_service` and the target `compose:<id>` or `application:<id>`:
+
+| Action | Recorded |
+| --- | --- |
+| `dokploy.placement_confirm` | Success, failure (Dokploy was unreachable or did not show the service), or denied |
+| `dokploy.placement_clear` | Success or denied |
+
+Denied attempts are recorded with target type `dokploy` and no target, like the connection's.
 
 ### The API key
 

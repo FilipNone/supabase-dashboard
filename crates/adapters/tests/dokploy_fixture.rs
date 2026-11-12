@@ -61,3 +61,98 @@ async fn fixture_dokploy_rejects_an_unknown_key() {
         DokployError::KeyRejected
     );
 }
+
+/// Calls a Dokploy mutation directly, to create synthetic records the
+/// client only reads.
+async fn post(url: &DokployUrl, call: &str, body: serde_json::Value) -> serde_json::Value {
+    use secrecy::ExposeSecret;
+    // reqwest is built without a default TLS provider; the fixture is
+    // plain HTTP, but the client still needs one to build.
+    let tls = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(rustls::RootCertStore::empty())
+    .with_no_client_auth();
+    let response = reqwest::Client::builder()
+        .tls_backend_preconfigured(tls)
+        .build()
+        .unwrap()
+        .post(url.api(call))
+        .header("x-api-key", fixture_key().expose_secret())
+        .header("content-type", "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "{call}: {}",
+        response.status()
+    );
+    serde_json::from_slice(&response.bytes().await.unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn fixture_dokploy_lists_the_service_behind_a_domain() {
+    use supabase_dashboard_domain::dokploy_placement::DokployServiceKind;
+
+    let Some(url) = fixture_url() else { return };
+    // A unique host per run, so earlier runs' records do not match.
+    let host = format!(
+        "dashboard-{}.fixture.test",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let created = post(
+        &url,
+        "project.create",
+        serde_json::json!({ "name": "placement-probe" }),
+    )
+    .await;
+    let environment_id = created["environment"]["environmentId"].as_str().unwrap();
+    let compose = post(
+        &url,
+        "compose.create",
+        serde_json::json!({
+            "name": "dashboard",
+            "environmentId": environment_id,
+            "composeType": "docker-compose",
+        }),
+    )
+    .await;
+    let compose_id = compose["composeId"].as_str().unwrap();
+    post(
+        &url,
+        "domain.create",
+        serde_json::json!({
+            "host": host,
+            "composeId": compose_id,
+            "serviceName": "server",
+            "port": 8080,
+            "https": false,
+            "certificateType": "none",
+            "domainType": "compose",
+        }),
+    )
+    .await;
+
+    let inventory = client().inventory(&url, &fixture_key()).await.unwrap();
+    let matches = inventory.services_serving(&host);
+    assert_eq!(matches.len(), 1, "{inventory:?}");
+    assert_eq!(matches[0].service.kind, DokployServiceKind::Compose);
+    assert_eq!(matches[0].service.id.as_str(), compose_id);
+    assert_eq!(matches[0].environment_id.as_str(), environment_id);
+    assert_eq!(matches[0].project_name, "placement-probe");
+    assert_eq!(matches[0].environment_name, "production");
+
+    post(
+        &url,
+        "project.remove",
+        serde_json::json!({ "projectId": created["project"]["projectId"] }),
+    )
+    .await;
+}

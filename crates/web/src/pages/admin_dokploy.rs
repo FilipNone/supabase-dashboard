@@ -16,7 +16,7 @@ use crate::{
     components::dialog::{ConfirmDialog, DialogCancel},
     components::page::{StatePanel, StateTone},
     error::AppError,
-    pages::account::utc_minutes,
+    pages::{account::utc_minutes, admin_dokploy_placement::DokployPlacementPanel},
     server_fns::{ConnectDokploy, DisconnectDokploy, ReplaceDokployKey, get_dokploy_connection},
 };
 
@@ -244,6 +244,9 @@ fn connected_view(
         </dl>
     }
     .into_any();
+    // Dokploy can be asked only with a key this server can read.
+    let placement =
+        (storage_available && connection.key_readable).then(|| view! { <DokployPlacementPanel/> });
     let replace_form_view = storage_available.then(|| {
         view! {
             <h3 class="subsection-title">"Replace the API key"</h3>
@@ -282,6 +285,7 @@ fn connected_view(
     view! {
         {connected}
         {details}
+        {placement}
         {replace_form_view}
         <h3 class="subsection-title">"Remove the connection"</h3>
         <p class="field-hint">

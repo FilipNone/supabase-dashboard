@@ -17,6 +17,7 @@ use supabase_dashboard_domain::{
         SavedCredential,
     },
     dokploy::DokployOverview,
+    dokploy_placement::PlacementOverview,
     health::InstallationHealth,
     invitation::{InvitationCode, InvitationPreview, InvitationSummary, IssuedInvitation},
     organization::{MemberSummary, OrganizationSummary},
@@ -716,5 +717,41 @@ pub async fn disconnect_dokploy() -> Result<(), AppError> {
     let audit = org_context::AuditContext::current();
     Ok(org_context::dokploy()?
         .remove(&session, audit.get())
+        .await?)
+}
+
+/// Where the dashboard runs in Dokploy: the confirmed service, if any, and
+/// the services Dokploy reports now, with those whose domain is the
+/// dashboard's public host first. Installation administrators only.
+#[server]
+pub async fn get_dokploy_placement() -> Result<PlacementOverview, AppError> {
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    Ok(org_context::dokploy()?
+        .placement(&session, audit.get())
+        .await?)
+}
+
+/// Confirms a service the stored key can see as the dashboard's own.
+/// `service` is the kind and ID as `compose:<id>` or `application:<id>`.
+/// Installation administrators only.
+#[server]
+pub async fn confirm_dokploy_placement(service: String) -> Result<PlacementOverview, AppError> {
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    let (kind, id) = service.split_once(':').unwrap_or((service.as_str(), ""));
+    Ok(org_context::dokploy()?
+        .confirm_placement(&session, kind, id, audit.get())
+        .await?)
+}
+
+/// Forgets the confirmed placement. Nothing in Dokploy changes.
+/// Installation administrators only.
+#[server]
+pub async fn clear_dokploy_placement() -> Result<(), AppError> {
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    Ok(org_context::dokploy()?
+        .clear_placement(&session, audit.get())
         .await?)
 }

@@ -187,11 +187,12 @@ mod tests {
         app::SIGN_IN_PATH,
         server_fns::{
             AdminListAccounts, AdminSetAccountDisabled, ChangePassword, CheckProjectHealth,
-            ConnectDokploy, CreateInvitation, CreateOrganization, DisconnectDokploy,
-            GetCurrentAccount, GetDokployConnection, GetInstallationHealth, GetOrganization,
-            GetProject, GetProjectAuthorities, GetProjectCredentials, GetProjectHealth,
-            GetStudioAccessLog, ListOrganizations, ListProjects, ListSessions, PreviewInvitation,
-            RegisterProject, RemoveProjectAuthorities, RemoveProjectCredential, RenameOrganization,
+            ClearDokployPlacement, ConfirmDokployPlacement, ConnectDokploy, CreateInvitation,
+            CreateOrganization, DisconnectDokploy, GetCurrentAccount, GetDokployConnection,
+            GetDokployPlacement, GetInstallationHealth, GetOrganization, GetProject,
+            GetProjectAuthorities, GetProjectCredentials, GetProjectHealth, GetStudioAccessLog,
+            ListOrganizations, ListProjects, ListSessions, PreviewInvitation, RegisterProject,
+            RemoveProjectAuthorities, RemoveProjectCredential, RenameOrganization,
             ReplaceDokployKey, ReplaceProjectAuthorities, ReplaceProjectCredential,
             ReplaceStudioLogin, RevokeSession, SignUpWithInvitation, UnregisterProject,
             UpdateProfile,
@@ -241,9 +242,13 @@ mod tests {
                     },
                 )
                 .unwrap(),
-            ),
+            )
+            .with_public_host(Some(TEST_PUBLIC_HOST)),
         )
     }
+
+    /// The public host the test servers' Dokploy service looks for.
+    const TEST_PUBLIC_HOST: &str = "dashboard.http-test.fixture.test";
 
     async fn router_with_dokploy_policy(
         db: Database,
@@ -2420,6 +2425,9 @@ mod tests {
             ),
             (ReplaceDokployKey::PATH, "key=marker-key"),
             (DisconnectDokploy::PATH, ""),
+            (GetDokployPlacement::PATH, ""),
+            (ConfirmDokployPlacement::PATH, "service=compose%3Aabc"),
+            (ClearDokployPlacement::PATH, ""),
         ] {
             let (parts, response) = call(path, body, &bob).await;
             assert_eq!(parts.status, StatusCode::FORBIDDEN, "{path}: {response}");
@@ -2466,6 +2474,9 @@ mod tests {
         assert!(body.contains("does not contact"), "{body}");
         assert!(!body.contains("marker"), "{body}");
         let (parts, body) = call(ReplaceDokployKey::PATH, "key=marker-key", &alice).await;
+        assert_eq!(parts.status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(body.contains("Dokploy is not connected"), "{body}");
+        let (parts, body) = call(GetDokployPlacement::PATH, "", &alice).await;
         assert_eq!(parts.status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
         assert!(body.contains("Dokploy is not connected"), "{body}");
         let failures: i64 = sqlx::query_scalar(
@@ -2568,6 +2579,26 @@ mod tests {
         assert_eq!(parts.status, StatusCode::OK, "{body}");
         assert!(body.contains(r#""key_replaced":{"#), "{body}");
 
+        // Placement: Dokploy's services are read with the stored key and
+        // looked through for the dashboard's public host. Nothing is
+        // confirmed until an admin picks a service the key can see.
+        let (parts, body) = call(GetDokployPlacement::PATH, String::new()).await;
+        assert!(!leaks(&body), "the placement response contains the key");
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        assert!(body.contains(r#""Found":{"#), "{body}");
+        assert!(body.contains(TEST_PUBLIC_HOST), "{body}");
+        assert!(body.contains(r#""confirmed":null"#), "{body}");
+        let (parts, body) = call(
+            ConfirmDokployPlacement::PATH,
+            "service=compose%3Anot-a-visible-service".to_owned(),
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(body.contains("does not show that service"), "{body}");
+        let (parts, page) = send(&router, get_with_cookie("/dashboard/admin", &alice)).await;
+        assert_eq!(parts.status, StatusCode::OK);
+        assert!(page.contains("Where the dashboard runs"), "{page}");
+
         // Removing forgets it; Dokploy itself is not called.
         let (parts, body) = call(DisconnectDokploy::PATH, String::new()).await;
         assert_eq!(parts.status, StatusCode::OK, "{body}");
@@ -2591,6 +2622,7 @@ mod tests {
                 ("dokploy.connect", "success"),
                 ("dokploy.key_replace", "failure"),
                 ("dokploy.key_replace", "success"),
+                ("dokploy.placement_confirm", "failure"),
                 ("dokploy.disconnect", "success"),
             ]
         );

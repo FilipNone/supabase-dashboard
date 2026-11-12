@@ -9,6 +9,7 @@ pub mod authority;
 pub mod authz;
 pub mod connection;
 pub mod dokploy;
+pub mod dokploy_placement;
 pub mod health;
 pub mod invitation;
 pub mod organization;

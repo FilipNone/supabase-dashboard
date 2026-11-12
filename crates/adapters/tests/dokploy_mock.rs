@@ -210,3 +210,116 @@ async fn the_application_connector_reports_the_version_or_the_refusal() {
         DokployError::UnsupportedVersion { .. }
     ));
 }
+
+/// Serves `services` and `domains` as Dokploy's overview calls, behind the
+/// key check.
+fn overview(services: String, domains: String) -> Router {
+    let answer = |body: String| {
+        move |headers: HeaderMap| {
+            let body = body.clone();
+            async move {
+                if headers.get("x-api-key").and_then(|v| v.to_str().ok()) != Some(GOOD_KEY) {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    body,
+                )
+                    .into_response()
+            }
+        }
+    };
+    Router::new()
+        .route("/api/overview.services", get(answer(services)))
+        .route("/api/overview.domains", get(answer(domains)))
+}
+
+/// Entries shaped like Dokploy v0.31.1's `overview.services`.
+const SERVICES: &str = r#"[
+  {"id":"xR0PpmF7yhLc7UYgqcPjo","name":"dash-app","appName":"app-x","status":"idle",
+   "createdAt":"2026-11-12T21:33:18.220Z","serverId":null,"serverName":null,
+   "projectId":"DFLuZTBRvbt4IvItevQcM","projectName":"probe","environmentId":"35--oTNsDM0g3O_k9V72j",
+   "environmentName":"production","icon":null,"type":"application","lastDeployAt":null},
+  {"id":"_IK3e1y1IwxNCLnlLGXEZ","name":"dashboard","appName":"compose-y","status":"idle",
+   "serverId":"srv1","serverName":"edge-1",
+   "projectId":"DFLuZTBRvbt4IvItevQcM","projectName":"probe","environmentId":"35--oTNsDM0g3O_k9V72j",
+   "environmentName":"production","type":"compose"},
+  {"id":"pg1","name":"db","projectId":"p","projectName":"p","environmentId":"e",
+   "environmentName":"e","type":"postgres"},
+  {"id":"bad id","name":"x","projectId":"p","projectName":"p","environmentId":"e",
+   "environmentName":"e","type":"compose"},
+  {"unexpected":"shape"}
+]"#;
+
+const DOMAINS: &str = r#"[
+  {"domainId":"Swpf98Az7OrNWOxy1N0BN","host":"Dashboard.Example.Test","path":"/","port":8080,
+   "https":true,"enabled":true,"domainType":"compose","serviceOwnerId":"_IK3e1y1IwxNCLnlLGXEZ",
+   "serviceOwnerType":"compose","serviceName":"dashboard","projectId":"DFLuZTBRvbt4IvItevQcM",
+   "projectName":"probe","environmentId":"35--oTNsDM0g3O_k9V72j","environmentName":"production"},
+  {"host":"pr-1.example.test","enabled":true,"domainType":"preview",
+   "serviceOwnerId":"xR0PpmF7yhLc7UYgqcPjo","serviceOwnerType":"application"},
+  {"host":"off.example.test","enabled":false,"domainType":"application",
+   "serviceOwnerId":"xR0PpmF7yhLc7UYgqcPjo","serviceOwnerType":"application"},
+  {"host":"","enabled":true,"domainType":"compose",
+   "serviceOwnerId":"_IK3e1y1IwxNCLnlLGXEZ","serviceOwnerType":"compose"}
+]"#;
+
+#[tokio::test]
+async fn the_inventory_keeps_application_and_compose_services_and_their_domains() {
+    use supabase_dashboard_domain::dokploy_placement::DokployServiceKind;
+
+    let url = serve(overview(SERVICES.to_owned(), DOMAINS.to_owned())).await;
+    let inventory = client().inventory(&url, &key(GOOD_KEY)).await.unwrap();
+    let kinds: Vec<_> = inventory
+        .services
+        .iter()
+        .map(|info| (info.service.kind, info.service.id.as_str()))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            (DokployServiceKind::Application, "xR0PpmF7yhLc7UYgqcPjo"),
+            (DokployServiceKind::Compose, "_IK3e1y1IwxNCLnlLGXEZ"),
+        ]
+    );
+    assert_eq!(inventory.services[1].server_name.as_deref(), Some("edge-1"));
+    assert_eq!(inventory.services[1].environment_name, "production");
+
+    // The empty host is dropped; hosts are lowercased; preview and
+    // disabled domains are kept but marked.
+    assert_eq!(inventory.domains.len(), 3);
+    assert_eq!(inventory.domains[0].host, "dashboard.example.test");
+    assert!(inventory.domains[1].preview);
+    assert!(!inventory.domains[2].enabled);
+    let matches = inventory.services_serving("dashboard.example.test");
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].name, "dashboard");
+
+    assert_eq!(
+        client().inventory(&url, &key("wrong")).await.unwrap_err(),
+        DokployError::KeyRejected
+    );
+}
+
+#[tokio::test]
+async fn an_inventory_that_is_not_a_list_or_too_large_is_refused() {
+    let url = serve(overview(r#"{"items":[]}"#.to_owned(), "[]".to_owned())).await;
+    assert_eq!(
+        client().inventory(&url, &key(GOOD_KEY)).await.unwrap_err(),
+        DokployError::InvalidResponse
+    );
+
+    // Over the 4 MiB list bound.
+    let entry = r#"{"id":"a","name":"n","projectId":"p","projectName":"p","environmentId":"e","environmentName":"e","type":"compose"},"#;
+    let mut huge = String::from("[");
+    while huge.len() <= 4 * 1024 * 1024 {
+        huge.push_str(entry);
+    }
+    huge.push_str(r#"{"id":"b"}]"#);
+    let url = serve(overview(huge, "[]".to_owned())).await;
+    assert_eq!(
+        client().inventory(&url, &key(GOOD_KEY)).await.unwrap_err(),
+        DokployError::InvalidResponse
+    );
+}

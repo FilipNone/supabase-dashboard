@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex};
 use secrecy::{ExposeSecret, SecretString};
 use supabase_dashboard_application::{
     auth::{CurrentSession, RequestContext},
-    dokploy::{ConnectFuture, DokployConnector, DokployService, DokployServiceError},
+    dokploy::{
+        ConnectFuture, DokployConnector, DokployService, DokployServiceError, InventoryFuture,
+    },
     key_rotation::{KeyUsage, RotationSummary, key_usage, reseal_credentials},
     secrets::CredentialCipher,
 };
@@ -17,6 +19,10 @@ use supabase_dashboard_domain::{
     account::{DisplayName, Email},
     connection::UnreachableReason,
     dokploy::{DokployError, DokployKeyError, DokployUrl, DokployVersion, TESTED_DOKPLOY_VERSION},
+    dokploy_placement::{
+        DokployDomainInfo, DokployId, DokployInventory, DokployServiceInfo, DokployServiceKind,
+        DokployServiceRef, PlacementLookup, PlacementStatus,
+    },
 };
 use supabase_dashboard_persistence::{Database, accounts::AccountRecord};
 use uuid::Uuid;
@@ -53,6 +59,10 @@ fn secret(value: &str) -> SecretString {
 struct FakeDokploy {
     calls: Mutex<Vec<(String, String)>>,
     answer: Mutex<Option<DokployError>>,
+    /// The keys `inventory` was called with.
+    inventory_calls: Mutex<Vec<String>>,
+    inventory: Mutex<DokployInventory>,
+    inventory_error: Mutex<Option<DokployError>>,
 }
 
 impl FakeDokploy {
@@ -62,6 +72,10 @@ impl FakeDokploy {
 
     fn calls(&self) -> Vec<(String, String)> {
         self.calls.lock().unwrap().clone()
+    }
+
+    fn show(&self, inventory: DokployInventory) {
+        *self.inventory.lock().unwrap() = inventory;
     }
 }
 
@@ -78,6 +92,18 @@ impl DokployConnector for FakeDokploy {
                 None => Ok(TESTED_DOKPLOY_VERSION),
             }
         })
+    }
+
+    fn inventory<'a>(&'a self, _url: &'a DokployUrl, key: &'a SecretString) -> InventoryFuture<'a> {
+        self.inventory_calls
+            .lock()
+            .unwrap()
+            .push(key.expose_secret().to_owned());
+        let answer = match self.inventory_error.lock().unwrap().clone() {
+            Some(err) => Err(err),
+            None => Ok(self.inventory.lock().unwrap().clone()),
+        };
+        Box::pin(async move { answer })
     }
 }
 
@@ -658,6 +684,271 @@ async fn rotating_the_encryption_key_reseals_the_dokploy_key() {
             changed_meanwhile: 0
         }
     );
+
+    f.db.close().await;
+    scratch.drop().await;
+}
+
+const PUBLIC_HOST: &str = "dashboard.example.test";
+
+fn dokploy_service(kind: DokployServiceKind, id: &str, env: &str) -> DokployServiceInfo {
+    DokployServiceInfo {
+        service: DokployServiceRef {
+            kind,
+            id: DokployId::parse(id).unwrap(),
+        },
+        name: format!("svc-{id}"),
+        project_id: DokployId::parse("proj1").unwrap(),
+        project_name: "Infra".to_owned(),
+        environment_id: DokployId::parse(env).unwrap(),
+        environment_name: format!("env-{env}"),
+        server_name: None,
+    }
+}
+
+fn routed(host: &str, service: &DokployServiceInfo) -> DokployDomainInfo {
+    DokployDomainInfo {
+        host: host.to_owned(),
+        service: service.service.clone(),
+        enabled: true,
+        preview: false,
+    }
+}
+
+async fn placement_rows(db: &Database) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM dokploy_placement")
+        .fetch_one(db.pool())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn the_dashboards_service_is_found_by_its_domain_and_confirmed() {
+    let Some(scratch) = ScratchDb::create("dokploy_placement").await else {
+        return;
+    };
+    let mut f = setup(&scratch, Some(KEY_A)).await;
+    f.service = DokployService::new(f.db.clone(), Some(cipher(KEY_A)), f.fake.clone())
+        .with_public_host(Some("Dashboard.Example.Test"));
+    let admin = account(&f.db, "Admin", true).await;
+    let bob = account(&f.db, "Bob", false).await;
+
+    // Nothing to look up before Dokploy is connected.
+    assert!(matches!(
+        f.service.placement(&admin, ctx()).await,
+        Err(DokployServiceError::NotConnected)
+    ));
+    f.service
+        .connect(&admin, URL, &secret(DOKPLOY_KEY), ctx())
+        .await
+        .unwrap();
+
+    let dashboard = dokploy_service(DokployServiceKind::Compose, "dash", "prod");
+    let other = dokploy_service(DokployServiceKind::Application, "other", "prod");
+    f.fake.show(DokployInventory {
+        services: vec![other.clone(), dashboard.clone()],
+        domains: vec![
+            routed("other.example.test", &other),
+            routed(PUBLIC_HOST, &dashboard),
+        ],
+    });
+
+    // One match is offered; nothing is stored until it is confirmed.
+    let overview = f.service.placement(&admin, ctx()).await.unwrap();
+    assert_eq!(overview.public_host.as_deref(), Some(PUBLIC_HOST));
+    assert_eq!(overview.confirmed, None);
+    let PlacementLookup::Found {
+        matches,
+        services,
+        truncated,
+        status,
+    } = overview.lookup
+    else {
+        panic!("Dokploy was not read");
+    };
+    assert_eq!(matches, std::slice::from_ref(&dashboard));
+    assert_eq!(services.len(), 2);
+    assert!(!truncated);
+    assert_eq!(status, None);
+    assert_eq!(placement_rows(&f.db).await, 0);
+    // The inventory was read with the stored key.
+    assert_eq!(
+        f.fake.inventory_calls.lock().unwrap().last().unwrap(),
+        DOKPLOY_KEY
+    );
+
+    // Bob can neither look nor confirm, and Dokploy is not asked for him.
+    let calls = f.fake.inventory_calls.lock().unwrap().len();
+    assert!(matches!(
+        f.service.placement(&bob, ctx()).await,
+        Err(DokployServiceError::Forbidden)
+    ));
+    assert!(matches!(
+        f.service
+            .confirm_placement(&bob, "compose", "dash", ctx())
+            .await,
+        Err(DokployServiceError::Forbidden)
+    ));
+    assert!(matches!(
+        f.service.clear_placement(&bob, ctx()).await,
+        Err(DokployServiceError::Forbidden)
+    ));
+    assert_eq!(f.fake.inventory_calls.lock().unwrap().len(), calls);
+    assert_eq!(
+        audits(&f.db, "dokploy.placement_confirm", "denied").await,
+        [(Some(bob.account.id), Some("dokploy".to_owned()), None)]
+    );
+
+    // A service the key cannot see, or a malformed reference, is refused.
+    for (kind, id) in [
+        ("compose", "missing"),
+        ("application", "dash"),
+        ("postgres", "dash"),
+        ("compose", "../x"),
+    ] {
+        assert!(
+            matches!(
+                f.service.confirm_placement(&admin, kind, id, ctx()).await,
+                Err(DokployServiceError::ServiceNotVisible)
+            ),
+            "{kind}:{id}"
+        );
+    }
+    assert_eq!(placement_rows(&f.db).await, 0);
+    assert_eq!(
+        audits(&f.db, "dokploy.placement_confirm", "failure").await,
+        [
+            (
+                Some(admin.account.id),
+                Some("dokploy_service".to_owned()),
+                Some("compose:missing".to_owned())
+            ),
+            (
+                Some(admin.account.id),
+                Some("dokploy_service".to_owned()),
+                Some("application:dash".to_owned())
+            ),
+        ]
+    );
+
+    // Confirming stores the service with its project and environment.
+    let overview = f
+        .service
+        .confirm_placement(&admin, "compose", "dash", ctx())
+        .await
+        .unwrap();
+    let confirmed = overview.confirmed.unwrap();
+    assert_eq!(confirmed.placement.service, dashboard.service);
+    assert_eq!(confirmed.placement.environment_name, "env-prod");
+    assert_eq!(
+        confirmed.confirmed_by.map(|name| name.as_str().to_owned()),
+        Some("Admin".to_owned())
+    );
+    let PlacementLookup::Found { status, .. } = overview.lookup else {
+        panic!("Dokploy was not read");
+    };
+    assert_eq!(status, Some(PlacementStatus::Current));
+    assert_eq!(
+        audits(&f.db, "dokploy.placement_confirm", "success").await,
+        [(
+            Some(admin.account.id),
+            Some("dokploy_service".to_owned()),
+            Some("compose:dash".to_owned())
+        )]
+    );
+    let (placement, status) = f.service.placement_status().await.unwrap().unwrap();
+    assert_eq!(placement.service, dashboard.service);
+    assert_eq!(status, PlacementStatus::Current);
+
+    // Moved in Dokploy: shown, not followed.
+    let moved = dokploy_service(DokployServiceKind::Compose, "dash", "staging");
+    f.fake.show(DokployInventory {
+        services: vec![moved.clone()],
+        domains: vec![routed(PUBLIC_HOST, &moved)],
+    });
+    let (placement, status) = f.service.placement_status().await.unwrap().unwrap();
+    assert_eq!(placement.environment_name, "env-prod");
+    assert_eq!(
+        status,
+        PlacementStatus::Moved {
+            now: Box::new(moved)
+        }
+    );
+
+    // Deleted in Dokploy.
+    f.fake.show(DokployInventory::default());
+    let (_, status) = f.service.placement_status().await.unwrap().unwrap();
+    assert_eq!(status, PlacementStatus::Missing);
+
+    // Dokploy unreachable: the confirmed placement still shows.
+    *f.fake.inventory_error.lock().unwrap() = Some(DokployError::KeyRejected);
+    let overview = f.service.placement(&admin, ctx()).await.unwrap();
+    assert!(overview.confirmed.is_some());
+    assert!(
+        matches!(overview.lookup, PlacementLookup::Failed(ref message) if message.contains("refused the API key"))
+    );
+    assert!(f.service.placement_status().await.is_err());
+    *f.fake.inventory_error.lock().unwrap() = None;
+
+    // Clearing forgets it and is audited; clearing again is a no-op.
+    f.service.clear_placement(&admin, ctx()).await.unwrap();
+    f.service.clear_placement(&admin, ctx()).await.unwrap();
+    assert_eq!(placement_rows(&f.db).await, 0);
+    assert_eq!(
+        audits(&f.db, "dokploy.placement_clear", "success").await,
+        [(
+            Some(admin.account.id),
+            Some("dokploy_service".to_owned()),
+            Some("compose:dash".to_owned())
+        )]
+    );
+    assert_eq!(f.service.placement_status().await.unwrap(), None);
+    assert!(!all_audit_text(&f.db).await.contains(DOKPLOY_KEY));
+
+    f.db.close().await;
+    scratch.drop().await;
+}
+
+#[tokio::test]
+async fn removing_the_connection_removes_the_placement() {
+    let Some(scratch) = ScratchDb::create("dokploy_placement_remove").await else {
+        return;
+    };
+    let f = setup(&scratch, Some(KEY_A)).await;
+    let admin = account(&f.db, "Admin", true).await;
+    f.service
+        .connect(&admin, URL, &secret(DOKPLOY_KEY), ctx())
+        .await
+        .unwrap();
+    let dashboard = dokploy_service(DokployServiceKind::Application, "dash", "prod");
+    f.fake.show(DokployInventory {
+        services: vec![dashboard],
+        domains: Vec::new(),
+    });
+
+    // Without a public URL nothing matches, but any visible service can
+    // still be chosen, and its status says the domain does not match.
+    let overview = f.service.placement(&admin, ctx()).await.unwrap();
+    assert_eq!(overview.public_host, None);
+    assert!(
+        matches!(overview.lookup, PlacementLookup::Found { ref matches, .. } if matches.is_empty())
+    );
+    f.service
+        .confirm_placement(&admin, "application", "dash", ctx())
+        .await
+        .unwrap();
+    let (_, status) = f.service.placement_status().await.unwrap().unwrap();
+    assert_eq!(status, PlacementStatus::DomainChanged);
+
+    // Replacing the key keeps it; removing the connection removes it.
+    f.service
+        .replace_key(&admin, &secret(NEW_KEY), ctx())
+        .await
+        .unwrap();
+    assert_eq!(placement_rows(&f.db).await, 1);
+    f.service.remove(&admin, ctx()).await.unwrap();
+    assert_eq!(placement_rows(&f.db).await, 0);
+    assert_eq!(f.service.placement_status().await.unwrap(), None);
 
     f.db.close().await;
     scratch.drop().await;

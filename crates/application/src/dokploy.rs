@@ -16,14 +16,24 @@
 use std::{future::Future, pin::Pin, sync::Arc};
 
 use secrecy::SecretString;
-use supabase_dashboard_domain::dokploy::{
-    DokployChange, DokployConnectionSummary, DokployError, DokployKeyError, DokployOverview,
-    DokployUrl, DokployVersion, InvalidDokployUrl, check_dokploy_key,
+use supabase_dashboard_domain::{
+    dokploy::{
+        DokployChange, DokployConnectionSummary, DokployError, DokployKeyError, DokployOverview,
+        DokployUrl, DokployVersion, InvalidDokployUrl, check_dokploy_key,
+    },
+    dokploy_placement::{
+        ConfirmedPlacement, DokployId, DokployInventory, DokployPlacement, DokployServiceKind,
+        DokployServiceRef, MAX_LISTED_SERVICES, PlacementLookup, PlacementOverview,
+        PlacementStatus, normalize_host,
+    },
 };
 use supabase_dashboard_persistence::{
     Database, PersistenceError,
     audit::{AuditEvent, AuditOutcome},
-    dokploy::{NewDokployConnection, ReplacedDokployKey, StoredDokployConnection},
+    dokploy::{
+        NewDokployConnection, NewDokployPlacement, ReplacedDokployKey, StoredDokployConnection,
+        StoredDokployPlacement,
+    },
 };
 
 use crate::{
@@ -37,6 +47,9 @@ const AUDIT_TARGET_MAX_CHARS: usize = 128;
 pub type ConnectFuture<'a> =
     Pin<Box<dyn Future<Output = Result<DokployVersion, DokployError>> + Send + 'a>>;
 
+pub type InventoryFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<DokployInventory, DokployError>> + Send + 'a>>;
+
 /// Calls Dokploy with a key. Implementations must enforce the outbound
 /// address policy at connection time, never follow redirects, bound time
 /// and response size, and never put the key anywhere but the request
@@ -45,6 +58,10 @@ pub trait DokployConnector: Send + Sync {
     /// Reads Dokploy's version with `key` and refuses a release the
     /// dashboard does not support. Returns the supported version found.
     fn connect<'a>(&'a self, url: &'a DokployUrl, key: &'a SecretString) -> ConnectFuture<'a>;
+
+    /// The application and compose services `key` can see, with the
+    /// domains routed to them.
+    fn inventory<'a>(&'a self, url: &'a DokployUrl, key: &'a SecretString) -> InventoryFuture<'a>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -60,6 +77,11 @@ pub enum DokployServiceError {
     AlreadyConnected,
     #[error("Dokploy is not connected")]
     NotConnected,
+    #[error(
+        "Dokploy does not show that service to the stored key; it may have been deleted, or the \
+         key's member cannot access it"
+    )]
+    ServiceNotVisible,
     #[error(transparent)]
     Url(#[from] InvalidDokployUrl),
     #[error(transparent)]
@@ -93,6 +115,9 @@ pub struct DokployService {
     db: Database,
     cipher: Option<CredentialCipher>,
     connector: Arc<dyn DokployConnector>,
+    /// The host of the dashboard's public URL, normalized, which finds the
+    /// dashboard's own service among Dokploy's domains.
+    public_host: Option<String>,
 }
 
 impl DokployService {
@@ -105,7 +130,17 @@ impl DokployService {
             db,
             cipher,
             connector,
+            public_host: None,
         }
+    }
+
+    /// Sets the host of the dashboard's public URL, without which the
+    /// dashboard's own service cannot be found by its domain and has to be
+    /// chosen by hand.
+    #[must_use]
+    pub fn with_public_host(mut self, host: Option<&str>) -> Self {
+        self.public_host = host.map(normalize_host).filter(|host| !host.is_empty());
+        self
     }
 
     /// The connection as the administrator page shows it, without the key.
@@ -262,6 +297,207 @@ impl DokployService {
         Ok(Some(DokployCredentials { url, key }))
     }
 
+    /// Where the dashboard runs in Dokploy: the confirmed placement, if
+    /// any, and what Dokploy reports now. Dokploy is asked on every call,
+    /// so the page reflects moves and deletions made in Dokploy. A failed
+    /// call is reported in the answer rather than as an error, so the
+    /// confirmed placement still shows.
+    pub async fn placement(
+        &self,
+        current: &CurrentSession,
+        ctx: RequestContext<'_>,
+    ) -> Result<PlacementOverview, DokployServiceError> {
+        self.require_admin(current, "dokploy.view", ctx).await?;
+        let stored = self
+            .db
+            .find_dokploy_connection()
+            .await?
+            .ok_or(DokployServiceError::NotConnected)?;
+        let confirmed = self.confirmed_placement().await?;
+        let lookup = match self.read_inventory(&stored).await {
+            Ok(inventory) => {
+                let matches = self
+                    .public_host
+                    .as_deref()
+                    .map(|host| inventory.services_serving(host))
+                    .unwrap_or_default();
+                let status = confirmed.as_ref().map(|confirmed| {
+                    PlacementStatus::check(
+                        &confirmed.placement,
+                        &inventory,
+                        self.public_host.as_deref(),
+                    )
+                });
+                let truncated = inventory.services.len() > MAX_LISTED_SERVICES;
+                let mut services = inventory.services;
+                services.truncate(MAX_LISTED_SERVICES);
+                PlacementLookup::Found {
+                    matches,
+                    services,
+                    truncated,
+                    status,
+                }
+            }
+            Err(err) => PlacementLookup::Failed(err.to_string()),
+        };
+        Ok(PlacementOverview {
+            public_host: self.public_host.clone(),
+            confirmed,
+            lookup,
+        })
+    }
+
+    /// Confirms `service` as the dashboard's own Dokploy service. Dokploy
+    /// is asked again, and the service is stored with the project and
+    /// environment it reports, only if the stored key can see it. Any
+    /// service the key can see may be confirmed, not only one whose domain
+    /// matches, because the dashboard may be reached through another proxy.
+    pub async fn confirm_placement(
+        &self,
+        current: &CurrentSession,
+        kind: &str,
+        id: &str,
+        ctx: RequestContext<'_>,
+    ) -> Result<PlacementOverview, DokployServiceError> {
+        let action = "dokploy.placement_confirm";
+        self.require_admin(current, action, ctx).await?;
+        // A malformed reference cannot name a service Dokploy showed.
+        let service = DokployServiceKind::parse(kind)
+            .zip(DokployId::parse(id).ok())
+            .map(|(kind, id)| DokployServiceRef { kind, id })
+            .ok_or(DokployServiceError::ServiceNotVisible)?;
+        let stored = self
+            .db
+            .find_dokploy_connection()
+            .await?
+            .ok_or(DokployServiceError::NotConnected)?;
+        let inventory = match self.read_inventory(&stored).await {
+            Ok(inventory) => inventory,
+            Err(err) => {
+                self.audit_best_effort(&service_event(
+                    current,
+                    action,
+                    Some(&service),
+                    AuditOutcome::Failure,
+                    ctx,
+                ))
+                .await;
+                return Err(err);
+            }
+        };
+        let Some(info) = inventory.service(&service) else {
+            self.audit_best_effort(&service_event(
+                current,
+                action,
+                Some(&service),
+                AuditOutcome::Failure,
+                ctx,
+            ))
+            .await;
+            return Err(DokployServiceError::ServiceNotVisible);
+        };
+        let placement = DokployPlacement::from(info);
+        let stored_placement = self
+            .db
+            .confirm_dokploy_placement(
+                &NewDokployPlacement {
+                    url: &stored.url,
+                    service_kind: placement.service.kind.as_str(),
+                    service_id: placement.service.id.as_str(),
+                    service_name: &placement.service_name,
+                    project_id: placement.project_id.as_str(),
+                    project_name: &placement.project_name,
+                    environment_id: placement.environment_id.as_str(),
+                    environment_name: &placement.environment_name,
+                    confirmed_by: current.account.id,
+                },
+                &service_event(current, action, Some(&service), AuditOutcome::Success, ctx),
+            )
+            .await?;
+        if !stored_placement {
+            return Err(DokployServiceError::NotConnected);
+        }
+        tracing::info!(
+            service_kind = placement.service.kind.as_str(),
+            service_id = placement.service.id.as_str(),
+            "Dokploy placement confirmed"
+        );
+        self.placement(current, ctx).await
+    }
+
+    /// Forgets the confirmed placement. Nothing in Dokploy changes.
+    pub async fn clear_placement(
+        &self,
+        current: &CurrentSession,
+        ctx: RequestContext<'_>,
+    ) -> Result<(), DokployServiceError> {
+        let action = "dokploy.placement_clear";
+        self.require_admin(current, action, ctx).await?;
+        let Some(row) = self.db.find_dokploy_placement().await? else {
+            return Ok(());
+        };
+        // A row this server cannot read is still cleared.
+        let service = placement_from_row(&row)
+            .ok()
+            .map(|confirmed| confirmed.placement.service);
+        self.db
+            .clear_dokploy_placement(&service_event(
+                current,
+                action,
+                service.as_ref(),
+                AuditOutcome::Success,
+                ctx,
+            ))
+            .await?;
+        tracing::info!("Dokploy placement cleared");
+        Ok(())
+    }
+
+    /// The confirmed placement compared with what Dokploy reports, for the
+    /// startup report. No operator is involved, so nothing is audited.
+    /// `None` when Dokploy is not connected or no placement is confirmed.
+    pub async fn placement_status(
+        &self,
+    ) -> Result<Option<(DokployPlacement, PlacementStatus)>, DokployServiceError> {
+        let Some(stored) = self.db.find_dokploy_connection().await? else {
+            return Ok(None);
+        };
+        let Some(confirmed) = self.confirmed_placement().await? else {
+            return Ok(None);
+        };
+        let inventory = self.read_inventory(&stored).await?;
+        let status = PlacementStatus::check(
+            &confirmed.placement,
+            &inventory,
+            self.public_host.as_deref(),
+        );
+        Ok(Some((confirmed.placement, status)))
+    }
+
+    async fn confirmed_placement(&self) -> Result<Option<ConfirmedPlacement>, DokployServiceError> {
+        self.db
+            .find_dokploy_placement()
+            .await?
+            .as_ref()
+            .map(placement_from_row)
+            .transpose()
+            .map_err(DokployServiceError::from)
+    }
+
+    /// Reads what the stored key can see in Dokploy.
+    async fn read_inventory(
+        &self,
+        stored: &StoredDokployConnection,
+    ) -> Result<DokployInventory, DokployServiceError> {
+        let cipher = self
+            .cipher
+            .as_ref()
+            .ok_or(DokployServiceError::StorageUnavailable)?;
+        let url = stored_url(stored)?;
+        let key = cipher.open_dokploy_key(url.as_str(), &sealed(stored))?;
+        Ok(self.connector.inventory(&url, &key).await?)
+    }
+
     async fn current_overview(&self) -> Result<DokployOverview, DokployServiceError> {
         let connection = match self.db.find_dokploy_connection().await? {
             Some(stored) => Some(self.summary(&stored)?),
@@ -367,6 +603,50 @@ fn sealed(stored: &StoredDokployConnection) -> Sealed {
         key_id: stored.key.key_id.clone(),
         nonce: stored.key.nonce.clone(),
         ciphertext: stored.key.ciphertext.clone(),
+    }
+}
+
+fn placement_from_row(
+    row: &StoredDokployPlacement,
+) -> Result<ConfirmedPlacement, PersistenceError> {
+    let invalid = |column| PersistenceError::InvalidRow(column);
+    let id = |raw: &str, column| DokployId::parse(raw).map_err(|_| invalid(column));
+    Ok(ConfirmedPlacement {
+        placement: DokployPlacement {
+            service: DokployServiceRef {
+                kind: DokployServiceKind::parse(&row.service_kind)
+                    .ok_or(invalid("dokploy_placement.service_kind"))?,
+                id: id(&row.service_id, "dokploy_placement.service_id")?,
+            },
+            service_name: row.service_name.clone(),
+            project_id: id(&row.project_id, "dokploy_placement.project_id")?,
+            project_name: row.project_name.clone(),
+            environment_id: id(&row.environment_id, "dokploy_placement.environment_id")?,
+            environment_name: row.environment_name.clone(),
+        },
+        confirmed_at: row.confirmed_at,
+        confirmed_by: row.confirmed_by()?,
+    })
+}
+
+/// An audit event naming a Dokploy service by kind and ID, such as
+/// `compose:_IK3e1y1IwxNCLnlLGXEZ`. Both are checked Dokploy IDs, so the
+/// target holds nothing else.
+fn service_event<'a>(
+    current: &CurrentSession,
+    action: &'static str,
+    service: Option<&DokployServiceRef>,
+    outcome: AuditOutcome,
+    ctx: RequestContext<'a>,
+) -> AuditEvent<'a> {
+    AuditEvent {
+        actor_account_id: Some(current.account.id),
+        action,
+        target_type: Some("dokploy_service"),
+        target_id: service
+            .map(|service| format!("{}:{}", service.kind.as_str(), service.id.as_str())),
+        outcome,
+        request_id: ctx.request_id,
     }
 }
 

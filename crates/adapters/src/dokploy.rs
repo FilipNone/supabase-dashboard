@@ -16,10 +16,15 @@ use reqwest::{
     redirect,
 };
 use secrecy::{ExposeSecret, SecretString};
-use supabase_dashboard_application::dokploy::{ConnectFuture, DokployConnector};
+use serde::Deserialize;
+use supabase_dashboard_application::dokploy::{ConnectFuture, DokployConnector, InventoryFuture};
 use supabase_dashboard_domain::{
     connection::UnreachableReason,
     dokploy::{DokployUrl, DokployVersion},
+    dokploy_placement::{
+        DokployDomainInfo, DokployId, DokployInventory, DokployServiceInfo, DokployServiceKind,
+        DokployServiceRef, bounded_name, normalize_host,
+    },
 };
 
 /// Defined with the domain types so the application layer can name it;
@@ -34,6 +39,14 @@ use crate::{
 
 /// Largest body read from a small Dokploy answer, such as the version.
 const MAX_SMALL_BODY_BYTES: usize = 4 * 1024;
+
+/// Largest body read from a list, such as every service the key can see.
+/// A service takes about 400 bytes in `overview.services`, so this covers
+/// several thousand.
+const MAX_LIST_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+/// Most entries read from one list; the rest are ignored.
+const MAX_LIST_ENTRIES: usize = 10_000;
 
 #[derive(Debug, Clone)]
 pub struct DokploySettings {
@@ -115,10 +128,43 @@ impl DokployClient {
         url: &DokployUrl,
         key: &SecretString,
     ) -> Result<DokployVersion, DokployError> {
-        let body = self.get(url, "settings.getDokployVersion", key).await?;
+        let body = self
+            .get(url, "settings.getDokployVersion", key, MAX_SMALL_BODY_BYTES)
+            .await?;
         let raw: String =
             serde_json::from_slice(&body).map_err(|_| DokployError::InvalidResponse)?;
         DokployVersion::parse(&raw).ok_or(DokployError::InvalidResponse)
+    }
+
+    /// The application and compose services the key can see
+    /// (`overview.services`) and the domains routed to them
+    /// (`overview.domains`). Both are limited by Dokploy to the key's
+    /// organization and to the services its member may access, and need
+    /// the member's `service` and `domain` read permissions. Entries of
+    /// other kinds, or with IDs that are not Dokploy IDs, are left out.
+    pub async fn inventory(
+        &self,
+        url: &DokployUrl,
+        key: &SecretString,
+    ) -> Result<DokployInventory, DokployError> {
+        let services = self
+            .get(url, "overview.services", key, MAX_LIST_BODY_BYTES)
+            .await?;
+        let services: Vec<RawService> = parse_list(&services)?;
+        let domains = self
+            .get(url, "overview.domains", key, MAX_LIST_BODY_BYTES)
+            .await?;
+        let domains: Vec<RawDomain> = parse_list(&domains)?;
+        Ok(DokployInventory {
+            services: services
+                .into_iter()
+                .filter_map(RawService::into_info)
+                .collect(),
+            domains: domains
+                .into_iter()
+                .filter_map(RawDomain::into_info)
+                .collect(),
+        })
     }
 
     async fn get(
@@ -126,6 +172,7 @@ impl DokployClient {
         base: &DokployUrl,
         call: &str,
         key: &SecretString,
+        max_body_bytes: usize,
     ) -> Result<Vec<u8>, DokployError> {
         let unreachable = DokployError::Unreachable;
         let url = reqwest::Url::parse(&base.api(call))
@@ -148,7 +195,7 @@ impl DokployClient {
             .await
             .map_err(|err| unreachable(classify(&err)))?;
         match response.status() {
-            status if status.is_success() => read_bounded(response).await,
+            status if status.is_success() => read_bounded(response, max_body_bytes).await,
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(DokployError::KeyRejected),
             status => Err(DokployError::Http(status.as_u16())),
         }
@@ -163,14 +210,92 @@ impl DokployConnector for DokployClient {
                 .map(|connection| connection.version)
         })
     }
+
+    fn inventory<'a>(&'a self, url: &'a DokployUrl, key: &'a SecretString) -> InventoryFuture<'a> {
+        Box::pin(DokployClient::inventory(self, url, key))
+    }
 }
 
-async fn read_bounded(mut response: Response) -> Result<Vec<u8>, DokployError> {
+/// A list Dokploy answered with, each entry read on its own so one entry
+/// of an unexpected shape is skipped rather than failing the whole list.
+fn parse_list<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<Vec<T>, DokployError> {
+    let entries: Vec<serde_json::Value> =
+        serde_json::from_slice(body).map_err(|_| DokployError::InvalidResponse)?;
+    Ok(entries
+        .into_iter()
+        .take(MAX_LIST_ENTRIES)
+        .filter_map(|entry| serde_json::from_value(entry).ok())
+        .collect())
+}
+
+/// One entry of `overview.services`, as of Dokploy v0.31.1. Unknown fields
+/// are ignored.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawService {
+    id: String,
+    #[serde(rename = "type")]
+    kind: String,
+    name: String,
+    project_id: String,
+    project_name: String,
+    environment_id: String,
+    environment_name: String,
+    server_name: Option<String>,
+}
+
+impl RawService {
+    fn into_info(self) -> Option<DokployServiceInfo> {
+        Some(DokployServiceInfo {
+            service: DokployServiceRef {
+                kind: DokployServiceKind::parse(&self.kind)?,
+                id: DokployId::parse(&self.id).ok()?,
+            },
+            name: bounded_name(&self.name),
+            project_id: DokployId::parse(&self.project_id).ok()?,
+            project_name: bounded_name(&self.project_name),
+            environment_id: DokployId::parse(&self.environment_id).ok()?,
+            environment_name: bounded_name(&self.environment_name),
+            server_name: self.server_name.as_deref().map(bounded_name),
+        })
+    }
+}
+
+/// One entry of `overview.domains`, as of Dokploy v0.31.1.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawDomain {
+    host: String,
+    enabled: bool,
+    domain_type: Option<String>,
+    service_owner_id: String,
+    service_owner_type: String,
+}
+
+impl RawDomain {
+    fn into_info(self) -> Option<DokployDomainInfo> {
+        let host = normalize_host(&self.host);
+        if host.is_empty() || host.len() > 253 {
+            return None;
+        }
+        Some(DokployDomainInfo {
+            host,
+            service: DokployServiceRef {
+                kind: DokployServiceKind::parse(&self.service_owner_type)?,
+                id: DokployId::parse(&self.service_owner_id).ok()?,
+            },
+            enabled: self.enabled,
+            preview: self.domain_type.as_deref() == Some("preview"),
+        })
+    }
+}
+
+async fn read_bounded(mut response: Response, max_bytes: usize) -> Result<Vec<u8>, DokployError> {
     let mut body = Vec::new();
     loop {
         match response.chunk().await {
             Ok(Some(chunk)) => {
-                if body.len().saturating_add(chunk.len()) > MAX_SMALL_BODY_BYTES {
+                if body.len().saturating_add(chunk.len()) > max_bytes {
                     return Err(DokployError::InvalidResponse);
                 }
                 body.extend_from_slice(&chunk);

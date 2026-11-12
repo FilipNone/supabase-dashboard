@@ -264,3 +264,128 @@ impl Database {
         Ok(updated == 1)
     }
 }
+
+/// The confirmed Dokploy placement as stored. The application parses the
+/// IDs and kind again.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct StoredDokployPlacement {
+    pub service_kind: String,
+    pub service_id: String,
+    pub service_name: String,
+    pub project_id: String,
+    pub project_name: String,
+    pub environment_id: String,
+    pub environment_name: String,
+    pub confirmed_at: OffsetDateTime,
+    #[sqlx(rename = "confirmed_by_name")]
+    pub confirmed_by_raw: Option<String>,
+}
+
+impl StoredDokployPlacement {
+    /// Who confirmed it, `None` once that account has been deleted.
+    pub fn confirmed_by(&self) -> Result<Option<DisplayName>, PersistenceError> {
+        display_name(self.confirmed_by_raw.clone())
+    }
+}
+
+pub struct NewDokployPlacement<'a> {
+    /// The connection the placement was read through. Nothing is written
+    /// when the stored connection points elsewhere by now.
+    pub url: &'a str,
+    pub service_kind: &'a str,
+    pub service_id: &'a str,
+    pub service_name: &'a str,
+    pub project_id: &'a str,
+    pub project_name: &'a str,
+    pub environment_id: &'a str,
+    pub environment_name: &'a str,
+    pub confirmed_by: Uuid,
+}
+
+impl Database {
+    /// The confirmed placement, if there is one.
+    pub async fn find_dokploy_placement(
+        &self,
+    ) -> Result<Option<StoredDokployPlacement>, PersistenceError> {
+        sqlx::query_as(
+            "SELECT p.service_kind, p.service_id, p.service_name, p.project_id, \
+                    p.project_name, p.environment_id, p.environment_name, p.confirmed_at, \
+                    a.display_name AS confirmed_by_name \
+             FROM dokploy_placement p \
+             LEFT JOIN accounts a ON a.id = p.confirmed_by",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(query_err)
+    }
+
+    /// Stores `placement` in place of any confirmed before, and records
+    /// `audit`. Returns `false`, writing nothing, when no connection to
+    /// `placement.url` is stored.
+    pub async fn confirm_dokploy_placement(
+        &self,
+        placement: &NewDokployPlacement<'_>,
+        audit: &AuditEvent<'_>,
+    ) -> Result<bool, PersistenceError> {
+        let mut tx = self.pool.begin().await.map_err(query_err)?;
+        // Locks the connection row, so a concurrent removal waits and then
+        // removes this placement with it.
+        let connected: Option<bool> = sqlx::query_scalar(
+            "SELECT singleton FROM dokploy_connection WHERE url = $1 FOR UPDATE",
+        )
+        .bind(placement.url)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(query_err)?;
+        if connected.is_none() {
+            return Ok(false);
+        }
+        sqlx::query(
+            "INSERT INTO dokploy_placement \
+                 (service_kind, service_id, service_name, project_id, project_name, \
+                  environment_id, environment_name, confirmed_by) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+             ON CONFLICT (singleton) DO UPDATE SET \
+                 service_kind = EXCLUDED.service_kind, service_id = EXCLUDED.service_id, \
+                 service_name = EXCLUDED.service_name, project_id = EXCLUDED.project_id, \
+                 project_name = EXCLUDED.project_name, \
+                 environment_id = EXCLUDED.environment_id, \
+                 environment_name = EXCLUDED.environment_name, \
+                 confirmed_by = EXCLUDED.confirmed_by, confirmed_at = now()",
+        )
+        .bind(placement.service_kind)
+        .bind(placement.service_id)
+        .bind(placement.service_name)
+        .bind(placement.project_id)
+        .bind(placement.project_name)
+        .bind(placement.environment_id)
+        .bind(placement.environment_name)
+        .bind(placement.confirmed_by)
+        .execute(&mut *tx)
+        .await
+        .map_err(query_err)?;
+        insert_audit_event(&mut *tx, audit).await?;
+        tx.commit().await.map_err(query_err)?;
+        Ok(true)
+    }
+
+    /// Deletes the confirmed placement and records `audit`. Returns
+    /// `false`, writing nothing, when none was confirmed.
+    pub async fn clear_dokploy_placement(
+        &self,
+        audit: &AuditEvent<'_>,
+    ) -> Result<bool, PersistenceError> {
+        let mut tx = self.pool.begin().await.map_err(query_err)?;
+        let removed = sqlx::query("DELETE FROM dokploy_placement")
+            .execute(&mut *tx)
+            .await
+            .map_err(query_err)?
+            .rows_affected();
+        if removed == 0 {
+            return Ok(false);
+        }
+        insert_audit_event(&mut *tx, audit).await?;
+        tx.commit().await.map_err(query_err)?;
+        Ok(true)
+    }
+}

@@ -411,11 +411,11 @@ async fn run() -> Result<(), StartupError> {
     ));
     tokio::spawn(prune_studio_access(Arc::clone(&studio_access)));
 
-    let dokploy = Arc::new(DokployService::new(
-        db.clone(),
-        cipher.clone(),
-        dokploy_client,
-    ));
+    let dokploy = Arc::new(
+        DokployService::new(db.clone(), cipher.clone(), dokploy_client)
+            .with_public_host(config.public_url.as_ref().and_then(url::Url::host_str)),
+    );
+    tokio::spawn(report_dokploy_placement(Arc::clone(&dokploy)));
     let connections = Arc::new(ConnectionService::new(db.clone(), cipher, probe));
     match config.health_check_interval {
         Some(interval) => {
@@ -488,6 +488,35 @@ async fn prune_sessions(auth: Arc<AuthService>) {
             Ok(count) => tracing::info!(count, "pruned expired sessions"),
             Err(err) => tracing::warn!(error = %err, "could not prune sessions"),
         }
+    }
+}
+
+/// Reports at startup whether the dashboard's confirmed Dokploy service is
+/// still where it was confirmed. Runs once, in the background, so an
+/// unreachable Dokploy never delays startup; the administrator page asks
+/// Dokploy again whenever it is opened.
+async fn report_dokploy_placement(dokploy: Arc<DokployService>) {
+    use supabase_dashboard_domain::dokploy_placement::PlacementStatus;
+
+    match dokploy.placement_status().await {
+        Ok(None) => {}
+        Ok(Some((placement, PlacementStatus::Current))) => tracing::info!(
+            service = %placement.service_name,
+            project = %placement.project_name,
+            environment = %placement.environment_name,
+            "the dashboard's Dokploy service is where it was confirmed"
+        ),
+        Ok(Some((placement, status))) => tracing::warn!(
+            service = %placement.service_name,
+            project = %placement.project_name,
+            environment = %placement.environment_name,
+            "{} Check the Dokploy section of the administrator page.",
+            status.message()
+        ),
+        Err(err) => tracing::warn!(
+            error = %err,
+            "could not check the dashboard's Dokploy service at startup"
+        ),
     }
 }
 

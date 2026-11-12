@@ -194,6 +194,7 @@ mod server {
                 DokployServiceError::StorageUnavailable
                 | DokployServiceError::AlreadyConnected
                 | DokployServiceError::NotConnected
+                | DokployServiceError::ServiceNotVisible
                 | DokployServiceError::Url(_)
                 | DokployServiceError::Key(_)
                 | DokployServiceError::Dokploy(_) => Self::Rejected(sentence(&err.to_string())),
