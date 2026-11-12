@@ -412,9 +412,12 @@ async fn run() -> Result<(), StartupError> {
         extra_roots: extra_roots.clone(),
         ..GatewaySettings::default()
     })?;
+    // The deployment's Dokploy URL is enrolled, so it may be on loopback;
+    // an administrator's is held to the same rules as project checks.
     let dokploy_client = DokployClient::shared(DokploySettings {
         policy,
         extra_roots: extra_roots.clone(),
+        enrolled_url: config.dokploy.as_ref().map(|dokploy| dokploy.url.clone()),
         ..DokploySettings::default()
     })?;
     let studio = match (&config.studio_hosts, &config.public_url) {

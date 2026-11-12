@@ -55,6 +55,12 @@ pub struct DokploySettings {
     pub request_timeout: Duration,
     /// Authorities trusted in addition to the bundled roots.
     pub extra_roots: ExtraRoots,
+    /// The Dokploy URL the deployment supplies. Calls to exactly this URL
+    /// may also reach loopback addresses, so a Dokploy on the same host
+    /// works without opening loopback to project checks. Every other
+    /// address rule still applies, and calls to any other URL use
+    /// `policy`.
+    pub enrolled_url: Option<DokployUrl>,
 }
 
 impl Default for DokploySettings {
@@ -64,6 +70,7 @@ impl Default for DokploySettings {
             connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(15),
             extra_roots: ExtraRoots::default(),
+            enrolled_url: None,
         }
     }
 }
@@ -79,26 +86,52 @@ pub struct DokployConnection {
 pub struct DokployClient {
     clients: Arc<Clients>,
     policy: TargetPolicy,
+    enrolled: Option<Arc<Enrolled>>,
+}
+
+/// The clients for the enrolled URL, whose resolver allows loopback.
+struct Enrolled {
+    url: DokployUrl,
+    clients: Clients,
+    policy: TargetPolicy,
 }
 
 impl DokployClient {
     pub fn new(settings: DokploySettings) -> Result<Self, GatewayError> {
-        let policy = settings.policy;
-        let clients = Clients::new(settings.extra_roots, move |config| {
+        let enrolled = match &settings.enrolled_url {
+            Some(url) => {
+                let policy = TargetPolicy {
+                    allow_loopback: true,
+                };
+                Some(Arc::new(Enrolled {
+                    url: url.clone(),
+                    clients: Self::clients(&settings, policy)?,
+                    policy,
+                }))
+            }
+            None => None,
+        };
+        Ok(Self {
+            clients: Arc::new(Self::clients(&settings, settings.policy)?),
+            policy: settings.policy,
+            enrolled,
+        })
+    }
+
+    fn clients(settings: &DokploySettings, policy: TargetPolicy) -> Result<Clients, GatewayError> {
+        let connect_timeout = settings.connect_timeout;
+        let request_timeout = settings.request_timeout;
+        Clients::new(settings.extra_roots.clone(), move |config| {
             Client::builder()
                 .tls_backend_preconfigured(config)
                 .dns_resolver(PolicyResolver { policy })
                 .redirect(redirect::Policy::none())
                 .no_proxy()
-                .connect_timeout(settings.connect_timeout)
-                .timeout(settings.request_timeout)
+                .connect_timeout(connect_timeout)
+                .timeout(request_timeout)
                 .pool_idle_timeout(Duration::from_secs(30))
                 .user_agent(concat!("supabase-dashboard/", env!("CARGO_PKG_VERSION")))
                 .build()
-        })?;
-        Ok(Self {
-            clients: Arc::new(clients),
-            policy,
         })
     }
 
@@ -177,14 +210,18 @@ impl DokployClient {
         let unreachable = DokployError::Unreachable;
         let url = reqwest::Url::parse(&base.api(call))
             .map_err(|_| unreachable(UnreachableReason::InvalidResponse))?;
-        if refused_literal(&url, self.policy) {
+        // The enrolled URL's clients only ever see requests built from it.
+        let (clients, policy) = match &self.enrolled {
+            Some(enrolled) if enrolled.url == *base => (&enrolled.clients, enrolled.policy),
+            _ => (&*self.clients, self.policy),
+        };
+        if refused_literal(&url, policy) {
             return Err(unreachable(UnreachableReason::DestinationNotAllowed));
         }
         let mut key_header =
             HeaderValue::from_str(key.expose_secret()).map_err(|_| DokployError::KeyRejected)?;
         key_header.set_sensitive(true);
-        let client = self
-            .clients
+        let client = clients
             .get(None)
             .map_err(|_| unreachable(UnreachableReason::Tls))?;
         let response = client

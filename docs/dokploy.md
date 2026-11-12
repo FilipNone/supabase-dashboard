@@ -90,7 +90,7 @@ When Dokploy cannot be reached, or answers with a server error, the server tries
 
 While the deployment supplies the connection, the page shows it as managed by the server configuration and offers no way to replace or remove it, and the server refuses both. Changes the server makes this way are audited as `dokploy.connect` and `dokploy.key_replace` without an actor, and so are a refused key and an unsupported version; an unreachable Dokploy is not audited, since it is retried. When the deployment stops supplying a connection, the stored one stays and administrators can replace or remove it again.
 
-A Dokploy on the same host still needs `SUPABASE_DASHBOARD_ALLOW_LOOPBACK_TARGETS=true`, as on the page.
+The URL the deployment supplies is an enrolled destination: calls to exactly that URL may reach a loopback address, such as a Dokploy published on `127.0.0.1` of the same host, without `SUPABASE_DASHBOARD_ALLOW_LOOPBACK_TARGETS`. The other address rules still apply to it, and project checks and any URL an administrator enters keep the general policy.
 
 ### Where the dashboard runs
 
@@ -122,7 +122,7 @@ The dashboard cannot show when the key in use expires. In v0.31.1, `user.get` re
 
 ### Destinations
 
-The Dokploy URL is the only destination the connection adds, and it is enrolled by an administrator entering it. Nothing in Dokploy's answers adds another: the client builds every request URL from the stored URL, does not follow redirects, and checks each resolved address against the same address policy as project checks. Private addresses are allowed, such as Dokploy's address on a shared Docker network. Loopback is refused unless `SUPABASE_DASHBOARD_ALLOW_LOOPBACK_TARGETS=true`, which applies to project checks as well. The extra certificate authorities in `SUPABASE_DASHBOARD_EXTRA_CA_FILE` are trusted for Dokploy too.
+The Dokploy URL is the only destination the connection adds, and it is enrolled by an administrator entering it. Nothing in Dokploy's answers adds another: the client builds every request URL from the stored URL, does not follow redirects, and checks each resolved address against the same address policy as project checks. Private addresses are allowed, such as Dokploy's address on a shared Docker network. Loopback is refused unless `SUPABASE_DASHBOARD_ALLOW_LOOPBACK_TARGETS=true`, which applies to project checks as well, or the URL is the one the deployment supplies (see "Supplied by the deployment"). The extra certificate authorities in `SUPABASE_DASHBOARD_EXTRA_CA_FILE` are trusted for Dokploy too.
 
 ## Test fixture
 

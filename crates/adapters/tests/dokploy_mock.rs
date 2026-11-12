@@ -162,6 +162,45 @@ async fn refused_destinations_are_not_contacted() {
 }
 
 #[tokio::test]
+async fn only_the_enrolled_url_may_be_on_loopback() {
+    let url = serve(dokploy(r#""v0.31.1""#)).await;
+    let other = serve(dokploy(r#""v0.31.1""#)).await;
+    let enrolled = DokployClient::new(DokploySettings {
+        enrolled_url: Some(url.clone()),
+        ..DokploySettings::default()
+    })
+    .unwrap();
+    assert_eq!(
+        enrolled
+            .connect(&url, &key(GOOD_KEY))
+            .await
+            .unwrap()
+            .version,
+        TESTED_DOKPLOY_VERSION
+    );
+    // Another port on the same loopback address is not enrolled.
+    assert_eq!(
+        enrolled.connect(&other, &key(GOOD_KEY)).await.unwrap_err(),
+        DokployError::Unreachable(UnreachableReason::DestinationNotAllowed)
+    );
+    // Enrolling loopback does not open metadata addresses.
+    let metadata = DokployUrl::parse("http://169.254.169.254").unwrap();
+    let enrolled_metadata = DokployClient::new(DokploySettings {
+        enrolled_url: Some(metadata.clone()),
+        connect_timeout: Duration::from_secs(1),
+        ..DokploySettings::default()
+    })
+    .unwrap();
+    assert_eq!(
+        enrolled_metadata
+            .connect(&metadata, &key(GOOD_KEY))
+            .await
+            .unwrap_err(),
+        DokployError::Unreachable(UnreachableReason::DestinationNotAllowed)
+    );
+}
+
+#[tokio::test]
 async fn a_closed_port_is_unreachable() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
