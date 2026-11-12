@@ -1521,6 +1521,23 @@ mod tests {
         let (parts, _) = send(&router, forged).await;
         assert_eq!(parts.status, StatusCode::FORBIDDEN);
 
+        // Studio hosts have their own body limit (4096 in these tests): a
+        // body over the dashboard's 1024 reaches Studio, one over the
+        // Studio limit does not.
+        let upload = |len: usize| {
+            Request::post("/api/platform/storage/default/upload")
+                .header(header::HOST, &main_host)
+                .header(header::COOKIE, &studio_cookie)
+                .header("sec-fetch-site", "same-origin")
+                .header(header::CONTENT_LENGTH, len.to_string())
+                .body(Body::from(vec![b'x'; len]))
+                .unwrap()
+        };
+        let (parts, body) = send(&router, upload(2048)).await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        let (parts, _) = send(&router, upload(8192)).await;
+        assert_eq!(parts.status, StatusCode::PAYLOAD_TOO_LARGE);
+
         // Without a cookie, page loads go back to the launcher with the path
         // and API calls get 401.
         let (parts, _) = send(
