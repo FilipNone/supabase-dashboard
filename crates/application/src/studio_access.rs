@@ -85,13 +85,15 @@ impl StudioAccessService {
 
     /// One page of a project's entries, newest first, for its owners and
     /// admins: the newest ones, or those older than the entry with id
-    /// `before`. With `member`, only that account's entries.
+    /// `before`. With `member`, only that account's entries. A member
+    /// without access is refused and audited as `studio_access.read`.
     pub async fn read(
         &self,
         current: &CurrentSession,
         project_id: Uuid,
         member: Option<Uuid>,
         before: Option<i64>,
+        ctx: RequestContext<'_>,
     ) -> Result<StudioAccessLog, StudioAccessError> {
         let access = self
             .db
@@ -99,6 +101,17 @@ impl StudioAccessService {
             .await?
             .ok_or(StudioAccessError::NotFound)?;
         if !access.role.allows(Permission::AuditRead) {
+            let denied = AuditEvent {
+                actor_account_id: Some(current.account.id),
+                action: "studio_access.read",
+                target_type: Some("project"),
+                target_id: Some(project_id.to_string()),
+                outcome: AuditOutcome::Denied,
+                request_id: ctx.request_id,
+            };
+            if let Err(err) = self.db.record_audit_event(&denied).await {
+                tracing::error!(error = %err, "could not record audit event");
+            }
             return Err(StudioAccessError::Forbidden);
         }
         let Some(retention_days) = self.retention_days else {

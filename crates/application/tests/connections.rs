@@ -19,7 +19,7 @@ use supabase_dashboard_application::{
 };
 use supabase_dashboard_domain::{
     account::{DisplayName, Email},
-    authz::OrgRole,
+    authz::{OrgRole, Permission},
     connection::{
         ApiKeyError, CredentialKind, CredentialState, HEALTH_HISTORY_MAX_ENTRIES,
         HEALTH_HISTORY_PAGE, HealthHour, SavedCredential, ServiceCheck, ServiceStatus, SkipReason,
@@ -156,6 +156,19 @@ async fn audit_count(db: &Database, action: &str, outcome: &str) -> i64 {
         .unwrap()
 }
 
+/// Refusals recorded for `actor` doing `action`.
+async fn denied_by(db: &Database, action: &str, actor: &CurrentSession) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events \
+         WHERE action = $1 AND outcome = 'denied' AND actor_account_id = $2",
+    )
+    .bind(action)
+    .bind(actor.account.id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap()
+}
+
 /// An organization with an owner and one registered project.
 async fn project(f: &Fixture, owner: &CurrentSession, org_name: &str) -> (Uuid, Uuid) {
     let org = f.orgs.create(owner, org_name, ctx()).await.unwrap().id;
@@ -271,6 +284,84 @@ async fn only_owners_and_admins_change_keys_and_values_stay_encrypted() {
             .await,
         Err(ConnectionError::NotStored)
     ));
+}
+
+/// Removing a key needs `Permission::ProjectCredentialsReplace`: owners and
+/// admins only. Refusals are audited and leave the key stored.
+#[tokio::test]
+async fn removing_keys_follows_the_role_matrix() {
+    let Some(scratch) = ScratchDb::create("conn_remove_matrix").await else {
+        return;
+    };
+    let f = setup(&scratch, Some(KEY_A)).await;
+    let owner = account(&f.db, "Owner").await;
+    let admin = account(&f.db, "Admin").await;
+    let developer = account(&f.db, "Developer").await;
+    let viewer = account(&f.db, "Viewer").await;
+    let outsider = account(&f.db, "Outsider").await;
+    let (org, id) = project(&f, &owner, "Acme").await;
+    add_member(&f.db, org, &admin, OrgRole::Admin).await;
+    add_member(&f.db, org, &developer, OrgRole::Developer).await;
+    add_member(&f.db, org, &viewer, OrgRole::Viewer).await;
+    project(&f, &outsider, "Globex").await;
+    let anon = SecretString::from(ANON);
+
+    let cases = [
+        (&owner, Some(OrgRole::Owner), true),
+        (&admin, Some(OrgRole::Admin), true),
+        (&developer, Some(OrgRole::Developer), false),
+        (&viewer, Some(OrgRole::Viewer), false),
+        (&outsider, None, false),
+    ];
+    for (actor, role, allowed) in cases {
+        let who = actor.account.display_name.as_str();
+        if let Some(role) = role {
+            assert_eq!(
+                role.allows(Permission::ProjectCredentialsReplace),
+                allowed,
+                "{who}"
+            );
+        }
+        f.connections
+            .replace_credential(&owner, id, CredentialKind::AnonKey, &anon, ctx())
+            .await
+            .unwrap();
+        let result = f
+            .connections
+            .remove_credential(actor, id, CredentialKind::AnonKey, ctx())
+            .await;
+        let overview = f.connections.credentials(&owner, id).await.unwrap();
+        let stored = state(&overview, CredentialKind::AnonKey);
+        match role {
+            Some(_) if allowed => {
+                assert!(result.is_ok(), "{who}: {result:?}");
+                assert_eq!(stored, &CredentialState::NotSet, "{who}");
+            }
+            Some(_) => {
+                assert!(
+                    matches!(result, Err(ConnectionError::Forbidden)),
+                    "{who}: {result:?}"
+                );
+                assert!(matches!(stored, CredentialState::Set { .. }), "{who}");
+                assert_eq!(
+                    denied_by(&f.db, "project.credential.remove", actor).await,
+                    1,
+                    "{who}"
+                );
+            }
+            None => {
+                assert!(
+                    matches!(result, Err(ConnectionError::NotFound)),
+                    "{who}: {result:?}"
+                );
+                assert!(matches!(stored, CredentialState::Set { .. }), "{who}");
+            }
+        }
+    }
+    assert_eq!(
+        audit_count(&f.db, "project.credential.remove", "success").await,
+        2
+    );
 }
 
 #[tokio::test]

@@ -305,8 +305,9 @@ pub async fn get_studio_access_log(
     before: Option<i64>,
 ) -> Result<StudioAccessLog, AppError> {
     let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
     Ok(org_context::studio_access()?
-        .read(&session, id, member, before)
+        .read(&session, id, member, before, audit.get())
         .await?)
 }
 

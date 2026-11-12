@@ -149,7 +149,19 @@ impl ProjectService {
                 role,
             }),
             CreateProjectOutcome::OrganizationNotFound => Err(ProjectError::NotFound),
-            CreateProjectOutcome::LimitReached => Err(ProjectError::LimitReached),
+            CreateProjectOutcome::LimitReached => {
+                let event = event(
+                    current,
+                    action,
+                    ("organization", organization_id.to_string()),
+                    AuditOutcome::Failure,
+                    ctx,
+                );
+                if let Err(err) = self.db.record_audit_event(&event).await {
+                    tracing::error!(error = %err, action, "could not record audit event");
+                }
+                Err(ProjectError::LimitReached)
+            }
         }
     }
 

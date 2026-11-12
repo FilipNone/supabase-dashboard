@@ -10,7 +10,7 @@ use supabase_dashboard_application::{
 };
 use supabase_dashboard_domain::{
     account::{DisplayName, Email},
-    authz::OrgRole,
+    authz::{OrgRole, Permission},
     project::{MAX_PROJECTS_PER_ORGANIZATION, ProjectInputError},
 };
 use supabase_dashboard_persistence::{Database, accounts::AccountRecord};
@@ -97,6 +97,70 @@ async fn audit_count(db: &Database, action: &str, outcome: &str) -> i64 {
         .fetch_one(db.pool())
         .await
         .unwrap()
+}
+
+/// Refusals recorded for `actor` doing `action`.
+async fn denied_by(db: &Database, action: &str, actor: &CurrentSession) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events \
+         WHERE action = $1 AND outcome = 'denied' AND actor_account_id = $2",
+    )
+    .bind(action)
+    .bind(actor.account.id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap()
+}
+
+/// An organization with a member of each role, an operator who owns another
+/// organization, and one registered project.
+struct Matrix {
+    owner: CurrentSession,
+    admin: CurrentSession,
+    developer: CurrentSession,
+    viewer: CurrentSession,
+    outsider: CurrentSession,
+    project: Uuid,
+}
+
+impl Matrix {
+    async fn new(f: &Fixture) -> Self {
+        let owner = account(&f.db, "Owner").await;
+        let admin = account(&f.db, "Admin").await;
+        let developer = account(&f.db, "Developer").await;
+        let viewer = account(&f.db, "Viewer").await;
+        let outsider = account(&f.db, "Outsider").await;
+        let org = f.orgs.create(&owner, "Acme", ctx()).await.unwrap().id;
+        add_member(&f.db, org, &admin, OrgRole::Admin).await;
+        add_member(&f.db, org, &developer, OrgRole::Developer).await;
+        add_member(&f.db, org, &viewer, OrgRole::Viewer).await;
+        f.orgs.create(&outsider, "Globex", ctx()).await.unwrap();
+        let project = f
+            .projects
+            .register(&owner, org, registration("Prod"), ctx())
+            .await
+            .unwrap()
+            .id;
+        Self {
+            owner,
+            admin,
+            developer,
+            viewer,
+            outsider,
+            project,
+        }
+    }
+
+    /// Each operator with their role (`None` outside the organization).
+    fn cases(&self) -> [(&CurrentSession, Option<OrgRole>); 5] {
+        [
+            (&self.owner, Some(OrgRole::Owner)),
+            (&self.admin, Some(OrgRole::Admin)),
+            (&self.developer, Some(OrgRole::Developer)),
+            (&self.viewer, Some(OrgRole::Viewer)),
+            (&self.outsider, None),
+        ]
+    }
 }
 
 #[tokio::test]
@@ -335,6 +399,11 @@ async fn registration_validates_input_and_limits() {
         f.projects.list(&owner, org).await.unwrap().len(),
         MAX_PROJECTS_PER_ORGANIZATION
     );
+    assert_eq!(
+        audit_count(&f.db, "project.register", "failure").await,
+        1,
+        "a registration refused at the limit is recorded"
+    );
 
     f.db.close().await;
     scratch.drop().await;
@@ -426,6 +495,112 @@ async fn url_changes_are_checked_authorized_and_audited() {
             .as_str(),
         "http://10.0.0.5:8000"
     );
+    assert_eq!(audit_count(&f.db, "project.change_url", "success").await, 2);
+
+    f.db.close().await;
+    scratch.drop().await;
+}
+
+/// Renaming needs `Permission::ProjectUpdate`: owners and admins only.
+#[tokio::test]
+async fn renaming_follows_the_role_matrix() {
+    let Some(scratch) = ScratchDb::create("project_rename_matrix").await else {
+        return;
+    };
+    let f = setup(&scratch).await;
+    let m = Matrix::new(&f).await;
+    let expected = [true, true, false, false, false];
+
+    for ((actor, role), allowed) in m.cases().into_iter().zip(expected) {
+        let who = actor.account.display_name.as_str();
+        if let Some(role) = role {
+            assert_eq!(role.allows(Permission::ProjectUpdate), allowed, "{who}");
+        }
+        let before = f.projects.get(&m.owner, m.project).await.unwrap().name;
+        let wanted = format!("Renamed by {who}");
+        let result = f.projects.rename(actor, m.project, &wanted, ctx()).await;
+        let after = f.projects.get(&m.owner, m.project).await.unwrap().name;
+        match role {
+            Some(role) if allowed => {
+                let renamed = result.unwrap();
+                assert_eq!(renamed.name.as_str(), wanted, "{who}");
+                assert_eq!(renamed.role, role, "{who}");
+                assert_eq!(after.as_str(), wanted, "{who}");
+            }
+            Some(_) => {
+                assert!(
+                    matches!(result, Err(ProjectError::Forbidden)),
+                    "{who}: {result:?}"
+                );
+                assert_eq!(after, before, "{who}");
+                assert_eq!(denied_by(&f.db, "project.rename", actor).await, 1, "{who}");
+            }
+            None => {
+                assert!(
+                    matches!(result, Err(ProjectError::NotFound)),
+                    "{who}: {result:?}"
+                );
+                assert_eq!(after, before, "{who}");
+            }
+        }
+    }
+    assert_eq!(audit_count(&f.db, "project.rename", "success").await, 2);
+
+    f.db.close().await;
+    scratch.drop().await;
+}
+
+/// Changing the API URL needs `Permission::ProjectUpdate`: owners and
+/// admins only.
+#[tokio::test]
+async fn url_changes_follow_the_role_matrix() {
+    let Some(scratch) = ScratchDb::create("project_url_matrix").await else {
+        return;
+    };
+    let f = setup(&scratch).await;
+    let m = Matrix::new(&f).await;
+    let expected = [true, true, false, false, false];
+
+    for (n, ((actor, role), allowed)) in m.cases().into_iter().zip(expected).enumerate() {
+        let who = actor.account.display_name.as_str();
+        if let Some(role) = role {
+            assert_eq!(role.allows(Permission::ProjectUpdate), allowed, "{who}");
+        }
+        let before = f.projects.get(&m.owner, m.project).await.unwrap().api_url;
+        let wanted = format!("https://stack{n}.example.test");
+        let result = f
+            .projects
+            .change_url(actor, m.project, &wanted, false, ctx())
+            .await;
+        let after = f.projects.get(&m.owner, m.project).await.unwrap().api_url;
+        match role {
+            Some(role) if allowed => {
+                let changed = result.unwrap();
+                assert_eq!(changed.api_url.as_str(), wanted, "{who}");
+                assert_eq!(changed.role, role, "{who}");
+                assert_eq!(after.as_str(), wanted, "{who}");
+            }
+            Some(_) => {
+                assert!(
+                    matches!(result, Err(ProjectError::Forbidden)),
+                    "{who}: {result:?}"
+                );
+                assert_eq!(after, before, "{who}");
+                assert_eq!(
+                    denied_by(&f.db, "project.change_url", actor).await,
+                    1,
+                    "{who}"
+                );
+            }
+            None => {
+                assert!(
+                    matches!(result, Err(ProjectError::NotFound)),
+                    "{who}: {result:?}"
+                );
+                assert_eq!(after, before, "{who}");
+            }
+        }
+    }
     assert_eq!(audit_count(&f.db, "project.change_url", "success").await, 2);
 
     f.db.close().await;

@@ -139,7 +139,18 @@ impl OrganizationService {
                 name,
                 role: OrgRole::Owner,
             }),
-            CreateOrganizationOutcome::LimitReached => Err(OrganizationError::LimitReached),
+            CreateOrganizationOutcome::LimitReached => {
+                let target = ("account", current.account.id.to_string());
+                self.record(
+                    current,
+                    "organization.create",
+                    target,
+                    AuditOutcome::Failure,
+                    ctx,
+                )
+                .await;
+                Err(OrganizationError::LimitReached)
+            }
         }
     }
 
@@ -436,13 +447,13 @@ impl OrganizationService {
         code: &str,
         ctx: RequestContext<'_>,
     ) -> Result<Uuid, OrganizationError> {
-        let token = InvitationToken::parse(code).ok_or(OrganizationError::InvitationInvalid)?;
-        let invitation = self
-            .db
-            .find_open_invitation_by_token(token.hash())
-            .await?
-            .ok_or(OrganizationError::InvitationInvalid)?;
         let action = "organization.invitation_accept";
+        let Some(token) = InvitationToken::parse(code) else {
+            return Err(self.unknown_invitation(current, action, ctx).await);
+        };
+        let Some(invitation) = self.db.find_open_invitation_by_token(token.hash()).await? else {
+            return Err(self.unknown_invitation(current, action, ctx).await);
+        };
         let target = ("organization_invitation", invitation.id.to_string());
         let outcome = self
             .db
@@ -457,8 +468,15 @@ impl OrganizationService {
         match outcome {
             AcceptOutcome::Joined { organization_id }
             | AcceptOutcome::AlreadyMember { organization_id } => Ok(organization_id),
-            AcceptOutcome::Invalid => Err(OrganizationError::InvitationInvalid),
-            AcceptOutcome::LimitReached => Err(OrganizationError::LimitReached),
+            AcceptOutcome::Invalid => {
+                self.deny(current, action, target, ctx).await;
+                Err(OrganizationError::InvitationInvalid)
+            }
+            AcceptOutcome::LimitReached => {
+                self.record(current, action, target, AuditOutcome::Failure, ctx)
+                    .await;
+                Err(OrganizationError::LimitReached)
+            }
             AcceptOutcome::EmailMismatch => {
                 self.deny(current, action, target, ctx).await;
                 Err(OrganizationError::InvitationEmailMismatch)
@@ -512,7 +530,42 @@ impl OrganizationService {
         target: (&'static str, String),
         ctx: RequestContext<'_>,
     ) {
-        let event = event(current, action, target, AuditOutcome::Denied, ctx);
+        self.record(current, action, target, AuditOutcome::Denied, ctx)
+            .await;
+    }
+
+    /// Records a code that matches no open invitation. There is no
+    /// invitation to name, and the code is not kept.
+    async fn unknown_invitation(
+        &self,
+        current: &CurrentSession,
+        action: &'static str,
+        ctx: RequestContext<'_>,
+    ) -> OrganizationError {
+        let mut event = event(
+            current,
+            action,
+            ("organization_invitation", String::new()),
+            AuditOutcome::Denied,
+            ctx,
+        );
+        event.target_id = None;
+        if let Err(err) = self.db.record_audit_event(&event).await {
+            tracing::error!(error = %err, action, "could not record audit event");
+        }
+        OrganizationError::InvitationInvalid
+    }
+
+    /// Records a refusal. Best effort: a failed write is logged.
+    async fn record(
+        &self,
+        current: &CurrentSession,
+        action: &'static str,
+        target: (&'static str, String),
+        outcome: AuditOutcome,
+        ctx: RequestContext<'_>,
+    ) {
+        let event = event(current, action, target, outcome, ctx);
         if let Err(err) = self.db.record_audit_event(&event).await {
             tracing::error!(error = %err, action, "could not record audit event");
         }

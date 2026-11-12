@@ -10,7 +10,7 @@ use supabase_dashboard_application::{
 };
 use supabase_dashboard_domain::{
     account::{DisplayName, Email},
-    authz::{MembershipError, OrgRole},
+    authz::{MembershipError, OrgRole, Permission},
 };
 use supabase_dashboard_persistence::{Database, accounts::AccountRecord};
 use uuid::Uuid;
@@ -90,6 +90,32 @@ async fn audit_count(db: &Database, action: &str, outcome: &str) -> i64 {
         .fetch_one(db.pool())
         .await
         .unwrap()
+}
+
+/// Adds a member directly, standing in for an accepted invitation.
+async fn add_member(db: &Database, org: Uuid, who: &CurrentSession, role: OrgRole) {
+    sqlx::query(
+        "INSERT INTO organization_members (organization_id, account_id, role) VALUES ($1, $2, $3)",
+    )
+    .bind(org)
+    .bind(who.account.id)
+    .bind(role.as_str())
+    .execute(db.pool())
+    .await
+    .unwrap();
+}
+
+/// Refusals recorded for `actor` doing `action`.
+async fn denied_by(db: &Database, action: &str, actor: &CurrentSession) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events \
+         WHERE action = $1 AND outcome = 'denied' AND actor_account_id = $2",
+    )
+    .bind(action)
+    .bind(actor.account.id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap()
 }
 
 #[tokio::test]
@@ -299,6 +325,18 @@ async fn invitations_are_single_use_bound_to_email_and_expire() {
             Err(OrganizationError::InvitationInvalid)
         ));
     }
+    let unknown: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events WHERE action = 'organization.invitation_accept' \
+         AND outcome = 'denied' AND actor_account_id = $1 AND target_id IS NULL",
+    )
+    .bind(dev.account.id)
+    .fetch_one(s.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        unknown, 4,
+        "used and malformed codes are recorded, without the code"
+    );
     assert!(s.orgs.invitations(&owner, org).await.unwrap().is_empty());
 
     // Expired invitations cannot be previewed, accepted, or listed.
@@ -417,4 +455,131 @@ async fn new_accounts_are_created_once_from_an_invitation() {
             .await,
         Err(InvitationSignUpError::AccountExists)
     ));
+}
+
+/// Every role, and an operator from another organization, invites someone
+/// and withdraws an invitation the owner sent. Only roles with
+/// `Permission::MembersManage` succeed; refusals are audited and change no
+/// invitation.
+#[tokio::test]
+async fn invitation_changes_follow_the_role_matrix() {
+    let Some(scratch) = ScratchDb::create("app_invite_matrix").await else {
+        return;
+    };
+    let s = setup(&scratch).await;
+    let owner = account(&s.db, "Olivia").await;
+    let admin = account(&s.db, "Adam").await;
+    let dev = account(&s.db, "Dana").await;
+    let viewer = account(&s.db, "Vera").await;
+    let outsider = account(&s.db, "Oscar").await;
+    let org = s.orgs.create(&owner, "Acme", ctx()).await.unwrap().id;
+    add_member(&s.db, org, &admin, OrgRole::Admin).await;
+    add_member(&s.db, org, &dev, OrgRole::Developer).await;
+    add_member(&s.db, org, &viewer, OrgRole::Viewer).await;
+    s.orgs.create(&outsider, "Globex", ctx()).await.unwrap();
+
+    let cases = [
+        (&owner, Some(OrgRole::Owner), true),
+        (&admin, Some(OrgRole::Admin), true),
+        (&dev, Some(OrgRole::Developer), false),
+        (&viewer, Some(OrgRole::Viewer), false),
+        (&outsider, None, false),
+    ];
+    for (n, (actor, role, allowed)) in cases.into_iter().enumerate() {
+        let who = actor.account.display_name.as_str();
+        if let Some(role) = role {
+            assert_eq!(role.allows(Permission::MembersManage), allowed, "{who}");
+        }
+        let email = format!("invitee{n}@example.test");
+        let invited = s
+            .orgs
+            .invite(actor, org, &email, OrgRole::Developer, ctx())
+            .await;
+        let pending = s
+            .orgs
+            .invite(
+                &owner,
+                org,
+                &format!("pending{n}@example.test"),
+                OrgRole::Developer,
+                ctx(),
+            )
+            .await
+            .unwrap()
+            .invitation;
+        let revoked = s
+            .orgs
+            .revoke_invitation(actor, org, pending.id, ctx())
+            .await;
+
+        let open = s.orgs.invitations(&owner, org).await.unwrap();
+        let sent = open.iter().any(|i| i.email.as_str() == email);
+        let still_pending = open.contains(&pending);
+        match (role, allowed) {
+            (Some(_), true) => {
+                assert!(invited.is_ok(), "{who}: {invited:?}");
+                assert!(revoked.is_ok(), "{who}: {revoked:?}");
+                assert!(sent, "{who}");
+                assert!(!still_pending, "{who}");
+            }
+            (Some(_), false) => {
+                assert!(
+                    matches!(invited, Err(OrganizationError::Forbidden)),
+                    "{who}: {invited:?}"
+                );
+                assert!(
+                    matches!(revoked, Err(OrganizationError::Forbidden)),
+                    "{who}: {revoked:?}"
+                );
+                assert!(!sent, "{who}");
+                assert!(still_pending, "{who}");
+                for action in [
+                    "organization.invitation_create",
+                    "organization.invitation_revoke",
+                ] {
+                    assert_eq!(denied_by(&s.db, action, actor).await, 1, "{who} {action}");
+                }
+            }
+            (None, _) => {
+                assert!(
+                    matches!(invited, Err(OrganizationError::NotFound)),
+                    "{who}: {invited:?}"
+                );
+                assert!(
+                    matches!(revoked, Err(OrganizationError::NotFound)),
+                    "{who}: {revoked:?}"
+                );
+                assert!(!sent, "{who}");
+                assert!(still_pending, "{who}");
+            }
+        }
+    }
+
+    // An admin refused an owner invitation's withdrawal is audited, and the
+    // invitation stays open.
+    let boss = s
+        .orgs
+        .invite(&owner, org, "boss@example.test", OrgRole::Owner, ctx())
+        .await
+        .unwrap()
+        .invitation;
+    assert!(matches!(
+        s.orgs.revoke_invitation(&admin, org, boss.id, ctx()).await,
+        Err(OrganizationError::Membership(
+            MembershipError::OwnerRoleRequiresOwner
+        ))
+    ));
+    assert!(
+        s.orgs
+            .invitations(&owner, org)
+            .await
+            .unwrap()
+            .contains(&boss)
+    );
+    assert_eq!(
+        denied_by(&s.db, "organization.invitation_revoke", &admin).await,
+        1
+    );
+    s.db.close().await;
+    scratch.drop().await;
 }

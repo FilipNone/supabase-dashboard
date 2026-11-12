@@ -118,19 +118,24 @@ impl StudioService {
             .await?
             .ok_or(StudioError::NotFound)?;
         let target = ("project", project_id.to_string());
-        if !access.role.allows(Permission::StudioOpen) {
-            let denied = event(current, ACTION, target, AuditOutcome::Denied, ctx);
-            if let Err(err) = self.db.record_audit_event(&denied).await {
-                tracing::error!(error = %err, "could not record audit event");
+        let refuse = |outcome, error| {
+            let refusal = event(current, ACTION, target.clone(), outcome, ctx);
+            async move {
+                if let Err(err) = self.db.record_audit_event(&refusal).await {
+                    tracing::error!(error = %err, "could not record audit event");
+                }
+                Err(error)
             }
-            return Err(StudioError::Forbidden);
+        };
+        if !access.role.allows(Permission::StudioOpen) {
+            return refuse(AuditOutcome::Denied, StudioError::Forbidden).await;
         }
         let usable = self.db.list_credentials(project_id).await?.iter().any(|c| {
             c.kind == CredentialKind::StudioLogin
                 && self.cipher.as_ref().is_some_and(|k| k.can_open(&c.key_id))
         });
         if !usable {
-            return Err(StudioError::NotConfigured);
+            return refuse(AuditOutcome::Failure, StudioError::NotConfigured).await;
         }
         let code = RandomToken::generate()?;
         let audit = event(current, ACTION, target, AuditOutcome::Success, ctx);

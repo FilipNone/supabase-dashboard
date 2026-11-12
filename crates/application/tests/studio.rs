@@ -16,7 +16,7 @@ use supabase_dashboard_application::{
 };
 use supabase_dashboard_domain::{
     account::{DisplayName, Email},
-    authz::OrgRole,
+    authz::{OrgRole, Permission},
     connection::{CredentialKind, ServiceCheck, ServiceStatus, StackService, check_studio_login},
     project::ProjectUrl,
     studio_access::{NewStudioAccess, STUDIO_ACCESS_EXPORT_MAX, StudioAccessLog, loggable_path},
@@ -145,6 +145,20 @@ async fn audit_count(db: &Database, outcome: &str) -> i64 {
         "SELECT count(*) FROM audit_events WHERE action = 'studio.open' AND outcome = $1",
     )
     .bind(outcome)
+    .fetch_one(db.pool())
+    .await
+    .unwrap()
+}
+
+/// Audit events for `actor` doing `action` with `outcome`.
+async fn audited(db: &Database, action: &str, outcome: &str, actor: &CurrentSession) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events \
+         WHERE action = $1 AND outcome = $2 AND actor_account_id = $3",
+    )
+    .bind(action)
+    .bind(outcome)
+    .bind(actor.account.id)
     .fetch_one(db.pool())
     .await
     .unwrap()
@@ -365,6 +379,11 @@ async fn access_ends_with_the_session_role_membership_and_login() {
         f.studio.begin(&owner, id, None, ctx()).await,
         Err(StudioError::NotConfigured)
     ));
+    assert_eq!(
+        audited(&f.db, "studio.open", "failure", &owner).await,
+        1,
+        "an open refused for a missing login is recorded"
+    );
 
     // Unregistering the project removes its Studio sessions.
     let login = SecretString::from(check_studio_login("supabase", PASSWORD).unwrap());
@@ -431,7 +450,7 @@ async fn studio_requests_are_logged_for_owners_and_admins_to_read() {
                 retention_days,
                 older,
                 ..
-            } = log.read(&owner, id, None, None).await.unwrap()
+            } = log.read(&owner, id, None, None, ctx()).await.unwrap()
             else {
                 panic!("the log is on");
             };
@@ -464,13 +483,13 @@ async fn studio_requests_are_logged_for_owners_and_admins_to_read() {
         .unwrap();
     assert_eq!(total, 3);
 
-    assert!(log.read(&admin, id, None, None).await.is_ok());
+    assert!(log.read(&admin, id, None, None, ctx()).await.is_ok());
     assert!(matches!(
-        log.read(&developer, id, None, None).await,
+        log.read(&developer, id, None, None, ctx()).await,
         Err(StudioAccessError::Forbidden)
     ));
     assert!(matches!(
-        log.read(&outsider, id, None, None).await,
+        log.read(&outsider, id, None, None, ctx()).await,
         Err(StudioAccessError::NotFound)
     ));
 
@@ -487,7 +506,7 @@ async fn studio_requests_are_logged_for_owners_and_admins_to_read() {
     assert_eq!(log.prune().await.unwrap(), 1);
     let off = StudioAccessService::new(f.db.clone(), None);
     assert_eq!(
-        off.read(&owner, id, None, None).await.unwrap(),
+        off.read(&owner, id, None, None, ctx()).await.unwrap(),
         StudioAccessLog::Off
     );
     assert_eq!(off.prune().await.unwrap(), 3);
@@ -524,7 +543,7 @@ async fn the_access_log_pages_through_entries_with_the_same_time() {
     .await
     .unwrap();
     let log = StudioAccessService::new(f.db.clone(), Some(7));
-    let page = async |before| match log.read(&owner, id, None, before).await.unwrap() {
+    let page = async |before| match log.read(&owner, id, None, before, ctx()).await.unwrap() {
         StudioAccessLog::On { entries, older, .. } => (entries, older),
         StudioAccessLog::Off => panic!("the log is on"),
     };
@@ -609,7 +628,7 @@ async fn the_access_log_filters_by_member() {
 
     let log = StudioAccessService::new(f.db.clone(), Some(7));
     let read = async |member: Option<Uuid>, before| match log
-        .read(&owner, id, member, before)
+        .read(&owner, id, member, before, ctx())
         .await
         .unwrap()
     {
@@ -661,7 +680,7 @@ async fn the_access_log_filters_by_member() {
     let developer = account(&f.db, "Developer").await;
     add_member(&f.db, org, &developer, OrgRole::Developer).await;
     assert!(matches!(
-        log.read(&developer, id, Some(developer.account.id), None)
+        log.read(&developer, id, Some(developer.account.id), None, ctx())
             .await,
         Err(StudioAccessError::Forbidden)
     ));
@@ -715,4 +734,90 @@ async fn exports_stop_at_the_row_limit() {
     // With the log off there is nothing to export.
     let off = StudioAccessService::new(f.db.clone(), None);
     assert_eq!(off.export(&owner, id, None, ctx()).await.unwrap(), None);
+}
+
+/// Reading and exporting the Studio access log need `Permission::AuditRead`:
+/// owners and admins only. Every export attempt by a member is audited.
+#[tokio::test]
+async fn the_access_log_follows_the_role_matrix() {
+    let Some(scratch) = ScratchDb::create("studio_access_matrix").await else {
+        return;
+    };
+    let f = setup(&scratch).await;
+    let owner = account(&f.db, "Owner").await;
+    let (org, id) = project(&f, &owner, "Acme").await;
+    let admin = account(&f.db, "Admin").await;
+    let developer = account(&f.db, "Developer").await;
+    let viewer = account(&f.db, "Viewer").await;
+    let outsider = account(&f.db, "Outsider").await;
+    add_member(&f.db, org, &admin, OrgRole::Admin).await;
+    add_member(&f.db, org, &developer, OrgRole::Developer).await;
+    add_member(&f.db, org, &viewer, OrgRole::Viewer).await;
+    project(&f, &outsider, "Globex").await;
+    sqlx::query(
+        "INSERT INTO studio_access_log (project_id, account_id, at, method, path, status) \
+         VALUES ($1, $2, now(), 'GET', '/project/default', 200)",
+    )
+    .bind(id)
+    .bind(developer.account.id)
+    .execute(f.db.pool())
+    .await
+    .unwrap();
+    let log = StudioAccessService::new(f.db.clone(), Some(7));
+    const EXPORT: &str = "studio_access.export";
+
+    let cases = [
+        (&owner, Some(OrgRole::Owner), true),
+        (&admin, Some(OrgRole::Admin), true),
+        (&developer, Some(OrgRole::Developer), false),
+        (&viewer, Some(OrgRole::Viewer), false),
+        (&outsider, None, false),
+    ];
+    for (actor, role, allowed) in cases {
+        let who = actor.account.display_name.as_str();
+        if let Some(role) = role {
+            assert_eq!(role.allows(Permission::AuditRead), allowed, "{who}");
+        }
+        let read = log.read(actor, id, None, None, ctx()).await;
+        let export = log.export(actor, id, None, ctx()).await;
+        match role {
+            Some(_) if allowed => {
+                let Ok(StudioAccessLog::On { entries, .. }) = read else {
+                    panic!("{who}: {read:?}");
+                };
+                assert_eq!(entries.len(), 1, "{who}");
+                let export = export.unwrap().unwrap();
+                assert_eq!(export.entries.len(), 1, "{who}");
+                assert_eq!(audited(&f.db, EXPORT, "success", actor).await, 1, "{who}");
+            }
+            Some(_) => {
+                assert!(
+                    matches!(read, Err(StudioAccessError::Forbidden)),
+                    "{who}: {read:?}"
+                );
+                assert!(
+                    matches!(export, Err(StudioAccessError::Forbidden)),
+                    "{who}: {export:?}"
+                );
+                assert_eq!(audited(&f.db, EXPORT, "denied", actor).await, 1, "{who}");
+                assert_eq!(audited(&f.db, EXPORT, "success", actor).await, 0, "{who}");
+                assert_eq!(
+                    audited(&f.db, "studio_access.read", "denied", actor).await,
+                    1,
+                    "{who}"
+                );
+            }
+            None => {
+                assert!(
+                    matches!(read, Err(StudioAccessError::NotFound)),
+                    "{who}: {read:?}"
+                );
+                assert!(
+                    matches!(export, Err(StudioAccessError::NotFound)),
+                    "{who}: {export:?}"
+                );
+                assert_eq!(audited(&f.db, EXPORT, "success", actor).await, 0, "{who}");
+            }
+        }
+    }
 }

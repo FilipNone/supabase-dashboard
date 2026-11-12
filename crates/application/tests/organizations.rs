@@ -9,7 +9,7 @@ use supabase_dashboard_application::{
 };
 use supabase_dashboard_domain::{
     account::{DisplayName, Email},
-    authz::{MembershipError, OrgRole},
+    authz::{MembershipError, OrgRole, Permission},
 };
 use supabase_dashboard_persistence::{
     Database, accounts::AccountRecord, audit::AuditEvent, audit::AuditOutcome,
@@ -81,6 +81,30 @@ async fn denied_count(db: &Database, action: &str) -> i64 {
         .fetch_one(db.pool())
         .await
         .unwrap()
+}
+
+/// Refusals recorded for `actor` doing `action`.
+async fn denied_by(db: &Database, action: &str, actor: &CurrentSession) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events \
+         WHERE action = $1 AND outcome = 'denied' AND actor_account_id = $2",
+    )
+    .bind(action)
+    .bind(actor.account.id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap()
+}
+
+async fn role_of(db: &Database, org: Uuid, who: &CurrentSession) -> Option<String> {
+    sqlx::query_scalar(
+        "SELECT role FROM organization_members WHERE organization_id = $1 AND account_id = $2",
+    )
+    .bind(org)
+    .bind(who.account.id)
+    .fetch_optional(db.pool())
+    .await
+    .unwrap()
 }
 
 #[tokio::test]
@@ -374,6 +398,153 @@ async fn membership_count_is_capped() {
     assert_eq!(
         db.count_audit_events("organization.create").await.unwrap(),
         2
+    );
+    db.close().await;
+    scratch.drop().await;
+}
+
+/// Every role, and an operator from another organization, changes a
+/// member's role and then removes them. Only roles with
+/// `Permission::MembersManage` succeed; refusals are audited and leave the
+/// member as they were.
+#[tokio::test]
+async fn member_changes_follow_the_role_matrix() {
+    let Some(scratch) = ScratchDb::create("app_org_matrix").await else {
+        return;
+    };
+    let (db, orgs) = setup(&scratch).await;
+    let owner = account(&db, "Owner").await;
+    let admin = account(&db, "Admin").await;
+    let dev = account(&db, "Dev").await;
+    let viewer = account(&db, "Viewer").await;
+    let outsider = account(&db, "Outsider").await;
+    let org = orgs.create(&owner, "Acme", ctx()).await.unwrap().id;
+    add_member(&db, org, &admin, OrgRole::Admin).await;
+    add_member(&db, org, &dev, OrgRole::Developer).await;
+    add_member(&db, org, &viewer, OrgRole::Viewer).await;
+    orgs.create(&outsider, "Globex", ctx()).await.unwrap();
+
+    let cases = [
+        (&owner, Some(OrgRole::Owner), true),
+        (&admin, Some(OrgRole::Admin), true),
+        (&dev, Some(OrgRole::Developer), false),
+        (&viewer, Some(OrgRole::Viewer), false),
+        (&outsider, None, false),
+    ];
+    for (n, (actor, role, allowed)) in cases.into_iter().enumerate() {
+        let who = actor.account.display_name.as_str();
+        if let Some(role) = role {
+            assert_eq!(role.allows(Permission::MembersManage), allowed, "{who}");
+        }
+        let target = account(&db, &format!("Target{n}")).await;
+        add_member(&db, org, &target, OrgRole::Viewer).await;
+
+        let changed = orgs
+            .change_role(actor, org, target.account.id, OrgRole::Developer, ctx())
+            .await;
+        let after_change = role_of(&db, org, &target).await;
+        let removed = orgs
+            .remove_member(actor, org, target.account.id, ctx())
+            .await;
+        let after_remove = role_of(&db, org, &target).await;
+
+        match (role, allowed) {
+            (Some(_), true) => {
+                assert!(changed.is_ok(), "{who}: {changed:?}");
+                assert_eq!(after_change.as_deref(), Some("developer"), "{who}");
+                assert!(removed.is_ok(), "{who}: {removed:?}");
+                assert_eq!(after_remove, None, "{who}");
+            }
+            (Some(_), false) => {
+                assert!(
+                    matches!(changed, Err(OrganizationError::Forbidden)),
+                    "{who}: {changed:?}"
+                );
+                assert!(
+                    matches!(removed, Err(OrganizationError::Forbidden)),
+                    "{who}: {removed:?}"
+                );
+                assert_eq!(after_remove.as_deref(), Some("viewer"), "{who}");
+                for action in [
+                    "organization.member_role_change",
+                    "organization.member_remove",
+                ] {
+                    assert_eq!(denied_by(&db, action, actor).await, 1, "{who} {action}");
+                }
+            }
+            (None, _) => {
+                assert!(
+                    matches!(changed, Err(OrganizationError::NotFound)),
+                    "{who}: {changed:?}"
+                );
+                assert!(
+                    matches!(removed, Err(OrganizationError::NotFound)),
+                    "{who}: {removed:?}"
+                );
+                assert_eq!(after_remove.as_deref(), Some("viewer"), "{who}");
+            }
+        }
+    }
+
+    // An admin refused for touching the owner role is audited as well, and
+    // the owner stays.
+    assert!(matches!(
+        orgs.change_role(&admin, org, owner.account.id, OrgRole::Viewer, ctx())
+            .await,
+        Err(OrganizationError::Membership(
+            MembershipError::OwnerRoleRequiresOwner
+        ))
+    ));
+    assert!(matches!(
+        orgs.remove_member(&admin, org, owner.account.id, ctx())
+            .await,
+        Err(OrganizationError::Membership(
+            MembershipError::OwnerRoleRequiresOwner
+        ))
+    ));
+    assert_eq!(role_of(&db, org, &owner).await.as_deref(), Some("owner"));
+    for action in [
+        "organization.member_role_change",
+        "organization.member_remove",
+    ] {
+        assert_eq!(denied_by(&db, action, &admin).await, 1, "{action}");
+    }
+    db.close().await;
+    scratch.drop().await;
+}
+
+/// Creating an organization past the per-account limit is refused and
+/// recorded as a failure against the account.
+#[tokio::test]
+async fn the_organization_limit_is_audited() {
+    let Some(scratch) = ScratchDb::create("app_org_limit_audit").await else {
+        return;
+    };
+    let (db, orgs) = setup(&scratch).await;
+    let alice = account(&db, "Alice").await;
+    for n in 0..supabase_dashboard_domain::organization::MAX_ORGANIZATIONS_PER_ACCOUNT {
+        let org = Uuid::now_v7();
+        sqlx::query("INSERT INTO organizations (id, name) VALUES ($1, $2)")
+            .bind(org)
+            .bind(format!("Org {n}"))
+            .execute(db.pool())
+            .await
+            .unwrap();
+        add_member(&db, org, &alice, OrgRole::Owner).await;
+    }
+    assert!(matches!(
+        orgs.create(&alice, "One more", ctx()).await,
+        Err(OrganizationError::LimitReached)
+    ));
+    let recorded: Vec<(Option<String>, String)> = sqlx::query_as(
+        "SELECT target_id, outcome FROM audit_events WHERE action = 'organization.create'",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        recorded,
+        [(Some(alice.account.id.to_string()), "failure".to_owned())]
     );
     db.close().await;
     scratch.drop().await;
