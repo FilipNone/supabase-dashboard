@@ -252,15 +252,16 @@ async fn a_job_whose_runner_stopped_is_resumed_by_another() {
     };
     let f = setup(&scratch).await;
     let id = enqueue(&f, "start", false).await;
-    // A runner claims the job with a short lease and stops.
+    // A runner claims the job with a short lease and stops. The lease is
+    // long enough that a slow machine still sees it held below.
     let gone = Uuid::now_v7();
-    let claimed = f.db.claim_job(gone, 0.05).await.unwrap().unwrap();
+    let claimed = f.db.claim_job(gone, 1.0).await.unwrap().unwrap();
     assert_eq!(claimed.id, id);
     let handler = Arc::new(Scripted::default());
     let runner = runner(&f.db, handler.clone(), fast());
     assert_eq!(runner.run_due().await.unwrap(), RunResult::Idle);
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
     assert_eq!(runner.run_due().await.unwrap(), RunResult::Ran(id));
     let job = f.db.get_job(id).await.unwrap().unwrap();
     assert_eq!(job.interruptions, 1);
