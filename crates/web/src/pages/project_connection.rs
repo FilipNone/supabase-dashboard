@@ -10,7 +10,7 @@ use supabase_dashboard_domain::{
     connection::{
         API_KEY_MAX_LEN, CredentialKind, CredentialOverview, CredentialState, CredentialStatus,
         HealthReport, STUDIO_PASSWORD_MAX_LEN, STUDIO_PASSWORD_MIN_LEN, STUDIO_USERNAME_MAX_LEN,
-        ServiceCheck, ServiceStatus, SkipReason, StackService,
+        SavedCredential, ServiceCheck, ServiceStatus, SkipReason, StackService,
     },
     project::ProjectSummary,
 };
@@ -331,6 +331,28 @@ fn state_badge(state: &CredentialState) -> (&'static str, String, bool) {
     }
 }
 
+/// What saving a Studio login found at the gateway. A login the gateway
+/// refused arrives as an error and was not stored.
+fn studio_saved(result: Result<SavedCredential, AppError>) -> AnyView {
+    match result {
+        Ok(SavedCredential::Confirmed | SavedCredential::NotChecked) => view! {
+            <p class="form-ok" role="status">"Studio login saved. The gateway accepted it."</p>
+        }
+        .into_any(),
+        Ok(SavedCredential::Unconfirmed { status }) => {
+            let (_, label, detail) = describe(StackService::Studio, &status);
+            view! {
+                <div class="form-warning" role="status">
+                    <p>{format!("Studio login saved, but the gateway did not confirm it: {label}.")}</p>
+                    {detail.map(|text| view! { <p>{text}</p> })}
+                </div>
+            }
+            .into_any()
+        }
+        Err(err) => view! { <p class="form-error" role="alert">{err.to_string()}</p> }.into_any(),
+    }
+}
+
 /// The settings page's Studio section: the gateway login the dashboard
 /// adds when it opens the project's Studio for a member.
 #[component]
@@ -421,7 +443,7 @@ pub fn StudioLoginPanel(project: ProjectSummary) -> impl IntoView {
                     .into_any(),
                 })}
             </Transition>
-            {move || feedback(replace.value().get(), "Studio login saved.")}
+            {move || replace.value().get().map(studio_saved)}
             {move || feedback(remove.value().get(), "Studio login removed.")}
             {(!can_manage).then(|| view! {
                 <p class="field-hint">"Only owners and administrators can change the Studio login."</p>

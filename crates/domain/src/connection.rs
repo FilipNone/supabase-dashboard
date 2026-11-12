@@ -321,6 +321,25 @@ pub struct HealthReport {
     pub checks: Vec<ServiceCheck>,
 }
 
+/// What the dashboard learned about a key when it saved it.
+///
+/// API keys are stored without contacting the stack; the next health check
+/// tells whether they work. A Studio login is tried against the gateway's
+/// Studio route first. A login the gateway refuses is never stored, so
+/// only the outcomes that still lead to a stored login appear here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum SavedCredential {
+    /// Stored without a check.
+    NotChecked,
+    /// The gateway refused Studio without the login and accepted it with
+    /// the login.
+    Confirmed,
+    /// Stored, but the gateway did not confirm the login, for example
+    /// because it was unreachable or serves Studio without a password.
+    Unconfirmed { status: ServiceStatus },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -18,8 +18,8 @@ use supabase_dashboard_domain::{
     account::{DisplayName, Email},
     authz::OrgRole,
     connection::{
-        ApiKeyError, CredentialKind, CredentialState, ServiceCheck, ServiceStatus, SkipReason,
-        StackService, check_studio_login,
+        ApiKeyError, CredentialKind, CredentialState, SavedCredential, ServiceCheck, ServiceStatus,
+        SkipReason, StackService, UnreachableReason, check_studio_login,
     },
     project::ProjectUrl,
 };
@@ -48,10 +48,12 @@ fn cipher(key: &str) -> CredentialCipher {
     CredentialCipher::from_base64(&SecretString::from(key)).unwrap()
 }
 
-/// Records which key each service was checked with and reports healthy.
+/// Records which key each service was checked with. Reports healthy,
+/// except for Studio when `studio` holds another answer.
 #[derive(Default)]
 struct FakeProbe {
     calls: Mutex<Vec<(StackService, String)>>,
+    studio: Mutex<Option<ServiceStatus>>,
 }
 
 impl StackProbe for FakeProbe {
@@ -65,10 +67,15 @@ impl StackProbe for FakeProbe {
             .lock()
             .unwrap()
             .push((service, key.expose_secret().to_owned()));
+        let status = match service {
+            StackService::Studio => self.studio.lock().unwrap().clone(),
+            _ => None,
+        }
+        .unwrap_or(ServiceStatus::Healthy);
         Box::pin(async move {
             ServiceCheck {
                 service,
-                status: ServiceStatus::Healthy,
+                status,
                 version: Some("v-test".into()),
                 latency_ms: Some(1),
             }
@@ -352,6 +359,11 @@ async fn checks_prefer_the_least_privileged_key_and_are_saved() {
             .await
             .unwrap();
     }
+    // Saving the Studio login tried it once; the check below tries it again.
+    assert_eq!(
+        f.probe.calls.lock().unwrap().drain(..).collect::<Vec<_>>(),
+        vec![(StackService::Studio, studio.clone())]
+    );
     let report = f.connections.check_now(&owner, id).await.unwrap();
     assert!(
         report
@@ -537,4 +549,95 @@ async fn malformed_keys_and_unregistered_projects() {
     .await
     .unwrap();
     assert_eq!(left, 0);
+}
+
+#[tokio::test]
+async fn studio_logins_are_tried_before_they_are_saved() {
+    let Some(scratch) = ScratchDb::create("conn_studio_save").await else {
+        return;
+    };
+    let f = setup(&scratch, Some(KEY_A)).await;
+    let owner = account(&f.db, "Owner").await;
+    let (_, id) = project(&f, &owner, "Acme").await;
+    let first = SecretString::from(check_studio_login("supabase", STUDIO_PASSWORD).unwrap());
+    let save = async |login: &SecretString| {
+        f.connections
+            .replace_credential(&owner, id, CredentialKind::StudioLogin, login, ctx())
+            .await
+    };
+    let stored_ciphertext = || async {
+        sqlx::query_scalar::<_, Vec<u8>>(
+            "SELECT ciphertext FROM project_credentials WHERE project_id = $1 AND kind = 'studio_login'",
+        )
+        .bind(id)
+        .fetch_optional(f.db.pool())
+        .await
+        .unwrap()
+    };
+
+    // Accepted by the gateway: stored and confirmed.
+    assert_eq!(save(&first).await.unwrap(), SavedCredential::Confirmed);
+    let confirmed = stored_ciphertext().await.unwrap();
+
+    // Refused by the gateway: not stored, the earlier login stays, and the
+    // attempt is audited as a failure without the password.
+    *f.probe.studio.lock().unwrap() = Some(ServiceStatus::KeyRejected { http_status: 401 });
+    let wrong =
+        SecretString::from(check_studio_login("supabase", "a-wrong-studio-password").unwrap());
+    assert!(matches!(
+        save(&wrong).await,
+        Err(ConnectionError::StudioLoginRejected { http_status: 401 })
+    ));
+    assert_eq!(stored_ciphertext().await.unwrap(), confirmed);
+    assert_eq!(
+        audit_count(&f.db, "project.credential.replace", "failure").await,
+        1
+    );
+
+    // Unreachable or unprotected gateways: stored, with the reason.
+    for status in [
+        ServiceStatus::Unreachable {
+            reason: UnreachableReason::Connect,
+        },
+        ServiceStatus::Unprotected { http_status: 200 },
+    ] {
+        *f.probe.studio.lock().unwrap() = Some(status.clone());
+        assert_eq!(
+            save(&first).await.unwrap(),
+            SavedCredential::Unconfirmed { status }
+        );
+    }
+    assert_ne!(stored_ciphertext().await.unwrap(), confirmed);
+    assert_eq!(
+        audit_count(&f.db, "project.credential.replace", "success").await,
+        3
+    );
+
+    // API keys are not sent anywhere when saved.
+    f.probe.calls.lock().unwrap().clear();
+    assert_eq!(
+        f.connections
+            .replace_credential(
+                &owner,
+                id,
+                CredentialKind::AnonKey,
+                &SecretString::from(ANON),
+                ctx()
+            )
+            .await
+            .unwrap(),
+        SavedCredential::NotChecked
+    );
+    assert!(f.probe.calls.lock().unwrap().is_empty());
+
+    let audit_text: Vec<String> =
+        sqlx::query_scalar("SELECT coalesce(target_id, '') FROM audit_events")
+            .fetch_all(f.db.pool())
+            .await
+            .unwrap();
+    assert!(
+        audit_text
+            .iter()
+            .all(|t| !t.contains(STUDIO_PASSWORD) && !t.contains("a-wrong-studio-password"))
+    );
 }

@@ -40,6 +40,7 @@ docker compose -p sd-fixture down -v
 | PostgREST reachability through the gateway (service role key; the gateway refuses the anon key on the root path with 403) | Verified against PostgREST v14.18 via Kong 3.9.3 | same test |
 | Wrong key reported as rejected (401) | Verified | same test |
 | Studio route: refuses requests without the login or with a wrong one, accepts the stored login | Verified against Studio 2026.11.02-sha-a05e7ec via Kong 3.9.3 | `fixture_studio_route_needs_the_login` in `crates/adapters/tests/gateway_fixture.rs`, CI job `fixture` |
+| Saving a Studio login tries it against the Studio route first and refuses a login the gateway rejects | Verified against Studio 2026.11.02-sha-a05e7ec via Kong 3.9.3 | `studio_opens_the_fixture_studio` in `apps/server/src/app.rs` (saves the fixture's login through the settings form); refusal covered by application tests |
 | Studio route: reports a gateway that opens Studio without a login | Mock gateway only | `crates/adapters/tests/gateway_mock.rs` |
 | Studio forwarding: the stored login replaces the browser's, Studio's redirect comes back as a path, pages and Studio's own API answer | Verified against the same Studio and gateway | `fixture_studio_is_reached_through_the_proxy` in `crates/adapters/tests/gateway_fixture.rs` |
 | Envoy gateway, new-style `sb_publishable_`/`sb_secret_` keys | Not tested | No fixture yet |

@@ -118,7 +118,7 @@ A self-hosted stack serves Studio itself, behind HTTP basic auth on the gateway'
    ```
 
 2. Set it as `DASHBOARD_PASSWORD` in the stack's `.env`, and restart the stack's API gateway so it reads the new value.
-3. Save the same username and password on the project's Settings page in the dashboard, then run "Check now" on the project page. The Studio row should report that the stored login is accepted.
+3. Save the same username and password on the project's Settings page in the dashboard. The dashboard tries the login against the gateway before storing it: if the gateway refuses it, nothing is saved and the page says so. If the gateway cannot be reached, or still opens Studio without a password, the login is saved with a warning; restart the gateway and run "Check now" on the project page until the Studio row reports the stored login as accepted.
 4. Do not keep the password anywhere else. If someone needs Studio, give them a dashboard role that allows it.
 
 Where the network allows it, also keep the gateway's Studio route away from the internet: for example, let only the dashboard server reach the stack's gateway port, or put the stack's public API behind a separate proxy that serves only the API paths (`/auth/v1/`, `/rest/v1/`, `/storage/v1/`, `/realtime/v1/`, `/functions/v1/`, and the others your apps use). Closing the API paths themselves to members' browsers breaks the Studio pages that call them directly. These setups depend on the stack's gateway and network and have not been tested with this dashboard yet.

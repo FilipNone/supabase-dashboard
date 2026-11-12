@@ -16,7 +16,7 @@ use supabase_dashboard_application::{
 use supabase_dashboard_domain::{
     account::{DisplayName, Email},
     authz::OrgRole,
-    connection::{CredentialKind, StackService, check_studio_login},
+    connection::{CredentialKind, ServiceCheck, ServiceStatus, StackService, check_studio_login},
     project::ProjectUrl,
 };
 use supabase_dashboard_persistence::{Database, accounts::AccountRecord};
@@ -41,16 +41,30 @@ fn cipher() -> CredentialCipher {
     CredentialCipher::from_base64(&SecretString::from(KEY)).unwrap()
 }
 
-struct NoProbe;
+/// Accepts every Studio login, which is all these tests need: the gateway
+/// side of saving a login is covered in `connections.rs`.
+struct AcceptingProbe;
 
-impl StackProbe for NoProbe {
+impl StackProbe for AcceptingProbe {
     fn check<'a>(
         &'a self,
         _: &'a ProjectUrl,
-        _: StackService,
+        service: StackService,
         _: &'a SecretString,
     ) -> ProbeFuture<'a> {
-        unreachable!("no checks in these tests")
+        assert_eq!(
+            service,
+            StackService::Studio,
+            "only Studio logins are checked"
+        );
+        Box::pin(async move {
+            ServiceCheck {
+                service,
+                status: ServiceStatus::Healthy,
+                version: None,
+                latency_ms: Some(1),
+            }
+        })
     }
 }
 
@@ -68,7 +82,7 @@ async fn setup(scratch: &ScratchDb) -> Fixture {
     Fixture {
         orgs: OrganizationService::new(db.clone()),
         projects: ProjectService::new(db.clone()),
-        connections: ConnectionService::new(db.clone(), Some(cipher()), Arc::new(NoProbe)),
+        connections: ConnectionService::new(db.clone(), Some(cipher()), Arc::new(AcceptingProbe)),
         studio: StudioService::new(db.clone(), Some(cipher()), Duration::from_secs(3600)),
         db,
     }

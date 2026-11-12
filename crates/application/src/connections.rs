@@ -16,8 +16,8 @@ use supabase_dashboard_domain::{
     authz::Permission,
     connection::{
         ApiKeyError, CredentialKind, CredentialOverview, CredentialState, CredentialStatus,
-        HEALTH_CHECK_COOLDOWN_SECS, HealthReport, ServiceCheck, ServiceStatus, SkipReason,
-        StackService, check_api_key,
+        HEALTH_CHECK_COOLDOWN_SECS, HealthReport, SavedCredential, ServiceCheck, ServiceStatus,
+        SkipReason, StackService, check_api_key,
     },
     project::ProjectUrl,
 };
@@ -53,6 +53,11 @@ pub enum ConnectionError {
     CheckTooSoon { retry_after_secs: i64 },
     #[error("a check of this project is already running")]
     CheckInProgress,
+    #[error(
+        "the stack's gateway refused this Studio login (HTTP {http_status}), so it was not \
+         saved; check DASHBOARD_USERNAME and DASHBOARD_PASSWORD on the stack"
+    )]
+    StudioLoginRejected { http_status: u16 },
     #[error(transparent)]
     Input(#[from] ApiKeyError),
     #[error(transparent)]
@@ -167,6 +172,12 @@ impl ConnectionService {
     }
 
     /// Stores a key, replacing any previous value without reading it.
+    ///
+    /// A Studio login is tried against the gateway first. When the gateway
+    /// refuses it, nothing is stored, the attempt is audited as a failure,
+    /// and the previous login stays in place. Other outcomes of the check
+    /// (unreachable, no password asked) are returned with the stored login,
+    /// so an operator can save it before the stack is up.
     pub async fn replace_credential(
         &self,
         current: &CurrentSession,
@@ -174,9 +185,10 @@ impl ConnectionService {
         kind: CredentialKind,
         value: &SecretString,
         ctx: RequestContext<'_>,
-    ) -> Result<(), ConnectionError> {
+    ) -> Result<SavedCredential, ConnectionError> {
         let action = "project.credential.replace";
-        self.audited_access(current, project_id, action, ctx)
+        let access = self
+            .audited_access(current, project_id, action, ctx)
             .await?;
         let cipher = self
             .cipher
@@ -185,6 +197,31 @@ impl ConnectionService {
         let value = {
             use secrecy::ExposeSecret;
             SecretString::from(check_api_key(kind, value.expose_secret())?)
+        };
+        let saved = if kind == CredentialKind::StudioLogin {
+            let check = self
+                .probe
+                .check(&access.project.api_url, StackService::Studio, &value)
+                .await;
+            match check.status {
+                ServiceStatus::Healthy => SavedCredential::Confirmed,
+                ServiceStatus::KeyRejected { http_status } => {
+                    let event = event(
+                        current,
+                        action,
+                        credential_target(project_id, kind),
+                        AuditOutcome::Failure,
+                        ctx,
+                    );
+                    if let Err(err) = self.db.record_audit_event(&event).await {
+                        tracing::error!(error = %err, action, "could not record audit event");
+                    }
+                    return Err(ConnectionError::StudioLoginRejected { http_status });
+                }
+                status => SavedCredential::Unconfirmed { status },
+            }
+        } else {
+            SavedCredential::NotChecked
         };
         let sealed = cipher.seal(project_id, kind, &value)?;
         let stored = self
@@ -208,7 +245,7 @@ impl ConnectionService {
             )
             .await?;
         if stored {
-            Ok(())
+            Ok(saved)
         } else {
             Err(ConnectionError::NotFound)
         }

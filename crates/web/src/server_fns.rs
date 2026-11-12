@@ -11,7 +11,7 @@ use supabase_dashboard_domain::{
     account::{AccountSummary, AdminAccountSummary, SessionSummary},
     admin::RegisteredResources,
     authz::OrgRole,
-    connection::{CredentialKind, CredentialOverview, HealthReport},
+    connection::{CredentialKind, CredentialOverview, HealthReport, SavedCredential},
     health::InstallationHealth,
     invitation::{InvitationCode, InvitationPreview, InvitationSummary, IssuedInvitation},
     organization::{MemberSummary, OrganizationSummary},
@@ -215,7 +215,7 @@ pub async fn replace_project_credential(
     id: Uuid,
     kind: CredentialKind,
     value: SecretInput,
-) -> Result<(), AppError> {
+) -> Result<SavedCredential, AppError> {
     let session = org_context::session()?;
     let audit = org_context::AuditContext::current();
     let value = secrecy::SecretString::from(value.0);
@@ -224,13 +224,14 @@ pub async fn replace_project_credential(
         .await?)
 }
 
-/// Stores or replaces the gateway's Studio login for a project.
+/// Stores or replaces the gateway's Studio login for a project, after
+/// trying it against the gateway's Studio route.
 #[server]
 pub async fn replace_studio_login(
     id: Uuid,
     username: String,
     password: SecretInput,
-) -> Result<(), AppError> {
+) -> Result<SavedCredential, AppError> {
     let session = org_context::session()?;
     let audit = org_context::AuditContext::current();
     let login = supabase_dashboard_domain::connection::check_studio_login(&username, &password.0)

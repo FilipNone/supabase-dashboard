@@ -125,6 +125,7 @@ mod server {
                 | ConnectionError::NotStored
                 | ConnectionError::CheckTooSoon { .. }
                 | ConnectionError::CheckInProgress
+                | ConnectionError::StudioLoginRejected { .. }
                 | ConnectionError::Input(_) => Self::Rejected(sentence(&err.to_string())),
                 ConnectionError::Cipher(err) => {
                     tracing::error!(error = %err, "credential encryption failed");

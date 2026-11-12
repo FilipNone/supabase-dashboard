@@ -975,11 +975,19 @@ mod tests {
                 .build(),
             organizations: Arc::new(OrganizationService::new(db.clone())),
             projects: Arc::new(ProjectService::new(db.clone())),
+            // The gateways in these tests listen on loopback.
             connections: Arc::new(ConnectionService::new(
                 db.clone(),
                 Some(cipher),
-                supabase_dashboard_adapters::gateway::GatewayProbe::shared(Default::default())
-                    .unwrap(),
+                supabase_dashboard_adapters::gateway::GatewayProbe::shared(
+                    supabase_dashboard_adapters::gateway::GatewaySettings {
+                        policy: TargetPolicy {
+                            allow_loopback: true,
+                        },
+                        ..Default::default()
+                    },
+                )
+                .unwrap(),
             )),
             db: db.clone(),
             readiness_timeout: Duration::from_secs(1),
@@ -1378,6 +1386,22 @@ mod tests {
         .await;
         let project: serde_json::Value = serde_json::from_str(&body).unwrap();
         let id: uuid::Uuid = project["id"].as_str().unwrap().parse().unwrap();
+        // A login the gateway refuses is not saved; the real one is
+        // confirmed by the gateway before it is stored.
+        let (parts, body) = send(
+            &router,
+            form_post(
+                ReplaceStudioLogin::PATH,
+                &format!(
+                    "id={id}&username={}&password=not-the-fixture-password",
+                    fixture_value("DASHBOARD_USERNAME"),
+                ),
+                Some(&alice),
+            ),
+        )
+        .await;
+        assert_ne!(parts.status, StatusCode::OK, "{body}");
+        assert!(body.contains("refused this Studio login"), "{body}");
         let (parts, body) = send(
             &router,
             form_post(
@@ -1392,6 +1416,7 @@ mod tests {
         )
         .await;
         assert_eq!(parts.status, StatusCode::OK, "{body}");
+        assert!(body.contains(r#""result":"confirmed""#), "{body}");
         let launch = format!("/dashboard/project/{id}");
 
         // A viewer is refused before anything reaches the gateway.
