@@ -64,7 +64,7 @@ pub fn HealthPanel(project: ProjectSummary) -> impl IntoView {
                         <StatePanel
                             tone=StateTone::Empty
                             title="Not checked yet".to_string()
-                            detail="Run a check to see whether the stack's Auth and REST services answer. Checks use the API keys stored under Settings.".to_string()
+                            detail="Run a check to see whether the stack's Auth, REST, Storage, Realtime, and Studio services answer. Checks use the API keys and the Studio login stored under Settings.".to_string()
                         />
                     }
                     .into_any(),
@@ -302,7 +302,7 @@ fn key_row(
             <p class="field-hint" id=hint_id>
                 {format!("{} in the stack's .env file.", kind.env_name())}
                 {matches!(kind, CredentialKind::AnonKey)
-                    .then_some(" Used for the Auth check.")}
+                    .then_some(" Used for the Auth, Storage, and Realtime checks.")}
                 {matches!(kind, CredentialKind::ServiceRoleKey)
                     .then_some(" Used for the REST check, which current gateway configurations limit to this key.")}
             </p>
@@ -342,8 +342,12 @@ fn state_badge(state: &CredentialState) -> (&'static str, String, bool) {
 /// refused arrives as an error and was not stored.
 fn studio_saved(result: Result<SavedCredential, AppError>) -> AnyView {
     match result {
-        Ok(SavedCredential::Confirmed | SavedCredential::NotChecked) => view! {
+        Ok(SavedCredential::Confirmed) => view! {
             <p class="form-ok" role="status">"Studio login saved. The gateway accepted it."</p>
+        }
+        .into_any(),
+        Ok(SavedCredential::NotChecked) => view! {
+            <p class="form-ok" role="status">"Studio login saved."</p>
         }
         .into_any(),
         Ok(SavedCredential::Unconfirmed { status }) => {
