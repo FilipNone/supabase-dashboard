@@ -142,22 +142,42 @@ impl Database {
         rows.into_iter().map(ProjectRecord::try_from).collect()
     }
 
-    /// Projects never checked or last checked more than `older_than_secs`
-    /// ago, never checked first and then oldest first, at most `limit`.
-    pub async fn projects_due_for_check(
+    /// Claims, for `lease_secs`, the projects never checked or last checked
+    /// more than `older_than_secs` ago that no other pass has claimed: never
+    /// checked first and then oldest first, at most `limit`. Two passes,
+    /// even from separate processes, never claim the same project while
+    /// its claim lasts, because the insert only replaces a lapsed claim.
+    pub async fn claim_projects_due_for_check(
         &self,
         older_than_secs: i64,
+        lease_secs: i64,
         limit: usize,
     ) -> Result<Vec<ProjectRecord>, PersistenceError> {
         let rows: Vec<ProjectRow> = sqlx::query_as(
-            "SELECT p.id, p.organization_id, p.name, p.api_url, p.created_at \
-             FROM projects p LEFT JOIN project_health_reports h ON h.project_id = p.id \
-             WHERE h.checked_at IS NULL \
-                OR h.checked_at < now() - make_interval(secs => $1::double precision) \
-             ORDER BY h.checked_at NULLS FIRST, p.id \
-             LIMIT $2",
+            "WITH due AS ( \
+                SELECT p.id, h.checked_at FROM projects p \
+                LEFT JOIN project_health_reports h ON h.project_id = p.id \
+                LEFT JOIN project_check_claims c ON c.project_id = p.id \
+                WHERE (h.checked_at IS NULL \
+                       OR h.checked_at < now() - make_interval(secs => $1::double precision)) \
+                  AND (c.claimed_until IS NULL OR c.claimed_until < now()) \
+                ORDER BY h.checked_at NULLS FIRST, p.id \
+                LIMIT $3 \
+                FOR UPDATE OF p SKIP LOCKED \
+             ), claimed AS ( \
+                INSERT INTO project_check_claims (project_id, claimed_until) \
+                SELECT id, now() + make_interval(secs => $2::double precision) FROM due \
+                ON CONFLICT (project_id) DO UPDATE SET claimed_until = EXCLUDED.claimed_until \
+                WHERE project_check_claims.claimed_until < now() \
+                RETURNING project_id \
+             ) \
+             SELECT p.id, p.organization_id, p.name, p.api_url, p.created_at \
+             FROM claimed JOIN projects p ON p.id = claimed.project_id \
+             JOIN due ON due.id = claimed.project_id \
+             ORDER BY due.checked_at NULLS FIRST, p.id",
         )
         .bind(older_than_secs)
+        .bind(lease_secs)
         .bind(i64::try_from(limit).unwrap_or(i64::MAX))
         .fetch_all(&self.pool)
         .await

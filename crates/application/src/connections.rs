@@ -112,6 +112,10 @@ pub struct ScheduledChecks {
     pub batch: usize,
     /// Most checks running at once.
     pub concurrency: usize,
+    /// How long a pass holds the projects it picked. Other passes, in this
+    /// process or another one sharing the database, leave them alone until
+    /// then. Longer than a check can take.
+    pub lease: std::time::Duration,
 }
 
 /// What one scheduled pass did.
@@ -426,7 +430,10 @@ impl ConnectionService {
     /// One pass of the dashboard's own checks: projects never checked or
     /// last checked longer ago than `schedule.older_than`, oldest first,
     /// at most `schedule.batch` of them and `schedule.concurrency` at a
-    /// time. A project with a check already running is skipped. No member
+    /// time. Each pass claims its projects for `schedule.lease` first, so
+    /// server processes sharing the database split the work instead of
+    /// repeating it. A project with a check already running in this
+    /// process is skipped. No member
     /// is involved, so nothing is audited; results are saved like a check
     /// a member asked for.
     pub async fn check_due(
@@ -434,9 +441,10 @@ impl ConnectionService {
         schedule: ScheduledChecks,
     ) -> Result<ScheduledRun, ConnectionError> {
         let older_than = i64::try_from(schedule.older_than.as_secs()).unwrap_or(i64::MAX);
+        let lease = i64::try_from(schedule.lease.as_secs()).unwrap_or(i64::MAX);
         let due = self
             .db
-            .projects_due_for_check(older_than, schedule.batch)
+            .claim_projects_due_for_check(older_than, lease, schedule.batch)
             .await?;
         let mut run = ScheduledRun::default();
         let mut tasks = tokio::task::JoinSet::new();

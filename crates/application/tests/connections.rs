@@ -854,6 +854,7 @@ async fn scheduled_checks_take_the_oldest_due_projects_first() {
         older_than: std::time::Duration::from_secs(3600),
         batch: 1,
         concurrency: 2,
+        lease: std::time::Duration::from_secs(600),
     };
 
     // A batch of one takes the project never checked.
@@ -886,4 +887,78 @@ async fn scheduled_checks_take_the_oldest_due_projects_first() {
             .unwrap(),
         ScheduledRun::default()
     );
+}
+
+#[tokio::test]
+async fn processes_sharing_the_database_split_scheduled_checks() {
+    let Some(scratch) = ScratchDb::create("conn_claims").await else {
+        return;
+    };
+    let f = setup(&scratch, Some(KEY_A)).await;
+    // Two services on one database stand for two server processes.
+    let first = Arc::new(ConnectionService::new(
+        f.db.clone(),
+        Some(cipher(KEY_A)),
+        f.probe.clone(),
+    ));
+    let second = Arc::new(ConnectionService::new(
+        f.db.clone(),
+        Some(cipher(KEY_A)),
+        f.probe.clone(),
+    ));
+    let owner = account(&f.db, "Owner").await;
+    let (org, _) = project(&f, &owner, "Acme").await;
+    for n in 0..9 {
+        f.projects
+            .register(
+                &owner,
+                org,
+                Registration {
+                    name: &format!("Stack {n}"),
+                    api_url: "https://other.example.test",
+                    allow_unencrypted: false,
+                },
+                ctx(),
+            )
+            .await
+            .unwrap();
+    }
+    let schedule = ScheduledChecks {
+        older_than: std::time::Duration::from_secs(3600),
+        batch: 10,
+        concurrency: 3,
+        lease: std::time::Duration::from_secs(600),
+    };
+
+    let (a, b) = tokio::join!(first.check_due(schedule), second.check_due(schedule));
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert_eq!(a.checked + b.checked, 10);
+    assert_eq!(a.skipped + b.skipped + a.failed + b.failed, 0);
+    let saved: Vec<i64> = sqlx::query_scalar(
+        "SELECT count(h.checked_at) FROM projects p \
+         LEFT JOIN project_health_history h ON h.project_id = p.id \
+         GROUP BY p.id",
+    )
+    .fetch_all(f.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(saved, vec![1; 10], "each project is checked exactly once");
+
+    // A claim still running holds the project even once it is due again.
+    sqlx::query("UPDATE project_health_reports SET checked_at = now() - interval '2 hours'")
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        first.check_due(schedule).await.unwrap(),
+        ScheduledRun::default()
+    );
+
+    // A lapsed claim does not: a process that stopped halfway through
+    // leaves its projects to the next pass.
+    sqlx::query("UPDATE project_check_claims SET claimed_until = now() - interval '1 second'")
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(second.check_due(schedule).await.unwrap().checked, 10);
 }

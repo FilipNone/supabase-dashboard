@@ -349,6 +349,9 @@ async fn scheduled_checks(connections: Arc<ConnectionService>, interval: Duratio
         older_than: interval,
         batch: 20,
         concurrency: 4,
+        // A check makes five requests of at most 10 s each, and a batch of
+        // 20 at 4 at a time takes about 250 s at worst.
+        lease: Duration::from_secs(600),
     };
     let period = Duration::from_secs(60);
     let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
