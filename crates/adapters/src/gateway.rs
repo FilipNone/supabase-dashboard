@@ -131,9 +131,16 @@ impl GatewayProbe {
                     Ok(body) => (ServiceStatus::Healthy, auth_version(&body)),
                     Err(reason) => (ServiceStatus::Unreachable { reason }, None),
                 },
+                StackService::Storage => match read_bounded(response).await {
+                    Ok(body) => (ServiceStatus::Healthy, storage_version(&body)),
+                    Err(reason) => (ServiceStatus::Unreachable { reason }, None),
+                },
                 // The REST root is the OpenAPI description, which can be
-                // large. The status is enough; the body is not read.
-                StackService::Rest | StackService::Studio => (ServiceStatus::Healthy, None),
+                // large, and Realtime's ping says only "Success". The status
+                // is enough; the body is not read.
+                StackService::Rest | StackService::Realtime | StackService::Studio => {
+                    (ServiceStatus::Healthy, None)
+                }
             }
         } else {
             (status_failure(status), None)
@@ -241,6 +248,8 @@ const fn path(service: StackService) -> &'static str {
     match service {
         StackService::Auth => "/auth/v1/health",
         StackService::Rest => "/rest/v1/",
+        StackService::Storage => "/storage/v1/version",
+        StackService::Realtime => "/realtime/v1/api/ping",
         StackService::Studio => "/",
     }
 }
@@ -249,6 +258,8 @@ const fn accept(service: StackService) -> &'static str {
     match service {
         StackService::Auth => "application/json",
         StackService::Rest => "application/openapi+json",
+        StackService::Storage => "text/plain",
+        StackService::Realtime => "application/json",
         StackService::Studio => "text/html",
     }
 }
@@ -310,6 +321,12 @@ fn auth_version(body: &[u8]) -> Option<String> {
         .and_then(|v| sanitize_version(&v))
 }
 
+/// Storage's version path answers with the bare version, such as
+/// `1.89.12`. Anything longer or unprintable is dropped.
+fn storage_version(body: &[u8]) -> Option<String> {
+    std::str::from_utf8(body).ok().and_then(sanitize_version)
+}
+
 /// rustls with the ring provider (the one SQLx already uses) and the
 /// Mozilla root store from `webpki-roots`. Stacks behind a private CA are
 /// not supported yet.
@@ -360,5 +377,14 @@ mod tests {
         assert_eq!(auth_version(br#"{"name":"GoTrue"}"#), None);
         assert_eq!(auth_version(b"not json"), None);
         assert_eq!(auth_version(br#"{"version":"v1\u0000"}"#), None);
+    }
+
+    #[test]
+    fn storage_version_is_the_body() {
+        assert_eq!(storage_version(b"1.89.12"), Some("1.89.12".into()));
+        assert_eq!(storage_version(b"1.89.12\n"), Some("1.89.12".into()));
+        assert_eq!(storage_version(b""), None);
+        assert_eq!(storage_version(&[0xff, 0xfe]), None);
+        assert_eq!(storage_version("v".repeat(100).as_bytes()), None);
     }
 }

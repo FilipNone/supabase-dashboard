@@ -96,7 +96,7 @@ The server logs a short key ID at startup, never the key. Each stored API key is
 
 ### Service checks
 
-The project overview's "Check now" button asks the stack's API gateway for `/auth/v1/health` (with the anon key) and `/rest/v1/` (with the service role key). Only those two paths under the registered API URL are requested. The client refuses loopback (unless allowed above), link-local, multicast, and cloud metadata addresses, checks every address a host name resolves to, does not follow redirects, ignores proxy environment variables, and gives up after 5 seconds to connect or 10 seconds in total. HTTPS uses the Mozilla root store bundled with the binary; stacks behind a private certificate authority are not supported yet. A project can be checked once every 10 seconds.
+The project overview's "Check now" button asks the stack's API gateway for `/auth/v1/health`, `/storage/v1/version`, and `/realtime/v1/api/ping` (with the anon key), `/rest/v1/` (with the service role key), and `/` (Studio's route, once without a login and once with the stored one). Only those paths under the registered API URL are requested. Saving a Studio login requests `/` the same way before storing it. The client refuses loopback (unless allowed above), link-local, multicast, and cloud metadata addresses, checks every address a host name resolves to, does not follow redirects, ignores proxy environment variables, and gives up after 5 seconds to connect or 10 seconds in total. HTTPS uses the Mozilla root store bundled with the binary; stacks behind a private certificate authority are not supported yet. A project can be checked once every 10 seconds.
 
 ## Endpoints
 

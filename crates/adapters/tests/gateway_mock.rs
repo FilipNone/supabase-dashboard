@@ -67,6 +67,29 @@ fn gateway() -> Router {
                 }
             }),
         )
+        .route(
+            "/storage/v1/version",
+            get(|| async { (StatusCode::OK, "1.89.12") }),
+        )
+        .route(
+            "/realtime/v1/api/ping",
+            get(|headers: HeaderMap| async move {
+                if has_good_key(&headers) {
+                    (StatusCode::OK, r#"{"message":"Success"}"#).into_response()
+                } else {
+                    StatusCode::UNAUTHORIZED.into_response()
+                }
+            }),
+        )
+}
+
+/// A gateway that routes only Auth, like a stack without Storage or
+/// Realtime.
+fn auth_only_gateway() -> Router {
+    Router::new().route(
+        "/auth/v1/health",
+        get(|| async { (StatusCode::OK, r#"{"version":"v2.197.0"}"#) }),
+    )
 }
 
 fn probe(policy: TargetPolicy) -> GatewayProbe {
@@ -95,6 +118,25 @@ async fn healthy_services_report_status_and_version() {
     assert!(auth.latency_ms.is_some());
     let rest = probe.check(&url, StackService::Rest, &key).await;
     assert_eq!(rest.status, ServiceStatus::Healthy);
+    let storage = probe.check(&url, StackService::Storage, &key).await;
+    assert_eq!(storage.status, ServiceStatus::Healthy);
+    assert_eq!(storage.version.as_deref(), Some("1.89.12"));
+    let realtime = probe.check(&url, StackService::Realtime, &key).await;
+    assert_eq!(realtime.status, ServiceStatus::Healthy);
+}
+
+#[tokio::test]
+async fn services_without_a_route_are_reported_as_not_found() {
+    let url = serve(auth_only_gateway()).await;
+    let probe = probe(loopback());
+    let key = SecretString::from(GOOD_KEY);
+    for service in [StackService::Storage, StackService::Realtime] {
+        assert_eq!(
+            probe.check(&url, service, &key).await.status,
+            ServiceStatus::Unhealthy { http_status: 404 },
+            "{service:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -109,6 +151,10 @@ async fn rejected_keys_are_reported() {
     assert_eq!(
         probe.check(&url, StackService::Rest, &key).await.status,
         ServiceStatus::KeyRejected { http_status: 403 }
+    );
+    assert_eq!(
+        probe.check(&url, StackService::Realtime, &key).await.status,
+        ServiceStatus::KeyRejected { http_status: 401 }
     );
 }
 

@@ -155,6 +155,13 @@ fn describe(
             format!("Redirected (HTTP {http_status})"),
             Some("The dashboard does not follow redirects. Check the API URL."),
         ),
+        ServiceStatus::Unhealthy { http_status: 404 } if !studio => (
+            "badge badge-error",
+            "Not found (HTTP 404)".into(),
+            Some(
+                "The gateway has no route for this service. The stack may not run it, or its gateway configuration leaves it out.",
+            ),
+        ),
         ServiceStatus::Unhealthy { http_status } => (
             "badge badge-error",
             format!("Error (HTTP {http_status})"),

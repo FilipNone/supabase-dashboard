@@ -377,6 +377,8 @@ async fn checks_prefer_the_least_privileged_key_and_are_saved() {
         vec![
             (StackService::Auth, ANON.to_owned()),
             (StackService::Rest, SERVICE.to_owned()),
+            (StackService::Storage, ANON.to_owned()),
+            (StackService::Realtime, ANON.to_owned()),
             (StackService::Studio, studio.clone()),
         ]
     );

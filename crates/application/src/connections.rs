@@ -83,10 +83,13 @@ pub trait StackProbe: Send + Sync {
 /// Which stored key a service check uses. The least privileged key that
 /// works is preferred: Auth's health endpoint accepts the anon key, while
 /// PostgREST's root (its OpenAPI description) is limited to the service role
-/// in current upstream gateway configurations.
+/// in current upstream gateway configurations. Storage's version path and
+/// Realtime's ping answer the anon key.
 pub const fn key_preference(service: StackService) -> &'static [CredentialKind] {
     match service {
-        StackService::Auth => &[CredentialKind::AnonKey, CredentialKind::ServiceRoleKey],
+        StackService::Auth | StackService::Storage | StackService::Realtime => {
+            &[CredentialKind::AnonKey, CredentialKind::ServiceRoleKey]
+        }
         StackService::Rest => &[CredentialKind::ServiceRoleKey, CredentialKind::AnonKey],
         StackService::Studio => &[CredentialKind::StudioLogin],
     }

@@ -93,6 +93,36 @@ async fn fixture_gateway_reports_auth_and_rest() {
 }
 
 #[tokio::test]
+async fn fixture_gateway_reports_storage_and_realtime() {
+    let Some(url) = fixture_url() else { return };
+    let probe = GatewayProbe::new(GatewaySettings {
+        policy: loopback(),
+        ..GatewaySettings::default()
+    })
+    .unwrap();
+    let anon = SecretString::from(fixture_value("ANON_KEY"));
+
+    let storage = probe.check(&url, StackService::Storage, &anon).await;
+    assert_eq!(storage.status, ServiceStatus::Healthy);
+    assert_eq!(storage.version.as_deref(), Some("1.89.12"));
+
+    let realtime = probe.check(&url, StackService::Realtime, &anon).await;
+    assert_eq!(realtime.status, ServiceStatus::Healthy);
+    assert_eq!(realtime.version, None);
+
+    // Realtime sits behind the gateway's key check; Storage checks keys
+    // itself and leaves its version path open, as upstream does.
+    let wrong = SecretString::from("not-a-key");
+    assert_eq!(
+        probe
+            .check(&url, StackService::Realtime, &wrong)
+            .await
+            .status,
+        ServiceStatus::KeyRejected { http_status: 401 }
+    );
+}
+
+#[tokio::test]
 async fn fixture_studio_route_needs_the_login() {
     let Some(url) = fixture_url() else { return };
     let probe = GatewayProbe::new(GatewaySettings {

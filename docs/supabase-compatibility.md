@@ -39,6 +39,9 @@ docker compose -p sd-fixture down -v
 | Auth health and version through the gateway (anon key) | Verified against GoTrue v2.197.0 via Kong 3.9.3 | `crates/adapters/tests/gateway_fixture.rs`, CI job `fixture` |
 | PostgREST reachability through the gateway (service role key; the gateway refuses the anon key on the root path with 403) | Verified against PostgREST v14.18 via Kong 3.9.3 | same test |
 | Wrong key reported as rejected (401) | Verified | same test |
+| Storage reachability and version through the gateway (`/storage/v1/version`, anon key) | Verified against Storage v1.89.12 via Kong 3.9.3 | `fixture_gateway_reports_storage_and_realtime` in `crates/adapters/tests/gateway_fixture.rs`, CI job `fixture` |
+| Realtime reachability through the gateway (`/realtime/v1/api/ping`, anon key; no WebSocket and no tenant database check) | Verified against Realtime v2.148.3 via Kong 3.9.3 | same test |
+| A service the gateway has no route for is reported as not found (404) | Mock gateway only | `services_without_a_route_are_reported_as_not_found` in `crates/adapters/tests/gateway_mock.rs` |
 | Studio route: refuses requests without the login or with a wrong one, accepts the stored login | Verified against Studio 2026.11.02-sha-a05e7ec via Kong 3.9.3 | `fixture_studio_route_needs_the_login` in `crates/adapters/tests/gateway_fixture.rs`, CI job `fixture` |
 | Saving a Studio login tries it against the Studio route first and refuses a login the gateway rejects | Verified against Studio 2026.11.02-sha-a05e7ec via Kong 3.9.3 | `studio_opens_the_fixture_studio` in `apps/server/src/app.rs` (saves the fixture's login through the settings form); refusal covered by application tests |
 | Studio route: reports a gateway that opens Studio without a login | Mock gateway only | `crates/adapters/tests/gateway_mock.rs` |

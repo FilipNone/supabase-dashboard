@@ -203,17 +203,32 @@ pub enum StackService {
     Auth,
     /// PostgREST, checked at `/rest/v1/`.
     Rest,
+    /// Supabase Storage, checked at `/storage/v1/version`, which also
+    /// gives its version.
+    Storage,
+    /// Supabase Realtime, checked at `/realtime/v1/api/ping`. This shows
+    /// the service answers; it does not open a WebSocket or check the
+    /// tenant's database connection.
+    Realtime,
     /// Studio, behind the gateway's basic-auth route at `/`.
     Studio,
 }
 
 impl StackService {
-    pub const ALL: [Self; 3] = [Self::Auth, Self::Rest, Self::Studio];
+    pub const ALL: [Self; 5] = [
+        Self::Auth,
+        Self::Rest,
+        Self::Storage,
+        Self::Realtime,
+        Self::Studio,
+    ];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::Auth => "Auth",
             Self::Rest => "REST API (PostgREST)",
+            Self::Storage => "Storage",
+            Self::Realtime => "Realtime",
             Self::Studio => "Studio",
         }
     }
