@@ -23,7 +23,7 @@ use supabase_dashboard_adapters::{
 };
 use supabase_dashboard_application::{
     auth::{AuthConfig, AuthError, AuthService, BootstrapError, PasswordResetError},
-    connections::ConnectionService,
+    connections::{ConnectionService, ScheduledChecks},
     organizations::OrganizationService,
     projects::ProjectService,
     secrets::{CredentialCipher, KeyError},
@@ -237,6 +237,18 @@ async fn run() -> Result<(), StartupError> {
         }
     };
 
+    let connections = Arc::new(ConnectionService::new(db.clone(), cipher, probe));
+    match config.health_check_interval {
+        Some(interval) => {
+            tracing::info!(
+                interval_mins = interval.as_secs() / 60,
+                "projects are checked on a schedule"
+            );
+            tokio::spawn(scheduled_checks(Arc::clone(&connections), interval));
+        }
+        None => tracing::info!("scheduled project checks are off"),
+    }
+
     let secure_cookie = config
         .public_url
         .as_ref()
@@ -248,7 +260,7 @@ async fn run() -> Result<(), StartupError> {
         auth,
         organizations: Arc::new(OrganizationService::new(db.clone())),
         projects: Arc::new(ProjectService::new(db.clone())),
-        connections: Arc::new(ConnectionService::new(db.clone(), cipher, probe)),
+        connections,
         cookie: CookieSettings::new(secure_cookie, config.session_lifetime.as_secs()),
         expected_origin: config
             .public_url
@@ -294,6 +306,34 @@ async fn prune_sessions(auth: Arc<AuthService>) {
             Ok(0) => {}
             Ok(count) => tracing::info!(count, "pruned expired sessions"),
             Err(err) => tracing::warn!(error = %err, "could not prune sessions"),
+        }
+    }
+}
+
+/// Checks projects whose last check is older than `interval`, once a
+/// minute, a bounded number at a time, so a large registry is spread over
+/// several minutes instead of checked all at once. The first pass waits a
+/// minute after startup.
+async fn scheduled_checks(connections: Arc<ConnectionService>, interval: Duration) {
+    let schedule = ScheduledChecks {
+        older_than: interval,
+        batch: 20,
+        concurrency: 4,
+    };
+    let period = Duration::from_secs(60);
+    let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticks.tick().await;
+        match connections.check_due(schedule).await {
+            Ok(run) if run.checked + run.skipped + run.failed == 0 => {}
+            Ok(run) => tracing::info!(
+                checked = run.checked,
+                skipped = run.skipped,
+                failed = run.failed,
+                "scheduled project checks ran"
+            ),
+            Err(err) => tracing::warn!(error = %err, "could not run scheduled project checks"),
         }
     }
 }

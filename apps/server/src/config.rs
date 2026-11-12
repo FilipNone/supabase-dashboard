@@ -53,6 +53,9 @@ pub struct Config {
     /// Longest time a Studio request may take to answer, because Studio's
     /// SQL editor can run long queries.
     pub studio_request_timeout: Duration,
+    /// How old a project's last check may get before the server checks it
+    /// again on its own. `None` turns the server's own checks off.
+    pub health_check_interval: Option<Duration>,
 }
 
 #[derive(Debug, Clone)]
@@ -180,6 +183,17 @@ impl Config {
         )?;
         let studio_request_timeout =
             secs(bounded(&get, "STUDIO_REQUEST_TIMEOUT_SECS", 300, 10, 3600)?);
+        let health_check_interval =
+            match bounded(&get, "HEALTH_CHECK_INTERVAL_MINS", 15, 0, 24 * 60)? {
+                0 => None,
+                1..5 => {
+                    return Err(invalid(
+                        "HEALTH_CHECK_INTERVAL_MINS",
+                        "must be 0 (off) or between 5 and 1440",
+                    ));
+                }
+                mins => Some(secs(mins * 60)),
+            };
 
         Ok(Self {
             environment,
@@ -198,6 +212,7 @@ impl Config {
             studio_max_body_bytes: usize::try_from(studio_max_body_bytes)
                 .map_err(|_| invalid("STUDIO_MAX_BODY_BYTES", "does not fit in memory size"))?,
             studio_request_timeout,
+            health_check_interval,
         })
     }
 }
@@ -329,6 +344,26 @@ mod tests {
         ])
         .unwrap_err();
         assert!(!err.to_string().contains("hunter2"));
+    }
+
+    #[test]
+    fn health_checks_default_to_every_fifteen_minutes_and_can_be_turned_off() {
+        let dev = (("ENV", "development"), DB);
+        let config = load(&[dev.0, dev.1]).unwrap();
+        assert_eq!(config.health_check_interval, Some(Duration::from_secs(900)));
+        let off = load(&[dev.0, dev.1, ("HEALTH_CHECK_INTERVAL_MINS", "0")]).unwrap();
+        assert_eq!(off.health_check_interval, None);
+        let hourly = load(&[dev.0, dev.1, ("HEALTH_CHECK_INTERVAL_MINS", "60")]).unwrap();
+        assert_eq!(
+            hourly.health_check_interval,
+            Some(Duration::from_secs(3600))
+        );
+        for bad in ["1", "4", "1441", "soon"] {
+            assert!(
+                load(&[dev.0, dev.1, ("HEALTH_CHECK_INTERVAL_MINS", bad)]).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

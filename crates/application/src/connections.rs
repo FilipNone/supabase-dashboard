@@ -25,7 +25,7 @@ use supabase_dashboard_persistence::{
     Database, PersistenceError,
     audit::AuditOutcome,
     connections::{NewCredential, StoredCredential},
-    projects::ProjectAccess,
+    projects::{ProjectAccess, ProjectRecord},
 };
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -92,6 +92,45 @@ pub const fn key_preference(service: StackService) -> &'static [CredentialKind] 
         }
         StackService::Rest => &[CredentialKind::ServiceRoleKey, CredentialKind::AnonKey],
         StackService::Studio => &[CredentialKind::StudioLogin],
+    }
+}
+
+/// How the dashboard checks projects on its own schedule.
+#[derive(Debug, Clone, Copy)]
+pub struct ScheduledChecks {
+    /// Check a project again once its last check is older than this.
+    pub older_than: std::time::Duration,
+    /// Most projects checked in one pass.
+    pub batch: usize,
+    /// Most checks running at once.
+    pub concurrency: usize,
+}
+
+/// What one scheduled pass did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ScheduledRun {
+    pub checked: usize,
+    /// Skipped because a check of the project was already running.
+    pub skipped: usize,
+    /// The check could not be run or saved. Problems at the stack are not
+    /// failures here; they are recorded in the saved report.
+    pub failed: usize,
+}
+
+impl ScheduledRun {
+    fn count(&mut self, joined: Result<Result<bool, ConnectionError>, tokio::task::JoinError>) {
+        match joined {
+            Ok(Ok(true)) => self.checked += 1,
+            Ok(Ok(false)) => self.skipped += 1,
+            Ok(Err(err)) => {
+                tracing::warn!(error = %err, "scheduled project check failed");
+                self.failed += 1;
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "scheduled project check stopped");
+                self.failed += 1;
+            }
+        }
     }
 }
 
@@ -347,14 +386,57 @@ impl ConnectionService {
         let Some(_guard) = RunningGuard::acquire(&self.running, project_id) else {
             return Err(ConnectionError::CheckInProgress);
         };
-        let report = self.run_check(&access).await?;
+        let report = self.run_check(&access.project).await?;
         self.db.save_health_report(project_id, &report).await?;
         tracing::info!(project_id = %project_id, "project services checked");
         Ok(report)
     }
 
-    async fn run_check(&self, access: &ProjectAccess) -> Result<HealthReport, ConnectionError> {
-        let project = &access.project;
+    /// One pass of the dashboard's own checks: projects never checked or
+    /// last checked longer ago than `schedule.older_than`, oldest first,
+    /// at most `schedule.batch` of them and `schedule.concurrency` at a
+    /// time. A project with a check already running is skipped. No member
+    /// is involved, so nothing is audited; results are saved like a check
+    /// a member asked for.
+    pub async fn check_due(
+        self: &Arc<Self>,
+        schedule: ScheduledChecks,
+    ) -> Result<ScheduledRun, ConnectionError> {
+        let older_than = i64::try_from(schedule.older_than.as_secs()).unwrap_or(i64::MAX);
+        let due = self
+            .db
+            .projects_due_for_check(older_than, schedule.batch)
+            .await?;
+        let mut run = ScheduledRun::default();
+        let mut tasks = tokio::task::JoinSet::new();
+        let concurrency = schedule.concurrency.max(1);
+        for project in due {
+            while tasks.len() >= concurrency {
+                if let Some(joined) = tasks.join_next().await {
+                    run.count(joined);
+                }
+            }
+            let service = Arc::clone(self);
+            tasks.spawn(async move { service.scheduled_check(&project).await });
+        }
+        while let Some(joined) = tasks.join_next().await {
+            run.count(joined);
+        }
+        Ok(run)
+    }
+
+    /// Checks one project for [`Self::check_due`]. `Ok(false)` means a
+    /// check of it was already running.
+    async fn scheduled_check(&self, project: &ProjectRecord) -> Result<bool, ConnectionError> {
+        let Some(_guard) = RunningGuard::acquire(&self.running, project.id) else {
+            return Ok(false);
+        };
+        let report = self.run_check(project).await?;
+        self.db.save_health_report(project.id, &report).await?;
+        Ok(true)
+    }
+
+    async fn run_check(&self, project: &ProjectRecord) -> Result<HealthReport, ConnectionError> {
         let stored = self.db.list_credentials(project.id).await?;
         let mut checks = Vec::with_capacity(StackService::ALL.len());
         for service in StackService::ALL {

@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex};
 use secrecy::{ExposeSecret, SecretString};
 use supabase_dashboard_application::{
     auth::{CurrentSession, RequestContext},
-    connections::{ConnectionError, ConnectionService, ProbeFuture, StackProbe},
+    connections::{
+        ConnectionError, ConnectionService, ProbeFuture, ScheduledChecks, ScheduledRun, StackProbe,
+    },
     organizations::OrganizationService,
     projects::{ProjectService, Registration},
     secrets::CredentialCipher,
@@ -712,4 +714,97 @@ async fn health_digests_cover_one_organization_for_its_members() {
         f.connections.health_digests(&viewer, other_org).await,
         Err(ConnectionError::NotFound)
     ));
+}
+
+#[tokio::test]
+async fn scheduled_checks_take_the_oldest_due_projects_first() {
+    let Some(scratch) = ScratchDb::create("conn_scheduled").await else {
+        return;
+    };
+    let f = setup(&scratch, Some(KEY_A)).await;
+    let service = Arc::new(ConnectionService::new(
+        f.db.clone(),
+        Some(cipher(KEY_A)),
+        f.probe.clone(),
+    ));
+    let owner = account(&f.db, "Owner").await;
+    let (org, recent) = project(&f, &owner, "Acme").await;
+    let register = async |name: &str| {
+        f.projects
+            .register(
+                &owner,
+                org,
+                Registration {
+                    name,
+                    api_url: "https://other.example.test",
+                    allow_unencrypted: false,
+                },
+                ctx(),
+            )
+            .await
+            .unwrap()
+            .id
+    };
+    let old = register("Old").await;
+    let never = register("Never").await;
+    for id in [recent, old] {
+        f.connections.check_now(&owner, id).await.unwrap();
+    }
+    sqlx::query(
+        "UPDATE project_health_reports SET checked_at = now() - interval '2 hours' \
+         WHERE project_id = $1",
+    )
+    .bind(old)
+    .execute(f.db.pool())
+    .await
+    .unwrap();
+    let checked_at = |id: Uuid| {
+        let db = f.db.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<time::OffsetDateTime>>(
+                "SELECT max(checked_at) FROM project_health_reports WHERE project_id = $1",
+            )
+            .bind(id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap()
+        }
+    };
+    let recent_before = checked_at(recent).await;
+    let hour = ScheduledChecks {
+        older_than: std::time::Duration::from_secs(3600),
+        batch: 1,
+        concurrency: 2,
+    };
+
+    // A batch of one takes the project never checked.
+    let run = service.check_due(hour).await.unwrap();
+    assert_eq!(
+        run,
+        ScheduledRun {
+            checked: 1,
+            skipped: 0,
+            failed: 0
+        }
+    );
+    assert!(checked_at(never).await.is_some());
+
+    // Then the one checked two hours ago; the recent one is left alone.
+    let run = service
+        .check_due(ScheduledChecks { batch: 10, ..hour })
+        .await
+        .unwrap();
+    assert_eq!(run.checked, 1);
+    let old_after = checked_at(old).await.unwrap();
+    assert!(old_after > time::OffsetDateTime::now_utc() - time::Duration::minutes(1));
+    assert_eq!(checked_at(recent).await, recent_before);
+
+    // Nothing is due now.
+    assert_eq!(
+        service
+            .check_due(ScheduledChecks { batch: 10, ..hour })
+            .await
+            .unwrap(),
+        ScheduledRun::default()
+    );
 }

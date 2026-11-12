@@ -142,6 +142,29 @@ impl Database {
         rows.into_iter().map(ProjectRecord::try_from).collect()
     }
 
+    /// Projects never checked or last checked more than `older_than_secs`
+    /// ago, never checked first and then oldest first, at most `limit`.
+    pub async fn projects_due_for_check(
+        &self,
+        older_than_secs: i64,
+        limit: usize,
+    ) -> Result<Vec<ProjectRecord>, PersistenceError> {
+        let rows: Vec<ProjectRow> = sqlx::query_as(
+            "SELECT p.id, p.organization_id, p.name, p.api_url, p.created_at \
+             FROM projects p LEFT JOIN project_health_reports h ON h.project_id = p.id \
+             WHERE h.checked_at IS NULL \
+                OR h.checked_at < now() - make_interval(secs => $1::double precision) \
+             ORDER BY h.checked_at NULLS FIRST, p.id \
+             LIMIT $2",
+        )
+        .bind(older_than_secs)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(query_err)?;
+        rows.into_iter().map(ProjectRecord::try_from).collect()
+    }
+
     /// The project and the account's role in its organization, or `None`
     /// when the project does not exist or the account is not a member.
     pub async fn find_project_access(
