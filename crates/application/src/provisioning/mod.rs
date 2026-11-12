@@ -41,13 +41,15 @@ use supabase_dashboard_domain::{
     dokploy_placement::DokployId,
     dokploy_target::{DefaultTarget, StackTarget},
     job::JobKind,
+    job::JobState,
     project::{MAX_PROJECTS_PER_ORGANIZATION, ProjectInputError, ProjectName, ProjectUrl},
+    provisioning::{ProvisionJobSummary, ProvisionStep, ProvisionTargets, TargetChoice},
 };
 use supabase_dashboard_persistence::{
     Database, PersistenceError,
     audit::{AuditEvent, AuditOutcome},
     connections::NewCredential,
-    jobs::{NewJob, SealedJobSecrets},
+    jobs::{NewJob, SealedJobSecrets, StoredJob},
     projects::NewProject,
     provisioning::{NewDokployService, RegisterProvisionedOutcome},
 };
@@ -302,6 +304,140 @@ impl ProvisioningService {
     }
 }
 
+/// Most provisioning jobs listed for an organization.
+const MAX_LISTED_JOBS: i64 = 20;
+
+impl ProvisioningService {
+    /// The targets the operator may choose for a new stack in
+    /// `organization_id`. Owners and admins only.
+    pub async fn targets(
+        &self,
+        current: &CurrentSession,
+        organization_id: Uuid,
+    ) -> Result<ProvisionTargets, ProvisionError> {
+        self.require(current, organization_id, Permission::ProjectRegister)
+            .await?;
+        let targets = match self.dokploy.organization_targets(organization_id).await {
+            Ok(targets) => targets,
+            Err(DokployServiceError::NotConnected) => return Ok(ProvisionTargets::NotConnected),
+            Err(err) => return Err(err.into()),
+        };
+        Ok(match targets {
+            EffectiveTargets::Allowed(allowed) => ProvisionTargets::Choices(
+                allowed
+                    .iter()
+                    .map(|(target, names)| TargetChoice {
+                        value: target.value(),
+                        label: names.label(),
+                    })
+                    .collect(),
+            ),
+            EffectiveTargets::Default(DefaultTarget::Placement { target, names }) => {
+                ProvisionTargets::Choices(vec![TargetChoice {
+                    value: target.value(),
+                    label: names.label(),
+                }])
+            }
+            EffectiveTargets::Default(DefaultTarget::NoPlacement) => ProvisionTargets::NoTarget,
+            EffectiveTargets::Default(DefaultTarget::Unavailable(reason)) => {
+                tracing::warn!(%reason, "the default stack target could not be read");
+                ProvisionTargets::Unavailable
+            }
+        })
+    }
+
+    /// A provisioning job, for members of its organization.
+    pub async fn job(
+        &self,
+        current: &CurrentSession,
+        job_id: Uuid,
+    ) -> Result<ProvisionJobSummary, ProvisionError> {
+        let job = self
+            .db
+            .get_job(job_id)
+            .await?
+            .filter(|job| job.kind == JobKind::ProvisionStack.as_str())
+            .ok_or(ProvisionError::NotFound)?;
+        self.require(current, job.organization_id, Permission::ProjectRead)
+            .await?;
+        let project = self
+            .db
+            .provisioned_projects(&[job.id])
+            .await?
+            .first()
+            .map(|(_, project)| *project);
+        summary(job, project).ok_or_else(|| ProvisionError::Internal("unreadable job".to_owned()))
+    }
+
+    /// The organization's latest provisioning jobs, newest first.
+    pub async fn jobs(
+        &self,
+        current: &CurrentSession,
+        organization_id: Uuid,
+    ) -> Result<Vec<ProvisionJobSummary>, ProvisionError> {
+        self.require(current, organization_id, Permission::ProjectRead)
+            .await?;
+        let jobs: Vec<StoredJob> = self
+            .db
+            .list_organization_jobs(organization_id, MAX_LISTED_JOBS)
+            .await?
+            .into_iter()
+            .filter(|job| job.kind == JobKind::ProvisionStack.as_str())
+            .collect();
+        let ids: Vec<Uuid> = jobs.iter().map(|job| job.id).collect();
+        let projects = self.db.provisioned_projects(&ids).await?;
+        Ok(jobs
+            .into_iter()
+            .filter_map(|job| {
+                let project = projects
+                    .iter()
+                    .find(|(id, _)| *id == job.id)
+                    .map(|(_, project)| *project);
+                summary(job, project)
+            })
+            .collect())
+    }
+
+    /// The operator's membership allows `permission`. A non-member gets
+    /// [`ProvisionError::NotFound`].
+    async fn require(
+        &self,
+        current: &CurrentSession,
+        organization_id: Uuid,
+        permission: Permission,
+    ) -> Result<(), ProvisionError> {
+        let membership = self
+            .db
+            .find_membership(organization_id, current.account.id)
+            .await?
+            .ok_or(ProvisionError::NotFound)?;
+        if membership.role.allows(permission) {
+            Ok(())
+        } else {
+            Err(ProvisionError::Forbidden)
+        }
+    }
+}
+
+/// What members see of a stored job. `None` when its data is unreadable.
+fn summary(job: StoredJob, project_id: Option<Uuid>) -> Option<ProvisionJobSummary> {
+    let data: JobData = serde_json::from_str(&job.data).ok()?;
+    Some(ProvisionJobSummary {
+        id: job.id,
+        organization_id: job.organization_id,
+        name: data.name,
+        host: data.host,
+        https: data.https,
+        state: JobState::parse(&job.state)?,
+        step: ProvisionStep::parse(&job.step),
+        message: job.message,
+        project_id,
+        created_at: job.created_at,
+        updated_at: job.updated_at,
+        finished_at: job.finished_at,
+    })
+}
+
 fn target_allowed(targets: &EffectiveTargets, target: &StackTarget) -> bool {
     match targets {
         EffectiveTargets::Allowed(allowed) => allowed.iter().any(|(t, _)| t == target),
@@ -405,19 +541,9 @@ impl JobHandler for ProvisionStackHandler {
     }
 }
 
-/// The saved step names, as `&'static str` for [`StepOutcome`].
+/// The saved step name, as `&'static str` for [`StepOutcome`].
 fn step_name(step: &str) -> &'static str {
-    match step {
-        "check" => "check",
-        "create_service" => "create_service",
-        "configure" => "configure",
-        "mounts" => "mounts",
-        "domain" => "domain",
-        "deploy" => "deploy",
-        "wait_deploy" => "wait_deploy",
-        "register" => "register",
-        _ => "health",
-    }
+    ProvisionStep::parse(step).map_or("check", ProvisionStep::as_str)
 }
 
 enum Then {

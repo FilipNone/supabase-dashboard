@@ -40,7 +40,9 @@ use supabase_dashboard_domain::{
         DokployServiceRef,
     },
     dokploy_target::{DokployEnvironmentInfo, DokployTargetInventory},
+    job::JobState,
     project::ProjectUrl,
+    provisioning::{ProvisionStep, ProvisionTargets, TargetChoice},
 };
 use supabase_dashboard_persistence::{Database, accounts::AccountRecord};
 use uuid::Uuid;
@@ -851,4 +853,70 @@ async fn names_hosts_and_targets_are_checked_before_queueing() {
         Err(ProvisionError::NotFound)
     ));
     assert_eq!(count(&f.db, "SELECT count(*) FROM jobs").await, 0);
+}
+
+#[tokio::test]
+async fn members_see_targets_and_progress_by_their_role() {
+    let Some(scratch) = ScratchDb::create("provision_views").await else {
+        return;
+    };
+    let f = setup(&scratch).await;
+    let dev = account(&f.db, "Dev", false).await;
+    add_member(&f.db, f.organization, &dev, OrgRole::Developer).await;
+    let stranger = account(&f.db, "Stranger", false).await;
+
+    let targets = f.service.targets(&f.owner, f.organization).await.unwrap();
+    assert_eq!(
+        targets,
+        ProvisionTargets::Choices(vec![TargetChoice {
+            value: "prod".to_owned(),
+            label: "Infra / prod, on Dokploy's own server".to_owned(),
+        }])
+    );
+    assert!(matches!(
+        f.service.targets(&dev, f.organization).await,
+        Err(ProvisionError::Forbidden)
+    ));
+    assert!(matches!(
+        f.service.targets(&stranger, f.organization).await,
+        Err(ProvisionError::NotFound)
+    ));
+
+    let job = f
+        .service
+        .start(&f.owner, f.organization, shop(), ctx())
+        .await
+        .unwrap();
+    let queued = f.service.job(&dev, job).await.unwrap();
+    assert_eq!(queued.state, JobState::Queued);
+    assert_eq!(queued.step, Some(ProvisionStep::Check));
+    assert_eq!(queued.name, "Shop");
+    assert_eq!(queued.public_url(), "https://shop.example.test");
+    assert_eq!(queued.project_id, None);
+
+    run_all(&f).await;
+    let done = f.service.job(&dev, job).await.unwrap();
+    assert_eq!(done.state, JobState::Succeeded);
+    let project: Uuid = sqlx::query_scalar("SELECT id FROM projects")
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(done.project_id, Some(project));
+    assert_eq!(
+        f.service.jobs(&dev, f.organization).await.unwrap(),
+        vec![done]
+    );
+
+    assert!(matches!(
+        f.service.job(&stranger, job).await,
+        Err(ProvisionError::NotFound)
+    ));
+    assert!(matches!(
+        f.service.jobs(&stranger, f.organization).await,
+        Err(ProvisionError::NotFound)
+    ));
+    assert!(matches!(
+        f.service.job(&f.owner, Uuid::now_v7()).await,
+        Err(ProvisionError::NotFound)
+    ));
 }

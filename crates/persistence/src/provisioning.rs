@@ -130,6 +130,20 @@ impl Database {
         Ok(active == Some(true))
     }
 
+    /// The projects these jobs registered, as (job, project) pairs.
+    pub async fn provisioned_projects(
+        &self,
+        job_ids: &[Uuid],
+    ) -> Result<Vec<(Uuid, Uuid)>, PersistenceError> {
+        sqlx::query_as(
+            "SELECT job_id, project_id FROM project_dokploy_services WHERE job_id = ANY($1)",
+        )
+        .bind(job_ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(query_err)
+    }
+
     /// How many projects the organization has.
     pub async fn count_projects(&self, organization_id: Uuid) -> Result<i64, PersistenceError> {
         sqlx::query_scalar("SELECT count(*) FROM projects WHERE organization_id = $1")

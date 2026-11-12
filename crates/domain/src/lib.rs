@@ -17,5 +17,6 @@ pub mod invitation;
 pub mod job;
 pub mod organization;
 pub mod project;
+pub mod provisioning;
 pub mod studio_access;
 pub mod theme;

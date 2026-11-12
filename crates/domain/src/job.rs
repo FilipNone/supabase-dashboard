@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JobKind {
     /// Provision a new stack through the deployment provider.
@@ -29,7 +31,8 @@ impl fmt::Display for JobKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum JobState {
     /// Waiting for a worker, either new or between steps that wait.
     Queued,
