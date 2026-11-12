@@ -10,7 +10,7 @@ use axum::{
     extract::RawQuery,
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Redirect},
-    routing::get,
+    routing::{get, post},
 };
 use secrecy::SecretString;
 use supabase_dashboard_adapters::{
@@ -360,5 +360,158 @@ async fn an_inventory_that_is_not_a_list_or_too_large_is_refused() {
     assert_eq!(
         client().inventory(&url, &key(GOOD_KEY)).await.unwrap_err(),
         DokployError::InvalidResponse
+    );
+}
+
+/// Entries shaped like Dokploy v0.31.1's `project.all`.
+const PROJECTS: &str = r#"[
+  {"projectId":"QlbI3adcGw0aceVUvZHIu","name":"Infra","description":null,"env":"",
+   "organizationId":"o","environments":[
+     {"name":"production","environmentId":"OYAGyOPBPVVsxJOj5jGOX","isDefault":true,
+      "applications":[],"compose":[{"composeId":"c1","name":"x","composeStatus":"idle"}]},
+     {"name":"stacks","environmentId":"2EzIU5fQhBLtL1YVZ4zLP","isDefault":false},
+     {"name":"bad","environmentId":"bad id"},
+     {"unexpected":"shape"}
+   ],"projectTags":[]},
+  {"projectId":"bad id","name":"Skipped","environments":[
+     {"name":"production","environmentId":"e1","isDefault":true}]},
+  {"unexpected":"shape"}
+]"#;
+
+/// Entries shaped like Dokploy v0.31.1's `server.all`.
+const SERVERS: &str = r#"[
+  {"serverId":"FrFq15ucKbuYbI3kSEpRS","name":"edge-1","ipAddress":"192.0.2.10",
+   "serverStatus":"active","serverType":"deploy",
+   "metricsConfig":{"server":{"token":"metrics-token-marker"}}},
+  {"serverId":"b1","name":"builder","serverStatus":"active","serverType":"build"},
+  {"serverId":"i1","name":"off","serverStatus":"inactive","serverType":"deploy"},
+  {"serverId":"bad id","name":"x","serverStatus":"active","serverType":"deploy"}
+]"#;
+
+fn projects_and_servers(servers: StatusCode) -> Router {
+    let checked = |status: StatusCode, body: &'static str| {
+        move |headers: HeaderMap| async move {
+            if headers.get("x-api-key").and_then(|v| v.to_str().ok()) != Some(GOOD_KEY) {
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+            (status, [(header::CONTENT_TYPE, "application/json")], body).into_response()
+        }
+    };
+    Router::new()
+        .route("/api/project.all", get(checked(StatusCode::OK, PROJECTS)))
+        .route("/api/server.all", get(checked(servers, SERVERS)))
+}
+
+#[tokio::test]
+async fn targets_keep_valid_environments_and_active_deploy_servers() {
+    let url = serve(projects_and_servers(StatusCode::OK)).await;
+    let targets = client().targets(&url, &key(GOOD_KEY)).await.unwrap();
+    let envs: Vec<(&str, &str, &str, bool)> = targets
+        .environments
+        .iter()
+        .map(|env| {
+            (
+                env.project_name.as_str(),
+                env.environment_id.as_str(),
+                env.environment_name.as_str(),
+                env.is_default,
+            )
+        })
+        .collect();
+    assert_eq!(
+        envs,
+        [
+            ("Infra", "OYAGyOPBPVVsxJOj5jGOX", "production", true),
+            ("Infra", "2EzIU5fQhBLtL1YVZ4zLP", "stacks", false),
+        ]
+    );
+    let servers = targets.servers.unwrap();
+    assert_eq!(servers.len(), 1);
+    assert_eq!(servers[0].id.as_str(), "FrFq15ucKbuYbI3kSEpRS");
+    assert_eq!(servers[0].name, "edge-1");
+    // Nothing else from the server entry is kept.
+    assert!(!format!("{servers:?}").contains("metrics-token-marker"));
+
+    assert_eq!(
+        client().targets(&url, &key("wrong")).await.unwrap_err(),
+        DokployError::KeyRejected
+    );
+}
+
+#[tokio::test]
+async fn a_key_that_may_not_list_servers_still_lists_environments() {
+    let url = serve(projects_and_servers(StatusCode::FORBIDDEN)).await;
+    let targets = client().targets(&url, &key(GOOD_KEY)).await.unwrap();
+    assert_eq!(targets.environments.len(), 2);
+    assert_eq!(targets.servers, None);
+
+    let url = serve(projects_and_servers(StatusCode::INTERNAL_SERVER_ERROR)).await;
+    assert_eq!(
+        client().targets(&url, &key(GOOD_KEY)).await.unwrap_err(),
+        DokployError::Http(500)
+    );
+}
+
+#[tokio::test]
+async fn creating_an_environment_posts_its_name_and_project() {
+    use supabase_dashboard_domain::dokploy_placement::DokployId;
+
+    let router = Router::new().route(
+        "/api/environment.create",
+        post(
+            |headers: HeaderMap, RawQuery(query): RawQuery, body: String| async move {
+                assert_eq!(query, None, "nothing goes in the query string");
+                assert_eq!(
+                    headers.get(header::CONTENT_TYPE).unwrap(),
+                    "application/json"
+                );
+                if headers.get("x-api-key").and_then(|v| v.to_str().ok()) != Some(GOOD_KEY) {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                let sent: serde_json::Value = serde_json::from_str(&body).unwrap();
+                let project = sent["projectId"].as_str().unwrap();
+                assert_eq!(sent["name"], "staging");
+                // Answers for another project when asked for `other`.
+                let answered = if project == "other" { "p9" } else { project };
+                let answer = serde_json::json!({
+                    "environmentId": "Gr8jX76uotrD6gnwzCmtY",
+                    "name": "staging",
+                    "projectId": answered,
+                    "isDefault": false,
+                });
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    answer.to_string(),
+                )
+                    .into_response()
+            },
+        ),
+    );
+    let url = serve(router).await;
+    let project = DokployId::parse("QlbI3adcGw0aceVUvZHIu").unwrap();
+    let created = client()
+        .create_environment(&url, &key(GOOD_KEY), &project, "staging")
+        .await
+        .unwrap();
+    assert_eq!(created.as_str(), "Gr8jX76uotrD6gnwzCmtY");
+    assert_eq!(
+        client()
+            .create_environment(
+                &url,
+                &key(GOOD_KEY),
+                &DokployId::parse("other").unwrap(),
+                "staging"
+            )
+            .await
+            .unwrap_err(),
+        DokployError::InvalidResponse
+    );
+    assert_eq!(
+        client()
+            .create_environment(&url, &key("wrong"), &project, "staging")
+            .await
+            .unwrap_err(),
+        DokployError::KeyRejected
     );
 }

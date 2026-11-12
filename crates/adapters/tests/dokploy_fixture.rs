@@ -156,3 +156,84 @@ async fn fixture_dokploy_lists_the_service_behind_a_domain() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn fixture_dokploy_lists_environments_and_servers_and_creates_an_environment() {
+    use supabase_dashboard_domain::dokploy_placement::DokployId;
+
+    let Some(url) = fixture_url() else { return };
+    let created = post(
+        &url,
+        "project.create",
+        serde_json::json!({ "name": "targets-probe" }),
+    )
+    .await;
+    let project_id = DokployId::parse(created["project"]["projectId"].as_str().unwrap()).unwrap();
+    // A server record on a documentation address; Dokploy stores it
+    // without connecting, and nothing is ever deployed to it.
+    let server = post(
+        &url,
+        "server.create",
+        serde_json::json!({
+            "name": "targets-probe-server",
+            "description": null,
+            "ipAddress": "192.0.2.10",
+            "port": 22,
+            "username": "root",
+            "sshKeyId": null,
+            "serverType": "deploy",
+        }),
+    )
+    .await;
+    let server_id = server["serverId"].as_str().unwrap().to_owned();
+
+    let key = fixture_key();
+    let environment_id = client()
+        .create_environment(&url, &key, &project_id, "stacks")
+        .await
+        .unwrap();
+    let targets = client().targets(&url, &key).await.unwrap();
+    let mine: Vec<_> = targets
+        .environments
+        .iter()
+        .filter(|env| env.project_id == project_id)
+        .collect();
+    assert_eq!(mine.len(), 2, "{targets:?}");
+    assert!(
+        mine.iter()
+            .any(|env| env.environment_name == "production" && env.is_default)
+    );
+    assert!(mine.iter().any(|env| env.environment_id == environment_id
+        && env.environment_name == "stacks"
+        && !env.is_default
+        && env.project_name == "targets-probe"));
+    let servers = targets.servers.as_ref().unwrap();
+    assert!(
+        servers
+            .iter()
+            .any(|s| s.id.as_str() == server_id && s.name == "targets-probe-server"),
+        "{servers:?}"
+    );
+
+    // A project that does not exist is Dokploy's 404, not a new record.
+    assert_eq!(
+        client()
+            .create_environment(&url, &key, &DokployId::parse("missing").unwrap(), "x")
+            .await
+            .unwrap_err(),
+        DokployError::Http(404)
+    );
+
+    post(
+        &url,
+        "server.remove",
+        serde_json::json!({ "serverId": server_id }),
+    )
+    .await;
+    post(
+        &url,
+        "project.remove",
+        serde_json::json!({ "projectId": project_id.as_str() }),
+    )
+    .await;
+}

@@ -99,7 +99,7 @@ struct ConnectionRow {
     key_replaced_by_deployment: bool,
 }
 
-fn display_name(raw: Option<String>) -> Result<Option<DisplayName>, PersistenceError> {
+pub(crate) fn display_name(raw: Option<String>) -> Result<Option<DisplayName>, PersistenceError> {
     raw.map(|name| {
         DisplayName::parse(&name).map_err(|_| PersistenceError::InvalidRow("accounts.display_name"))
     })

@@ -117,6 +117,7 @@ pub struct DokployServiceInfo {
     pub environment_id: DokployId,
     pub environment_name: String,
     /// The remote server it is deployed on; `None` for Dokploy's own host.
+    pub server_id: Option<DokployId>,
     pub server_name: Option<String>,
 }
 
@@ -334,6 +335,7 @@ mod tests {
             project_name: "Infra".to_owned(),
             environment_id: id(env),
             environment_name: format!("env-{env}"),
+            server_id: None,
             server_name: None,
         }
     }

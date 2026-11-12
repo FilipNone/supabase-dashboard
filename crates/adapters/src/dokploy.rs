@@ -11,13 +11,15 @@
 use std::{sync::Arc, time::Duration};
 
 use reqwest::{
-    Client, Response, StatusCode,
-    header::{ACCEPT, HeaderValue},
+    Client, Method, Response, StatusCode,
+    header::{ACCEPT, CONTENT_TYPE, HeaderValue},
     redirect,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
-use supabase_dashboard_application::dokploy::{ConnectFuture, DokployConnector, InventoryFuture};
+use supabase_dashboard_application::dokploy::{
+    ConnectFuture, CreateEnvironmentFuture, DokployConnector, InventoryFuture, TargetsFuture,
+};
 use supabase_dashboard_domain::{
     connection::UnreachableReason,
     dokploy::{DokployUrl, DokployVersion},
@@ -25,6 +27,7 @@ use supabase_dashboard_domain::{
         DokployDomainInfo, DokployId, DokployInventory, DokployServiceInfo, DokployServiceKind,
         DokployServiceRef, bounded_name, normalize_host,
     },
+    dokploy_target::{DokployEnvironmentInfo, DokployServerInfo, DokployTargetInventory},
 };
 
 /// Defined with the domain types so the application layer can name it;
@@ -200,11 +203,90 @@ impl DokployClient {
         })
     }
 
+    /// The environments the key can see (`project.all`, which Dokploy
+    /// limits to the key's organization and the member's projects and
+    /// environments), and the active deploy servers (`server.all`). A key
+    /// whose member may not list servers gets `servers: None`: Dokploy
+    /// accepted the same key for `project.all` a moment before, so a
+    /// refusal here is about the permission, not the key.
+    pub async fn targets(
+        &self,
+        url: &DokployUrl,
+        key: &SecretString,
+    ) -> Result<DokployTargetInventory, DokployError> {
+        let projects = self
+            .get(url, "project.all", key, MAX_LIST_BODY_BYTES)
+            .await?;
+        let projects: Vec<RawProject> = parse_list(&projects)?;
+        let environments = projects
+            .into_iter()
+            .flat_map(RawProject::into_environments)
+            .take(MAX_LIST_ENTRIES)
+            .collect();
+        let servers = match self.get(url, "server.all", key, MAX_LIST_BODY_BYTES).await {
+            Ok(body) => Some(
+                parse_list::<RawServer>(&body)?
+                    .into_iter()
+                    .filter_map(RawServer::into_info)
+                    .collect(),
+            ),
+            Err(DokployError::KeyRejected) => None,
+            Err(err) => return Err(err),
+        };
+        Ok(DokployTargetInventory {
+            environments,
+            servers,
+        })
+    }
+
+    /// Creates an environment called `name` in project `project_id`
+    /// (`environment.create`) and returns its ID. Dokploy accepts a name
+    /// that is already taken, so callers check the name first. Not
+    /// idempotent: the request is sent once and never retried.
+    pub async fn create_environment(
+        &self,
+        url: &DokployUrl,
+        key: &SecretString,
+        project_id: &DokployId,
+        name: &str,
+    ) -> Result<DokployId, DokployError> {
+        let body = serde_json::json!({ "name": name, "projectId": project_id.as_str() });
+        let answer = self
+            .send(
+                Method::POST,
+                url,
+                "environment.create",
+                key,
+                Some(&body),
+                MAX_SMALL_BODY_BYTES,
+            )
+            .await?;
+        let created: RawCreatedEnvironment =
+            serde_json::from_slice(&answer).map_err(|_| DokployError::InvalidResponse)?;
+        if created.project_id != project_id.as_str() {
+            return Err(DokployError::InvalidResponse);
+        }
+        DokployId::parse(&created.environment_id).map_err(|_| DokployError::InvalidResponse)
+    }
+
     async fn get(
         &self,
         base: &DokployUrl,
         call: &str,
         key: &SecretString,
+        max_body_bytes: usize,
+    ) -> Result<Vec<u8>, DokployError> {
+        self.send(Method::GET, base, call, key, None, max_body_bytes)
+            .await
+    }
+
+    async fn send(
+        &self,
+        method: Method,
+        base: &DokployUrl,
+        call: &str,
+        key: &SecretString,
+        body: Option<&serde_json::Value>,
         max_body_bytes: usize,
     ) -> Result<Vec<u8>, DokployError> {
         let unreachable = DokployError::Unreachable;
@@ -224,10 +306,15 @@ impl DokployClient {
         let client = clients
             .get(None)
             .map_err(|_| unreachable(UnreachableReason::Tls))?;
-        let response = client
-            .get(url)
+        let mut request = client
+            .request(method, url)
             .header("x-api-key", key_header)
-            .header(ACCEPT, "application/json")
+            .header(ACCEPT, "application/json");
+        if let Some(body) = body {
+            let body = serde_json::to_vec(body).map_err(|_| DokployError::InvalidResponse)?;
+            request = request.header(CONTENT_TYPE, "application/json").body(body);
+        }
+        let response = request
             .send()
             .await
             .map_err(|err| unreachable(classify(&err)))?;
@@ -250,6 +337,22 @@ impl DokployConnector for DokployClient {
 
     fn inventory<'a>(&'a self, url: &'a DokployUrl, key: &'a SecretString) -> InventoryFuture<'a> {
         Box::pin(DokployClient::inventory(self, url, key))
+    }
+
+    fn targets<'a>(&'a self, url: &'a DokployUrl, key: &'a SecretString) -> TargetsFuture<'a> {
+        Box::pin(DokployClient::targets(self, url, key))
+    }
+
+    fn create_environment<'a>(
+        &'a self,
+        url: &'a DokployUrl,
+        key: &'a SecretString,
+        project_id: &'a DokployId,
+        name: &'a str,
+    ) -> CreateEnvironmentFuture<'a> {
+        Box::pin(DokployClient::create_environment(
+            self, url, key, project_id, name,
+        ))
     }
 }
 
@@ -278,6 +381,7 @@ struct RawService {
     project_name: String,
     environment_id: String,
     environment_name: String,
+    server_id: Option<String>,
     server_name: Option<String>,
 }
 
@@ -293,6 +397,10 @@ impl RawService {
             project_name: bounded_name(&self.project_name),
             environment_id: DokployId::parse(&self.environment_id).ok()?,
             environment_name: bounded_name(&self.environment_name),
+            server_id: match self.server_id.as_deref() {
+                Some(raw) => Some(DokployId::parse(raw).ok()?),
+                None => None,
+            },
             server_name: self.server_name.as_deref().map(bounded_name),
         })
     }
@@ -325,6 +433,85 @@ impl RawDomain {
             preview: self.domain_type.as_deref() == Some("preview"),
         })
     }
+}
+
+/// One entry of `project.all`, as of Dokploy v0.31.1. The services nested
+/// in each environment are ignored.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawProject {
+    project_id: String,
+    name: String,
+    #[serde(default)]
+    environments: Vec<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawEnvironment {
+    environment_id: String,
+    name: String,
+    #[serde(default)]
+    is_default: bool,
+}
+
+impl RawProject {
+    /// The project's environments, each read on its own so one odd entry
+    /// does not hide the rest.
+    fn into_environments(self) -> Vec<DokployEnvironmentInfo> {
+        let Ok(project_id) = DokployId::parse(&self.project_id) else {
+            return Vec::new();
+        };
+        let project_name = bounded_name(&self.name);
+        self.environments
+            .into_iter()
+            .take(MAX_LIST_ENTRIES)
+            .filter_map(|raw| serde_json::from_value::<RawEnvironment>(raw).ok())
+            .filter_map(|env| {
+                Some(DokployEnvironmentInfo {
+                    project_id: project_id.clone(),
+                    project_name: project_name.clone(),
+                    environment_id: DokployId::parse(&env.environment_id).ok()?,
+                    environment_name: bounded_name(&env.name),
+                    is_default: env.is_default,
+                })
+            })
+            .collect()
+    }
+}
+
+/// One entry of `server.all`, as of Dokploy v0.31.1. Only these fields
+/// are read; the rest, which includes monitoring settings, is ignored.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawServer {
+    server_id: String,
+    name: String,
+    server_status: Option<String>,
+    server_type: Option<String>,
+}
+
+impl RawServer {
+    /// Active deploy servers only; build servers never run stacks.
+    fn into_info(self) -> Option<DokployServerInfo> {
+        let active = self.server_status.as_deref() == Some("active");
+        let deploy = self.server_type.as_deref().unwrap_or("deploy") == "deploy";
+        if !(active && deploy) {
+            return None;
+        }
+        Some(DokployServerInfo {
+            id: DokployId::parse(&self.server_id).ok()?,
+            name: bounded_name(&self.name),
+        })
+    }
+}
+
+/// The answer to `environment.create`, as of Dokploy v0.31.1.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawCreatedEnvironment {
+    environment_id: String,
+    project_id: String,
 }
 
 async fn read_bounded(mut response: Response, max_bytes: usize) -> Result<Vec<u8>, DokployError> {

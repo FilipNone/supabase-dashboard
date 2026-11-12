@@ -2,6 +2,7 @@ pub mod account;
 pub mod admin;
 mod admin_dokploy;
 mod admin_dokploy_placement;
+mod admin_dokploy_targets;
 mod health_chart;
 pub mod invite;
 pub mod not_found;

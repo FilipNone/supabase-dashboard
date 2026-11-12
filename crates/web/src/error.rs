@@ -195,6 +195,15 @@ mod server {
                 | DokployServiceError::AlreadyConnected
                 | DokployServiceError::NotConnected
                 | DokployServiceError::ServiceNotVisible
+                | DokployServiceError::TargetNotVisible
+                | DokployServiceError::ProjectNotVisible
+                | DokployServiceError::TargetAlreadyAllowed
+                | DokployServiceError::TooManyTargets
+                | DokployServiceError::OrganizationNotFound
+                | DokployServiceError::TargetNotFound
+                | DokployServiceError::EnvironmentExists
+                | DokployServiceError::EnvironmentOutcomeUnknown
+                | DokployServiceError::EnvironmentName(_)
                 | DokployServiceError::FromDeployment
                 | DokployServiceError::DeploymentConflict { .. }
                 | DokployServiceError::Url(_)

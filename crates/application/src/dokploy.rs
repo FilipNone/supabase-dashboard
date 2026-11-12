@@ -26,6 +26,7 @@ use supabase_dashboard_domain::{
         DokployServiceRef, MAX_LISTED_SERVICES, PlacementLookup, PlacementOverview,
         PlacementStatus, normalize_host,
     },
+    dokploy_target::{DokployTargetInventory, EnvironmentNameError, MAX_TARGETS_PER_ORGANIZATION},
 };
 use supabase_dashboard_persistence::{
     Database, PersistenceError,
@@ -41,6 +42,10 @@ use crate::{
     secrets::{CipherError, CredentialCipher, Sealed},
 };
 
+mod targets;
+
+pub use targets::EffectiveTargets;
+
 /// Longest audit target ID the audit log accepts.
 const AUDIT_TARGET_MAX_CHARS: usize = 128;
 
@@ -49,6 +54,12 @@ pub type ConnectFuture<'a> =
 
 pub type InventoryFuture<'a> =
     Pin<Box<dyn Future<Output = Result<DokployInventory, DokployError>> + Send + 'a>>;
+
+pub type TargetsFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<DokployTargetInventory, DokployError>> + Send + 'a>>;
+
+pub type CreateEnvironmentFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<DokployId, DokployError>> + Send + 'a>>;
 
 /// Calls Dokploy with a key. Implementations must enforce the outbound
 /// address policy at connection time, never follow redirects, bound time
@@ -62,6 +73,19 @@ pub trait DokployConnector: Send + Sync {
     /// The application and compose services `key` can see, with the
     /// domains routed to them.
     fn inventory<'a>(&'a self, url: &'a DokployUrl, key: &'a SecretString) -> InventoryFuture<'a>;
+
+    /// The environments `key` can see and the servers Dokploy deploys to.
+    fn targets<'a>(&'a self, url: &'a DokployUrl, key: &'a SecretString) -> TargetsFuture<'a>;
+
+    /// Creates environment `name` in project `project_id` and returns its
+    /// ID. Sent once, never retried.
+    fn create_environment<'a>(
+        &'a self,
+        url: &'a DokployUrl,
+        key: &'a SecretString,
+        project_id: &'a DokployId,
+        name: &'a str,
+    ) -> CreateEnvironmentFuture<'a>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -95,6 +119,35 @@ pub enum DokployServiceError {
          key's member cannot access it"
     )]
     ServiceNotVisible,
+    #[error(
+        "Dokploy does not show that environment or server to the stored key; it may have been \
+         deleted, or the key's member cannot access it"
+    )]
+    TargetNotVisible,
+    #[error(
+        "Dokploy does not show that project to the stored key; it may have been deleted, or the \
+         key's member cannot access it"
+    )]
+    ProjectNotVisible,
+    #[error("that organization may already use this environment and server")]
+    TargetAlreadyAllowed,
+    #[error("an organization may use at most {MAX_TARGETS_PER_ORGANIZATION} targets")]
+    TooManyTargets,
+    #[error("that organization does not exist")]
+    OrganizationNotFound,
+    #[error("that organization has no such target")]
+    TargetNotFound,
+    #[error("that project already has an environment with this name")]
+    EnvironmentExists,
+    /// Dokploy did not answer the request to create an environment, so it
+    /// may or may not exist now. Never retried on its own.
+    #[error(
+        "Dokploy did not answer, so the environment may or may not have been created; reload the \
+         page to check before trying again"
+    )]
+    EnvironmentOutcomeUnknown,
+    #[error(transparent)]
+    EnvironmentName(#[from] EnvironmentNameError),
     #[error(transparent)]
     Url(#[from] InvalidDokployUrl),
     #[error(transparent)]
@@ -676,12 +729,7 @@ impl DokployService {
         &self,
         stored: &StoredDokployConnection,
     ) -> Result<DokployInventory, DokployServiceError> {
-        let cipher = self
-            .cipher
-            .as_ref()
-            .ok_or(DokployServiceError::StorageUnavailable)?;
-        let url = stored_url(stored)?;
-        let key = cipher.open_dokploy_key(url.as_str(), &sealed(stored))?;
+        let (url, key) = self.open_key(stored)?;
         Ok(self.connector.inventory(&url, &key).await?)
     }
 

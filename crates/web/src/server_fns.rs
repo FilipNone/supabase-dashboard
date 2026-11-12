@@ -18,6 +18,7 @@ use supabase_dashboard_domain::{
     },
     dokploy::DokployOverview,
     dokploy_placement::PlacementOverview,
+    dokploy_target::StackTargetsOverview,
     health::InstallationHealth,
     invitation::{InvitationCode, InvitationPreview, InvitationSummary, IssuedInvitation},
     organization::{MemberSummary, OrganizationSummary},
@@ -754,4 +755,58 @@ pub async fn clear_dokploy_placement() -> Result<(), AppError> {
     Ok(org_context::dokploy()?
         .clear_placement(&session, audit.get())
         .await?)
+}
+
+/// Where organizations' new stacks may go: the default target, each
+/// organization's allowed targets, and the environments and servers the
+/// stored key can see. Installation administrators only.
+#[server]
+pub async fn get_dokploy_targets() -> Result<StackTargetsOverview, AppError> {
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    Ok(org_context::dokploy()?
+        .stack_targets(&session, audit.get())
+        .await?)
+}
+
+/// Allows `organization` a Dokploy environment, on Dokploy's own server
+/// when `server` is empty or missing. Installation administrators only.
+#[server]
+pub async fn allow_dokploy_target(
+    organization: Uuid,
+    environment: String,
+    server: Option<String>,
+) -> Result<(), AppError> {
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    let value = match server.as_deref().map(str::trim) {
+        Some(server) if !server.is_empty() => format!("{}@{server}", environment.trim()),
+        _ => environment.trim().to_owned(),
+    };
+    Ok(org_context::dokploy()?
+        .allow_stack_target(&session, organization, &value, audit.get())
+        .await?)
+}
+
+/// Removes target `id` from `organization`. Nothing in Dokploy changes.
+/// Installation administrators only.
+#[server]
+pub async fn remove_dokploy_target(organization: Uuid, id: Uuid) -> Result<(), AppError> {
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    Ok(org_context::dokploy()?
+        .remove_stack_target(&session, organization, id, audit.get())
+        .await?)
+}
+
+/// Creates an environment called `name` in Dokploy project `project`.
+/// Installation administrators only.
+#[server]
+pub async fn create_dokploy_environment(project: String, name: String) -> Result<(), AppError> {
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    org_context::dokploy()?
+        .create_environment(&session, &project, &name, audit.get())
+        .await?;
+    Ok(())
 }

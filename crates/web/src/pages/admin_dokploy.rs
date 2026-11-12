@@ -18,7 +18,10 @@ use crate::{
     components::dialog::{ConfirmDialog, DialogCancel},
     components::page::{StatePanel, StateTone},
     error::AppError,
-    pages::{account::utc_minutes, admin_dokploy_placement::DokployPlacementPanel},
+    pages::{
+        account::utc_minutes, admin_dokploy_placement::DokployPlacementPanel,
+        admin_dokploy_targets::DokployTargetsPanel,
+    },
     server_fns::{ConnectDokploy, DisconnectDokploy, ReplaceDokployKey, get_dokploy_connection},
 };
 
@@ -261,8 +264,13 @@ fn connected_view(
     }
     .into_any();
     // Dokploy can be asked only with a key this server can read.
-    let placement =
-        (storage_available && connection.key_readable).then(|| view! { <DokployPlacementPanel/> });
+    let placement = (storage_available && connection.key_readable).then(|| {
+        let changes = RwSignal::new(0usize);
+        view! {
+            <DokployPlacementPanel changes/>
+            <DokployTargetsPanel placement_changes=changes/>
+        }
+    });
     // The deployment's configuration owns a connection it supplies.
     let manageable = !from_deployment;
     let replace_form_view = (storage_available && manageable).then(|| {

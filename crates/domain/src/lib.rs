@@ -10,6 +10,7 @@ pub mod authz;
 pub mod connection;
 pub mod dokploy;
 pub mod dokploy_placement;
+pub mod dokploy_target;
 pub mod health;
 pub mod invitation;
 pub mod organization;

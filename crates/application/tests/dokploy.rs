@@ -10,8 +10,8 @@ use secrecy::{ExposeSecret, SecretString};
 use supabase_dashboard_application::{
     auth::{CurrentSession, RequestContext},
     dokploy::{
-        ConnectFuture, DeploymentConnection, DokployConnector, DokployCredentials, DokployService,
-        DokployServiceError, InventoryFuture,
+        ConnectFuture, CreateEnvironmentFuture, DeploymentConnection, DokployConnector,
+        DokployCredentials, DokployService, DokployServiceError, InventoryFuture, TargetsFuture,
     },
     key_rotation::{KeyUsage, RotationSummary, key_usage, reseal_credentials},
     secrets::CredentialCipher,
@@ -108,6 +108,21 @@ impl DokployConnector for FakeDokploy {
             None => Ok(self.inventory.lock().unwrap().clone()),
         };
         Box::pin(async move { answer })
+    }
+
+    // Stack targets have their own tests in `dokploy_targets.rs`.
+    fn targets<'a>(&'a self, _url: &'a DokployUrl, _key: &'a SecretString) -> TargetsFuture<'a> {
+        Box::pin(async { Err(DokployError::InvalidResponse) })
+    }
+
+    fn create_environment<'a>(
+        &'a self,
+        _url: &'a DokployUrl,
+        _key: &'a SecretString,
+        _project_id: &'a DokployId,
+        _name: &'a str,
+    ) -> CreateEnvironmentFuture<'a> {
+        Box::pin(async { Err(DokployError::InvalidResponse) })
     }
 }
 
@@ -710,6 +725,7 @@ fn dokploy_service(kind: DokployServiceKind, id: &str, env: &str) -> DokployServ
         project_name: "Infra".to_owned(),
         environment_id: DokployId::parse(env).unwrap(),
         environment_name: format!("env-{env}"),
+        server_id: None,
         server_name: None,
     }
 }

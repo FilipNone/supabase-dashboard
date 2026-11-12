@@ -20,10 +20,18 @@ use crate::{
     server_fns::{ClearDokployPlacement, ConfirmDokployPlacement, get_dokploy_placement},
 };
 
+/// `changes` counts confirmations and clears, so the stack targets panel,
+/// whose default depends on the placement, can load again.
 #[component]
-pub fn DokployPlacementPanel() -> impl IntoView {
+pub fn DokployPlacementPanel(changes: RwSignal<usize>) -> impl IntoView {
     let confirm = ServerAction::<ConfirmDokployPlacement>::new();
     let clear = ServerAction::<ClearDokployPlacement>::new();
+    Effect::new(move |_| {
+        let count = confirm.version().get() + clear.version().get();
+        if changes.get_untracked() != count {
+            changes.set(count);
+        }
+    });
     let placement = Resource::new(
         move || (confirm.version().get(), clear.version().get()),
         |_| get_dokploy_placement(),
@@ -337,6 +345,7 @@ mod tests {
             project_name: "Infra".to_owned(),
             environment_id: DokployId::parse("e").unwrap(),
             environment_name: "production".to_owned(),
+            server_id: None,
             server_name: None,
         };
         assert_eq!(service_value(&info.service), "compose:abc_1");

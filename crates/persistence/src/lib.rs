@@ -8,6 +8,7 @@ pub mod admin;
 pub mod audit;
 pub mod connections;
 pub mod dokploy;
+pub mod dokploy_targets;
 pub mod invitations;
 pub mod organizations;
 pub mod projects;

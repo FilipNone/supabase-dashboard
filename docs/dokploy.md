@@ -25,8 +25,11 @@ The client in `crates/adapters/src/dokploy.rs` uses the same connection rules as
 | `settings.getDokployVersion` | GET | none | Read the version before anything else; the answer is a JSON string such as `"v0.31.1"` |
 | `overview.services` | GET | none | Every service the key can see, with its type, project, environment, and server |
 | `overview.domains` | GET | none | Every domain the key can see, with its host, whether it is enabled, whether it is a preview domain, and the service it routes to |
+| `project.all` | GET | none | Every project and environment the key can see, for choosing where stacks go; the services nested in each environment are ignored |
+| `server.all` | GET | none | Dokploy's remote servers; only active deploy servers are kept, and only their ID and name are read |
+| `environment.create` | POST | `name`, `projectId` | Create an environment for stacks, sent once and never retried |
 
-Both lists are read with a 4 MiB body bound and at most 10,000 entries. An entry that does not parse, a service type other than application or compose, an ID outside `[A-Za-z0-9_-]{1,64}`, and an empty or overlong host are skipped one at a time, so one odd entry does not hide the rest.
+Every list is read with a 4 MiB body bound and at most 10,000 entries. An entry that does not parse, a service type other than application or compose, an ID outside `[A-Za-z0-9_-]{1,64}`, and an empty or overlong host are skipped one at a time, so one odd entry does not hide the rest.
 
 ### Planned
 
@@ -34,11 +37,8 @@ These are the calls the M4 roadmap items need, with their required inputs in v0.
 
 | Call | Method | Required input | Roadmap use |
 | --- | --- | --- | --- |
-| `project.all` | GET | none | Projects and environments the key can see |
 | `project.one` | GET | `projectId` | One project's environments and services |
-| `environment.create` | POST | `name`, `projectId` | New environment for stacks |
 | `environment.one` | GET | `environmentId` | Environment details |
-| `server.all` | GET | none | Servers Dokploy manages |
 | `compose.search` | GET | none (`q`, `name`, `appName`, `projectId`, `environmentId`, `limit`, `offset`) | Find existing Supabase stacks; look up a job's service before creating it |
 | `compose.move` | POST | `composeId`, `targetEnvironmentId` | Not planned for the dashboard; the browser check uses it to move a service and show the Moved state |
 | `compose.create` | POST | `name`, `environmentId` | Create a stack's compose service |
@@ -117,6 +117,26 @@ Audit events for the placement have target type `dokploy_service` and the target
 | `dokploy.placement_clear` | Success or denied |
 
 Denied attempts are recorded with target type `dokploy` and no target, like the connection's.
+
+### Where stacks go
+
+A new stack goes into a Dokploy environment, on Dokploy's own server or on one of its remote servers. Dashboard organizations and Dokploy organizations are separate, so an installation administrator chooses in the Dokploy section which of these targets each dashboard organization may use. Creating stacks is not built yet; the next roadmap item uses these targets.
+
+- **Default.** An organization with no targets of its own may use only the dashboard's own environment, on the server the dashboard's service runs on. That default exists only while the confirmed placement is Current or Domain differs. With no placement confirmed, or one that has moved or disappeared, there is no default, and an organization without targets of its own cannot create stacks.
+- **Allowing a target.** The admin picks an organization, an environment the key can see, and a server: Dokploy's own server or an active deploy server from `server.all`. The server reads `project.all` and `server.all` again and refuses an environment or server the key cannot see, then stores the environment and server IDs with their names. An organization may have up to 50 targets. When the key's member may not list servers (Dokploy answers 401 or 403 to `server.all` after accepting the key for `project.all`), only Dokploy's own server can be chosen.
+- **Status.** The page compares each stored target with Dokploy's lists and shows it as Available, Environment not found, Server not found, or Not checked (when the key may not list servers, or Dokploy cannot be reached).
+- **Removing a target** changes nothing in Dokploy. An organization whose last target is removed falls back to the default.
+- **Creating an environment.** The admin can create an empty environment in a project the key can see. Dokploy accepts a name that is already taken, so the dashboard refuses a name the project already has (compared without case) before calling `environment.create`. Names are 1 to 64 letters, digits, spaces, `.`, `_`, and `-`, starting with a letter or digit. The request is sent once; when Dokploy does not answer, the page says the environment may or may not exist and asks the admin to reload before trying again.
+
+The stored targets belong to the connected Dokploy: removing the connection, or replacing a deployment-supplied connection with one at another URL, removes them. Replacing the key keeps them. Deleting an organization removes its targets.
+
+Audit events:
+
+| Action | Target | Recorded |
+| --- | --- | --- |
+| `dokploy.target_allow` | `organization`, the organization's ID | Success, failure (Dokploy was unreachable or did not show the environment or server, the target was already allowed, or the limit was reached), or denied |
+| `dokploy.target_remove` | `organization`, the organization's ID | Success or denied |
+| `dokploy.environment_create` | `dokploy_project`, `<project ID>/<environment ID>` on success, the project ID otherwise | Success, failure, or denied |
 
 ### The API key
 
