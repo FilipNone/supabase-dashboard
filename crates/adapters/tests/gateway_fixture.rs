@@ -79,6 +79,7 @@ async fn fixture_gateway_reports_auth_and_rest() {
     // Upstream limits the PostgREST root to the service role.
     let rest = probe.check(&url, StackService::Rest, &service).await;
     assert_eq!(rest.status, ServiceStatus::Healthy);
+    assert_eq!(rest.version.as_deref(), Some("14.18"));
     let rest_anon = probe.check(&url, StackService::Rest, &anon).await;
     assert_eq!(
         rest_anon.status,

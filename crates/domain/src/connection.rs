@@ -295,8 +295,9 @@ impl StackService {
     pub const fn tested_version(self) -> Option<&'static str> {
         match self {
             Self::Auth => Some("2.197.0"),
+            Self::Rest => Some("14.18"),
             Self::Storage => Some("1.89.12"),
-            Self::Rest | Self::Realtime | Self::Studio => None,
+            Self::Realtime | Self::Studio => None,
         }
     }
 
@@ -773,7 +774,17 @@ mod tests {
             StackService::Storage.version_support("1.89.12"),
             Some(Tested)
         );
-        assert_eq!(StackService::Rest.version_support("v14.18"), None);
+        let rest = StackService::Rest;
+        assert_eq!(rest.version_support("14.18"), Some(Tested));
+        assert_eq!(rest.version_support("14.18.0"), Some(Tested));
+        assert_eq!(
+            rest.version_support("12.2.3"),
+            Some(Older { tested: "14.18" })
+        );
+        assert_eq!(
+            rest.version_support("14.19"),
+            Some(Newer { tested: "14.18" })
+        );
         assert_eq!(StackService::Realtime.version_support("v2.148.3"), None);
     }
 
@@ -784,6 +795,7 @@ mod tests {
         for (service, image) in [
             (StackService::Auth, "supabase/gotrue"),
             (StackService::Storage, "supabase/storage-api"),
+            (StackService::Rest, "postgrest/postgrest"),
         ] {
             let tag = format!("{image}:v{}", service.tested_version().unwrap());
             assert!(fixture.contains(&tag), "fixture does not use {tag}");

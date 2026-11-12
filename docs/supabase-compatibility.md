@@ -37,7 +37,7 @@ docker compose -p sd-fixture down -v
 | --- | --- | --- |
 | Fixture services start and report healthy | Verified | CI job `fixture` (`up --wait`) |
 | Auth health and version through the gateway (anon key) | Verified against GoTrue v2.197.0 via Kong 3.9.3 | `crates/adapters/tests/gateway_fixture.rs`, CI job `fixture` |
-| PostgREST reachability through the gateway (service role key; the gateway refuses the anon key on the root path with 403) | Verified against PostgREST v14.18 via Kong 3.9.3 | same test |
+| PostgREST reachability through the gateway (service role key; the gateway refuses the anon key on the root path with 403), and its version from the `Server` header (`postgrest/14.18`), which Kong passes through | Verified against PostgREST v14.18 via Kong 3.9.3 | same test |
 | Wrong key reported as rejected (401) | Verified | same test |
 | Storage reachability and version through the gateway (`/storage/v1/version`, anon key) | Verified against Storage v1.89.12 via Kong 3.9.3 | `fixture_gateway_reports_storage_and_realtime` in `crates/adapters/tests/gateway_fixture.rs`, CI job `fixture` |
 | Realtime reachability through the gateway (`/realtime/v1/api/ping`, anon key; no WebSocket and no tenant database check) | Verified against Realtime v2.148.3 via Kong 3.9.3 | same test |
@@ -46,7 +46,7 @@ docker compose -p sd-fixture down -v
 | Saving a Studio login tries it against the Studio route first and refuses a login the gateway rejects | Verified against Studio 2026.11.02-sha-a05e7ec via Kong 3.9.3 | `studio_opens_the_fixture_studio` in `apps/server/src/app.rs` (saves the fixture's login through the settings form); refusal covered by application tests |
 | Studio route: reports a gateway that opens Studio without a login | Mock gateway only | `crates/adapters/tests/gateway_mock.rs` |
 | Studio forwarding: the stored login replaces the browser's, Studio's redirect comes back as a path, pages and Studio's own API answer | Verified against the same Studio and gateway | `fixture_studio_is_reached_through_the_proxy` in `crates/adapters/tests/gateway_fixture.rs` |
-| Reported Auth and Storage versions compared with this baseline: the service health table marks each as tested, older, newer, or not comparable | Comparison unit-tested; a test fails if the fixture images and this table stop matching the versions in code | `reported_versions_are_compared_with_the_tested_ones` and `tested_versions_match_the_fixture_and_the_baseline` in `crates/domain/src/connection.rs`; table checked in Chromium on 2026-11-12 with a synthetic report |
+| Reported Auth, PostgREST, and Storage versions compared with this baseline: the service health table marks each as tested, older, newer, or not comparable | Comparison unit-tested; a test fails if the fixture images and this table stop matching the versions in code | `reported_versions_are_compared_with_the_tested_ones` and `tested_versions_match_the_fixture_and_the_baseline` in `crates/domain/src/connection.rs`; table checked in Chromium on 2026-11-12 with a synthetic report |
 | Envoy gateway, new-style `sb_publishable_`/`sb_secret_` keys | Not tested | No fixture yet |
 | Studio through the dashboard: launcher, one-time code, Studio host cookie, Studio's redirect and project page, a same-origin SQL query through Studio's API, a cross-site write refused, a viewer refused, sign-out ending access | Verified against Studio 2026.11.02-sha-a05e7ec via Kong 3.9.3 | `studio_opens_the_fixture_studio` in `apps/server/src/app.rs`, CI job `fixture` |
 | Studio pages in a browser through the dashboard: Home, Table editor (a table and row created through the SQL API are listed), SQL editor, Auth users | Checked by hand in headless Chromium on 2026-11-09, light and dark themes, at 1280×720; no page errors | Not automated |
@@ -54,4 +54,4 @@ docker compose -p sd-fixture down -v
 | Studio's Realtime inspector: joins a channel and receives presence | Checked by hand in Chromium on 2026-11-09 | Not automated. The inspector's WebSocket goes from the browser straight to the stack's public API URL with the service role key, not through the dashboard |
 | Studio pages whose services are not in the fixture: Edge Functions, logs | Not checked | The fixture has no Functions or analytics services |
 
-Update the baseline only together with a fixture change and a passing CI run. For Auth and Storage, also change `StackService::tested_version` in `crates/domain/src/connection.rs`.
+Update the baseline only together with a fixture change and a passing CI run. For Auth, PostgREST, and Storage, also change `StackService::tested_version` in `crates/domain/src/connection.rs`.

@@ -11,7 +11,7 @@ use std::{sync::Arc, time::Duration};
 
 use reqwest::{
     Client, Response, StatusCode,
-    header::{ACCEPT, HeaderMap, HeaderValue},
+    header::{ACCEPT, HeaderMap, HeaderValue, SERVER},
     redirect,
 };
 use secrecy::{ExposeSecret, SecretString};
@@ -144,11 +144,14 @@ impl GatewayProbe {
                     Err(reason) => (ServiceStatus::Unreachable { reason }, None),
                 },
                 // The REST root is the OpenAPI description, which can be
-                // large, and Realtime's ping says only "Success". The status
-                // is enough; the body is not read.
-                StackService::Rest | StackService::Realtime | StackService::Studio => {
-                    (ServiceStatus::Healthy, None)
-                }
+                // large, so its version comes from the `Server` header
+                // instead. Realtime's ping says only "Success". The body is
+                // not read.
+                StackService::Rest => (
+                    ServiceStatus::Healthy,
+                    rest_version(response.headers().get(SERVER)),
+                ),
+                StackService::Realtime | StackService::Studio => (ServiceStatus::Healthy, None),
             }
         } else {
             (status_failure(status), None)
@@ -329,6 +332,18 @@ fn auth_version(body: &[u8]) -> Option<String> {
         .and_then(|v| sanitize_version(&v))
 }
 
+/// PostgREST names itself in the `Server` header, such as
+/// `postgrest/14.18`. Kong passes the header through; a gateway that
+/// replaces it with its own name leaves the version unknown.
+fn rest_version(server: Option<&HeaderValue>) -> Option<String> {
+    let server = server?.to_str().ok()?;
+    let (name, version) = server.split_once('/')?;
+    name.trim()
+        .eq_ignore_ascii_case("postgrest")
+        .then(|| sanitize_version(version))
+        .flatten()
+}
+
 /// Storage's version path answers with the bare version, such as
 /// `1.89.12`. Anything longer or unprintable is dropped.
 fn storage_version(body: &[u8]) -> Option<String> {
@@ -371,6 +386,18 @@ mod tests {
         assert_eq!(auth_version(br#"{"name":"GoTrue"}"#), None);
         assert_eq!(auth_version(b"not json"), None);
         assert_eq!(auth_version(br#"{"version":"v1\u0000"}"#), None);
+    }
+
+    #[test]
+    fn rest_version_is_read_from_the_server_header() {
+        let read = |raw: &str| rest_version(Some(&HeaderValue::from_str(raw).unwrap()));
+        assert_eq!(read("postgrest/14.18"), Some("14.18".into()));
+        assert_eq!(read("PostgREST/12.2.3"), Some("12.2.3".into()));
+        assert_eq!(read("envoy"), None);
+        assert_eq!(read("kong/3.9.3"), None);
+        assert_eq!(read("postgrest/"), None);
+        assert_eq!(read(&format!("postgrest/{}", "1".repeat(100))), None);
+        assert_eq!(rest_version(None), None);
     }
 
     #[test]
