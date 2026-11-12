@@ -584,7 +584,7 @@ mod tests {
         let mut answers = Vec::new();
         for id in [&acme_id, &made_up] {
             let (parts, body) = call(GetOrganization::PATH, format!("id={id}"), &bob).await;
-            assert!(!parts.status.is_success());
+            assert_eq!(parts.status, StatusCode::NOT_FOUND, "{body}");
             assert!(
                 body.contains("NotFound") && !body.contains("Acme"),
                 "{body}"
@@ -668,7 +668,7 @@ mod tests {
             &alice,
         )
         .await;
-        assert!(!parts.status.is_success());
+        assert_eq!(parts.status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
         assert!(
             body.contains("plain HTTP") || body.contains("unencrypted"),
             "{body}"
@@ -1400,7 +1400,7 @@ mod tests {
             ),
         )
         .await;
-        assert_ne!(parts.status, StatusCode::OK, "{body}");
+        assert_eq!(parts.status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
         assert!(body.contains("refused this Studio login"), "{body}");
         let (parts, body) = send(
             &router,

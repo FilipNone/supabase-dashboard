@@ -6,6 +6,7 @@
 //! [`AppError::Unavailable`].
 
 use leptos::server_fn::{
+    Bytes, Encodes,
     codec::JsonEncoding,
     error::{FromServerFnError, ServerFnErrorErr},
 };
@@ -37,6 +38,34 @@ impl FromServerFnError for AppError {
 
     fn from_server_fn_error(_value: ServerFnErrorErr) -> Self {
         Self::Transport
+    }
+
+    /// Server functions serialize their error just before answering, so
+    /// this is where the response gets a status that says what happened.
+    /// Without it every error, including a rejected form, would be a 500.
+    fn ser(&self) -> Bytes {
+        #[cfg(feature = "ssr")]
+        if let Some(response) = leptos::prelude::use_context::<leptos_axum::ResponseOptions>() {
+            response.set_status(self.http_status());
+        }
+        <JsonEncoding as Encodes<Self>>::encode(self)
+            .or_else(|_| <JsonEncoding as Encodes<Self>>::encode(&Self::Transport))
+            .unwrap_or_default()
+    }
+}
+
+impl AppError {
+    /// The HTTP status a server function answers with for this error.
+    #[cfg(feature = "ssr")]
+    pub fn http_status(&self) -> http::StatusCode {
+        use http::StatusCode;
+        match self {
+            Self::Unauthenticated => StatusCode::UNAUTHORIZED,
+            Self::NotFound => StatusCode::NOT_FOUND,
+            Self::Forbidden => StatusCode::FORBIDDEN,
+            Self::Rejected(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::Unavailable | Self::Transport => StatusCode::INTERNAL_SERVER_ERROR,
+        }
     }
 }
 
@@ -191,5 +220,39 @@ mod tests {
         ));
         assert_eq!(err, AppError::Transport);
         assert!(!err.to_string().contains("10.0.0.5"));
+    }
+
+    #[test]
+    fn errors_round_trip_through_their_encoding() {
+        for err in [
+            AppError::Unauthenticated,
+            AppError::NotFound,
+            AppError::Forbidden,
+            AppError::Rejected("Name is too long.".into()),
+            AppError::Unavailable,
+            AppError::Transport,
+        ] {
+            assert_eq!(AppError::de(err.ser()), err);
+        }
+    }
+
+    #[cfg(feature = "ssr")]
+    #[test]
+    fn rejected_input_is_not_a_server_error() {
+        use http::StatusCode;
+        assert_eq!(
+            AppError::Rejected("x".into()).http_status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(AppError::Forbidden.http_status(), StatusCode::FORBIDDEN);
+        assert_eq!(AppError::NotFound.http_status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            AppError::Unauthenticated.http_status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            AppError::Unavailable.http_status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 }
