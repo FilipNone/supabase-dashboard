@@ -286,6 +286,14 @@ pub fn ApiKeysPanel(project: ProjectSummary) -> impl IntoView {
         .allows(supabase_dashboard_domain::authz::Permission::ProjectCredentialsReplace);
     let replace = ServerAction::<ReplaceProjectCredential>::new();
     let remove = ServerAction::<RemoveProjectCredential>::new();
+    // The action forgets its input once it completes; the result is shown
+    // under the key that was submitted, so remember which one that was.
+    let submitted = RwSignal::new(None::<CredentialKind>);
+    Effect::new(move |_| {
+        if let Some(input) = replace.input().get() {
+            submitted.set(Some(input.kind));
+        }
+    });
     let overview = Resource::new(
         move || (replace.version().get(), remove.version().get()),
         move |_| get_project_credentials(id),
@@ -299,7 +307,10 @@ pub fn ApiKeysPanel(project: ProjectSummary) -> impl IntoView {
             </p>
             <Transition fallback=|| view! { <p class="loading" role="status">"Loading keys…"</p> }>
                 {move || overview.get().map(|result| match result {
-                    Ok(overview) => keys_view(overview, id.to_string(), can_manage, replace, remove).into_any(),
+                    Ok(overview) => {
+                        keys_view(overview, id.to_string(), can_manage, replace, remove, submitted)
+                            .into_any()
+                    }
                     Err(err) => view! {
                         <StatePanel
                             tone=StateTone::Error
@@ -310,7 +321,6 @@ pub fn ApiKeysPanel(project: ProjectSummary) -> impl IntoView {
                     .into_any(),
                 })}
             </Transition>
-            {move || feedback(replace.value().get(), "Key saved.")}
             {move || feedback(remove.value().get(), "Key removed.")}
             {(!can_manage).then(|| view! {
                 <p class="field-hint">"Only owners and administrators can change API keys."</p>
@@ -325,6 +335,7 @@ fn keys_view(
     can_manage: bool,
     replace: ServerAction<ReplaceProjectCredential>,
     remove: ServerAction<RemoveProjectCredential>,
+    submitted: RwSignal<Option<CredentialKind>>,
 ) -> impl IntoView {
     let unavailable = (!overview.storage_available).then(|| {
         view! {
@@ -340,7 +351,16 @@ fn keys_view(
         .credentials
         .into_iter()
         .filter(|status| CredentialKind::API_KEYS.contains(&status.kind))
-        .map(|status| key_row(status, id.clone(), can_manage, can_save, replace, remove))
+        .map(|status| {
+            key_row(
+                status,
+                id.clone(),
+                can_manage,
+                can_save,
+                (replace, remove),
+                submitted,
+            )
+        })
         .collect_view();
     view! {
         {unavailable}
@@ -353,12 +373,23 @@ fn key_row(
     id: String,
     can_manage: bool,
     can_save: bool,
-    replace: ServerAction<ReplaceProjectCredential>,
-    remove: ServerAction<RemoveProjectCredential>,
+    (replace, remove): (
+        ServerAction<ReplaceProjectCredential>,
+        ServerAction<RemoveProjectCredential>,
+    ),
+    submitted: RwSignal<Option<CredentialKind>>,
 ) -> impl IntoView {
     let kind = status.kind;
     let field_id = format!("key-{}", kind.as_str());
     let hint_id = format!("{field_id}-hint");
+    let result_id = format!("{field_id}-result");
+    // The last save of this key, if it was the last key submitted.
+    let result = move || {
+        (submitted.get() == Some(kind))
+            .then(|| replace.value().get())
+            .flatten()
+    };
+    let failed = move || matches!(result(), Some(Err(_)));
     let (badge, state_text, stored) = state_badge(&status.state);
     let expiry = match status.state {
         CredentialState::Set {
@@ -372,10 +403,12 @@ fn key_row(
         <div class="key-item">
             <h3 class="subsection-title">
                 {kind.label()} " " <span class=badge>{state_text}</span>
-                {expiry.map(|(class, text)| view! { <span class=class>{text}</span> })}
+                {expiry.map(|(class, text)| view! { " " <span class=class>{text}</span> })}
             </h3>
             {
-                let (id, field_id, hint_id) = (id.clone(), field_id.clone(), hint_id.clone());
+                let (id, field_id, hint_id, result_id) =
+                    (id.clone(), field_id.clone(), hint_id.clone(), result_id.clone());
+                let described_by = format!("{hint_id} {result_id}");
                 can_save.then(move || view! {
                 <ActionForm action=replace attr:class="inline-form">
                     <input type="hidden" name="id" value=id.clone()/>
@@ -388,7 +421,8 @@ fn key_row(
                             class="input" id=field_id.clone() name="value" type="password" required
                             autocomplete="off" spellcheck="false"
                             maxlength=API_KEY_MAX_LEN.to_string()
-                            aria-describedby=hint_id.clone()
+                            aria-describedby=described_by.clone()
+                            aria-invalid=move || failed().then_some("true")
                         />
                     </label>
                     <button type="submit" class="button button-primary"
@@ -405,6 +439,7 @@ fn key_row(
                 {matches!(kind, CredentialKind::ServiceRoleKey)
                     .then_some(" Used for the REST check, which current gateway configurations limit to this key.")}
             </p>
+            <div id=result_id>{move || feedback(result(), "Key saved.")}</div>
             {(can_manage && stored).then(|| view! {
                 <ActionForm action=remove>
                     <input type="hidden" name="id" value=id.clone()/>
@@ -446,7 +481,7 @@ fn expiry_badge(expiry: KeyExpiry) -> (&'static str, String) {
     } else if expiry.expires_soon() {
         let days = match expiry.days_left {
             0 => "today".to_owned(),
-            1 => "in 1 day".to_owned(),
+            1 => "tomorrow".to_owned(),
             n => format!("in {n} days"),
         };
         ("badge badge-error", format!("Expires {date}, {days}"))
@@ -643,43 +678,49 @@ fn access_log_view(
     let days = if retention_days == 1 { "day" } else { "days" };
     let page = pages.with_untracked(Vec::len) + 1;
     let first_page = page == 1;
-    let pager = (!first_page || older.is_some()).then(|| {
-        view! {
-            <nav class="pager" aria-label="Access log pages">
-                <button
-                    type="button"
-                    class="button"
-                    disabled=first_page
-                    on:click=move |_| pages.set(Vec::new())
-                >
-                    "Newest"
-                </button>
-                <button
-                    type="button"
-                    class="button"
-                    disabled=first_page
-                    on:click=move |_| pages.update(|pages| {
-                        pages.pop();
-                    })
-                >
-                    "Newer"
-                </button>
-                <span class="field-hint" aria-live="polite">{format!("Page {page}")}</span>
-                <button
-                    type="button"
-                    class="button"
-                    disabled=older.is_none()
-                    on:click=move |_| {
-                        if let Some(before) = older {
-                            pages.update(|pages| pages.push(before));
+    let has_pages = !first_page || older.is_some();
+    let pager = move |where_: &'static str| {
+        has_pages.then(|| {
+            view! {
+                <nav class="pager" aria-label=format!("Access log pages, {where_}")>
+                    <button
+                        type="button"
+                        class="button"
+                        disabled=first_page
+                        on:click=move |_| pages.set(Vec::new())
+                    >
+                        "Newest"
+                    </button>
+                    <button
+                        type="button"
+                        class="button"
+                        disabled=first_page
+                        on:click=move |_| pages.update(|pages| {
+                            pages.pop();
+                        })
+                    >
+                        "Newer"
+                    </button>
+                    // Announced once, from the top pager only.
+                    <span class="field-hint" aria-live=(where_ == "top").then_some("polite")>
+                        {format!("Page {page}")}
+                    </span>
+                    <button
+                        type="button"
+                        class="button"
+                        disabled=older.is_none()
+                        on:click=move |_| {
+                            if let Some(before) = older {
+                                pages.update(|pages| pages.push(before));
+                            }
                         }
-                    }
-                >
-                    "Older"
-                </button>
-            </nav>
-        }
-    });
+                    >
+                        "Older"
+                    </button>
+                </nav>
+            }
+        })
+    };
     if entries.is_empty() {
         let text = if first_page {
             format!("No Studio requests in the last {retention_days} {days}.")
@@ -688,7 +729,7 @@ fn access_log_view(
         };
         return view! {
             <p class="section-text">{text}</p>
-            {pager}
+            {pager("bottom")}
         }
         .into_any();
     }
@@ -700,8 +741,9 @@ fn access_log_view(
                  Only the method, path, and status are kept; query strings, SQL, and data are not."
             )}
         </p>
+        {pager("top")}
         <div class="table-wrap" role="region" aria-label="Studio requests" tabindex="0">
-            <table class="data-table">
+            <table class="data-table access-table">
                 <caption class="visually-hidden">{format!("Studio requests, newest first, page {page}")}</caption>
                 <thead>
                     <tr>
@@ -714,7 +756,7 @@ fn access_log_view(
                 <tbody>{rows}</tbody>
             </table>
         </div>
-        {pager}
+        {pager("bottom")}
     }
     .into_any()
 }
@@ -737,7 +779,7 @@ fn access_row(entry: StudioAccessEntry) -> impl IntoView {
         <tr>
             <td class="nowrap">{utc_seconds(entry.at)}</td>
             <td>{member}</td>
-            <td><code class="request-path">{format!("{} {}", entry.method, entry.path)}</code></td>
+            <td class="request"><code class="request-path">{format!("{} {}", entry.method, entry.path)}</code></td>
             <td><span class=class>{entry.status}</span></td>
         </tr>
     }

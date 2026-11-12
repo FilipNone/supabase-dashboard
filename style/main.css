@@ -446,7 +446,11 @@ td { vertical-align: middle; }
 .card-stack > * { max-width: 100%; }
 .card-meta { color: var(--color-text-muted); font-size: var(--text-sm); }
 .request-path { overflow-wrap: anywhere; }
-.pager { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); margin-top: var(--space-4); }
+.pager { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
+/* Wide enough that paths wrap at sensible lengths; on a phone the table
+   scrolls sideways inside its region instead of growing very tall. */
+.access-table { min-width: 44rem; }
+.access-table td.request { min-width: 18rem; }
 .url-text { overflow-wrap: anywhere; font-family: var(--font-mono, ui-monospace, monospace); }
 .card-meta.url-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .checkbox-field { display: flex; align-items: flex-start; gap: var(--space-2); font-size: var(--text-sm); }

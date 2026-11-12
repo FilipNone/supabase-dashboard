@@ -1050,7 +1050,9 @@ async fn jwt_keys_are_checked_for_role_and_expiry() {
     let anon = expires(CredentialKind::AnonKey).unwrap();
     assert_eq!(anon.at.unix_timestamp(), anon_exp);
     assert!(!anon.expired && anon.expires_soon());
-    assert_eq!(anon.days_left, 10);
+    // Ten days and an hour ahead: ten or eleven calendar days, depending
+    // on whether the hour crosses midnight UTC.
+    assert!((10..=11).contains(&anon.days_left), "{}", anon.days_left);
     assert_eq!(expires(CredentialKind::ServiceRoleKey), None);
 
     // A key that expires after it was stored shows as expired.

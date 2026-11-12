@@ -214,7 +214,9 @@ pub enum CredentialState {
 pub struct KeyExpiry {
     pub at: OffsetDateTime,
     pub expired: bool,
-    /// Whole days left, rounded down; zero once expired.
+    /// UTC calendar days from today to the expiry date, so it matches the
+    /// date shown: 0 when it expires later today, 1 when tomorrow. Zero
+    /// once expired.
     pub days_left: i64,
 }
 
@@ -224,10 +226,12 @@ impl KeyExpiry {
 
     pub fn new(at: OffsetDateTime, now: OffsetDateTime) -> Self {
         let expired = at <= now;
+        let utc = time::UtcOffset::UTC;
+        let days = (at.to_offset(utc).date() - now.to_offset(utc).date()).whole_days();
         Self {
             at,
             expired,
-            days_left: if expired { 0 } else { (at - now).whole_days() },
+            days_left: if expired { 0 } else { days.max(0) },
         }
     }
 
@@ -603,17 +607,24 @@ mod tests {
     }
 
     #[test]
-    fn key_expiry_counts_whole_days() {
-        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+    fn key_expiry_counts_calendar_days() {
+        // 2027-01-15 08:00 UTC.
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000 - 1_800_000_000 % 86_400)
+            .unwrap()
+            + time::Duration::hours(8);
         let later = |hours: i64| KeyExpiry::new(now + time::Duration::hours(hours), now);
         assert!(later(0).expired);
         assert!(later(-1).expired);
         assert_eq!(later(-48).days_left, 0);
-        let soon = later(23);
-        assert!(!soon.expired && soon.expires_soon());
-        assert_eq!(soon.days_left, 0);
-        assert_eq!(later(24 * 29 + 23).days_left, 29);
-        assert!(later(24 * 29 + 23).expires_soon());
+        // Later today, then tomorrow even when under 24 hours away.
+        let today = later(15);
+        assert!(!today.expired && today.expires_soon());
+        assert_eq!(today.days_left, 0);
+        assert_eq!(later(17).days_left, 1);
+        // Ten days from now is ten days, whatever the hour.
+        assert_eq!(later(24 * 10).days_left, 10);
+        assert_eq!(later(24 * 10 - 1).days_left, 10);
+        assert!(later(24 * 29).expires_soon());
         assert!(!later(24 * 30).expires_soon());
         assert!(!later(-1).expires_soon());
     }
