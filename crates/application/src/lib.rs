@@ -13,6 +13,7 @@ pub mod key_rotation;
 pub mod organizations;
 pub mod password;
 pub mod projects;
+pub mod provisioning;
 pub mod secrets;
 pub mod stack_secrets;
 pub mod stack_template;

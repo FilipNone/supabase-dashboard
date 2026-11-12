@@ -80,6 +80,74 @@ impl StackSecrets {
     }
 }
 
+/// The JSON field names, in the order [`StackSecrets::to_json`] writes
+/// them.
+const FIELDS: [&str; 8] = [
+    "postgres_password",
+    "jwt_secret",
+    "anon_key",
+    "service_role_key",
+    "secret_key_base",
+    "realtime_db_enc_key",
+    "pg_meta_crypto_key",
+    "studio_password",
+];
+
+impl StackSecrets {
+    fn values(&self) -> [&SecretString; 8] {
+        [
+            &self.postgres_password,
+            &self.jwt_secret,
+            &self.anon_key,
+            &self.service_role_key,
+            &self.secret_key_base,
+            &self.realtime_db_enc_key,
+            &self.pg_meta_crypto_key,
+            &self.studio_password,
+        ]
+    }
+
+    /// The secrets as a JSON object, for sealing until they are stored
+    /// where they belong.
+    pub fn to_json(&self) -> SecretString {
+        let mut object = serde_json::Map::new();
+        for (name, value) in FIELDS.into_iter().zip(self.values()) {
+            object.insert(name.to_owned(), value.expose_secret().into());
+        }
+        object.insert(
+            "keys_issued_at".to_owned(),
+            self.keys_issued_at.unix_timestamp().into(),
+        );
+        SecretString::from(serde_json::Value::Object(object).to_string())
+    }
+
+    /// Reads what [`Self::to_json`] wrote. `None` when a field is missing
+    /// or of the wrong type.
+    pub fn from_json(json: &SecretString) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(json.expose_secret()).ok()?;
+        let field = |name: &str| {
+            value
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .map(|s| SecretString::from(s.to_owned()))
+        };
+        Some(Self {
+            postgres_password: field(FIELDS[0])?,
+            jwt_secret: field(FIELDS[1])?,
+            anon_key: field(FIELDS[2])?,
+            service_role_key: field(FIELDS[3])?,
+            secret_key_base: field(FIELDS[4])?,
+            realtime_db_enc_key: field(FIELDS[5])?,
+            pg_meta_crypto_key: field(FIELDS[6])?,
+            studio_password: field(FIELDS[7])?,
+            keys_issued_at: OffsetDateTime::from_unix_timestamp(
+                value.get("keys_issued_at")?.as_i64()?,
+            )
+            .ok()?,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiKeyRole {
     Anon,
@@ -196,6 +264,20 @@ mod tests {
             let resigned = sign_api_key(&secrets.jwt_secret, role, issued.unix_timestamp());
             assert_eq!(resigned.expose_secret(), key.expose_secret());
         }
+    }
+
+    #[test]
+    fn secrets_survive_their_json_form() {
+        let secrets = StackSecrets::generate().unwrap();
+        let back = StackSecrets::from_json(&secrets.to_json()).unwrap();
+        for (a, b) in secrets.values().into_iter().zip(back.values()) {
+            assert_eq!(a.expose_secret(), b.expose_secret());
+        }
+        assert_eq!(
+            back.keys_issued_at.unix_timestamp(),
+            secrets.keys_issued_at.unix_timestamp()
+        );
+        assert!(StackSecrets::from_json(&SecretString::from(r#"{"jwt_secret":"x"}"#)).is_none());
     }
 
     #[test]

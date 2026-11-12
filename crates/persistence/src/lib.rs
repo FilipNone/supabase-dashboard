@@ -13,6 +13,7 @@ pub mod invitations;
 pub mod jobs;
 pub mod organizations;
 pub mod projects;
+pub mod provisioning;
 pub mod sessions;
 pub mod studio;
 pub mod studio_access;

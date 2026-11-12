@@ -108,6 +108,40 @@ pub fn is_dashboard_compose_name(name: &str) -> bool {
         && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
+/// The compose service name for the stack a job provisions: `sd-` and
+/// the job ID as 32 hex digits. Unique to the job, so a job that lost an
+/// answer finds its own service again by name.
+pub fn compose_name_for_job(job_id: uuid::Uuid) -> String {
+    format!("sd-{}", job_id.simple())
+}
+
+/// Longest host name a stack may be given.
+pub const STACK_HOST_MAX_LEN: usize = 253;
+
+/// Normalizes and checks the host name a new stack is reached at: two or
+/// more labels of lowercase letters, digits, and `-`, none starting or
+/// ending with `-`, and not an IP address. Returns the lowercase form.
+pub fn check_stack_host(raw: &str) -> Option<String> {
+    let host = raw.trim().trim_end_matches('.').to_ascii_lowercase();
+    let labels: Vec<&str> = host.split('.').collect();
+    let valid = host.len() <= STACK_HOST_MAX_LEN
+        && labels.len() >= 2
+        && labels.iter().all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+        // The last label of a domain name is never all digits, which also
+        // rules out IPv4 addresses.
+        && labels
+            .last()
+            .is_some_and(|tld| !tld.bytes().all(|b| b.is_ascii_digit()));
+    valid.then_some(host)
+}
+
 /// Whether `path` is a file mount path the dashboard writes: relative,
 /// made of `[A-Za-z0-9._-]` segments separated by `/`, with no empty, `.`,
 /// or `..` segment.
@@ -148,6 +182,37 @@ mod tests {
         assert!(!is_file_mount_path("dir/"));
         assert!(!is_file_mount_path("a/./b"));
         assert!(!is_file_mount_path(""));
+    }
+
+    #[test]
+    fn job_names_are_dashboard_names() {
+        let name = compose_name_for_job(uuid::Uuid::from_u128(u128::MAX));
+        assert_eq!(name, format!("sd-{}", "f".repeat(32)));
+        assert!(is_dashboard_compose_name(&name));
+    }
+
+    #[test]
+    fn stack_hosts() {
+        assert_eq!(
+            check_stack_host(" Shop.Example.COM. ").as_deref(),
+            Some("shop.example.com")
+        );
+        assert!(check_stack_host("a-b.c1.example.test").is_some());
+        for bad in [
+            "",
+            "localhost",
+            "10.0.0.1",
+            "-shop.example.com",
+            "shop-.example.com",
+            "shop..example.com",
+            "shop_1.example.com",
+            "shop.example.com/x",
+            "shop.example.com:443",
+            "*.example.com",
+            &format!("{}.example.com", "a".repeat(64)),
+        ] {
+            assert_eq!(check_stack_host(bad), None, "{bad}");
+        }
     }
 
     #[test]

@@ -20,6 +20,8 @@ use supabase_dashboard_domain::{
     dokploy_placement::DokployId,
 };
 
+use supabase_dashboard_application::provisioning::{ComposeApi, DokployFuture};
+
 use super::{DokployClient, Input, MAX_LIST_BODY_BYTES, MAX_SMALL_BODY_BYTES, parse_list};
 
 /// Most search results asked for at once, Dokploy's own limit.
@@ -450,4 +452,125 @@ impl RawDomainRow {
 /// A name or title of at most 256 characters.
 fn bounded(value: String) -> Option<String> {
     (value.chars().count() <= 256).then_some(value)
+}
+
+impl ComposeApi for DokployClient {
+    fn find_compose<'a>(
+        &'a self,
+        url: &'a DokployUrl,
+        key: &'a SecretString,
+        environment_id: &'a DokployId,
+        name: &'a str,
+    ) -> DokployFuture<'a, Vec<ComposeService>> {
+        Box::pin(DokployClient::find_compose(
+            self,
+            url,
+            key,
+            environment_id,
+            name,
+        ))
+    }
+
+    fn create_compose<'a>(
+        &'a self,
+        url: &'a DokployUrl,
+        key: &'a SecretString,
+        new: &'a NewCompose<'a>,
+    ) -> DokployFuture<'a, ComposeService> {
+        Box::pin(DokployClient::create_compose(self, url, key, new))
+    }
+
+    fn configure_compose<'a>(
+        &'a self,
+        url: &'a DokployUrl,
+        key: &'a SecretString,
+        compose_id: &'a DokployId,
+        compose_file: &'a str,
+        env: &'a SecretString,
+    ) -> DokployFuture<'a, ()> {
+        Box::pin(DokployClient::configure_compose(
+            self,
+            url,
+            key,
+            compose_id,
+            compose_file,
+            env,
+        ))
+    }
+
+    fn file_mounts<'a>(
+        &'a self,
+        url: &'a DokployUrl,
+        key: &'a SecretString,
+        compose_id: &'a DokployId,
+    ) -> DokployFuture<'a, Vec<FileMount>> {
+        Box::pin(DokployClient::file_mounts(self, url, key, compose_id))
+    }
+
+    fn create_file_mount<'a>(
+        &'a self,
+        url: &'a DokployUrl,
+        key: &'a SecretString,
+        compose_id: &'a DokployId,
+        file_path: &'a str,
+        content: &'a str,
+    ) -> DokployFuture<'a, FileMount> {
+        Box::pin(DokployClient::create_file_mount(
+            self, url, key, compose_id, file_path, content,
+        ))
+    }
+
+    fn update_file_mount<'a>(
+        &'a self,
+        url: &'a DokployUrl,
+        key: &'a SecretString,
+        mount_id: &'a DokployId,
+        content: &'a str,
+    ) -> DokployFuture<'a, ()> {
+        Box::pin(DokployClient::update_file_mount(
+            self, url, key, mount_id, content,
+        ))
+    }
+
+    fn compose_domains<'a>(
+        &'a self,
+        url: &'a DokployUrl,
+        key: &'a SecretString,
+        compose_id: &'a DokployId,
+    ) -> DokployFuture<'a, Vec<ComposeDomain>> {
+        Box::pin(DokployClient::compose_domains(self, url, key, compose_id))
+    }
+
+    fn create_compose_domain<'a>(
+        &'a self,
+        url: &'a DokployUrl,
+        key: &'a SecretString,
+        compose_id: &'a DokployId,
+        domain: &'a NewComposeDomain<'a>,
+    ) -> DokployFuture<'a, ComposeDomain> {
+        Box::pin(DokployClient::create_compose_domain(
+            self, url, key, compose_id, domain,
+        ))
+    }
+
+    fn deploy_compose<'a>(
+        &'a self,
+        url: &'a DokployUrl,
+        key: &'a SecretString,
+        compose_id: &'a DokployId,
+        title: &'a str,
+    ) -> DokployFuture<'a, ()> {
+        Box::pin(DokployClient::deploy_compose(
+            self, url, key, compose_id, title,
+        ))
+    }
+
+    fn deployments<'a>(
+        &'a self,
+        url: &'a DokployUrl,
+        key: &'a SecretString,
+        compose_id: &'a DokployId,
+    ) -> DokployFuture<'a, Vec<DeploymentInfo>> {
+        Box::pin(DokployClient::deployments(self, url, key, compose_id))
+    }
 }

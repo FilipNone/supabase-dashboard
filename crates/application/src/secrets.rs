@@ -190,6 +190,23 @@ impl CredentialCipher {
         self.open_bound(&associated_data(project_id, kind), sealed)
     }
 
+    /// Seals a background job's secrets, bound to the job.
+    pub fn seal_job_secrets(
+        &self,
+        job_id: Uuid,
+        value: &SecretString,
+    ) -> Result<Sealed, CipherError> {
+        self.seal_bound(&job_associated_data(job_id), value)
+    }
+
+    pub fn open_job_secrets(
+        &self,
+        job_id: Uuid,
+        sealed: &Sealed,
+    ) -> Result<SecretString, CipherError> {
+        self.open_bound(&job_associated_data(job_id), sealed)
+    }
+
     /// Seals the installation's Dokploy API key, bound to the Dokploy URL
     /// that accepted it.
     pub fn seal_dokploy_key(
@@ -281,6 +298,10 @@ fn associated_data(project_id: Uuid, kind: CredentialKind) -> String {
     )
 }
 
+fn job_associated_data(job_id: Uuid) -> String {
+    format!("supabase-dashboard:job-secrets:v1:{job_id}")
+}
+
 fn dokploy_associated_data(dokploy_url: &str) -> String {
     format!("supabase-dashboard:dokploy-key:v1:{dokploy_url}")
 }
@@ -311,6 +332,21 @@ mod tests {
         );
         let opened = c.open(project, CredentialKind::AnonKey, &sealed).unwrap();
         assert_eq!(opened.expose_secret(), value.expose_secret());
+    }
+
+    #[test]
+    fn job_secrets_open_only_for_their_job() {
+        let c = cipher(KEY_A);
+        let value = SecretString::from(r#"{"jwt_secret":"synthetic"}"#);
+        let sealed = c.seal_job_secrets(Uuid::from_u128(7), &value).unwrap();
+        let opened = c.open_job_secrets(Uuid::from_u128(7), &sealed).unwrap();
+        assert_eq!(opened.expose_secret(), value.expose_secret());
+        assert!(c.open_job_secrets(Uuid::from_u128(8), &sealed).is_err());
+        // Nor as a project credential.
+        assert!(
+            c.open(Uuid::from_u128(7), CredentialKind::AnonKey, &sealed)
+                .is_err()
+        );
     }
 
     #[test]

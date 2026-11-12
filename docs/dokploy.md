@@ -81,6 +81,22 @@ The stack the dashboard provisions is pinned in `crates/application/stack`: a co
 
 The variables are `POSTGRES_PASSWORD`, `JWT_SECRET`, `ANON_KEY`, `SERVICE_ROLE_KEY`, `DASHBOARD_USERNAME`, `DASHBOARD_PASSWORD`, `REALTIME_DB_ENC_KEY`, `SECRET_KEY_BASE`, `PG_META_CRYPTO_KEY`, `SUPABASE_PUBLIC_URL`, and `SITE_URL`. Unit tests check that the compose file reads exactly these, that every mounted file is shipped and every shipped file mounted, that no service has a port or container name, and that the upstream files are byte for byte the fixture's copies. An opt-in fixture test deploys the stack through Dokploy; on 2026-11-13 every service came up healthy, and from inside the stack's network the gateway answered Auth's health check with the anon key, REST and Storage with the service role key, and Studio with the login, and refused requests without a key, as the Supabase fixture's Envoy does.
 
+### The provisioning job
+
+`crates/application/src/provisioning` holds the job that will create stacks; nothing in the server starts it yet. An owner or admin picks a name, a host, and one of the organization's targets. The server checks the role, the host (a lowercase name of two or more labels, not an IP address), and the target, generates the stack's secrets, and queues a job with the secrets encrypted apart from its data. The job then runs these steps, saving after each:
+
+1. Check that the account that asked may still register projects in the organization, and that the target is still allowed.
+2. Look up the compose service by its name, `sd-` and the job ID, and create it only if there is none.
+3. Set the compose file and the variables.
+4. Create or update the file mounts.
+5. Add the host as a domain on the Envoy service, port 8000, unless it is there.
+6. Start a deployment titled `supabase-dashboard provision <job ID>`, unless one with that title exists.
+7. Poll the deployment until it is done, failed, or cancelled.
+8. Check the role again, then register the project with its anon key, service role key, Studio login, and Dokploy service in one transaction.
+9. Check Auth at the public URL with the anon key, for about five minutes. If it does not answer, the job still succeeds and says to check the host's DNS.
+
+When Dokploy does not answer, the step runs again after 30 seconds, up to ten times in a row. A deployment request whose answer was lost is not sent again; the job waits for its title to appear. Any other refusal fails the job, and what it made stays in Dokploy, with the job's secrets kept. Tests with a fake Dokploy cover a full run, lost answers to the create and deploy requests, a failed deployment, a stack that never answers, and an account that loses its role while the job waits.
+
 ## Connecting
 
 An installation administrator connects the dashboard to Dokploy in the Dokploy section of the administrator page (`/dashboard/admin`), with Dokploy's URL and an API key. One Dokploy connection exists per installation.
