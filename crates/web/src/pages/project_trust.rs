@@ -100,13 +100,24 @@ pub fn AuthoritiesPanel(project: ProjectSummary) -> impl IntoView {
         move || (replace.version().get(), remove.version().get()),
         move |_| get_project_authorities(id),
     );
+    // Clear the pasted text once it is saved; a refusal keeps it so it can
+    // be corrected.
+    let form = NodeRef::<leptos::html::Form>::new();
+    Effect::new(move |_| {
+        if matches!(replace.value().get(), Some(Ok(_))) {
+            #[cfg(feature = "hydrate")]
+            if let Some(form) = form.get() {
+                form.reset();
+            }
+        }
+    });
     let id = id.to_string();
     let manage = move |stored: bool| {
         let id = id.clone();
         can_manage.then(move || {
             let remove_id = id.clone();
             view! {
-                <ActionForm action=replace attr:class="stacked-form">
+                <ActionForm action=replace node_ref=form attr:class="stacked-form">
                     <input type="hidden" name="id" value=id.clone()/>
                     <label class="field">
                         <span class="field-label">
