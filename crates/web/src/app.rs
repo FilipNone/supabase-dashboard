@@ -19,6 +19,7 @@ use crate::pages::{
     project::{
         NewProjectPage, ProjectLayout, ProjectOverviewPage, ProjectSettingsPage, ProjectSetupPage,
     },
+    provision::{NewStackPage, ProvisionJobPage},
     sign_in::SignInPage,
     status::StatusPage,
 };
@@ -128,8 +129,10 @@ pub fn App() -> impl IntoView {
                         <Route path=path!("") view=OrganizationProjectsPage/>
                         <Route path=path!("general") view=OrganizationGeneralPage/>
                         <Route path=path!("team") view=OrganizationTeamPage/>
+                        <Route path=path!("provisioning/:job_id") view=ProvisionJobPage/>
                     </ParentRoute>
                     <Route path=path!("new/:org_id") view=NewProjectPage/>
+                    <Route path=path!("new/:org_id/stack") view=NewStackPage/>
                 </ParentRoute>
             </Routes>
         </Router>

@@ -46,6 +46,7 @@ pub fn router(state: AppState, limits: &HttpLimits) -> Router {
     let connections = state.connections.clone();
     let studio_access = state.studio_access.clone();
     let dokploy = state.dokploy.clone();
+    let provisioning = state.provisioning.clone();
     let auth = state.auth.clone();
     let leptos_options = state.leptos_options.clone();
     let x_request_id = HeaderName::from_static("x-request-id");
@@ -87,6 +88,7 @@ pub fn router(state: AppState, limits: &HttpLimits) -> Router {
                 provide_context(connections.clone());
                 provide_context(studio_access.clone());
                 provide_context(dokploy.clone());
+                provide_context(provisioning.clone());
                 provide_context(auth.clone());
             },
             move || shell(leptos_options.clone()),
@@ -180,6 +182,7 @@ mod tests {
         connections::ConnectionService,
         organizations::OrganizationService,
         projects::ProjectService,
+        provisioning::ProvisioningService,
         studio_access::{StudioAccessRecorder, StudioAccessService},
     };
     use supabase_dashboard_persistence::{Database, DatabaseSettings};
@@ -190,12 +193,13 @@ mod tests {
             ClearDokployPlacement, ConfirmDokployPlacement, ConnectDokploy, CreateInvitation,
             CreateOrganization, DisconnectDokploy, GetCurrentAccount, GetDokployConnection,
             GetDokployPlacement, GetInstallationHealth, GetOrganization, GetProject,
-            GetProjectAuthorities, GetProjectCredentials, GetProjectHealth, GetStudioAccessLog,
-            ListOrganizations, ListProjects, ListSessions, PreviewInvitation, RegisterProject,
+            GetProjectAuthorities, GetProjectCredentials, GetProjectHealth, GetProvisionJob,
+            GetProvisionTargets, GetStudioAccessLog, ListOrganizations, ListProjects,
+            ListProvisionJobs, ListSessions, PreviewInvitation, RegisterProject,
             RemoveProjectAuthorities, RemoveProjectCredential, RenameOrganization,
             ReplaceDokployKey, ReplaceProjectAuthorities, ReplaceProjectCredential,
-            ReplaceStudioLogin, RevokeSession, SignUpWithInvitation, UnregisterProject,
-            UpdateProfile,
+            ReplaceStudioLogin, RevokeSession, SignUpWithInvitation, StartProvisioning,
+            UnregisterProject, UpdateProfile,
         },
     };
     use tower::ServiceExt;
@@ -260,6 +264,7 @@ mod tests {
             .await
             .unwrap();
         let studio_access = Arc::new(StudioAccessService::new(db.clone(), access_log_days));
+        let dokploy = dokploy_service(&db, cipher.clone(), dokploy_policy);
         let state = AppState {
             leptos_options: LeptosOptions::builder()
                 .output_name("supabase-dashboard")
@@ -267,7 +272,12 @@ mod tests {
                 .build(),
             organizations: Arc::new(OrganizationService::new(db.clone())),
             projects: Arc::new(ProjectService::new(db.clone())),
-            dokploy: dokploy_service(&db, cipher.clone(), dokploy_policy),
+            provisioning: Arc::new(ProvisioningService::new(
+                db.clone(),
+                cipher.clone(),
+                Arc::clone(&dokploy),
+            )),
+            dokploy,
             connections: Arc::new(ConnectionService::new(
                 db.clone(),
                 cipher,
@@ -824,6 +834,185 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provisioning_is_isolated_over_http() {
+        let Some(scratch) = ScratchDb::create("http_provisioning").await else {
+            return;
+        };
+        let db = Database::connect(&scratch.settings).await.unwrap();
+        db.migrate().await.unwrap();
+        let router = router_with_cipher(db.clone(), Some(test_cipher())).await;
+        let (alice, bob) = admin_and_member(&db, &router).await;
+        let call = |path: &'static str, body: String, cookie: &str| {
+            send(&router, form_post(path, &body, Some(cookie)))
+        };
+        let (_, body) = call(CreateOrganization::PATH, "name=Acme".into(), &alice).await;
+        let org: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let org_id = org["id"].as_str().unwrap().to_owned();
+        // A job as the server queues it, with a marker only its saved
+        // data holds.
+        let job_id = uuid::Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO jobs (id, kind, organization_id, state, step, data, created_by) \
+             SELECT $1::uuid, 'provision_stack', $2::uuid, 'queued', 'mounts', $3::jsonb, id \
+             FROM accounts WHERE email = 'alice@example.test'",
+        )
+        .bind(&job_id)
+        .bind(&org_id)
+        .bind(serde_json::json!({
+            "project_id": uuid::Uuid::now_v7(),
+            "name": "Synthetic Stack",
+            "environment_id": "env-marker-7f3a",
+            "server_id": null,
+            "host": "synthetic.example.test",
+            "https": true,
+            "compose_name": format!("sd-{job_id}"),
+        }))
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let start = |org: &str, host: &str| {
+            format!(
+                "organization_id={org}&name=Synthetic+Two&target=envSynthetic1\
+                 &host={host}&https=true"
+            )
+        };
+        let job_page = format!("/dashboard/org/{org_id}/provisioning/{job_id}");
+        let new_stack = format!("/dashboard/new/{org_id}/stack");
+
+        // Bob is not a member: every call answers as for a made-up ID.
+        for (path, body) in [
+            (GetProvisionJob::PATH, format!("id={job_id}")),
+            (
+                GetProvisionJob::PATH,
+                format!("id={}", uuid::Uuid::now_v7()),
+            ),
+            (ListProvisionJobs::PATH, format!("organization_id={org_id}")),
+            (
+                GetProvisionTargets::PATH,
+                format!("organization_id={org_id}"),
+            ),
+            (
+                StartProvisioning::PATH,
+                start(&org_id, "synthetic-two.example.test"),
+            ),
+        ] {
+            let (parts, response) = call(path, body, &bob).await;
+            assert_eq!(parts.status, StatusCode::NOT_FOUND, "{path}: {response}");
+            assert!(!response.contains("Synthetic"), "{path}: {response}");
+        }
+        let (_, body) = send(&router, get_with_cookie(&job_page, &bob)).await;
+        assert!(body.contains("Organization unavailable"), "{body}");
+        assert!(!body.contains("synthetic.example.test"), "{body}");
+
+        // As a viewer he follows the job but may not create stacks.
+        sqlx::query(
+            "INSERT INTO organization_members (organization_id, account_id, role) \
+             SELECT $1::uuid, id, 'viewer' FROM accounts WHERE email = 'bob@example.test'",
+        )
+        .bind(&org_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let (parts, body) = call(GetProvisionJob::PATH, format!("id={job_id}"), &bob).await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        let job: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(job["name"], "Synthetic Stack");
+        assert_eq!(job["state"], "queued");
+        assert_eq!(job["step"], "mounts");
+        assert!(!body.contains("env-marker"), "{body}");
+        let (parts, body) = call(
+            ListProvisionJobs::PATH,
+            format!("organization_id={org_id}"),
+            &bob,
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        assert!(
+            body.contains(&job_id) && !body.contains("env-marker"),
+            "{body}"
+        );
+        for (path, body) in [
+            (
+                GetProvisionTargets::PATH,
+                format!("organization_id={org_id}"),
+            ),
+            (
+                StartProvisioning::PATH,
+                start(&org_id, "synthetic-two.example.test"),
+            ),
+        ] {
+            let (parts, response) = call(path, body, &bob).await;
+            assert_eq!(parts.status, StatusCode::FORBIDDEN, "{path}: {response}");
+        }
+        let denied: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_events \
+             WHERE action = 'project.provision' AND outcome = 'denied'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(denied, 1);
+        let (_, body) = send(&router, get_with_cookie(&job_page, &bob)).await;
+        assert!(body.contains("New stack: Synthetic Stack"), "{body}");
+        assert!(body.contains("https://synthetic.example.test"), "{body}");
+        assert!(body.contains("Write the configuration files"), "{body}");
+        let (_, body) = send(&router, get_with_cookie(&new_stack, &bob)).await;
+        assert!(body.contains("You cannot create stacks here"), "{body}");
+        let org_page = format!("/dashboard/org/{org_id}");
+        let (_, body) = send(&router, get_with_cookie(&org_page, &bob)).await;
+        assert!(
+            body.contains("New stacks") && body.contains(&job_page),
+            "{body}"
+        );
+        assert!(!body.contains("Create a new stack"), "{body}");
+        // The job has to be in the organization of the path.
+        let (_, body) = call(CreateOrganization::PATH, "name=Other".into(), &alice).await;
+        let other: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let elsewhere = format!(
+            "/dashboard/org/{}/provisioning/{job_id}",
+            other["id"].as_str().unwrap()
+        );
+        let (_, body) = send(&router, get_with_cookie(&elsewhere, &alice)).await;
+        assert!(body.contains("New stack unavailable"), "{body}");
+        assert!(!body.contains("synthetic.example.test"), "{body}");
+
+        // Alice may create stacks, but nothing is connected, and bad input
+        // is refused with a sentence.
+        let (parts, body) = call(
+            GetProvisionTargets::PATH,
+            format!("organization_id={org_id}"),
+            &alice,
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        assert_eq!(body, r#""NotConnected""#);
+        let (_, body) = send(&router, get_with_cookie(&new_stack, &alice)).await;
+        assert!(body.contains("Dokploy is not connected"), "{body}");
+        let (parts, body) =
+            call(StartProvisioning::PATH, start(&org_id, "localhost"), &alice).await;
+        assert_eq!(parts.status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(body.contains("Enter a host name"), "{body}");
+        let (parts, body) = call(
+            StartProvisioning::PATH,
+            start(&org_id, "synthetic-two.example.test"),
+            &alice,
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(body.contains("Dokploy is not connected"), "{body}");
+        let (_, body) = send(&router, get_with_cookie(&org_page, &alice)).await;
+        assert!(body.contains("Create a new stack"), "{body}");
+        let jobs: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(jobs, 1);
+
+        db.close().await;
+        scratch.drop().await;
+    }
+
+    #[tokio::test]
     async fn the_access_log_downloads_as_csv_for_owners_only() {
         let Some(scratch) = ScratchDb::create("http_access_csv").await else {
             return;
@@ -1259,6 +1448,7 @@ mod tests {
             ORIGIN.to_owned(),
         )
         .with_access_log(StudioAccessRecorder::start(db.clone()));
+        let dokploy = dokploy_service(db, Some(cipher.clone()), TargetPolicy::default());
         let state = AppState {
             leptos_options: LeptosOptions::builder()
                 .output_name("supabase-dashboard")
@@ -1266,7 +1456,12 @@ mod tests {
                 .build(),
             organizations: Arc::new(OrganizationService::new(db.clone())),
             projects: Arc::new(ProjectService::new(db.clone())),
-            dokploy: dokploy_service(db, Some(cipher.clone()), TargetPolicy::default()),
+            dokploy: Arc::clone(&dokploy),
+            provisioning: Arc::new(ProvisioningService::new(
+                db.clone(),
+                Some(cipher.clone()),
+                dokploy,
+            )),
             // The gateways in these tests listen on loopback.
             connections: Arc::new(ConnectionService::new(
                 db.clone(),

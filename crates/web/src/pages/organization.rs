@@ -30,6 +30,7 @@ use crate::{
     pages::{
         account::utc_minutes,
         project::{project_entry, project_path},
+        provision::{RecentStacks, new_stack_path},
     },
     server_fns::{
         ChangeMemberRole, CreateInvitation, RemoveMember, RenameOrganization, RevokeInvitation,
@@ -149,11 +150,15 @@ pub fn OrganizationProjectsPage() -> impl IntoView {
     let can_register =
         move || loaded_org(ctx).is_some_and(|org| org.role.allows(Permission::ProjectRegister));
     let new_href = move || ctx.id.get().map(|id| format!("/dashboard/new/{id}"));
+    let stack_href = move || ctx.id.get().map(new_stack_path);
     view! {
         <div class="section-header">
             <h2 class="section-title">"Projects"</h2>
             {move || can_register().then(|| view! {
-                <a class="button button-primary" href=new_href()>"Register project"</a>
+                <div class="page-actions">
+                    <a class="button button-primary" href=stack_href()>"Create a new stack"</a>
+                    <a class="button" href=new_href()>"Register existing project"</a>
+                </div>
             })}
         </div>
         <Transition fallback=|| view! { <p class="loading" role="status">"Loading projects…"</p> }>
@@ -161,9 +166,9 @@ pub fn OrganizationProjectsPage() -> impl IntoView {
                 projects.get().map(|result| match result {
                     Ok(list) if list.is_empty() => {
                         let detail = if can_register() {
-                            "Register an existing self-hosted Supabase stack to manage it here."
+                            "Create a new self-hosted Supabase stack, or register an existing one to manage it here."
                         } else {
-                            "An owner or administrator can register an existing self-hosted Supabase stack."
+                            "An owner or administrator can create a new self-hosted Supabase stack or register an existing one."
                         };
                         view! {
                             <StatePanel
@@ -191,6 +196,7 @@ pub fn OrganizationProjectsPage() -> impl IntoView {
                 })
             }}
         </Transition>
+        <RecentStacks organization_id=ctx.id/>
     }
     .into_any()
 }

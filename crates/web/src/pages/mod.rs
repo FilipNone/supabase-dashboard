@@ -12,5 +12,6 @@ pub mod project;
 mod project_connect;
 pub mod project_connection;
 mod project_trust;
+pub mod provision;
 pub mod sign_in;
 pub mod status;

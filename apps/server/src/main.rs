@@ -33,7 +33,7 @@ use supabase_dashboard_application::{
     key_rotation::{RotationError, key_usage, reseal_credentials},
     organizations::OrganizationService,
     projects::ProjectService,
-    provisioning::{ComposeApi, ProvisionStackHandler},
+    provisioning::{ComposeApi, ProvisionStackHandler, ProvisioningService},
     secrets::{CredentialCipher, KeyError},
     studio::StudioService,
     studio_access::{StudioAccessRecorder, StudioAccessService},
@@ -499,6 +499,11 @@ async fn run() -> Result<(), StartupError> {
             })
             .await;
     });
+    let provisioning = Arc::new(ProvisioningService::new(
+        db.clone(),
+        cipher.clone(),
+        Arc::clone(&dokploy),
+    ));
     let connections = Arc::new(ConnectionService::new(db.clone(), cipher, probe));
     match config.health_check_interval {
         Some(interval) => {
@@ -525,6 +530,7 @@ async fn run() -> Result<(), StartupError> {
         connections,
         studio_access,
         dokploy,
+        provisioning,
         cookie: CookieSettings::new(secure_cookie, config.session_lifetime.as_secs()),
         expected_origin: config
             .public_url

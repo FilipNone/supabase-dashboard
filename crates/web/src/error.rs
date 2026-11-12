@@ -77,6 +77,7 @@ mod server {
         dokploy::DokployServiceError,
         organizations::OrganizationError,
         projects::ProjectError,
+        provisioning::ProvisionError,
         studio_access::StudioAccessError,
     };
 
@@ -221,6 +222,25 @@ mod server {
         }
     }
 
+    impl From<ProvisionError> for AppError {
+        fn from(err: ProvisionError) -> Self {
+            match err {
+                ProvisionError::Forbidden => Self::Forbidden,
+                ProvisionError::NotFound => Self::NotFound,
+                ProvisionError::Input(_)
+                | ProvisionError::InvalidHost
+                | ProvisionError::TargetNotAllowed
+                | ProvisionError::NotConnected
+                | ProvisionError::NoCipher
+                | ProvisionError::LimitReached => Self::Rejected(sentence(&err.to_string())),
+                ProvisionError::Internal(err) => {
+                    tracing::error!(error = %err, "provisioning operation failed");
+                    Self::Unavailable
+                }
+            }
+        }
+    }
+
     /// Service messages are lowercase clauses; the UI shows sentences.
     fn sentence(message: &str) -> String {
         let mut chars = message.chars();
@@ -307,5 +327,42 @@ mod tests {
             AppError::Unavailable.http_status(),
             StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+
+    #[cfg(feature = "ssr")]
+    #[test]
+    fn provisioning_errors_are_sentences_and_hide_internals() {
+        use supabase_dashboard_application::provisioning::ProvisionError;
+        let internal = AppError::from(ProvisionError::Internal(
+            "postgres://dashboard:secret-pw@10.0.0.5/metadata refused".into(),
+        ));
+        assert_eq!(internal, AppError::Unavailable);
+        assert!(!internal.to_string().contains("secret-pw"));
+        assert_eq!(
+            AppError::from(ProvisionError::Forbidden),
+            AppError::Forbidden
+        );
+        assert_eq!(AppError::from(ProvisionError::NotFound), AppError::NotFound);
+        assert_eq!(
+            AppError::from(ProvisionError::InvalidHost),
+            AppError::Rejected("Enter a host name such as shop.example.com.".into())
+        );
+        assert_eq!(
+            AppError::from(ProvisionError::NotConnected),
+            AppError::Rejected(
+                "Dokploy is not connected; ask an installation administrator to connect it.".into()
+            )
+        );
+        for err in [
+            ProvisionError::TargetNotAllowed,
+            ProvisionError::NoCipher,
+            ProvisionError::LimitReached,
+        ] {
+            let AppError::Rejected(message) = AppError::from(err) else {
+                panic!("not shown to the operator");
+            };
+            assert!(message.starts_with(char::is_uppercase), "{message}");
+            assert!(message.ends_with('.'), "{message}");
+        }
     }
 }

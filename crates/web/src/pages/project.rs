@@ -77,16 +77,16 @@ pub fn project_path(organization_id: Uuid, id: Uuid) -> String {
     format!("/dashboard/org/{organization_id}/projects/{id}")
 }
 
-fn org_path(id: Uuid) -> String {
+pub(crate) fn org_path(id: Uuid) -> String {
     format!("/dashboard/org/{id}")
 }
 
-fn param_uuid(name: &'static str) -> Memo<Option<Uuid>> {
+pub(crate) fn param_uuid(name: &'static str) -> Memo<Option<Uuid>> {
     let params = use_params_map();
     Memo::new(move |_| params.read().get(name).and_then(|raw| raw.parse().ok()))
 }
 
-fn action_error<T>(value: Option<Result<T, AppError>>) -> Option<impl IntoView> {
+pub(crate) fn action_error<T>(value: Option<Result<T, AppError>>) -> Option<impl IntoView> {
     value
         .and_then(Result::err)
         .map(|err| view! { <p class="form-error" role="alert">{err.to_string()}</p> })

@@ -23,6 +23,7 @@ use supabase_dashboard_domain::{
     invitation::{InvitationCode, InvitationPreview, InvitationSummary, IssuedInvitation},
     organization::{MemberSummary, OrganizationSummary},
     project::ProjectSummary,
+    provisioning::{ProvisionJobSummary, ProvisionTargets},
     studio_access::StudioAccessLog,
 };
 use uuid::Uuid;
@@ -91,6 +92,7 @@ mod org_context {
         dokploy::DokployService,
         organizations::OrganizationService,
         projects::ProjectService,
+        provisioning::ProvisioningService,
         studio_access::StudioAccessService,
     };
 
@@ -145,6 +147,13 @@ mod org_context {
     pub fn dokploy() -> Result<Arc<DokployService>, AppError> {
         use_context::<Arc<DokployService>>().ok_or_else(|| {
             tracing::error!("Dokploy service is not configured");
+            AppError::Unavailable
+        })
+    }
+
+    pub fn provisioning() -> Result<Arc<ProvisioningService>, AppError> {
+        use_context::<Arc<ProvisioningService>>().ok_or_else(|| {
+            tracing::error!("provisioning service is not configured");
             AppError::Unavailable
         })
     }
@@ -397,6 +406,60 @@ pub async fn register_project(
     };
     Ok(org_context::projects()?
         .register(&session, organization_id, input, audit.get())
+        .await?)
+}
+
+/// Where the operator may create a new stack in an organization. Owners
+/// and admins only.
+#[server]
+pub async fn get_provision_targets(organization_id: Uuid) -> Result<ProvisionTargets, AppError> {
+    let session = org_context::session()?;
+    Ok(org_context::provisioning()?
+        .targets(&session, organization_id)
+        .await?)
+}
+
+/// Queues a new stack through Dokploy and returns the job's ID. The
+/// server checks the role, the name, the host, and that the organization
+/// may use `target`. Owners and admins only.
+#[server]
+pub async fn start_provisioning(
+    organization_id: Uuid,
+    name: String,
+    target: String,
+    host: String,
+    // Set by a checkbox, so it is absent when unchecked.
+    #[server(default)] https: bool,
+) -> Result<Uuid, AppError> {
+    use supabase_dashboard_application::provisioning::ProvisionRequest;
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    let request = ProvisionRequest {
+        name: &name,
+        target: &target,
+        host: &host,
+        https,
+    };
+    Ok(org_context::provisioning()?
+        .start(&session, organization_id, request, audit.get())
+        .await?)
+}
+
+/// One provisioning job, for members of its organization.
+#[server]
+pub async fn get_provision_job(id: Uuid) -> Result<ProvisionJobSummary, AppError> {
+    let session = org_context::session()?;
+    Ok(org_context::provisioning()?.job(&session, id).await?)
+}
+
+/// An organization's latest provisioning jobs, newest first.
+#[server]
+pub async fn list_provision_jobs(
+    organization_id: Uuid,
+) -> Result<Vec<ProvisionJobSummary>, AppError> {
+    let session = org_context::session()?;
+    Ok(org_context::provisioning()?
+        .jobs(&session, organization_id)
         .await?)
 }
 

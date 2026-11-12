@@ -541,3 +541,22 @@ td { vertical-align: middle; }
 .placement-choice summary { cursor: pointer; color: var(--color-text-muted); font-size: var(--text-sm); }
 .placement-choice summary:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 2px; }
 .placement-choice[open] summary { margin-bottom: var(--space-2); }
+
+/* Provisioning: a job's steps and an organization's new stacks. */
+:root { --color-current-bg: #e6eefb; --color-current-text: #1d4f91; }
+:root[data-theme="dark"] { --color-current-bg: #16263d; --color-current-text: #9cc3f5; }
+@media (prefers-color-scheme: dark) {
+  :root[data-theme="system"] { --color-current-bg: #16263d; --color-current-text: #9cc3f5; }
+}
+.badge-current { background: var(--color-current-bg); color: var(--color-current-text); }
+.job-steps { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--space-2); }
+.job-step { display: grid; grid-template-columns: 6.5rem 1fr; align-items: baseline; gap: var(--space-3); }
+.job-step .badge { justify-self: start; }
+.job-step[aria-current="step"] .job-step-label { font-weight: 600; }
+.recent-stacks { display: grid; gap: var(--space-3); margin-top: var(--space-8); }
+.form-note {
+  margin: 0; padding: var(--space-3); border-radius: var(--radius-md);
+  background: var(--color-muted-bg); color: var(--color-text); font-size: var(--text-sm);
+}
+/* Buttons side by side in a section header share the primary's height. */
+.section-header .page-actions .button { height: 2.5rem; }
