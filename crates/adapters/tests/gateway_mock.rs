@@ -97,6 +97,7 @@ fn probe(policy: TargetPolicy) -> GatewayProbe {
         policy,
         connect_timeout: Duration::from_secs(2),
         request_timeout: Duration::from_millis(800),
+        ..GatewaySettings::default()
     })
     .unwrap()
 }

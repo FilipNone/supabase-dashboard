@@ -45,6 +45,9 @@ pub struct Config {
     /// Let project checks connect to loopback addresses. For development
     /// against a stack on the same host only.
     pub allow_loopback_targets: bool,
+    /// A PEM file of certificate authorities trusted, in addition to the
+    /// bundled Mozilla roots, for project checks and Studio traffic.
+    pub extra_ca_file: Option<std::path::PathBuf>,
     /// Where each project's Studio is served. Without it, Studio cannot be
     /// opened through the dashboard.
     pub studio_hosts: Option<StudioHosts>,
@@ -225,6 +228,7 @@ impl Config {
             session_lifetime,
             secret_key,
             allow_loopback_targets,
+            extra_ca_file: get("EXTRA_CA_FILE").map(Into::into),
             studio_hosts,
             studio_max_body_bytes: usize::try_from(studio_max_body_bytes)
                 .map_err(|_| invalid("STUDIO_MAX_BODY_BYTES", "does not fit in memory size"))?,
@@ -458,6 +462,18 @@ mod tests {
         ])
         .unwrap_err();
         assert!(!err.to_string().contains("c2VjcmV0"));
+    }
+
+    #[test]
+    fn extra_authorities_are_read_from_a_file() {
+        let dev = ("ENV", "development");
+        assert!(load(&[DB, dev]).unwrap().extra_ca_file.is_none());
+        assert_eq!(
+            load(&[DB, dev, ("EXTRA_CA_FILE", "/run/secrets/ca.pem")])
+                .unwrap()
+                .extra_ca_file,
+            Some("/run/secrets/ca.pem".into())
+        );
     }
 
     #[test]

@@ -95,6 +95,8 @@ The encryption key is not in `.env`. `compose.yaml` mounts `secret.key` as a Com
 
 To check a stack that runs on the same server, register it by an address the container can reach, such as the host's private network address. Loopback addresses are refused unless `SUPABASE_DASHBOARD_ALLOW_LOOPBACK_TARGETS=true`, and inside the container `127.0.0.1` is the container itself.
 
+If a stack's gateway uses a certificate from a private certificate authority, mount the authority's certificate into the container read-only and point `SUPABASE_DASHBOARD_EXTRA_CA_FILE` at it, for example `/run/secrets/stacks-ca.pem`. Only the public certificate belongs there, never the authority's key. Restart the dashboard after changing the file; it is read once at startup.
+
 ## Studio access
 
 Members open a project's Studio through the dashboard, which serves each project's Studio on its own host under `SUPABASE_DASHBOARD_STUDIO_DOMAIN` (see `docs/adr/0002-studio-access.md`). To turn it on:

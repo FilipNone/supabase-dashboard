@@ -25,16 +25,21 @@ use supabase_dashboard_domain::{
 };
 use tokio::time::Instant;
 
-use crate::net::{DestinationNotAllowed, NameNotResolved, PolicyResolver, TargetPolicy, chain_has};
+use crate::{
+    net::{DestinationNotAllowed, NameNotResolved, PolicyResolver, TargetPolicy, chain_has},
+    tls::{self, ExtraRoots},
+};
 
 /// Largest response body read from a health endpoint.
 const MAX_HEALTH_BODY_BYTES: usize = 64 * 1024;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct GatewaySettings {
     pub policy: TargetPolicy,
     pub connect_timeout: Duration,
     pub request_timeout: Duration,
+    /// Authorities trusted in addition to the bundled roots.
+    pub extra_roots: ExtraRoots,
 }
 
 impl Default for GatewaySettings {
@@ -43,6 +48,7 @@ impl Default for GatewaySettings {
             policy: TargetPolicy::default(),
             connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(10),
+            extra_roots: ExtraRoots::default(),
         }
     }
 }
@@ -65,7 +71,9 @@ pub struct GatewayProbe {
 impl GatewayProbe {
     pub fn new(settings: GatewaySettings) -> Result<Self, GatewayError> {
         let client = Client::builder()
-            .tls_backend_preconfigured(tls_config()?)
+            .tls_backend_preconfigured(
+                tls::client_config(&settings.extra_roots).map_err(GatewayError::Tls)?,
+            )
             .dns_resolver(PolicyResolver {
                 policy: settings.policy,
             })
@@ -330,20 +338,6 @@ fn storage_version(body: &[u8]) -> Option<String> {
 /// rustls with the ring provider (the one SQLx already uses) and the
 /// Mozilla root store from `webpki-roots`. Stacks behind a private CA are
 /// not supported yet.
-pub(crate) fn tls_config() -> Result<rustls::ClientConfig, GatewayError> {
-    let roots = rustls::RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-    };
-    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .map_err(GatewayError::Tls)?
-    .with_root_certificates(roots)
-    .with_no_client_auth();
-    Ok(config)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

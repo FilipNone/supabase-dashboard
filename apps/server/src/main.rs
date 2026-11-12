@@ -20,6 +20,7 @@ use supabase_dashboard_adapters::{
     gateway::{GatewayError, GatewayProbe, GatewaySettings},
     net::TargetPolicy,
     studio_proxy::{StudioProxy, StudioProxySettings},
+    tls::{ExtraRoots, ExtraRootsError, MAX_EXTRA_CA_FILE_BYTES},
 };
 use supabase_dashboard_application::{
     auth::{AuthConfig, AuthError, AuthService, BootstrapError, PasswordResetError},
@@ -77,6 +78,43 @@ enum StartupError {
     SecretKey(#[from] KeyError),
     #[error("could not set up project connections: {0}")]
     Gateway(#[from] GatewayError),
+    #[error("could not read SUPABASE_DASHBOARD_EXTRA_CA_FILE {path}: {source}")]
+    ExtraCaFile {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
+    #[error("SUPABASE_DASHBOARD_EXTRA_CA_FILE {path} is invalid: {source}")]
+    ExtraCa {
+        path: std::path::PathBuf,
+        source: ExtraRootsError,
+    },
+}
+
+/// Loads the extra certificate authorities, if a file is configured. The
+/// size is checked before reading, so a wrong path fails fast.
+fn extra_roots(config: &Config) -> Result<ExtraRoots, StartupError> {
+    let Some(path) = &config.extra_ca_file else {
+        return Ok(ExtraRoots::default());
+    };
+    let read_err = |source| StartupError::ExtraCaFile {
+        path: path.clone(),
+        source,
+    };
+    let invalid = |source| StartupError::ExtraCa {
+        path: path.clone(),
+        source,
+    };
+    let len = std::fs::metadata(path).map_err(read_err)?.len();
+    if usize::try_from(len).map_or(true, |len| len > MAX_EXTRA_CA_FILE_BYTES) {
+        return Err(invalid(ExtraRootsError::TooLarge));
+    }
+    let pem = std::fs::read(path).map_err(read_err)?;
+    let roots = ExtraRoots::from_pem(&pem).map_err(invalid)?;
+    tracing::info!(
+        count = roots.len(),
+        "trusting extra certificate authorities for project connections"
+    );
+    Ok(roots)
 }
 
 #[tokio::main]
@@ -206,8 +244,10 @@ async fn run() -> Result<(), StartupError> {
     let policy = TargetPolicy {
         allow_loopback: config.allow_loopback_targets,
     };
+    let extra_roots = extra_roots(&config)?;
     let probe = GatewayProbe::shared(GatewaySettings {
         policy,
+        extra_roots: extra_roots.clone(),
         ..GatewaySettings::default()
     })?;
     let studio = match (&config.studio_hosts, &config.public_url) {
@@ -217,6 +257,7 @@ async fn run() -> Result<(), StartupError> {
             let proxy = StudioProxy::new(StudioProxySettings {
                 policy,
                 read_timeout: config.studio_request_timeout,
+                extra_roots,
                 ..StudioProxySettings::default()
             })?;
             tracing::info!(

@@ -93,6 +93,7 @@ fn proxy(policy: TargetPolicy) -> StudioProxy {
         policy,
         connect_timeout: Duration::from_secs(2),
         read_timeout: Duration::from_secs(2),
+        ..StudioProxySettings::default()
     })
     .unwrap()
 }

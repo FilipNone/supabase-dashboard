@@ -32,7 +32,9 @@ webpki-roots = "1"
 axum.workspace = true
 futures-util = { version = "0.3", default-features = false }
 http-body-util = "0.1"
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 
 [lints]
 workspace = true

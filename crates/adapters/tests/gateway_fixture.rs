@@ -148,6 +148,7 @@ async fn fixture_studio_is_reached_through_the_proxy() {
         policy: loopback(),
         connect_timeout: Duration::from_secs(5),
         read_timeout: Duration::from_secs(30),
+        ..StudioProxySettings::default()
     })
     .unwrap();
     let site = StudioSite {

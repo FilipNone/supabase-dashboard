@@ -21,20 +21,23 @@ use secrecy::{ExposeSecret, SecretString};
 use supabase_dashboard_domain::{connection::split_studio_login, project::ProjectUrl};
 
 use crate::{
-    gateway::{GatewayError, refused_literal, tls_config},
+    gateway::{GatewayError, refused_literal},
     net::{DestinationNotAllowed, NameNotResolved, PolicyResolver, TargetPolicy, chain_has},
+    tls::{self, ExtraRoots},
 };
 
 /// The body of a response from Studio, streamed to the browser.
 pub type UpstreamBody = reqwest::Body;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct StudioProxySettings {
     pub policy: TargetPolicy,
     pub connect_timeout: Duration,
     /// Longest wait for the next piece of a response. The total time is
     /// bounded by the caller, because Studio's SQL editor can run long.
     pub read_timeout: Duration,
+    /// Authorities trusted in addition to the bundled roots.
+    pub extra_roots: ExtraRoots,
 }
 
 impl Default for StudioProxySettings {
@@ -43,6 +46,7 @@ impl Default for StudioProxySettings {
             policy: TargetPolicy::default(),
             connect_timeout: Duration::from_secs(5),
             read_timeout: Duration::from_secs(300),
+            extra_roots: ExtraRoots::default(),
         }
     }
 }
@@ -115,7 +119,9 @@ pub struct StudioProxy {
 impl StudioProxy {
     pub fn new(settings: StudioProxySettings) -> Result<Self, GatewayError> {
         let client = Client::builder()
-            .tls_backend_preconfigured(tls_config()?)
+            .tls_backend_preconfigured(
+                tls::client_config(&settings.extra_roots).map_err(GatewayError::Tls)?,
+            )
             .dns_resolver(PolicyResolver {
                 policy: settings.policy,
             })

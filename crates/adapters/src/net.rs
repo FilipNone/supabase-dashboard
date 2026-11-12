@@ -161,7 +161,16 @@ pub(crate) fn chain_has<T: StdError + 'static>(err: &(dyn StdError + 'static)) -
         if err.is::<T>() {
             return true;
         }
-        current = err.source();
+        // An `io::Error` wrapping another error returns that error's source
+        // from `source()`, skipping the wrapped error itself; rustls
+        // certificate errors arrive this way.
+        current = match err
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+        {
+            Some(inner) => Some(inner),
+            None => err.source(),
+        };
     }
     false
 }

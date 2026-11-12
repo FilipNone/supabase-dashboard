@@ -78,9 +78,11 @@ impl Drop for ScratchDb {
             });
         })
         .join();
-        if dropped.is_err() && !std::thread::panicking() {
-            panic!("could not drop the scratch database {}", self.name);
-        }
+        assert!(
+            dropped.is_ok() || std::thread::panicking(),
+            "could not drop the scratch database {}",
+            self.name
+        );
     }
 }
 
