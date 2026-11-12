@@ -6,6 +6,7 @@ pub mod not_found;
 pub mod organization;
 pub mod organizations;
 pub mod project;
+mod project_connect;
 pub mod project_connection;
 mod project_trust;
 pub mod sign_in;

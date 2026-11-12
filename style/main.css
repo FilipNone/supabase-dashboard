@@ -524,4 +524,10 @@ td { vertical-align: middle; }
 .authority-list li { border: 1px solid var(--color-border); border-radius: var(--radius-md); padding: var(--space-3); }
 .authority-subject { margin: 0; overflow-wrap: anywhere; }
 .authority-fingerprint { margin: var(--space-1) 0 0; color: var(--color-text-muted); overflow-wrap: anywhere; }
+.code-block {
+  margin: 0 0 var(--space-3); padding: var(--space-3) var(--space-4);
+  overflow-x: auto; white-space: pre;
+  background: var(--color-surface-raised); border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+}
 .setup-progress { margin: 0; padding-left: var(--space-6); display: grid; gap: var(--space-2); }

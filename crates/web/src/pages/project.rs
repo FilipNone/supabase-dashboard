@@ -24,6 +24,7 @@ use crate::{
     },
     error::AppError,
     pages::{
+        project_connect::ConnectPanel,
         project_connection::{ApiKeysPanel, HealthPanel, StudioAccessPanel, StudioLoginPanel},
         project_trust::AuthoritiesPanel,
     },
@@ -557,9 +558,11 @@ pub fn ProjectOverviewPage() -> impl IntoView {
                         </div>
                     </dl>
                 </section>
-                <SetupChecklist project=project.clone()/>
-                <HealthPanel project=project.clone()/>
+                {view! { <SetupChecklist project=project.clone()/> }.into_any()}
+                {view! { <HealthPanel project=project.clone()/> }.into_any()}
+                {view! { <ConnectPanel project=project.clone()/> }.into_any()}
             }
+            .into_any()
         })}
     }
     .into_any()

@@ -1028,6 +1028,15 @@ mod tests {
         let check = body.find(r#"id="first-check""#).expect("first check step");
         assert!(keys < login && login < check);
         bodies.push(body);
+        // The overview's connection guidance lists the service addresses
+        // and names the key variables without showing a stored key.
+        let overview = format!("/dashboard/org/{acme_id}/projects/{project_id}");
+        let (parts, body) = send(&router, get_with_cookie(&overview, &alice)).await;
+        assert_eq!(parts.status, StatusCode::OK);
+        assert!(body.contains("Connect to this project"), "{body}");
+        assert!(body.contains("http://127.0.0.1:9/rest/v1/"), "{body}");
+        assert!(body.contains("ws://127.0.0.1:9/realtime/v1/websocket"));
+        bodies.push(body);
         for body in &bodies {
             assert!(!body.contains("redaction-marker"), "{body}");
         }

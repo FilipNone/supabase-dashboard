@@ -125,6 +125,46 @@ impl ProjectUrl {
     pub fn is_encrypted(&self) -> bool {
         self.0.starts_with("https://")
     }
+
+    /// The addresses an application uses for each service behind this
+    /// gateway, in the order the overview lists them. They are derived
+    /// from the URL alone; nothing here says the service is running.
+    pub fn client_endpoints(&self) -> [ClientEndpoint; 5] {
+        let base = self.as_str();
+        let socket = match base.strip_prefix("https://") {
+            Some(rest) => format!("wss://{rest}"),
+            None => format!("ws://{}", base.trim_start_matches("http://")),
+        };
+        [
+            ClientEndpoint {
+                service: "REST API",
+                url: format!("{base}/rest/v1/"),
+            },
+            ClientEndpoint {
+                service: "Auth",
+                url: format!("{base}/auth/v1/"),
+            },
+            ClientEndpoint {
+                service: "Storage",
+                url: format!("{base}/storage/v1/"),
+            },
+            ClientEndpoint {
+                service: "Realtime",
+                url: format!("{socket}/realtime/v1/websocket"),
+            },
+            ClientEndpoint {
+                service: "Edge Functions",
+                url: format!("{base}/functions/v1/<function name>"),
+            },
+        ]
+    }
+}
+
+/// One service's address under a project's gateway, for client setup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientEndpoint {
+    pub service: &'static str,
+    pub url: String,
 }
 
 impl TryFrom<String> for ProjectUrl {
@@ -170,6 +210,27 @@ pub struct ProjectSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_endpoints_follow_the_gateway_url() {
+        let url = ProjectUrl::parse("https://api.example.test/base/").unwrap();
+        let urls: Vec<String> = url.client_endpoints().into_iter().map(|e| e.url).collect();
+        assert_eq!(
+            urls,
+            [
+                "https://api.example.test/base/rest/v1/",
+                "https://api.example.test/base/auth/v1/",
+                "https://api.example.test/base/storage/v1/",
+                "wss://api.example.test/base/realtime/v1/websocket",
+                "https://api.example.test/base/functions/v1/<function name>",
+            ]
+        );
+        let plain = ProjectUrl::parse("http://10.0.0.5:8000").unwrap();
+        assert_eq!(
+            plain.client_endpoints()[3].url,
+            "ws://10.0.0.5:8000/realtime/v1/websocket"
+        );
+    }
 
     #[test]
     fn name_is_trimmed_and_bounded() {
