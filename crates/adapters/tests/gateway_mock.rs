@@ -112,6 +112,18 @@ fn auth_only_gateway() -> Router {
     )
 }
 
+/// A gateway that routes only Auth and sends every other path to Studio's
+/// basic-auth login, as upstream's Kong and Envoy configurations do.
+fn auth_and_studio_gateway() -> Router {
+    auth_only_gateway().fallback(|| async {
+        (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, r#"Basic realm="service""#)],
+            "Unauthorized",
+        )
+    })
+}
+
 fn probe(policy: TargetPolicy) -> GatewayProbe {
     GatewayProbe::new(GatewaySettings {
         policy,
@@ -196,6 +208,29 @@ async fn services_without_a_route_are_reported_as_not_found() {
             "{service:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn services_that_reach_the_studio_login_have_no_route() {
+    let url = serve(auth_and_studio_gateway()).await;
+    let probe = probe(loopback());
+    let key = SecretString::from(GOOD_KEY);
+    for service in [
+        StackService::Rest,
+        StackService::Storage,
+        StackService::Realtime,
+        StackService::Functions,
+    ] {
+        assert_eq!(
+            probe.check(&url, service, &key).await.status,
+            ServiceStatus::NotRouted { http_status: 401 },
+            "{service:?}"
+        );
+    }
+    assert_eq!(
+        probe.check(&url, StackService::Auth, &key).await.status,
+        ServiceStatus::Healthy
+    );
 }
 
 #[tokio::test]

@@ -417,6 +417,13 @@ pub enum ServiceStatus {
     Unhealthy {
         http_status: u16,
     },
+    /// The request reached the gateway's Studio login (a basic-auth
+    /// challenge) instead of the service. The standard gateways send every
+    /// path they have no other route for to Studio, so the gateway has no
+    /// route for the service, and the key was never checked.
+    NotRouted {
+        http_status: u16,
+    },
     Unreachable {
         reason: UnreachableReason,
     },
@@ -462,14 +469,15 @@ pub struct HealthReport {
 }
 
 impl HealthReport {
-    /// Services that refused the key, answered with an error, could not be
-    /// reached, or serve Studio without a password.
+    /// Services that refused the key, answered with an error, have no
+    /// route, could not be reached, or serve Studio without a password.
     pub fn failing(&self) -> Vec<StackService> {
         self.services(|status| {
             matches!(
                 status,
                 ServiceStatus::KeyRejected { .. }
                     | ServiceStatus::Unhealthy { .. }
+                    | ServiceStatus::NotRouted { .. }
                     | ServiceStatus::Unreachable { .. }
                     | ServiceStatus::Unprotected { .. }
             )

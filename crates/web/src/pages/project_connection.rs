@@ -301,6 +301,13 @@ fn describe(
             format!("Error (HTTP {http_status})"),
             None,
         ),
+        ServiceStatus::NotRouted { http_status } => (
+            "badge badge-error",
+            format!("No route (HTTP {http_status})"),
+            Some(
+                "The gateway sent the request to Studio's login, so it has no route for this service. The stored key was not checked.",
+            ),
+        ),
         ServiceStatus::Unreachable { reason } => (
             "badge badge-error",
             "Unreachable".into(),

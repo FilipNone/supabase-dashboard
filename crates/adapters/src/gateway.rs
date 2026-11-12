@@ -11,7 +11,7 @@ use std::{sync::Arc, time::Duration};
 
 use reqwest::{
     Client, Response, StatusCode,
-    header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, SERVER},
+    header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, SERVER, WWW_AUTHENTICATE},
     redirect,
 };
 use secrecy::{ExposeSecret, SecretString};
@@ -173,7 +173,7 @@ impl GatewayProbe {
                 }
             }
         } else {
-            (status_failure(status), None)
+            (failure(&response), None)
         };
         ServiceCheck {
             service,
@@ -295,6 +295,30 @@ const fn accept(service: StackService) -> &'static str {
     }
 }
 
+/// A failed service response. A 401 with a basic-auth challenge comes from
+/// the gateway's Studio route, which upstream's Kong and Envoy setups use
+/// for every path without another route; the services themselves and
+/// Kong's key check never ask for basic auth.
+fn failure(response: &Response) -> ServiceStatus {
+    let status = response.status();
+    if status == StatusCode::UNAUTHORIZED && asks_for_basic_auth(response.headers()) {
+        return ServiceStatus::NotRouted {
+            http_status: status.as_u16(),
+        };
+    }
+    status_failure(status)
+}
+
+fn asks_for_basic_auth(headers: &HeaderMap) -> bool {
+    headers.get_all(WWW_AUTHENTICATE).iter().any(|value| {
+        value
+            .as_bytes()
+            .get(..6)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case(b"basic "))
+            || value.as_bytes().eq_ignore_ascii_case(b"basic")
+    })
+}
+
 fn status_failure(status: StatusCode) -> ServiceStatus {
     let http_status = status.as_u16();
     if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
@@ -323,7 +347,7 @@ async fn functions_status(response: Response) -> ServiceStatus {
         return if routed {
             ServiceStatus::Healthy
         } else {
-            status_failure(status)
+            failure(&response)
         };
     }
     if status == StatusCode::BAD_REQUEST {
@@ -333,7 +357,7 @@ async fn functions_status(response: Response) -> ServiceStatus {
             Err(reason) => ServiceStatus::Unreachable { reason },
         };
     }
-    status_failure(status)
+    failure(&response)
 }
 
 fn missing_function_name(body: &[u8]) -> bool {
@@ -438,6 +462,24 @@ mod tests {
             status_failure(StatusCode::BAD_GATEWAY),
             ServiceStatus::Unhealthy { http_status: 502 }
         );
+    }
+
+    #[test]
+    fn basic_auth_challenges_are_told_from_key_checks() {
+        let challenge = |values: &[&str]| {
+            let mut headers = HeaderMap::new();
+            for value in values {
+                headers.append(WWW_AUTHENTICATE, HeaderValue::from_str(value).unwrap());
+            }
+            asks_for_basic_auth(&headers)
+        };
+        assert!(challenge(&[r#"Basic realm="service""#]));
+        assert!(challenge(&["basic"]));
+        assert!(challenge(&["Key", r#"BASIC realm="x""#]));
+        assert!(!challenge(&["Key"]));
+        assert!(!challenge(&[r#"Bearer realm="x""#]));
+        assert!(!challenge(&["Basicish"]));
+        assert!(!challenge(&[]));
     }
 
     #[test]
