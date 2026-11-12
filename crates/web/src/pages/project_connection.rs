@@ -188,6 +188,7 @@ fn history_row(entry: HealthHistoryEntry) -> impl IntoView {
 }
 
 fn report_view(report: HealthReport) -> impl IntoView {
+    let certificate = report.certificate_expiry().map(certificate_note);
     let rows = report.checks.into_iter().map(check_row).collect_view();
     view! {
         <p class="section-text">
@@ -196,6 +197,7 @@ fn report_view(report: HealthReport) -> impl IntoView {
                 utc_minutes(report.checked_at)
             )}
         </p>
+        {certificate}
         <div class="table-wrap" role="region" aria-label="Service health" tabindex="0">
             <table class="data-table">
                 <caption class="visually-hidden">"Service health"</caption>
@@ -210,6 +212,41 @@ fn report_view(report: HealthReport) -> impl IntoView {
                 <tbody>{rows}</tbody>
             </table>
         </div>
+    }
+}
+
+/// The gateway's TLS certificate expiry, flagged when it was less than
+/// [`KeyExpiry::WARN_DAYS`] away at the time of the check.
+fn certificate_note(expiry: KeyExpiry) -> impl IntoView {
+    let date = expiry.at.to_offset(time::UtcOffset::UTC).date();
+    let warning = expiry.expires_soon().then(|| {
+        let left = match expiry.days_left {
+            0 => "Less than a day left at this check".to_owned(),
+            1 => "1 day left at this check".to_owned(),
+            n => format!("{n} days left at this check"),
+        };
+        view! {
+            " "
+            <span class="badge badge-error">{left}</span>
+        }
+    });
+    let text = if expiry.expired {
+        format!("The gateway's TLS certificate expired on {date} (UTC).")
+    } else {
+        format!("The gateway's TLS certificate expires on {date} (UTC).")
+    };
+    let expired = expiry.expired.then(|| {
+        view! {
+            " "
+            <span class="badge badge-error">"Expired at this check"</span>
+        }
+    });
+    view! {
+        <p class="section-text">
+            {text}
+            {warning}
+            {expired}
+        </p>
     }
 }
 

@@ -516,6 +516,7 @@ impl ConnectionService {
                     status: ServiceStatus::NotChecked { reason },
                     version: None,
                     latency_ms: None,
+                    certificate_expires_at: None,
                 },
             };
             checks.push(check);

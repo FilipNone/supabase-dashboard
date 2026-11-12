@@ -679,6 +679,7 @@ async fn only_installation_admins_list_registered_resources() {
             status: ServiceStatus::KeyRejected { http_status: 401 },
             version: None,
             latency_ms: Some(3),
+            certificate_expires_at: None,
         }],
     };
     db.save_health_report(

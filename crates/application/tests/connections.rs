@@ -83,6 +83,7 @@ impl StackProbe for FakeProbe {
                 status,
                 version: Some("v-test".into()),
                 latency_ms: Some(1),
+                certificate_expires_at: None,
             }
         })
     }

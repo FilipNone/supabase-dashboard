@@ -65,6 +65,7 @@ impl StackProbe for AcceptingProbe {
                 status: ServiceStatus::Healthy,
                 version: None,
                 latency_ms: Some(1),
+                certificate_expires_at: None,
             }
         })
     }

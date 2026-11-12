@@ -149,6 +149,10 @@ async fn healthy_services_report_status_and_version() {
     assert_eq!(auth.status, ServiceStatus::Healthy);
     assert_eq!(auth.version.as_deref(), Some("v2.197.0"));
     assert!(auth.latency_ms.is_some());
+    assert_eq!(
+        auth.certificate_expires_at, None,
+        "plain HTTP has no certificate"
+    );
     let rest = probe.check(&url, StackService::Rest, &key).await;
     assert_eq!(rest.status, ServiceStatus::Healthy);
     let storage = probe.check(&url, StackService::Storage, &key).await;

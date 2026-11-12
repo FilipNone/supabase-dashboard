@@ -23,6 +23,7 @@ use supabase_dashboard_domain::{
     },
     project::ProjectUrl,
 };
+use time::OffsetDateTime;
 use tokio::time::Instant;
 
 use crate::{
@@ -78,6 +79,8 @@ impl GatewayProbe {
                 policy: settings.policy,
             })
             .redirect(redirect::Policy::none())
+            // Gives each response the server's certificate, for its expiry.
+            .tls_info(true)
             .no_proxy()
             .connect_timeout(settings.connect_timeout)
             .timeout(settings.request_timeout)
@@ -106,6 +109,7 @@ impl GatewayProbe {
             status: ServiceStatus::Unreachable { reason },
             version: None,
             latency_ms: None,
+            certificate_expires_at: None,
         };
         let Ok(url) = reqwest::Url::parse(&format!("{}{}", api_url.as_str(), path(service))) else {
             return unreachable(UnreachableReason::InvalidResponse);
@@ -141,6 +145,7 @@ impl GatewayProbe {
             Err(err) => return unreachable(classify(&err)),
         };
         let latency_ms = u32::try_from(started.elapsed().as_millis()).ok();
+        let certificate_expires_at = certificate_expiry(&response);
         let status = response.status();
         if service == StackService::Functions {
             return ServiceCheck {
@@ -148,6 +153,7 @@ impl GatewayProbe {
                 status: functions_status(response).await,
                 version: None,
                 latency_ms,
+                certificate_expires_at,
             };
         }
         let (status, version) = if status.is_success() {
@@ -180,6 +186,7 @@ impl GatewayProbe {
             status,
             version,
             latency_ms,
+            certificate_expires_at,
         }
     }
 }
@@ -190,17 +197,19 @@ impl GatewayProbe {
     /// so a redirect counts as success; it is not followed.
     async fn check_studio(&self, url: reqwest::Url, login: &SecretString) -> ServiceCheck {
         let service = StackService::Studio;
-        let done = |status, latency_ms| ServiceCheck {
+        let done = |status, latency_ms, certificate_expires_at| ServiceCheck {
             service,
             status,
             version: None,
             latency_ms,
+            certificate_expires_at,
         };
         let Some((username, password)) = split_studio_login(login.expose_secret()) else {
             return done(
                 ServiceStatus::Unreachable {
                     reason: UnreachableReason::InvalidResponse,
                 },
+                None,
                 None,
             );
         };
@@ -212,6 +221,7 @@ impl GatewayProbe {
                         reason: classify(&err),
                     },
                     None,
+                    None,
                 );
             }
         };
@@ -220,6 +230,7 @@ impl GatewayProbe {
                 ServiceStatus::Unprotected {
                     http_status: open.as_u16(),
                 },
+                None,
                 None,
             );
         }
@@ -238,15 +249,17 @@ impl GatewayProbe {
                         reason: classify(&err),
                     },
                     None,
+                    None,
                 );
             }
         };
         let latency_ms = u32::try_from(started.elapsed().as_millis()).ok();
+        let expires_at = certificate_expiry(&response);
         let status = response.status();
         if status.is_success() || status.is_redirection() {
-            done(ServiceStatus::Healthy, latency_ms)
+            done(ServiceStatus::Healthy, latency_ms, expires_at)
         } else {
-            done(status_failure(status), latency_ms)
+            done(status_failure(status), latency_ms, expires_at)
         }
     }
 }
@@ -326,6 +339,18 @@ fn status_failure(status: StatusCode) -> ServiceStatus {
     } else {
         ServiceStatus::Unhealthy { http_status }
     }
+}
+
+/// The expiry of the leaf certificate the gateway presented, from the TLS
+/// details reqwest attaches to each response. Only the validity period is
+/// read; trust was already decided by the handshake.
+fn certificate_expiry(response: &Response) -> Option<OffsetDateTime> {
+    let der = response
+        .extensions()
+        .get::<reqwest::tls::TlsInfo>()?
+        .peer_certificate()?;
+    let (_, certificate) = x509_parser::parse_x509_certificate(der).ok()?;
+    Some(certificate.validity().not_after.to_datetime())
 }
 
 /// The Edge Functions router answers a request without a function name

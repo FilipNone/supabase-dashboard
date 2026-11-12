@@ -36,7 +36,8 @@ fn private_pki() -> PrivatePki {
     let issuer = Issuer::new(ca_params, ca_key);
 
     let server_key = KeyPair::generate().unwrap();
-    let server_params = CertificateParams::new(vec!["127.0.0.1".to_owned()]).unwrap();
+    let mut server_params = CertificateParams::new(vec!["127.0.0.1".to_owned()]).unwrap();
+    server_params.not_after = rcgen::date_time_ymd(2031, 5, 6);
     let server_cert = server_params.signed_by(&server_key, &issuer).unwrap();
     PrivatePki {
         ca_pem: ca_cert.pem(),
@@ -113,6 +114,11 @@ async fn a_private_authority_is_trusted_only_when_configured() {
     let check = probe(roots).check(&url, StackService::Auth, &key).await;
     assert_eq!(check.status, ServiceStatus::Healthy);
     assert_eq!(check.version.as_deref(), Some("v2.197.0"));
+    // 2031-05-06 00:00:00 UTC, the server certificate's notAfter.
+    assert_eq!(
+        check.certificate_expires_at.map(|t| t.unix_timestamp()),
+        Some(1_935_792_000)
+    );
 
     // Another authority does not vouch for this server.
     let other = ExtraRoots::from_pem(private_pki().ca_pem.as_bytes()).unwrap();

@@ -3096,11 +3096,13 @@ dependencies = [
  "supabase-dashboard-application",
  "supabase-dashboard-domain",
  "thiserror 2.0.21",
+ "time",
  "tokio",
  "tokio-rustls",
  "tracing",
  "url",
  "webpki-roots",
+ "x509-parser",
 ]
 
 [[package]]

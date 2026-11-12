@@ -209,7 +209,8 @@ pub enum CredentialState {
     },
 }
 
-/// When a stored key expires, as of the moment the server read it.
+/// When a stored key or a gateway's certificate expires, as of a given
+/// moment: when the server read the key, or when the check ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyExpiry {
     pub at: OffsetDateTime,
@@ -445,6 +446,12 @@ pub struct ServiceCheck {
     pub version: Option<String>,
     /// Time to the response headers, when there was a response.
     pub latency_ms: Option<u32>,
+    /// When the TLS certificate the gateway presented for this check
+    /// expires. `None` over plain HTTP, without a response, or when the
+    /// certificate could not be read. Reports saved before this field
+    /// existed read as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate_expires_at: Option<OffsetDateTime>,
 }
 
 /// Upper bound on a reported version string, so a misbehaving service
@@ -482,6 +489,17 @@ impl HealthReport {
                     | ServiceStatus::Unprotected { .. }
             )
         })
+    }
+
+    /// The earliest expiry of the TLS certificates the gateway presented
+    /// during this check, as of the check. `None` over plain HTTP.
+    pub fn certificate_expiry(&self) -> Option<KeyExpiry> {
+        let at = self
+            .checks
+            .iter()
+            .filter_map(|check| check.certificate_expires_at)
+            .min()?;
+        Some(KeyExpiry::new(at, self.checked_at))
     }
 
     /// Services skipped because a key or login is missing or unreadable.
@@ -605,6 +623,7 @@ mod tests {
             status,
             version: None,
             latency_ms: None,
+            certificate_expires_at: None,
         };
         let report = HealthReport {
             checked_at,
@@ -648,6 +667,45 @@ mod tests {
             checked_at + time::Duration::hours(24) + time::Duration::seconds(1),
         );
         assert!(old.stale);
+    }
+
+    #[test]
+    fn the_earliest_certificate_expiry_is_reported_as_of_the_check() {
+        let checked_at = OffsetDateTime::from_unix_timestamp(1_794_441_600).unwrap();
+        let check = |expires: Option<i64>| ServiceCheck {
+            service: StackService::Auth,
+            status: ServiceStatus::Healthy,
+            version: None,
+            latency_ms: None,
+            certificate_expires_at: expires.map(|days| checked_at + time::Duration::days(days)),
+        };
+        let report = |checks| HealthReport { checked_at, checks };
+        assert_eq!(report(vec![check(None)]).certificate_expiry(), None);
+        let expiry = report(vec![check(Some(90)), check(None), check(Some(12))])
+            .certificate_expiry()
+            .unwrap();
+        assert_eq!(expiry.at, checked_at + time::Duration::days(12));
+        assert_eq!(expiry.days_left, 12);
+        assert!(expiry.expires_soon());
+        assert!(
+            !report(vec![check(Some(90))])
+                .certificate_expiry()
+                .unwrap()
+                .expires_soon()
+        );
+    }
+
+    #[test]
+    fn reports_saved_before_certificate_expiry_still_load() {
+        let saved =
+            r#"{"service":"auth","status":{"status":"healthy"},"version":null,"latency_ms":3}"#;
+        let check: ServiceCheck = serde_json::from_str(saved).unwrap();
+        assert_eq!(check.certificate_expires_at, None);
+        assert!(
+            !serde_json::to_string(&check)
+                .unwrap()
+                .contains("certificate_expires_at")
+        );
     }
 
     #[test]
@@ -835,6 +893,7 @@ mod tests {
                 status: ServiceStatus::KeyRejected { http_status: 401 },
                 version: None,
                 latency_ms: Some(12),
+                certificate_expires_at: None,
             }],
         };
         let json = serde_json::to_string(&report).unwrap();
