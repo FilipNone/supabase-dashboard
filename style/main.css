@@ -192,6 +192,7 @@ code { font-family: var(--font-mono); font-size: var(--text-sm); }
   font: inherit; font-size: var(--text-sm); text-decoration: none; cursor: pointer;
 }
 .button:hover { background: var(--color-surface-raised); }
+.button[aria-disabled="true"]:hover { background: var(--color-surface); }
 
 .segmented {
   display: inline-flex; padding: 2px; gap: 2px;
@@ -342,7 +343,7 @@ code { font-family: var(--font-mono); font-size: var(--text-sm); }
 .button:focus-visible, .card-link:focus-visible, .tab:focus-visible {
   outline: 2px solid var(--color-focus); outline-offset: 2px;
 }
-.button:disabled { opacity: 0.6; cursor: not-allowed; }
+.button:disabled, .button[aria-disabled="true"] { opacity: 0.6; cursor: not-allowed; }
 .button-danger { border-color: var(--color-error-text); color: var(--color-error-text); }
 .button-danger:hover { background: var(--color-error-bg); }
 

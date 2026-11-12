@@ -211,6 +211,7 @@ Release checks include a fresh installation, Studio access tests for each role, 
 
 ## Revision history
 
+- 2026-11-12: M5 Studio access log: pager buttons with no page to go to are marked unavailable instead of disabled, so keyboard focus stays on them.
 - 2026-11-12: M5 health history: the project overview draws the kept checks as a day by hour grid, with a per-day table. Marked the health history item done.
 - 2026-11-12: M5 Studio access log: CSV export. Removed it from the item's missing list.
 - 2026-11-12: M5 Studio access log: filter by member.

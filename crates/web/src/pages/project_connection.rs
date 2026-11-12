@@ -826,6 +826,10 @@ fn access_log_view(
     let page = pages.with_untracked(Vec::len) + 1;
     let first_page = page == 1;
     let has_pages = !first_page || older.is_some();
+    // Buttons that lead nowhere are marked `aria-disabled` rather than
+    // `disabled`: a disabled button drops keyboard focus to the page body,
+    // which happened whenever the pressed button had no further page.
+    let off = |off: bool| off.then_some("true");
     let pager = move |where_: &'static str| {
         has_pages.then(|| {
             view! {
@@ -833,18 +837,26 @@ fn access_log_view(
                     <button
                         type="button"
                         class="button"
-                        disabled=first_page
-                        on:click=move |_| pages.set(Vec::new())
+                        aria-disabled=off(first_page)
+                        on:click=move |_| {
+                            if !first_page {
+                                pages.set(Vec::new());
+                            }
+                        }
                     >
                         "Newest"
                     </button>
                     <button
                         type="button"
                         class="button"
-                        disabled=first_page
-                        on:click=move |_| pages.update(|pages| {
-                            pages.pop();
-                        })
+                        aria-disabled=off(first_page)
+                        on:click=move |_| {
+                            if !first_page {
+                                pages.update(|pages| {
+                                    pages.pop();
+                                });
+                            }
+                        }
                     >
                         "Newer"
                     </button>
@@ -855,7 +867,7 @@ fn access_log_view(
                     <button
                         type="button"
                         class="button"
-                        disabled=older.is_none()
+                        aria-disabled=off(older.is_none())
                         on:click=move |_| {
                             if let Some(before) = older {
                                 pages.update(|pages| pages.push(before));
