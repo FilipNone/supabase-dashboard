@@ -6,6 +6,10 @@
 //! changed variable names and the services that restart; "Apply and
 //! redeploy" queues the change. The server checks the role, the values,
 //! and that the stack did not change since the review.
+//!
+//! Above the form, the section lists by name the variables edited in
+//! Dokploy since the dashboard wrote them, and lets the operator accept
+//! them so they stop being listed.
 
 use leptos::{form::ActionForm, prelude::*};
 
@@ -16,7 +20,10 @@ use supabase_dashboard_domain::stack_settings::{
 
 use crate::{
     error::AppError,
-    server_fns::{PreviewStackSettings, QueueStackSettings, SettingsFields, get_stack_settings},
+    server_fns::{
+        AcceptStackVariables, PreviewStackSettings, QueueStackSettings, SettingsFields,
+        get_stack_settings,
+    },
 };
 
 #[component]
@@ -27,13 +34,15 @@ pub fn StackSettingsSection(
     finished: Signal<u32>,
 ) -> impl IntoView {
     let review = ServerAction::<PreviewStackSettings>::new();
-    // Counts refused applies: the settings are read again, because the
-    // refusal usually means they changed in Dokploy since the review.
-    let refused = RwSignal::new(0u32);
+    let accept = ServerAction::<AcceptStackVariables>::new();
+    // Counts refused applies and answered accepts: the settings are read
+    // again, because a refusal usually means they changed in Dokploy
+    // since the page read them, and an accept changes the list.
+    let reloads = RwSignal::new(0u32);
     // Read again once a queued change has been written, not when it is
     // queued: the section keeps its elements, and focus, until then.
     let settings = Resource::new(
-        move || (project, finished.get(), refused.get()),
+        move || (project, finished.get(), reloads.get()),
         |(id, _, _)| get_stack_settings(id),
     );
     // The review shows until a field changes or the stack's action ends.
@@ -50,15 +59,22 @@ pub fn StackSettingsSection(
             Some(Ok(_)) => queued.set(true),
             Some(Err(_)) => {
                 reviewing.set(false);
-                refused.update(|n| *n += 1);
+                reloads.update(|n| *n += 1);
             }
             None => {}
         });
     });
-    // A new review replaces the outcome of the last apply.
+    Effect::new(move |_| {
+        if accept.value().with(Option::is_some) {
+            reviewing.set(false);
+            reloads.update(|n| *n += 1);
+        }
+    });
+    // A new review replaces the outcome of the last apply or accept.
     Effect::new(move |_| {
         if review.pending().get() {
             apply.value().set(None);
+            accept.value().set(None);
         }
     });
     Effect::new(move |previous: Option<u32>| {
@@ -74,8 +90,9 @@ pub fn StackSettingsSection(
             {move || settings.get().map(|result| match result {
                 Ok(Some(view)) => {
                     // Not the first reading: the values on screen are stale.
-                    let reread = finished.get_untracked() > 0 || refused.get_untracked() > 0;
-                    section(view, project, review, apply, reviewing, queued, reread).into_any()
+                    let reread = finished.get_untracked() > 0 || reloads.get_untracked() > 0;
+                    let actions = Actions { review, apply, accept };
+                    section(view, project, actions, reviewing, queued, reread).into_any()
                 }
                 // Not provisioned, removed, or not an owner or admin.
                 Ok(None) | Err(AppError::Forbidden) | Err(AppError::NotFound) => ().into_any(),
@@ -91,11 +108,21 @@ pub fn StackSettingsSection(
     }
 }
 
+#[derive(Clone, Copy)]
+struct Actions {
+    review: ServerAction<PreviewStackSettings>,
+    apply: ServerAction<QueueStackSettings>,
+    accept: ServerAction<AcceptStackVariables>,
+}
+
 fn section(
     view: StackSettingsView,
     project: uuid::Uuid,
-    review: ServerAction<PreviewStackSettings>,
-    apply: ServerAction<QueueStackSettings>,
+    Actions {
+        review,
+        apply,
+        accept,
+    }: Actions,
     reviewing: RwSignal<bool>,
     queued: RwSignal<bool>,
     reread: bool,
@@ -136,7 +163,7 @@ fn section(
             .and_then(Result::err)
             .map(|err| view! { <p class="form-error" role="alert">{err.to_string()}</p> })
     };
-    let tracking = tracking_view(view.tracking);
+    let tracking = tracking_view(view.tracking, project, accept, Signal::derive(busy));
     let fields = view.settings.into_iter().map(field_view).collect_view();
     let summary = move || {
         if !reviewing.get() {
@@ -181,32 +208,78 @@ fn section(
 }
 
 /// Which variables were edited in Dokploy since the dashboard wrote
-/// them, by name.
-fn tracking_view(tracking: EnvTracking) -> impl IntoView {
-    match tracking {
+/// them, by name, and the form that accepts them.
+fn tracking_view(
+    tracking: EnvTracking,
+    project: uuid::Uuid,
+    accept: ServerAction<AcceptStackVariables>,
+    busy: Signal<bool>,
+) -> impl IntoView {
+    let seen = tracking.seen();
+    let form = move |label: &'static str| accept_form(project, seen.clone(), label, accept, busy);
+    let outcome = move || {
+        accept.value().get().map(|result| match result {
+            Ok(()) => view! {
+                <p class="form-ok" role="status">
+                    "Accepted. Later edits in Dokploy are listed against the variables as they were just read."
+                </p>
+            }
+            .into_any(),
+            Err(err) => view! { <p class="form-error" role="alert">{err.to_string()}</p> }.into_any(),
+        })
+    };
+    let body = match tracking {
         EnvTracking::Compared(changes) if changes.is_empty() => view! {
             <p class="field-hint">
-                "No variable of this service was changed in Dokploy since the dashboard last wrote them."
+                "No variable of this service was changed in Dokploy since the dashboard last wrote or accepted them."
             </p>
         }
         .into_any(),
-        EnvTracking::Compared(changes) => changes_view(changes).into_any(),
+        EnvTracking::Compared(changes) => {
+            changes_view(changes, form("Accept these edits")).into_any()
+        }
         EnvTracking::NotRecorded => view! {
-            <p class="field-hint">
-                "The dashboard has no record of the variables it wrote to this service, so it cannot tell which ones were changed in Dokploy."
-            </p>
+            <div class="field-hint">
+                <p>
+                    "The dashboard has no record of the variables it wrote to this service, so it cannot tell which ones were changed in Dokploy. Recording them now lists later edits."
+                </p>
+                {form("Record the current variables")}
+            </div>
         }
         .into_any(),
         EnvTracking::Unreadable => view! {
-            <p class="field-hint">
-                "The record of the variables the dashboard wrote is encrypted with a credential key this server does not have, so changes made in Dokploy cannot be shown."
-            </p>
+            <div class="field-hint">
+                <p>
+                    "The record of the variables the dashboard wrote is encrypted with a credential key this server does not have, so changes made in Dokploy cannot be shown. Recording them again with this server's key lists later edits."
+                </p>
+                {form("Record the current variables again")}
+            </div>
         }
         .into_any(),
+    };
+    view! { {body} {outcome} }
+}
+
+/// Accepting writes nothing to Dokploy; it changes what later edits are
+/// compared with.
+fn accept_form(
+    project: uuid::Uuid,
+    seen: String,
+    label: &'static str,
+    accept: ServerAction<AcceptStackVariables>,
+    busy: Signal<bool>,
+) -> impl IntoView {
+    let disabled = move || (busy.get() || accept.pending().get()).then_some("true");
+    view! {
+        <ActionForm action=accept attr:class="inline-form">
+            <input type="hidden" name="id" value=project.to_string()/>
+            <input type="hidden" name="seen" value=seen/>
+            <button type="submit" class="button" aria-disabled=disabled>{label}</button>
+        </ActionForm>
     }
 }
 
-fn changes_view(changes: EnvChanges) -> impl IntoView {
+fn changes_view(changes: EnvChanges, accept: impl IntoView) -> impl IntoView {
     let names = |names: Vec<String>| {
         names
             .into_iter()
@@ -225,11 +298,13 @@ fn changes_view(changes: EnvChanges) -> impl IntoView {
         <div class="form-warning env-changes">
             <p>
                 <strong>"Variables were changed in Dokploy"</strong>
-                " since the dashboard last wrote them. The dashboard keeps these edits; the settings below show the values in effect. Values are not shown here."
+                " since the dashboard last wrote or accepted them. The dashboard keeps these edits; the settings below show the values in effect. Values are not shown here."
             </p>
             {group("Changed:", changes.changed)}
             {group("Added:", changes.added)}
             {group("Removed:", changes.removed)}
+            <p>"Accepting them changes nothing in Dokploy; it stops listing them until they are edited again."</p>
+            {accept}
         </div>
     }
 }

@@ -161,6 +161,12 @@ pub enum ProvisionError {
     NoChanges,
     #[error("the stack's settings changed since the preview; review the changes again")]
     PreviewOutdated,
+    #[error("no variable was changed in Dokploy since the dashboard last wrote or accepted them")]
+    NoEdits,
+    #[error(
+        "the stack's variables changed in Dokploy since this page read them; check the list again"
+    )]
+    EditsOutdated,
     #[error("Dokploy no longer has this stack's service")]
     ServiceMissing,
     /// Dokploy did not answer or refused; the message says which.

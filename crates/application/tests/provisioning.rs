@@ -1972,3 +1972,137 @@ async fn owners_change_settings_and_edits_in_dokploy_stop_the_change() {
     .unwrap();
     assert_eq!(leaked, 0);
 }
+
+#[tokio::test]
+async fn owners_accept_variables_edited_in_dokploy() {
+    let Some(scratch) = ScratchDb::create("accept_variables").await else {
+        return;
+    };
+    let f = setup(&scratch).await;
+    let (_, project) = provisioned(&f).await;
+    let accept = |seen: String| {
+        f.service
+            .accept_variables(&f.owner, project, seen.leak(), ctx())
+    };
+    let edit = |from: &str, to: &str| {
+        if let Some((_, env)) = f.compose.state.lock().unwrap().configured.as_mut() {
+            *env = if from.is_empty() {
+                format!("{env}{to}")
+            } else {
+                env.replace(from, to)
+            };
+        }
+    };
+
+    // Nothing was edited, so there is nothing to accept.
+    let seen = tracking(&f, project).await.seen();
+    assert!(matches!(accept(seen).await, Err(ProvisionError::NoEdits)));
+
+    // Developers may not accept.
+    let dev = account(&f.db, "Dev", false).await;
+    add_member(&f.db, f.organization, &dev, OrgRole::Developer).await;
+    edit("", "PGRST_DB_SCHEMAS=public\n");
+    let listed = tracking(&f, project).await;
+    assert!(matches!(
+        f.service
+            .accept_variables(&dev, project, &listed.seen(), ctx())
+            .await,
+        Err(ProvisionError::Forbidden)
+    ));
+
+    // A list read before another edit is not accepted.
+    let stale = listed.seen();
+    edit("", "EXTRA_FLAG=1\n");
+    assert!(matches!(
+        accept(stale).await,
+        Err(ProvisionError::EditsOutdated)
+    ));
+    let listed = tracking(&f, project).await;
+    assert_eq!(
+        listed,
+        EnvTracking::Compared(EnvChanges {
+            added: vec!["EXTRA_FLAG".to_owned(), "PGRST_DB_SCHEMAS".to_owned()],
+            ..EnvChanges::default()
+        })
+    );
+    accept(listed.seen()).await.unwrap();
+    assert_eq!(
+        tracking(&f, project).await,
+        EnvTracking::Compared(EnvChanges::default())
+    );
+    // Nothing was written to Dokploy.
+    assert_eq!(
+        f.compose.state.lock().unwrap().count("update_compose_env"),
+        0
+    );
+
+    // An accepted variable edited again is listed again.
+    edit("PGRST_DB_SCHEMAS=public\n", "PGRST_DB_SCHEMAS=public,api\n");
+    let EnvTracking::Compared(changes) = tracking(&f, project).await else {
+        panic!("the record should be readable");
+    };
+    assert_eq!(changes.changed, ["PGRST_DB_SCHEMAS"]);
+
+    // Not while an action on the stack runs.
+    let reviewed = f
+        .service
+        .preview_settings(&f.owner, project, &[("JWT_EXPIRY", "7200")])
+        .await
+        .unwrap();
+    f.service
+        .queue_settings(
+            &f.owner,
+            project,
+            &[("JWT_EXPIRY", "7200")],
+            &reviewed.base,
+            ctx(),
+        )
+        .await
+        .unwrap();
+    let seen = tracking(&f, project).await.seen();
+    assert!(matches!(accept(seen).await, Err(ProvisionError::Busy)));
+    run_all(&f).await;
+    // The job recorded its own change, and the edit is still listed.
+    let EnvTracking::Compared(changes) = tracking(&f, project).await else {
+        panic!("the record should be readable");
+    };
+    assert_eq!(changes.changed, ["PGRST_DB_SCHEMAS"]);
+
+    // A record under a key this server lacks is replaced.
+    sqlx::query("UPDATE project_dokploy_env_records SET key_id = 'gone'")
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    let unreadable = tracking(&f, project).await;
+    assert_eq!(unreadable, EnvTracking::Unreadable);
+    accept(unreadable.seen()).await.unwrap();
+    assert_ne!(record_key(&f, project).await, "gone");
+    assert_eq!(
+        tracking(&f, project).await,
+        EnvTracking::Compared(EnvChanges::default())
+    );
+
+    // A stack without a record gets one.
+    sqlx::query("DELETE FROM project_dokploy_env_records")
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    let missing = tracking(&f, project).await;
+    assert_eq!(missing, EnvTracking::NotRecorded);
+    accept(missing.seen()).await.unwrap();
+    edit("EXTRA_FLAG=1\n", "");
+    let EnvTracking::Compared(changes) = tracking(&f, project).await else {
+        panic!("the record should be readable");
+    };
+    assert_eq!(changes.removed, ["EXTRA_FLAG"]);
+
+    let audited = |outcome: &'static str| {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM audit_events WHERE action = 'stack.variables_accept' AND outcome = $1",
+        )
+        .bind(outcome)
+        .fetch_one(f.db.pool())
+    };
+    assert_eq!(audited("success").await.unwrap(), 3);
+    assert_eq!(audited("denied").await.unwrap(), 1);
+}

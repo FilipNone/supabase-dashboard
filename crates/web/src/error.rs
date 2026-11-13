@@ -242,6 +242,8 @@ mod server {
                 | ProvisionError::SettingUnavailable(_)
                 | ProvisionError::NoChanges
                 | ProvisionError::PreviewOutdated
+                | ProvisionError::NoEdits
+                | ProvisionError::EditsOutdated
                 | ProvisionError::ServiceMissing
                 | ProvisionError::DokployUnavailable(_) => {
                     Self::Rejected(sentence(&err.to_string()))

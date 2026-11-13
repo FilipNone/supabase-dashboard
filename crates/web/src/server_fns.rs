@@ -577,6 +577,19 @@ pub async fn queue_stack_settings(
         .await?)
 }
 
+/// Takes the stack's variables as Dokploy has them now as the ones the
+/// dashboard wrote, so edits made in Dokploy stop being listed. `seen` is
+/// the list of names the page showed; the server refuses when it finds a
+/// different one. Nothing is written to Dokploy. Owners and admins.
+#[server]
+pub async fn accept_stack_variables(id: Uuid, seen: String) -> Result<(), AppError> {
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    Ok(org_context::provisioning()?
+        .accept_variables(&session, id, &seen, audit.get())
+        .await?)
+}
+
 /// An organization's latest provisioning jobs, newest first.
 #[server]
 pub async fn list_provision_jobs(

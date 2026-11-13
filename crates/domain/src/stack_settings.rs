@@ -447,9 +447,51 @@ pub enum EnvTracking {
     Compared(EnvChanges),
 }
 
+/// The longest [`EnvTracking::seen`] text the server takes back.
+pub const ENV_SEEN_MAX_LEN: usize = 16 * 1024;
+
+impl EnvTracking {
+    /// What the operator was shown, as text the page sends back when they
+    /// accept the variables as Dokploy has them: the listed names, never
+    /// a value or a digest of one. The server accepts only when it still
+    /// finds the same, so an edit made in Dokploy after the page was read
+    /// is not accepted unseen. Variable names hold no `,`, `;`, or `=`.
+    pub fn seen(&self) -> String {
+        match self {
+            Self::NotRecorded => "none".to_owned(),
+            Self::Unreadable => "unreadable".to_owned(),
+            Self::Compared(changes) => format!(
+                "changed={};added={};removed={}",
+                changes.changed.join(","),
+                changes.added.join(","),
+                changes.removed.join(",")
+            ),
+        }
+    }
+
+    /// Whether accepting would change anything.
+    pub fn has_edits(&self) -> bool {
+        !matches!(self, Self::Compared(changes) if changes.is_empty())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seen_lists_names_only() {
+        let tracking = EnvTracking::Compared(EnvChanges {
+            changed: vec!["A".into(), "B".into()],
+            added: vec![],
+            removed: vec!["C".into()],
+        });
+        assert_eq!(tracking.seen(), "changed=A,B;added=;removed=C");
+        assert!(tracking.has_edits());
+        assert!(!EnvTracking::Compared(EnvChanges::default()).has_edits());
+        assert_eq!(EnvTracking::NotRecorded.seen(), "none");
+        assert!(EnvTracking::Unreadable.has_edits());
+    }
 
     #[test]
     fn raw_values_keep_every_line_of_a_variable() {

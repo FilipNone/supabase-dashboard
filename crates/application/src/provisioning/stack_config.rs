@@ -10,14 +10,18 @@ use supabase_dashboard_domain::{
     dokploy_placement::DokployId,
     provisioning::StackAction,
     stack_settings::{
-        EnvFile, EnvValue, STACK_SETTINGS, SettingState, StackConfigPreview, StackSetting,
-        StackSettingView, StackSettingsView, stack_setting,
+        ENV_SEEN_MAX_LEN, EnvFile, EnvValue, STACK_SETTINGS, SettingState, StackConfigPreview,
+        StackSetting, StackSettingView, StackSettingsView, stack_setting,
     },
 };
 use supabase_dashboard_persistence::audit::AuditOutcome;
 use uuid::Uuid;
 
-use super::{ComposeConfig, ProvisionError, ProvisioningService, stack_action::SettingChange};
+use super::{
+    ComposeConfig, ProvisionError, ProvisioningService,
+    env_record::{self, EnvRecord},
+    stack_action::SettingChange,
+};
 use crate::{
     auth::{CurrentSession, RequestContext},
     dokploy::DokployServiceError,
@@ -197,7 +201,7 @@ impl ProvisioningService {
             .is_some_and(|last| !last.state.is_finished());
         let env = EnvFile::parse(config.env.expose_secret());
         let tracking =
-            super::env_record::tracking(&self.db, self.cipher.as_ref(), project_id, &env).await?;
+            env_record::tracking(&self.db, self.cipher.as_ref(), project_id, &env).await?;
         Ok(Some(StackSettingsView {
             settings: read_settings(&config)
                 .into_iter()
@@ -269,6 +273,82 @@ impl ProvisioningService {
         let settings = changes.into_iter().map(|(_, change)| change).collect();
         self.queue_settings_job(current, project_id, settings, ctx)
             .await
+    }
+
+    /// Takes the stack's variables as Dokploy has them now as the ones the
+    /// dashboard wrote, so edits made in Dokploy stop being listed.
+    /// Nothing is written to Dokploy. `seen` is what the page showed, from
+    /// [`EnvTracking::seen`](supabase_dashboard_domain::stack_settings::EnvTracking::seen);
+    /// when the comparison changed since, nothing is accepted. A record
+    /// sealed under a key this server lacks is replaced. Owners and admins.
+    pub async fn accept_variables(
+        &self,
+        current: &CurrentSession,
+        project_id: Uuid,
+        seen: &str,
+        ctx: RequestContext<'_>,
+    ) -> Result<(), ProvisionError> {
+        const ACTION: &str = "stack.variables_accept";
+        let audit = |outcome| {
+            event(
+                current,
+                ACTION,
+                ("project", project_id.to_string()),
+                outcome,
+                ctx,
+            )
+        };
+        let config = match self.read_config(current, project_id).await {
+            Err(ProvisionError::Forbidden) => {
+                if let Err(err) = self
+                    .db
+                    .record_audit_event(&audit(AuditOutcome::Denied))
+                    .await
+                {
+                    tracing::error!(error = %err, action = ACTION, "could not record audit event");
+                }
+                return Err(ProvisionError::Forbidden);
+            }
+            other => other?,
+        };
+        let cipher = self.cipher.as_ref().ok_or(ProvisionError::NoCipher)?;
+        if seen.len() > ENV_SEEN_MAX_LEN {
+            return Err(ProvisionError::EditsOutdated);
+        }
+        if self
+            .last_action(project_id)
+            .await?
+            .is_some_and(|last| !last.state.is_finished())
+        {
+            return Err(ProvisionError::Busy);
+        }
+        let env = EnvFile::parse(config.env.expose_secret());
+        let stored = env_record::load(&self.db, Some(cipher), project_id).await?;
+        let tracking = stored.tracking(&env);
+        if !tracking.has_edits() {
+            return Err(ProvisionError::NoEdits);
+        }
+        if tracking.seen() != seen {
+            return Err(ProvisionError::EditsOutdated);
+        }
+        let sealed = EnvRecord::of(&env).seal(cipher, project_id)?;
+        // Another accept, a settings job, or a key rotation replaced the
+        // record meanwhile.
+        if !self
+            .db
+            .replace_env_record(project_id, stored.nonce(), &sealed)
+            .await?
+        {
+            return Err(ProvisionError::EditsOutdated);
+        }
+        if let Err(err) = self
+            .db
+            .record_audit_event(&audit(AuditOutcome::Success))
+            .await
+        {
+            tracing::error!(error = %err, action = ACTION, "could not record audit event");
+        }
+        Ok(())
     }
 
     /// The service's variables and compose file, for an owner or admin of

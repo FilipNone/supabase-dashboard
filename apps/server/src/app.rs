@@ -189,18 +189,18 @@ mod tests {
     use supabase_dashboard_web::{
         app::SIGN_IN_PATH,
         server_fns::{
-            AdminListAccounts, AdminSetAccountDisabled, ChangePassword, CheckProjectHealth,
-            ClearDokployPlacement, ConfirmDokployPlacement, ConnectDokploy, CreateInvitation,
-            CreateOrganization, DisconnectDokploy, GetCurrentAccount, GetDokployConnection,
-            GetDokployPlacement, GetInstallationHealth, GetOrganization, GetProject,
-            GetProjectAuthorities, GetProjectCredentials, GetProjectDeployment, GetProjectHealth,
-            GetProvisionJob, GetProvisionTargets, GetStackSettings, GetStudioAccessLog,
-            ListOrganizations, ListProjects, ListProvisionJobs, ListSessions, PreviewInvitation,
-            PreviewStackSettings, QueueStackAction, QueueStackRemoval, QueueStackSettings,
-            RegisterProject, RemoveProjectAuthorities, RemoveProjectCredential, RenameOrganization,
-            ReplaceDokployKey, ReplaceProjectAuthorities, ReplaceProjectCredential,
-            ReplaceStudioLogin, RevokeSession, SignUpWithInvitation, StartProvisioning,
-            UnregisterProject, UpdateProfile,
+            AcceptStackVariables, AdminListAccounts, AdminSetAccountDisabled, ChangePassword,
+            CheckProjectHealth, ClearDokployPlacement, ConfirmDokployPlacement, ConnectDokploy,
+            CreateInvitation, CreateOrganization, DisconnectDokploy, GetCurrentAccount,
+            GetDokployConnection, GetDokployPlacement, GetInstallationHealth, GetOrganization,
+            GetProject, GetProjectAuthorities, GetProjectCredentials, GetProjectDeployment,
+            GetProjectHealth, GetProvisionJob, GetProvisionTargets, GetStackSettings,
+            GetStudioAccessLog, ListOrganizations, ListProjects, ListProvisionJobs, ListSessions,
+            PreviewInvitation, PreviewStackSettings, QueueStackAction, QueueStackRemoval,
+            QueueStackSettings, RegisterProject, RemoveProjectAuthorities, RemoveProjectCredential,
+            RenameOrganization, ReplaceDokployKey, ReplaceProjectAuthorities,
+            ReplaceProjectCredential, ReplaceStudioLogin, RevokeSession, SignUpWithInvitation,
+            StartProvisioning, UnregisterProject, UpdateProfile,
         },
     };
     use tower::ServiceExt;
@@ -1201,6 +1201,21 @@ mod tests {
         .await;
         assert_eq!(parts.status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
         assert!(body.contains("did not create"), "{body}");
+        // Accepting variables edited in Dokploy follows the same rules.
+        let accept = format!("id={provisioned}&seen=none");
+        let (parts, body) = settings(AcceptStackVariables::PATH, accept.clone(), &bob).await;
+        assert_eq!(parts.status, StatusCode::FORBIDDEN, "{body}");
+        let (parts, body) = settings(
+            AcceptStackVariables::PATH,
+            format!("id={registered}&seen=none"),
+            &alice,
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(body.contains("did not create"), "{body}");
+        let (parts, body) = settings(AcceptStackVariables::PATH, accept, &alice).await;
+        assert_eq!(parts.status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(body.contains("not connected"), "{body}");
         // Dokploy is not connected in this test.
         let (parts, body) = settings(QueueStackSettings::PATH, change, &alice).await;
         assert_eq!(parts.status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");

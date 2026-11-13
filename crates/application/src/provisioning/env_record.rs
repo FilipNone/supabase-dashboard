@@ -118,8 +118,33 @@ impl EnvRecord {
 /// A project's stored record, opened.
 pub(super) enum Stored {
     Missing,
-    Unreadable,
-    Found { record: EnvRecord, nonce: Vec<u8> },
+    /// Sealed under a key this server lacks, or not a record it reads.
+    Unreadable {
+        nonce: Vec<u8>,
+    },
+    Found {
+        record: EnvRecord,
+        nonce: Vec<u8>,
+    },
+}
+
+impl Stored {
+    /// The stored record's nonce, which a replacement must name.
+    pub(super) fn nonce(&self) -> Option<&[u8]> {
+        match self {
+            Self::Missing => None,
+            Self::Unreadable { nonce } | Self::Found { nonce, .. } => Some(nonce),
+        }
+    }
+
+    /// How `env` compares with this record.
+    pub(super) fn tracking(&self, env: &EnvFile) -> EnvTracking {
+        match self {
+            Self::Missing => EnvTracking::NotRecorded,
+            Self::Unreadable { .. } => EnvTracking::Unreadable,
+            Self::Found { record, .. } => EnvTracking::Compared(record.compare(env)),
+        }
+    }
 }
 
 pub(super) async fn load(
@@ -131,7 +156,9 @@ pub(super) async fn load(
         return Ok(Stored::Missing);
     };
     let Some(cipher) = cipher else {
-        return Ok(Stored::Unreadable);
+        return Ok(Stored::Unreadable {
+            nonce: stored.nonce,
+        });
     };
     let sealed = Sealed {
         key_id: stored.key_id,
@@ -147,7 +174,9 @@ pub(super) async fn load(
             record,
             nonce: sealed.nonce,
         },
-        None => Stored::Unreadable,
+        None => Stored::Unreadable {
+            nonce: sealed.nonce,
+        },
     })
 }
 
@@ -158,11 +187,7 @@ pub(super) async fn tracking(
     project_id: Uuid,
     env: &EnvFile,
 ) -> Result<EnvTracking, PersistenceError> {
-    Ok(match load(db, cipher, project_id).await? {
-        Stored::Missing => EnvTracking::NotRecorded,
-        Stored::Unreadable => EnvTracking::Unreadable,
-        Stored::Found { record, .. } => EnvTracking::Compared(record.compare(env)),
-    })
+    Ok(load(db, cipher, project_id).await?.tracking(env))
 }
 
 /// Records that the dashboard wrote `names` as `env` has them. A project
@@ -181,7 +206,7 @@ pub(super) async fn record_written(
         let (mut record, nonce) = match load(db, cipher, project_id).await {
             Ok(Stored::Found { record, nonce }) => (record, nonce),
             Ok(Stored::Missing) => return,
-            Ok(Stored::Unreadable) => {
+            Ok(Stored::Unreadable { .. }) => {
                 tracing::warn!(%project_id, "the stack's variable record cannot be opened; not updated");
                 return;
             }
