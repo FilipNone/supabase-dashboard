@@ -168,6 +168,10 @@ struct ComposeState {
     stopped: bool,
     /// Stop the containers, then answer as if the connection dropped.
     lose_stop_answer: bool,
+    /// `deleteVolumes` of each delete request.
+    deletes: Vec<bool>,
+    /// Delete the service, then answer as if the connection dropped.
+    lose_delete_answer: bool,
     next_id: u32,
 }
 
@@ -439,6 +443,29 @@ impl ComposeApi for FakeCompose {
         state.call("start_compose", key);
         state.stopped = false;
         Box::pin(async { Ok(()) })
+    }
+
+    fn delete_compose<'a>(
+        &'a self,
+        _url: &'a DokployUrl,
+        key: &'a SecretString,
+        compose_id: &'a DokployId,
+        delete_volumes: bool,
+    ) -> DokployFuture<'a, ()> {
+        let mut state = self.state.lock().unwrap();
+        state.call("delete_compose", key);
+        state.deletes.push(delete_volumes);
+        let before = state.services.len();
+        state.services.retain(|s| &s.compose_id != compose_id);
+        let answer = if state.services.len() == before {
+            Err(DokployError::Http(404))
+        } else if state.lose_delete_answer {
+            state.lose_delete_answer = false;
+            Err(lost())
+        } else {
+            Ok(())
+        };
+        Box::pin(async move { answer })
     }
 
     fn redeploy_compose<'a>(
@@ -1220,12 +1247,12 @@ async fn owners_stop_start_and_redeploy_a_provisioned_stack() {
     // is followed by another stop, which is harmless.
     let stop = f
         .service
-        .queue_action(&f.owner, project, StackAction::Stop, ctx())
+        .queue_action(&f.owner, project, StackAction::Stop, true, ctx())
         .await
         .unwrap();
     assert!(matches!(
         f.service
-            .queue_action(&f.owner, project, StackAction::Start, ctx())
+            .queue_action(&f.owner, project, StackAction::Start, true, ctx())
             .await,
         Err(ProvisionError::Busy)
     ));
@@ -1251,7 +1278,7 @@ async fn owners_stop_start_and_redeploy_a_provisioned_stack() {
     // Start.
     let start = f
         .service
-        .queue_action(&f.owner, project, StackAction::Start, ctx())
+        .queue_action(&f.owner, project, StackAction::Start, true, ctx())
         .await
         .unwrap();
     run_all(&f).await;
@@ -1266,7 +1293,7 @@ async fn owners_stop_start_and_redeploy_a_provisioned_stack() {
     f.compose.state.lock().unwrap().lose_deploy_answer = true;
     let redeploy = f
         .service
-        .queue_action(&f.owner, project, StackAction::Redeploy, ctx())
+        .queue_action(&f.owner, project, StackAction::Redeploy, true, ctx())
         .await
         .unwrap();
     run_all(&f).await;
@@ -1291,6 +1318,13 @@ async fn owners_stop_start_and_redeploy_a_provisioned_stack() {
     )
     .await;
     assert_eq!(audited, 3);
+    // The refused second action is recorded too.
+    let refused = count(
+        &f.db,
+        "SELECT count(*) FROM audit_events WHERE outcome = 'failure' AND action = 'stack.start'",
+    )
+    .await;
+    assert_eq!(refused, 1);
     let leaked = count(
         &f.db,
         "SELECT count(*) FROM jobs WHERE kind = 'stack_action' \
@@ -1313,13 +1347,13 @@ async fn only_owners_and_admins_operate_and_the_job_checks_again() {
 
     assert!(matches!(
         f.service
-            .queue_action(&dev, project, StackAction::Stop, ctx())
+            .queue_action(&dev, project, StackAction::Stop, true, ctx())
             .await,
         Err(ProvisionError::Forbidden)
     ));
     assert!(matches!(
         f.service
-            .queue_action(&stranger, project, StackAction::Stop, ctx())
+            .queue_action(&stranger, project, StackAction::Stop, true, ctx())
             .await,
         Err(ProvisionError::NotFound)
     ));
@@ -1348,7 +1382,7 @@ async fn only_owners_and_admins_operate_and_the_job_checks_again() {
     .unwrap();
     assert!(matches!(
         f.service
-            .queue_action(&f.owner, registered, StackAction::Stop, ctx())
+            .queue_action(&f.owner, registered, StackAction::Stop, true, ctx())
             .await,
         Err(ProvisionError::NotProvisioned)
     ));
@@ -1358,7 +1392,7 @@ async fn only_owners_and_admins_operate_and_the_job_checks_again() {
     add_member(&f.db, f.organization, &admin, OrgRole::Admin).await;
     let job = f
         .service
-        .queue_action(&admin, project, StackAction::Stop, ctx())
+        .queue_action(&admin, project, StackAction::Stop, true, ctx())
         .await
         .unwrap();
     sqlx::query("UPDATE organization_members SET role = 'developer' WHERE account_id = $1")
@@ -1376,7 +1410,7 @@ async fn only_owners_and_admins_operate_and_the_job_checks_again() {
     f.compose.state.lock().unwrap().services.clear();
     let job = f
         .service
-        .queue_action(&f.owner, project, StackAction::Redeploy, ctx())
+        .queue_action(&f.owner, project, StackAction::Redeploy, true, ctx())
         .await
         .unwrap();
     run_all(&f).await;
@@ -1389,4 +1423,158 @@ async fn only_owners_and_admins_operate_and_the_job_checks_again() {
             .contains("no longer has this service")
     );
     assert_eq!(f.compose.state.lock().unwrap().count("redeploy_compose"), 0);
+}
+
+#[tokio::test]
+async fn removing_and_destroying_need_the_name_and_the_right_role() {
+    let Some(scratch) = ScratchDb::create("stack_removal").await else {
+        return;
+    };
+    let f = setup(&scratch).await;
+    let (job, project) = provisioned(&f).await;
+    let admin = account(&f.db, "Ada", false).await;
+    add_member(&f.db, f.organization, &admin, OrgRole::Admin).await;
+    let dev = account(&f.db, "Dev", false).await;
+    add_member(&f.db, f.organization, &dev, OrgRole::Developer).await;
+
+    // Only owners destroy; admins remove; developers do neither.
+    assert!(matches!(
+        f.service
+            .queue_removal(&admin, project, StackAction::Destroy, "Shop", ctx())
+            .await,
+        Err(ProvisionError::Forbidden)
+    ));
+    assert!(matches!(
+        f.service
+            .queue_removal(&dev, project, StackAction::Remove, "Shop", ctx())
+            .await,
+        Err(ProvisionError::Forbidden)
+    ));
+    // The name must be typed; the plain path refuses deletions.
+    for typed in ["", "shop", "Shopping"] {
+        assert!(matches!(
+            f.service
+                .queue_removal(&f.owner, project, StackAction::Destroy, typed, ctx())
+                .await,
+            Err(ProvisionError::NameMismatch)
+        ));
+    }
+    assert!(matches!(
+        f.service
+            .queue_action(&f.owner, project, StackAction::Remove, true, ctx())
+            .await,
+        Err(ProvisionError::NameMismatch)
+    ));
+    assert!(matches!(
+        f.service
+            .queue_action(&f.owner, project, StackAction::Stop, false, ctx())
+            .await,
+        Err(ProvisionError::NotConfirmed)
+    ));
+    let StackDeploymentView::Found(view) = f.service.deployment(&admin, project).await.unwrap()
+    else {
+        panic!("the admin should see the service");
+    };
+    assert!(view.can_remove && !view.can_destroy);
+    assert!(f.compose.state.lock().unwrap().deletes.is_empty());
+
+    // An admin removes it and keeps the volumes. The delete's answer is
+    // lost; the job reads the service and does not ask again.
+    f.compose.state.lock().unwrap().lose_delete_answer = true;
+    let removal = f
+        .service
+        .queue_removal(&admin, project, StackAction::Remove, " Shop ", ctx())
+        .await
+        .unwrap();
+    run_all(&f).await;
+    let stored = f.db.get_job(removal).await.unwrap().unwrap();
+    assert_eq!(stored.state, "succeeded", "{:?}", stored.message);
+    assert!(stored.message.unwrap().contains("kept the data volumes"));
+    assert_eq!(f.compose.state.lock().unwrap().deletes, vec![false]);
+    let view = f.service.deployment(&admin, project).await.unwrap();
+    let StackDeploymentView::Removed {
+        volumes_deleted,
+        app_name,
+        last_action,
+        ..
+    } = view
+    else {
+        panic!("the removal should show: {view:?}");
+    };
+    assert!(!volumes_deleted);
+    assert!(
+        app_name
+            .unwrap()
+            .starts_with(&format!("sd-{}", job.simple()))
+    );
+    assert_eq!(last_action.unwrap().action, StackAction::Remove);
+    let StackDeploymentView::Removed { app_name, .. } =
+        f.service.deployment(&dev, project).await.unwrap()
+    else {
+        panic!("a developer should see the removal");
+    };
+    assert_eq!(app_name, None);
+    // The project stays registered, and nothing more can be done to it.
+    assert_eq!(count(&f.db, "SELECT count(*) FROM projects").await, 1);
+    assert!(matches!(
+        f.service
+            .queue_removal(&f.owner, project, StackAction::Destroy, "Shop", ctx())
+            .await,
+        Err(ProvisionError::AlreadyRemoved)
+    ));
+    assert!(matches!(
+        f.service
+            .queue_action(&f.owner, project, StackAction::Start, true, ctx())
+            .await,
+        Err(ProvisionError::AlreadyRemoved)
+    ));
+    let audited = count(
+        &f.db,
+        "SELECT count(*) FROM audit_events WHERE action = 'stack.remove' AND outcome = 'success'",
+    )
+    .await;
+    assert_eq!(audited, 1);
+}
+
+#[tokio::test]
+async fn destroying_deletes_the_volumes_and_a_vanished_service_is_not_deleted() {
+    let Some(scratch) = ScratchDb::create("stack_destroy").await else {
+        return;
+    };
+    let f = setup(&scratch).await;
+    let (_, project) = provisioned(&f).await;
+
+    // A service already gone in Dokploy: nothing is sent.
+    let saved = f.compose.state.lock().unwrap().services.clone();
+    f.compose.state.lock().unwrap().services.clear();
+    let job = f
+        .service
+        .queue_removal(&f.owner, project, StackAction::Destroy, "Shop", ctx())
+        .await
+        .unwrap();
+    run_all(&f).await;
+    let stored = f.db.get_job(job).await.unwrap().unwrap();
+    assert_eq!(stored.state, "failed");
+    assert!(stored.message.unwrap().contains("nothing was changed"));
+    assert!(f.compose.state.lock().unwrap().deletes.is_empty());
+
+    // The owner destroys it with its data.
+    f.compose.state.lock().unwrap().services = saved;
+    let job = f
+        .service
+        .queue_removal(&f.owner, project, StackAction::Destroy, "Shop", ctx())
+        .await
+        .unwrap();
+    run_all(&f).await;
+    let stored = f.db.get_job(job).await.unwrap().unwrap();
+    assert_eq!(stored.state, "succeeded", "{:?}", stored.message);
+    assert!(stored.message.unwrap().starts_with("Destroyed"));
+    assert_eq!(f.compose.state.lock().unwrap().deletes, vec![true]);
+    let StackDeploymentView::Removed {
+        volumes_deleted, ..
+    } = f.service.deployment(&f.owner, project).await.unwrap()
+    else {
+        panic!("the removal should show");
+    };
+    assert!(volumes_deleted);
 }

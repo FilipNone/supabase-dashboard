@@ -336,6 +336,41 @@ impl DokployClient {
         }
     }
 
+    /// Deletes the service (`compose.delete`): its containers, its folder
+    /// on the server, and its domains. With `delete_volumes`, its named
+    /// volumes go too, which deletes the stack's data; without, they stay
+    /// on the server. Dokploy answers once it is done (about 10 seconds on
+    /// the fixture), and 404 for a service it does not have. The answer
+    /// carries the service's variables, so only its ID is read.
+    pub async fn delete_compose(
+        &self,
+        url: &DokployUrl,
+        key: &SecretString,
+        compose_id: &DokployId,
+        delete_volumes: bool,
+    ) -> Result<(), DokployError> {
+        let body = serde_json::json!({
+            "composeId": compose_id.as_str(),
+            "deleteVolumes": delete_volumes,
+        });
+        let answer = self
+            .send(
+                url,
+                "compose.delete",
+                key,
+                Input::Post(&body),
+                MAX_LIST_BODY_BYTES,
+            )
+            .await?;
+        let deleted: RawDeleted =
+            serde_json::from_slice(&answer).map_err(|_| DokployError::InvalidResponse)?;
+        if deleted.compose_id.as_deref() == Some(compose_id.as_str()) {
+            Ok(())
+        } else {
+            Err(DokployError::InvalidResponse)
+        }
+    }
+
     /// The deployments of `compose_id` that have started, newest first
     /// (`deployment.allByCompose`).
     pub async fn deployments(
@@ -601,6 +636,12 @@ impl RawMount {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct RawDeleted {
+    compose_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RawQueued {
     success: bool,
     compose_id: Option<String>,
@@ -807,6 +848,22 @@ impl ComposeApi for DokployClient {
     ) -> DokployFuture<'a, ()> {
         Box::pin(DokployClient::redeploy_compose(
             self, url, key, compose_id, title,
+        ))
+    }
+
+    fn delete_compose<'a>(
+        &'a self,
+        url: &'a DokployUrl,
+        key: &'a SecretString,
+        compose_id: &'a DokployId,
+        delete_volumes: bool,
+    ) -> DokployFuture<'a, ()> {
+        Box::pin(DokployClient::delete_compose(
+            self,
+            url,
+            key,
+            compose_id,
+            delete_volumes,
         ))
     }
 }

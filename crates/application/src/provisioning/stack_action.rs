@@ -16,13 +16,22 @@
 //!    only looks for its title.
 //! 3. `wait`: for a redeployment, polls it until it finishes.
 //!
-//! None of these removes the service, its volumes, or the project.
+//! Removing and destroying run instead:
+//!
+//! 2. `act`: the service exists; the job records that it asks before it
+//!    asks.
+//! 3. `remove`: reads the service again and, while Dokploy still has it,
+//!    sends `compose.delete`, with the volumes only for destroy. A delete
+//!    is never sent without reading the service first.
+//! 4. `confirm_removed`: waits until Dokploy no longer lists the service,
+//!    then records the removal on the project.
+//!
+//! No action unregisters the project; that stays a separate operation.
 
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use supabase_dashboard_domain::{
-    authz::Permission,
-    dokploy::DokployUrl,
+    dokploy::{DokployError, DokployUrl},
     dokploy_compose::{DASHBOARD_DEPLOYMENT_TITLE_PREFIX, DeploymentStatus},
     dokploy_placement::DokployId,
     job::{JobKind, JobState},
@@ -59,6 +68,18 @@ struct ActionData {
     requested_at: Option<i64>,
     #[serde(default)]
     transient_errors: u32,
+    /// Dokploy answered the delete request.
+    #[serde(default)]
+    delete_answered: bool,
+}
+
+/// How the operator confirmed an action.
+#[derive(Clone, Copy)]
+enum Confirmation<'a> {
+    /// A confirmation checkbox, needed to stop.
+    Given(bool),
+    /// The project's name as typed, needed to remove or destroy.
+    TypedName(&'a str),
 }
 
 fn redeploy_title(job_id: Uuid) -> String {
@@ -67,12 +88,54 @@ fn redeploy_title(job_id: Uuid) -> String {
 
 impl ProvisioningService {
     /// Queues `action` on the Dokploy service of a project the dashboard
-    /// provisioned, and returns the job's ID.
+    /// provisioned, and returns the job's ID. Stopping takes the stack
+    /// offline, so it needs `confirmed`. Removing and destroying go through
+    /// [`Self::queue_removal`].
     pub async fn queue_action(
         &self,
         current: &CurrentSession,
         project_id: Uuid,
         action: StackAction,
+        confirmed: bool,
+        ctx: RequestContext<'_>,
+    ) -> Result<Uuid, ProvisionError> {
+        self.queue(
+            current,
+            project_id,
+            action,
+            Confirmation::Given(confirmed),
+            ctx,
+        )
+        .await
+    }
+
+    /// Queues removing the project's service from Dokploy, with its data
+    /// volumes for [`StackAction::Destroy`]. `typed_name` must be the
+    /// project's name.
+    pub async fn queue_removal(
+        &self,
+        current: &CurrentSession,
+        project_id: Uuid,
+        action: StackAction,
+        typed_name: &str,
+        ctx: RequestContext<'_>,
+    ) -> Result<Uuid, ProvisionError> {
+        self.queue(
+            current,
+            project_id,
+            action,
+            Confirmation::TypedName(typed_name),
+            ctx,
+        )
+        .await
+    }
+
+    async fn queue(
+        &self,
+        current: &CurrentSession,
+        project_id: Uuid,
+        action: StackAction,
+        confirmation: Confirmation<'_>,
         ctx: RequestContext<'_>,
     ) -> Result<Uuid, ProvisionError> {
         let audit = action.audit_action();
@@ -81,7 +144,7 @@ impl ProvisioningService {
             .find_project_access(project_id, current.account.id)
             .await?
             .ok_or(ProvisionError::NotFound)?;
-        if !access.role.allows(Permission::StackOperate) {
+        if !access.role.allows(action.permission()) {
             let denied = event(
                 current,
                 audit,
@@ -99,6 +162,20 @@ impl ProvisioningService {
             .find_project_dokploy_service(project_id)
             .await?
             .ok_or(ProvisionError::NotProvisioned)?;
+        if stored.removed_at.is_some() {
+            return Err(ProvisionError::AlreadyRemoved);
+        }
+        match (action, confirmation) {
+            (StackAction::Remove | StackAction::Destroy, Confirmation::TypedName(typed))
+                if typed.trim() == access.project.name.as_str() => {}
+            (StackAction::Remove | StackAction::Destroy, _) => {
+                return Err(ProvisionError::NameMismatch);
+            }
+            (StackAction::Stop, Confirmation::Given(false)) => {
+                return Err(ProvisionError::NotConfirmed);
+            }
+            _ => {}
+        }
         let job_id = Uuid::now_v7();
         let data = serde_json::to_string(&ActionData {
             project_id,
@@ -106,6 +183,7 @@ impl ProvisioningService {
             compose_id: stored.compose_id,
             requested_at: None,
             transient_errors: 0,
+            delete_answered: false,
         })
         .map_err(|err| ProvisionError::Internal(err.to_string()))?;
         let queued = self
@@ -132,6 +210,16 @@ impl ProvisioningService {
         if queued {
             Ok(job_id)
         } else {
+            let refused = event(
+                current,
+                audit,
+                ("project", project_id.to_string()),
+                AuditOutcome::Failure,
+                ctx,
+            );
+            if let Err(err) = self.db.record_audit_event(&refused).await {
+                tracing::error!(error = %err, action = audit, "could not record audit event");
+            }
             Err(ProvisionError::Busy)
         }
     }
@@ -256,6 +344,8 @@ fn action_step_name(step: &str) -> &'static str {
     match step {
         "act" => "act",
         "wait" => "wait",
+        "remove" => "remove",
+        "confirm_removed" => "confirm_removed",
         _ => "check",
     }
 }
@@ -271,6 +361,8 @@ impl ActionStep<'_> {
             "check" => self.check(data).await,
             "act" => self.act(data).await,
             "wait" => self.wait(data).await,
+            "remove" => self.remove(data).await,
+            "confirm_removed" => self.confirm_removed(data).await,
             other => Err(Stop::Fail(format!("Unknown step {other}."))),
         }
     }
@@ -296,7 +388,7 @@ impl ActionStep<'_> {
             Some(access)
                 if active
                     && access.project.organization_id == self.job.organization_id
-                    && access.role.allows(Permission::StackOperate) => {}
+                    && access.role.allows(data.action.permission()) => {}
             _ => {
                 return Err(Stop::Fail(
                     "The account that asked for this may no longer operate this project's stack."
@@ -308,10 +400,19 @@ impl ActionStep<'_> {
             .find_project_dokploy_service(data.project_id)
             .await
             .map_err(|err| internal("read the project's Dokploy service", err))?;
-        if stored.is_none_or(|stored| stored.compose_id != data.compose_id) {
-            return Err(Stop::Fail(
-                "The project no longer has the Dokploy service this was asked for.".to_owned(),
-            ));
+        match stored {
+            Some(stored) if stored.compose_id == data.compose_id => {
+                if stored.removed_at.is_some() {
+                    return Err(Stop::Fail(
+                        "The dashboard already removed this service from Dokploy.".to_owned(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(Stop::Fail(
+                    "The project no longer has the Dokploy service this was asked for.".to_owned(),
+                ));
+            }
         }
         Ok(Then::Next("act"))
     }
@@ -335,11 +436,17 @@ impl ActionStep<'_> {
         let api = &self.handler.compose;
         if api.compose_details(&url, &key, &compose).await?.is_none() {
             return Err(Stop::Fail(
-                "Dokploy no longer has this service. It was deleted in Dokploy, or the dashboard's key can no longer see it."
+                "Dokploy no longer has this service, so nothing was changed. It was deleted in Dokploy, or the dashboard's key can no longer see it."
                     .to_owned(),
             ));
         }
         match data.action {
+            StackAction::Remove | StackAction::Destroy => {
+                // Saved before anything is sent: from here on, a service
+                // that is gone counts as removed by this job.
+                data.requested_at = Some(time::OffsetDateTime::now_utc().unix_timestamp());
+                Ok(Then::Next("remove"))
+            }
             StackAction::Stop => {
                 api.stop_compose(&url, &key, &compose).await?;
                 Ok(Then::Succeed(
@@ -385,6 +492,95 @@ impl ActionStep<'_> {
             self.handler.timings.deploy_poll,
             Some("Redeploying the stack.".to_owned()),
         ))
+    }
+
+    /// Sends the delete while Dokploy still has the service. Runs again
+    /// only after an interruption, and reads the service first each time.
+    async fn remove(&self, data: &mut ActionData) -> Result<Then, Stop> {
+        let (url, key) = self.dokploy().await?;
+        let compose = Self::compose_id(data)?;
+        let api = &self.handler.compose;
+        if api.compose_details(&url, &key, &compose).await?.is_none() {
+            return self.removed(data).await;
+        }
+        let volumes = data.action == StackAction::Destroy;
+        match api.delete_compose(&url, &key, &compose, volumes).await {
+            Ok(()) => {
+                data.delete_answered = true;
+                Ok(Then::Next("confirm_removed"))
+            }
+            // Already gone: confirmed by the next read.
+            Err(DokployError::Http(404)) => Ok(Then::Next("confirm_removed")),
+            Err(err) if is_transient(&err) => {
+                tracing::warn!(error = %err, job = %self.job.id, "delete request unanswered");
+                Ok(Then::Wait(
+                    "confirm_removed",
+                    self.handler.timings.deploy_poll,
+                    Some("Waiting for Dokploy to remove the service.".to_owned()),
+                ))
+            }
+            Err(err) => Err(Stop::Fail(format!(
+                "Dokploy refused to remove the service: {err}. Part of it may already be gone; check it in Dokploy. The dashboard did not ask again."
+            ))),
+        }
+    }
+
+    /// Waits until Dokploy no longer lists the service. Never asks again.
+    async fn confirm_removed(&self, data: &mut ActionData) -> Result<Then, Stop> {
+        let (url, key) = self.dokploy().await?;
+        let compose = Self::compose_id(data)?;
+        if self
+            .handler
+            .compose
+            .compose_details(&url, &key, &compose)
+            .await?
+            .is_none()
+        {
+            return self.removed(data).await;
+        }
+        let elapsed = data.requested_at.map_or(0, |at| {
+            time::OffsetDateTime::now_utc().unix_timestamp() - at
+        });
+        let deadline =
+            i64::try_from(self.handler.timings.deploy_deadline.as_secs()).unwrap_or(i64::MAX);
+        if elapsed > deadline {
+            return Err(Stop::Fail(
+                "Dokploy still lists the service long after it was asked to remove it. Check it in Dokploy; the dashboard did not ask again."
+                    .to_owned(),
+            ));
+        }
+        Ok(Then::Wait(
+            "confirm_removed",
+            self.handler.timings.deploy_poll,
+            Some("Waiting for Dokploy to remove the service.".to_owned()),
+        ))
+    }
+
+    /// Records the removal on the project and ends the job.
+    async fn removed(&self, data: &ActionData) -> Result<Then, Stop> {
+        let destroy = data.action == StackAction::Destroy;
+        let recorded = self
+            .handler
+            .db
+            .mark_dokploy_service_removed(data.project_id, &data.compose_id, destroy)
+            .await
+            .map_err(|err| internal("record the removal", err))?;
+        let unregister = if recorded {
+            " The project stays registered until it is unregistered under Settings."
+        } else {
+            " The project was unregistered meanwhile."
+        };
+        let what = match (destroy, data.delete_answered) {
+            (true, true) => "Destroyed: Dokploy deleted the service and its data volumes.",
+            (true, false) => {
+                "Dokploy no longer lists the service. Its answer to the request to delete it with its data volumes was lost; check the server for volumes whose names start with the service's name."
+            }
+            (false, true) => "Removed from Dokploy. The data volumes stay on the server.",
+            (false, false) => {
+                "Dokploy no longer lists the service. The request kept the data volumes on the server."
+            }
+        };
+        Ok(Then::Succeed(format!("{what}{unregister}")))
     }
 
     async fn wait(&self, data: &ActionData) -> Result<Then, Stop> {

@@ -141,10 +141,14 @@ pub enum ProvisionError {
     LimitReached,
     #[error("the dashboard did not create this project's stack, so it cannot operate it")]
     NotProvisioned,
-    #[error(
-        "an earlier stop, start, or redeploy of this stack is still running; wait for it to finish"
-    )]
+    #[error("an earlier action on this stack is still running; wait for it to finish")]
     Busy,
+    #[error("the dashboard already removed this stack's service from Dokploy")]
+    AlreadyRemoved,
+    #[error("type the project's name exactly to confirm")]
+    NameMismatch,
+    #[error("confirm that the stack stops answering until it is started again")]
+    NotConfirmed,
     /// Internal failure. The message is for server logs only.
     #[error("{0}")]
     Internal(String),
@@ -444,6 +448,14 @@ impl ProvisioningService {
         let Some(stored) = self.db.find_project_dokploy_service(project_id).await? else {
             return Ok(StackDeploymentView::NotProvisioned);
         };
+        if let Some(removed_at) = stored.removed_at {
+            return Ok(StackDeploymentView::Removed {
+                removed_at,
+                volumes_deleted: stored.volumes_deleted,
+                app_name: manager.then(|| stored.app_name.clone()),
+                last_action: self.last_action(project_id).await?,
+            });
+        }
         let credentials = match self.dokploy.credentials().await {
             Ok(Some(credentials)) => credentials,
             Ok(None) | Err(DokployServiceError::NotConnected) => {
@@ -476,6 +488,8 @@ impl ProvisioningService {
         };
         let mut found = stack_deployment(&stored, details, manager.then_some(&credentials.url));
         found.can_operate = access.role.allows(Permission::StackOperate);
+        found.can_remove = access.role.allows(Permission::StackRemove);
+        found.can_destroy = access.role.allows(Permission::StackDestroy);
         found.last_action = self.last_action(project_id).await?;
         Ok(StackDeploymentView::Found(Box::new(found)))
     }
@@ -567,6 +581,8 @@ fn stack_deployment(
         deployments,
         more_deployments,
         can_operate: false,
+        can_remove: false,
+        can_destroy: false,
         last_action: None,
     }
 }

@@ -24,7 +24,7 @@ use supabase_dashboard_domain::{
 use crate::{
     components::page::{StatePanel, StateTone},
     pages::{account::utc_minutes, provision::poll_every},
-    server_fns::{QueueStackAction, get_project_deployment},
+    server_fns::{QueueStackAction, QueueStackRemoval, get_project_deployment},
 };
 
 /// How often the panel asks again while an action runs.
@@ -33,31 +33,66 @@ const ACTION_POLL: Duration = Duration::from_secs(4);
 #[component]
 pub fn DeploymentPanel(project: ProjectSummary) -> impl IntoView {
     let id = project.id;
+    let name = project.name.as_str().to_owned();
     let act = ServerAction::<QueueStackAction>::new();
+    let remove = ServerAction::<QueueStackRemoval>::new();
+    // The Stop confirmation is cleared after each request, so every stop
+    // is confirmed again: the panel re-renders into the same elements.
+    let confirmed = RwSignal::new(false);
+    Effect::new(move |_| {
+        act.version().track();
+        confirmed.set(false);
+    });
+    let actions = Actions {
+        act,
+        remove,
+        confirmed,
+    };
     let deployment = Resource::new(
-        move || (id, act.version().get()),
-        |(id, _)| get_project_deployment(id),
+        move || (id, act.version().get(), remove.version().get()),
+        |(id, _, _)| get_project_deployment(id),
     );
     // Keeps running for the page's life: a new action can start at any
     // time, and only an unfinished one triggers a request.
     poll_every(ACTION_POLL, move || {
-        let running = matches!(
-            deployment.get_untracked(),
-            Some(Ok(StackDeploymentView::Found(found)))
-                if found.last_action.as_ref().is_some_and(|last| !last.state.is_finished())
-        );
+        let unfinished = |last: &Option<StackActionSummary>| {
+            last.as_ref().is_some_and(|last| !last.state.is_finished())
+        };
+        let running = match deployment.get_untracked() {
+            Some(Ok(StackDeploymentView::Found(found))) => unfinished(&found.last_action),
+            Some(Ok(StackDeploymentView::Removed { last_action, .. })) => unfinished(&last_action),
+            _ => false,
+        };
         if running {
             deployment.refetch();
         }
         true
     });
+    // One live region beside the re-rendered panel, so an action's
+    // progress and outcome are announced.
+    let announcement = move || {
+        let last = match deployment.get() {
+            Some(Ok(StackDeploymentView::Found(found))) => found.last_action,
+            Some(Ok(StackDeploymentView::Removed { last_action, .. })) => last_action,
+            _ => None,
+        }?;
+        let (_, label) = action_badge(&last);
+        Some(format!(
+            "{}: {label}. {}",
+            last.action.label(),
+            last.message.unwrap_or_default()
+        ))
+    };
     view! {
         <Transition fallback=|| view! {
             <p class="loading" role="status">"Loading the Dokploy service…"</p>
         }>
+            // Kept across refetches: a Transition shows its children once
+            // loaded, so this element persists and its changes are read.
+            <p class="visually-hidden" role="status" aria-live="polite">{announcement}</p>
             {move || deployment.get().map(|result| match result {
                 Ok(StackDeploymentView::NotProvisioned) => ().into_any(),
-                Ok(view) => panel(state_view(view, act, id)).into_any(),
+                Ok(view) => panel(state_view(view, actions, id, &name)).into_any(),
                 Err(err) => panel(
                     view! {
                         <StatePanel
@@ -83,10 +118,19 @@ fn panel(body: AnyView) -> impl IntoView {
     }
 }
 
+/// The panel's two server actions.
+#[derive(Clone, Copy)]
+struct Actions {
+    act: ServerAction<QueueStackAction>,
+    remove: ServerAction<QueueStackRemoval>,
+    confirmed: RwSignal<bool>,
+}
+
 fn state_view(
     view: StackDeploymentView,
-    act: ServerAction<QueueStackAction>,
+    actions: Actions,
     project: uuid::Uuid,
+    project_name: &str,
 ) -> AnyView {
     match view {
         StackDeploymentView::NotProvisioned => ().into_any(),
@@ -122,7 +166,28 @@ fn state_view(
             }
             .into_any()
         }
-        StackDeploymentView::Found(found) => found_view(*found, act, project),
+        StackDeploymentView::Found(found) => found_view(*found, actions, project, project_name),
+        StackDeploymentView::Removed {
+            removed_at,
+            volumes_deleted,
+            app_name,
+            last_action,
+        } => {
+            let detail = match (volumes_deleted, app_name) {
+                (true, _) => "The dashboard deleted this stack's Dokploy service and its data volumes. Nothing of it is left to start again.".to_owned(),
+                (false, Some(app)) => format!(
+                    "The dashboard deleted this stack's Dokploy service and kept its data volumes on the server. Their names start with {app}_; delete them on the server when the data is no longer needed."
+                ),
+                (false, None) => "The dashboard deleted this stack's Dokploy service and kept its data volumes on the server. Ask an owner or admin about them.".to_owned(),
+            };
+            let title = format!("Removed from Dokploy {} (UTC)", utc_minutes(removed_at));
+            view! {
+                <StatePanel tone=StateTone::Empty title=title detail=detail/>
+                <dl class="detail-list">{last_action.map(last_action_view)}</dl>
+                <p class="field-hint">"The project stays registered until it is unregistered under Settings."</p>
+            }
+            .into_any()
+        }
     }
 }
 
@@ -147,10 +212,19 @@ fn run_badge(status: DeploymentStatus) -> &'static str {
 
 fn found_view(
     found: StackDeployment,
-    act: ServerAction<QueueStackAction>,
+    actions: Actions,
     project: uuid::Uuid,
+    project_name: &str,
 ) -> AnyView {
-    let (class, label) = status_badge(found.status);
+    let stopped = found.status == Some(ComposeStatus::Idle)
+        && found.last_action.as_ref().is_some_and(|last| {
+            last.action == StackAction::Stop && last.state == JobState::Succeeded
+        });
+    let (class, label) = if stopped {
+        ("badge badge-muted", "Stopped")
+    } else {
+        status_badge(found.status)
+    };
     let last = found.last_action.clone().map(last_action_view);
     let busy = found
         .last_action
@@ -158,7 +232,17 @@ fn found_view(
         .is_some_and(|last| !last.state.is_finished());
     let controls = found
         .can_operate
-        .then(|| controls_view(act, project, &found.name, busy).into_any());
+        .then(|| controls_view(actions, project, &found.name, busy).into_any());
+    let removal = (found.can_remove || found.can_destroy).then(|| {
+        removal_view(
+            actions.remove,
+            project,
+            project_name,
+            found.can_destroy,
+            busy,
+        )
+        .into_any()
+    });
     let moved = found.moved.then(|| {
         view! {
             <p class="form-error" role="status">
@@ -184,6 +268,7 @@ fn found_view(
         {moved}
         {controls}
         {deployments}
+        {removal}
     }
     .into_any()
 }
@@ -284,8 +369,10 @@ fn run_row(run: StackDeploymentRun) -> impl IntoView {
     }
 }
 
-fn action_badge(state: JobState) -> (&'static str, &'static str) {
-    match state {
+fn action_badge(last: &StackActionSummary) -> (&'static str, &'static str) {
+    match last.state {
+        // A job waiting between steps is queued again, with a message.
+        JobState::Queued if last.message.is_some() => ("badge badge-current", "Running"),
         JobState::Queued => ("badge badge-current", "Queued"),
         JobState::Running => ("badge badge-current", "Running"),
         JobState::Succeeded => ("badge badge-ok", "Done"),
@@ -294,7 +381,7 @@ fn action_badge(state: JobState) -> (&'static str, &'static str) {
 }
 
 fn last_action_view(last: StackActionSummary) -> impl IntoView {
-    let (class, label) = action_badge(last.state);
+    let (class, label) = action_badge(&last);
     let when = format!("Asked {} (UTC)", utc_minutes(last.created_at));
     view! {
         <div>
@@ -310,12 +397,9 @@ fn last_action_view(last: StackActionSummary) -> impl IntoView {
 
 /// Stop, start, and redeploy. Each queues a job; the panel follows it.
 /// Stopping takes the stack offline, so it asks for a confirmation.
-fn controls_view(
-    act: ServerAction<QueueStackAction>,
-    project: uuid::Uuid,
-    name: &str,
-    busy: bool,
-) -> impl IntoView {
+fn controls_view(actions: Actions, project: uuid::Uuid, name: &str, busy: bool) -> impl IntoView {
+    let act = actions.act;
+    let confirmed = actions.confirmed;
     let project = project.to_string();
     let stop_project = project.clone();
     let start_project = project.clone();
@@ -325,13 +409,15 @@ fn controls_view(
             .and_then(Result::err)
             .map(|err| view! { <p class="form-error" role="alert">{err.to_string()}</p> })
     };
-    let disabled = move || busy || act.pending().get();
+    // aria-disabled rather than disabled, so the focused button keeps focus
+    // after a click; the server refuses an action while another runs.
+    let disabled = move || (busy || act.pending().get()).then_some("true");
     let button = |action: StackAction, project: String, class: &'static str| {
         view! {
             <ActionForm action=act attr:class="inline-form compact">
                 <input type="hidden" name="id" value=project/>
                 <input type="hidden" name="action" value=action.as_str()/>
-                <button type="submit" class=class disabled=disabled>
+                <button type="submit" class=class aria-disabled=disabled>
                     {action.label()}
                 </button>
             </ActionForm>
@@ -346,10 +432,12 @@ fn controls_view(
                 <input type="hidden" name="id" value=stop_project/>
                 <input type="hidden" name="action" value=StackAction::Stop.as_str()/>
                 <label class="checkbox-field">
-                    <input type="checkbox" name="confirm" value="true" required/>
+                    <input type="checkbox" name="confirm" value="true" required
+                        prop:checked=move || confirmed.get()
+                        on:change=move |ev| confirmed.set(event_target_checked(&ev))/>
                     <span>{confirm_label}</span>
                 </label>
-                <button type="submit" class="button button-danger" disabled=disabled>
+                <button type="submit" class="button button-danger" aria-disabled=disabled>
                     {StackAction::Stop.label()}
                 </button>
             </ActionForm>
@@ -357,11 +445,59 @@ fn controls_view(
             {button(StackAction::Redeploy, project, "button")}
         </div>
         {busy.then(|| view! {
-            <p class="field-hint" role="status">"An action is running; the buttons come back when it finishes."</p>
+            <p class="field-hint">"An action is running; wait for it to finish before asking for another."</p>
         })}
         {error}
         <p class="field-hint">
             "Redeploy rebuilds the containers from the compose file and variables Dokploy holds, so changes made in Dokploy apply. None of these remove the service or its data."
         </p>
+    }
+}
+
+/// Remove and destroy, each confirmed by typing the project's name. The
+/// server checks the name and the role again.
+fn removal_view(
+    remove: ServerAction<QueueStackRemoval>,
+    project: uuid::Uuid,
+    name: &str,
+    can_destroy: bool,
+    busy: bool,
+) -> impl IntoView {
+    let disabled = move || (busy || remove.pending().get()).then_some("true");
+    let error = move || {
+        remove
+            .value()
+            .get()
+            .and_then(Result::err)
+            .map(|err| view! { <p class="form-error" role="alert">{err.to_string()}</p> })
+    };
+    let form = move |action: StackAction, id: &'static str, text: String| {
+        let label = format!("Type {name} to confirm");
+        view! {
+            <ActionForm action=remove attr:class="stacked-form">
+                <p class="section-text">{text}</p>
+                <input type="hidden" name="id" value=project.to_string()/>
+                <input type="hidden" name="action" value=action.as_str()/>
+                <div class="field">
+                    <label for=id>{label}</label>
+                    <input class="input" id=id name="name" type="text" required autocomplete="off" spellcheck="false"/>
+                </div>
+                <div>
+                    <button type="submit" class="button button-danger" aria-disabled=disabled>
+                        {action.label()}
+                    </button>
+                </div>
+            </ActionForm>
+        }
+    };
+    let remove_text = "Deletes the service in Dokploy: its containers, its folder on the server, and its domain. The database, stored files, and Studio snippets stay on the server in Docker volumes. The project stays registered here.".to_owned();
+    let destroy_text = "Deletes the service and its Docker volumes: the database, every stored file, and Studio's snippets. This cannot be undone. Take a backup first if you may need the data.".to_owned();
+    view! {
+        <div class="danger-zone" role="group" aria-labelledby="danger-title">
+            <h3 class="section-title" id="danger-title">"Remove the stack"</h3>
+            {form(StackAction::Remove, "remove-name", remove_text)}
+            {can_destroy.then(|| form(StackAction::Destroy, "destroy-name", destroy_text))}
+            {error}
+        </div>
     }
 }

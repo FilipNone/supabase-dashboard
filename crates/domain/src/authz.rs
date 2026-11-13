@@ -54,7 +54,7 @@ impl OrgRole {
         match self {
             Self::Owner => true,
             Self::Admin => match permission {
-                P::OrgDelete => false,
+                P::OrgDelete | P::StackDestroy => false,
                 P::OrgRead
                 | P::OrgUpdate
                 | P::MembersRead
@@ -66,6 +66,7 @@ impl OrgRole {
                 | P::ProjectCredentialsReplace
                 | P::ProjectUnregister
                 | P::StackOperate
+                | P::StackRemove
                 | P::StudioOpen => true,
             },
             Self::Developer => match permission {
@@ -78,7 +79,9 @@ impl OrgRole {
                 | P::ProjectUpdate
                 | P::ProjectCredentialsReplace
                 | P::ProjectUnregister
-                | P::StackOperate => false,
+                | P::StackOperate
+                | P::StackRemove
+                | P::StackDestroy => false,
             },
             Self::Viewer => match permission {
                 P::OrgRead | P::MembersRead | P::ProjectRead => true,
@@ -93,7 +96,9 @@ impl OrgRole {
                 | P::ProjectUpdate
                 | P::ProjectCredentialsReplace
                 | P::ProjectUnregister
-                | P::StackOperate => false,
+                | P::StackOperate
+                | P::StackRemove
+                | P::StackDestroy => false,
             },
         }
     }
@@ -121,6 +126,13 @@ pub enum Permission {
     /// Stop, start, or redeploy the Dokploy service of a stack the
     /// dashboard provisioned. Never removes the service or its data.
     StackOperate,
+    /// Delete a provisioned stack's Dokploy service, keeping its data
+    /// volumes on the server. The project stays registered.
+    StackRemove,
+    /// Delete a provisioned stack's Dokploy service together with its data
+    /// volumes: the database, the stored files, and Studio's snippets.
+    /// This cannot be undone, so only owners may.
+    StackDestroy,
     /// Open the project's Supabase Studio through the dashboard. Studio has
     /// no roles, so this grants full database access and shows the stack's
     /// API keys and JWT secret.
@@ -128,7 +140,7 @@ pub enum Permission {
 }
 
 impl Permission {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 15] = [
         Self::OrgRead,
         Self::OrgUpdate,
         Self::OrgDelete,
@@ -141,6 +153,8 @@ impl Permission {
         Self::ProjectCredentialsReplace,
         Self::ProjectUnregister,
         Self::StackOperate,
+        Self::StackRemove,
+        Self::StackDestroy,
         Self::StudioOpen,
     ];
 }
@@ -217,6 +231,7 @@ mod tests {
                 P::ProjectCredentialsReplace,
                 P::ProjectUnregister,
                 P::StackOperate,
+                P::StackRemove,
                 P::StudioOpen,
             ],
             Developer => &[P::OrgRead, P::MembersRead, P::ProjectRead, P::StudioOpen],

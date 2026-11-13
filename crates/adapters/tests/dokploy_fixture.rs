@@ -413,16 +413,19 @@ async fn fixture_dokploy_creates_configures_and_deploys_a_compose_service() {
         Err(DokployError::Http(_))
     ));
 
-    post(
-        &url,
-        "compose.delete",
-        serde_json::json!({ "composeId": compose.as_str(), "deleteVolumes": true }),
-    )
-    .await;
+    // Deleting answers once the service is gone; a second delete is 404.
+    client
+        .delete_compose(&url, &key, &compose, true)
+        .await
+        .unwrap();
     assert_eq!(
         client.compose_details(&url, &key, &compose).await.unwrap(),
         None
     );
+    assert!(matches!(
+        client.delete_compose(&url, &key, &compose, true).await,
+        Err(DokployError::Http(404))
+    ));
     post(
         &url,
         "project.remove",

@@ -196,10 +196,10 @@ mod tests {
             GetProjectAuthorities, GetProjectCredentials, GetProjectDeployment, GetProjectHealth,
             GetProvisionJob, GetProvisionTargets, GetStudioAccessLog, ListOrganizations,
             ListProjects, ListProvisionJobs, ListSessions, PreviewInvitation, QueueStackAction,
-            RegisterProject, RemoveProjectAuthorities, RemoveProjectCredential, RenameOrganization,
-            ReplaceDokployKey, ReplaceProjectAuthorities, ReplaceProjectCredential,
-            ReplaceStudioLogin, RevokeSession, SignUpWithInvitation, StartProvisioning,
-            UnregisterProject, UpdateProfile,
+            QueueStackRemoval, RegisterProject, RemoveProjectAuthorities, RemoveProjectCredential,
+            RenameOrganization, ReplaceDokployKey, ReplaceProjectAuthorities,
+            ReplaceProjectCredential, ReplaceStudioLogin, RevokeSession, SignUpWithInvitation,
+            StartProvisioning, UnregisterProject, UpdateProfile,
         },
     };
     use tower::ServiceExt;
@@ -1163,6 +1163,9 @@ mod tests {
         .unwrap();
         let (parts, body) = call(stop.clone(), &bob).await;
         assert_eq!(parts.status, StatusCode::FORBIDDEN, "{body}");
+        // The role is checked before the confirmation.
+        let (parts, body) = call(format!("id={provisioned}&action=stop"), &bob).await;
+        assert_eq!(parts.status, StatusCode::FORBIDDEN, "{body}");
         assert_eq!(jobs().await, 0);
 
         // Stopping must be confirmed; a registered stack is not operated.
@@ -1174,6 +1177,36 @@ mod tests {
         let (parts, body) = call(format!("id={provisioned}&action=delete"), &alice).await;
         // An action that does not exist is refused when decoded.
         assert_ne!(parts.status, StatusCode::OK, "{body}");
+        assert_eq!(jobs().await, 0);
+
+        // Removal needs its own endpoint, the role, and the exact name.
+        let removal = |body: String, cookie: &str| {
+            send(
+                &router,
+                form_post(QueueStackRemoval::PATH, &body, Some(cookie)),
+            )
+        };
+        let (parts, body) = removal(
+            format!("id={provisioned}&action=remove&name=Provisioned"),
+            &bob,
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::FORBIDDEN, "{body}");
+        let (parts, body) = call(format!("id={provisioned}&action=destroy"), &alice).await;
+        assert_eq!(parts.status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        let (parts, body) = removal(
+            format!("id={provisioned}&action=stop&name=Provisioned"),
+            &alice,
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        let (parts, body) = removal(
+            format!("id={provisioned}&action=destroy&name=provisioned"),
+            &alice,
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(body.contains("name exactly"), "{body}");
         assert_eq!(jobs().await, 0);
 
         // The owner queues one action; a second waits for it.
@@ -1188,7 +1221,7 @@ mod tests {
                 .fetch_one(db.pool())
                 .await
                 .unwrap();
-        assert_eq!(audited, 2, "one denied, one queued");
+        assert_eq!(audited, 3, "two denied, one queued");
 
         db.close().await;
         scratch.drop().await;

@@ -473,15 +473,32 @@ pub async fn queue_stack_action(
     // Set by a checkbox, so it is absent when unchecked.
     #[server(default)] confirm: bool,
 ) -> Result<Uuid, AppError> {
-    if action == StackAction::Stop && !confirm {
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    Ok(org_context::provisioning()?
+        .queue_action(&session, id, action, confirm, audit.get())
+        .await?)
+}
+
+/// Queues removing a provisioned project's Dokploy service: `remove`
+/// keeps the data volumes on the server, `destroy` deletes them. `name`
+/// must be the project's name. Owners and admins remove; only owners
+/// destroy. The project stays registered.
+#[server]
+pub async fn queue_stack_removal(
+    id: Uuid,
+    action: StackAction,
+    name: String,
+) -> Result<Uuid, AppError> {
+    if !action.deletes_service() {
         return Err(AppError::Rejected(
-            "Confirm that the stack stops answering until it is started again.".to_string(),
+            "Only removing or destroying a stack is asked for here.".to_string(),
         ));
     }
     let session = org_context::session()?;
     let audit = org_context::AuditContext::current();
     Ok(org_context::provisioning()?
-        .queue_action(&session, id, action, audit.get())
+        .queue_removal(&session, id, action, &name, audit.get())
         .await?)
 }
 

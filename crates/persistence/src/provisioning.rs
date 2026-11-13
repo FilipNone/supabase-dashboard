@@ -32,6 +32,10 @@ pub struct StoredDokployService {
     pub server_id: Option<String>,
     pub job_id: Uuid,
     pub created_at: time::OffsetDateTime,
+    /// Set once the dashboard removed the service from Dokploy.
+    pub removed_at: Option<time::OffsetDateTime>,
+    /// The removal deleted the data volumes too.
+    pub volumes_deleted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,13 +167,39 @@ impl Database {
         project_id: Uuid,
     ) -> Result<Option<StoredDokployService>, PersistenceError> {
         sqlx::query_as(
-            "SELECT compose_id, app_name, environment_id, server_id, job_id, created_at \
+            "SELECT compose_id, app_name, environment_id, server_id, job_id, created_at, \
+             removed_at, volumes_deleted \
              FROM project_dokploy_services WHERE project_id = $1",
         )
         .bind(project_id)
         .fetch_optional(&self.pool)
         .await
         .map_err(query_err)
+    }
+
+    /// Records that the dashboard removed the project's service
+    /// `compose_id` from Dokploy. Recording it again keeps the first time
+    /// and never clears `volumes_deleted`. Returns `false` when the project
+    /// no longer has that service.
+    pub async fn mark_dokploy_service_removed(
+        &self,
+        project_id: Uuid,
+        compose_id: &str,
+        volumes_deleted: bool,
+    ) -> Result<bool, PersistenceError> {
+        let updated = sqlx::query(
+            "UPDATE project_dokploy_services \
+             SET removed_at = COALESCE(removed_at, now()), \
+                 volumes_deleted = volumes_deleted OR $3 \
+             WHERE project_id = $1 AND compose_id = $2",
+        )
+        .bind(project_id)
+        .bind(compose_id)
+        .bind(volumes_deleted)
+        .execute(&self.pool)
+        .await
+        .map_err(query_err)?;
+        Ok(updated.rows_affected() == 1)
     }
 
     /// How many projects the organization has.

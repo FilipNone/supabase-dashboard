@@ -234,7 +234,10 @@ mod server {
                 | ProvisionError::NoCipher
                 | ProvisionError::LimitReached
                 | ProvisionError::NotProvisioned
-                | ProvisionError::Busy => Self::Rejected(sentence(&err.to_string())),
+                | ProvisionError::Busy
+                | ProvisionError::AlreadyRemoved
+                | ProvisionError::NameMismatch
+                | ProvisionError::NotConfirmed => Self::Rejected(sentence(&err.to_string())),
                 ProvisionError::Internal(err) => {
                     tracing::error!(error = %err, "provisioning operation failed");
                     Self::Unavailable

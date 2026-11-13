@@ -129,6 +129,17 @@ pub trait ComposeApi: Send + Sync {
         compose_id: &'a DokployId,
     ) -> DokployFuture<'a, ()>;
 
+    /// Deletes the service, and its named volumes with `delete_volumes`.
+    /// Answers 404 for a service Dokploy does not have. Never sent without
+    /// reading the service first.
+    fn delete_compose<'a>(
+        &'a self,
+        url: &'a DokployUrl,
+        key: &'a SecretString,
+        compose_id: &'a DokployId,
+        delete_volumes: bool,
+    ) -> DokployFuture<'a, ()>;
+
     /// Queues a redeployment titled `title`. Not idempotent.
     fn redeploy_compose<'a>(
         &'a self,

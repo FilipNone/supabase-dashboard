@@ -6,6 +6,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
+    authz::Permission,
     dokploy_compose::{ComposeStatus, DeploymentStatus},
     job::JobState,
 };
@@ -142,6 +143,15 @@ pub enum StackDeploymentView {
         compose_name: Option<String>,
     },
     Found(Box<StackDeployment>),
+    /// The dashboard removed the service from Dokploy. With
+    /// `volumes_deleted` false, the data volumes are still on the server;
+    /// owners and admins get their name prefix in `app_name`.
+    Removed {
+        removed_at: OffsetDateTime,
+        volumes_deleted: bool,
+        app_name: Option<String>,
+        last_action: Option<StackActionSummary>,
+    },
 }
 
 /// The provisioned project's service as Dokploy reports it now.
@@ -162,29 +172,60 @@ pub struct StackDeployment {
     pub more_deployments: bool,
     /// The operator may stop, start, and redeploy the service.
     pub can_operate: bool,
+    /// The operator may remove the service, keeping its data volumes.
+    pub can_remove: bool,
+    /// The operator may remove the service and its data volumes.
+    pub can_destroy: bool,
     /// The newest stop, start, or redeploy asked for, if any.
     pub last_action: Option<StackActionSummary>,
 }
 
-/// An operation on a provisioned stack's service. None of them removes
-/// the service or its data.
+/// An operation on a provisioned stack's service. Stop, start, and
+/// redeploy keep the service; remove deletes it and keeps the data
+/// volumes; destroy deletes both. None of them unregisters the project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StackAction {
     Stop,
     Start,
     Redeploy,
+    Remove,
+    Destroy,
 }
 
 impl StackAction {
-    pub const ALL: [Self; 3] = [Self::Stop, Self::Start, Self::Redeploy];
+    pub const ALL: [Self; 5] = [
+        Self::Stop,
+        Self::Start,
+        Self::Redeploy,
+        Self::Remove,
+        Self::Destroy,
+    ];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Stop => "stop",
             Self::Start => "start",
             Self::Redeploy => "redeploy",
+            Self::Remove => "remove",
+            Self::Destroy => "destroy",
         }
+    }
+
+    /// The permission the operator needs, checked when the action is asked
+    /// for and again when its job runs.
+    pub const fn permission(self) -> Permission {
+        match self {
+            Self::Stop | Self::Start | Self::Redeploy => Permission::StackOperate,
+            Self::Remove => Permission::StackRemove,
+            Self::Destroy => Permission::StackDestroy,
+        }
+    }
+
+    /// Deletes the Dokploy service. The operator must type the project's
+    /// name to ask for it.
+    pub const fn deletes_service(self) -> bool {
+        matches!(self, Self::Remove | Self::Destroy)
     }
 
     pub fn parse(raw: &str) -> Option<Self> {
@@ -196,6 +237,8 @@ impl StackAction {
             Self::Stop => "Stop",
             Self::Start => "Start",
             Self::Redeploy => "Redeploy",
+            Self::Remove => "Remove from Dokploy",
+            Self::Destroy => "Destroy stack and data",
         }
     }
 
@@ -205,6 +248,8 @@ impl StackAction {
             Self::Stop => "stack.stop",
             Self::Start => "stack.start",
             Self::Redeploy => "stack.redeploy",
+            Self::Remove => "stack.remove",
+            Self::Destroy => "stack.destroy",
         }
     }
 }
