@@ -48,6 +48,7 @@ use supabase_dashboard_domain::{
         ProvisionJobSummary, ProvisionStep, ProvisionTargets, StackDeployment, StackDeploymentRun,
         StackDeploymentView, StackLocation, TargetChoice,
     },
+    stack_settings::EnvFile,
 };
 use supabase_dashboard_persistence::{
     Database, PersistenceError,
@@ -70,6 +71,7 @@ use crate::{
     stack_template::{COMPOSE_FILE, GATEWAY_PORT, GATEWAY_SERVICE, STACK_FILES, stack_env},
 };
 
+mod env_record;
 mod port;
 mod stack_action;
 mod stack_config;
@@ -1089,6 +1091,12 @@ impl Step<'_> {
         let login = check_studio_login(STUDIO_USERNAME, secrets.studio_password.expose_secret())
             .map_err(|err| internal("check the Studio login", err))?;
         let project_id = data.project_id;
+        // What the configure step wrote, to tell edits made in Dokploy.
+        let written = stack_env(&secrets, &data.public_url())
+            .map_err(|err| internal("build the stack's variables", err))?;
+        let env_record = env_record::EnvRecord::of(&EnvFile::parse(written.expose_secret()))
+            .seal(cipher, project_id)
+            .map_err(|err| internal("encrypt the stack's variable record", err))?;
         let values = [
             (CredentialKind::AnonKey, secrets.anon_key),
             (CredentialKind::ServiceRoleKey, secrets.service_role_key),
@@ -1131,6 +1139,7 @@ impl Step<'_> {
                     environment_id: &data.environment_id,
                     server_id: data.server_id.as_deref(),
                     job_id: self.job.id,
+                    env_record: Some(&env_record),
                 },
                 &credentials,
                 MAX_PROJECTS_PER_ORGANIZATION,

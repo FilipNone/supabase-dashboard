@@ -491,6 +491,7 @@ async fn run() -> Result<(), StartupError> {
     ));
     let actions: Arc<dyn JobHandler> = Arc::new(StackActionHandler::new(
         db.clone(),
+        cipher.clone(),
         Arc::clone(&dokploy),
         Arc::clone(&dokploy_client) as Arc<dyn ComposeApi>,
     ));

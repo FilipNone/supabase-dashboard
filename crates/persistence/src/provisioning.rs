@@ -20,6 +20,25 @@ pub struct NewDokployService<'a> {
     pub environment_id: &'a str,
     pub server_id: Option<&'a str>,
     pub job_id: Uuid,
+    /// The sealed record of the variables the job wrote.
+    pub env_record: Option<&'a SealedEnvRecord>,
+}
+
+/// A project's sealed variable record as stored.
+#[derive(Clone, sqlx::FromRow)]
+pub struct SealedEnvRecord {
+    pub key_id: String,
+    pub nonce: Vec<u8>,
+    pub ciphertext: Vec<u8>,
+}
+
+// Ciphertext is not secret without the key, but keep it out of logs.
+impl std::fmt::Debug for SealedEnvRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SealedEnvRecord")
+            .field("key_id", &self.key_id)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The recorded Dokploy service of a provisioned project, as it was when
@@ -114,6 +133,19 @@ impl Database {
         .execute(&mut *tx)
         .await
         .map_err(query_err)?;
+        if let Some(record) = service.env_record {
+            sqlx::query(
+                "INSERT INTO project_dokploy_env_records (project_id, key_id, nonce, ciphertext) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(project.id)
+            .bind(&record.key_id)
+            .bind(&record.nonce)
+            .bind(&record.ciphertext)
+            .execute(&mut *tx)
+            .await
+            .map_err(query_err)?;
+        }
         for credential in credentials {
             sqlx::query(
                 "INSERT INTO project_credentials \
@@ -175,6 +207,97 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map_err(query_err)
+    }
+
+    /// The project's sealed variable record, if it has one.
+    pub async fn find_env_record(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Option<SealedEnvRecord>, PersistenceError> {
+        sqlx::query_as(
+            "SELECT key_id, nonce, ciphertext FROM project_dokploy_env_records \
+             WHERE project_id = $1",
+        )
+        .bind(project_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(query_err)
+    }
+
+    /// Replaces the project's variable record when it still holds the
+    /// value read with `old_nonce`, or stores it when `old_nonce` is `None`
+    /// and the project has none. Returns `false` when the record changed
+    /// meanwhile or the project has no Dokploy service.
+    pub async fn replace_env_record(
+        &self,
+        project_id: Uuid,
+        old_nonce: Option<&[u8]>,
+        record: &SealedEnvRecord,
+    ) -> Result<bool, PersistenceError> {
+        let updated = match old_nonce {
+            Some(old_nonce) => {
+                sqlx::query(
+                    "UPDATE project_dokploy_env_records \
+                 SET key_id = $3, nonce = $4, ciphertext = $5, updated_at = now() \
+                 WHERE project_id = $1 AND nonce = $2",
+                )
+                .bind(project_id)
+                .bind(old_nonce)
+                .bind(&record.key_id)
+                .bind(&record.nonce)
+                .bind(&record.ciphertext)
+                .execute(&self.pool)
+                .await
+            }
+            None => sqlx::query(
+                "INSERT INTO project_dokploy_env_records (project_id, key_id, nonce, ciphertext) \
+                 SELECT $1, $2, $3, $4 FROM project_dokploy_services WHERE project_id = $1 \
+                 ON CONFLICT (project_id) DO NOTHING",
+            )
+            .bind(project_id)
+            .bind(&record.key_id)
+            .bind(&record.nonce)
+            .bind(&record.ciphertext)
+            .execute(&self.pool)
+            .await,
+        }
+        .map_err(query_err)?
+        .rows_affected();
+        Ok(updated == 1)
+    }
+
+    /// Up to `limit` variable records not sealed under `key_id`, by
+    /// project, starting after `after`.
+    pub async fn env_records_not_under(
+        &self,
+        key_id: &str,
+        after: Option<Uuid>,
+        limit: i64,
+    ) -> Result<Vec<(Uuid, SealedEnvRecord)>, PersistenceError> {
+        let rows: Vec<(Uuid, String, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+            "SELECT project_id, key_id, nonce, ciphertext FROM project_dokploy_env_records \
+             WHERE key_id <> $1 AND ($2::uuid IS NULL OR project_id > $2) \
+             ORDER BY project_id LIMIT $3",
+        )
+        .bind(key_id)
+        .bind(after)
+        .bind(limit.clamp(1, 500))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(query_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|(project_id, key_id, nonce, ciphertext)| {
+                (
+                    project_id,
+                    SealedEnvRecord {
+                        key_id,
+                        nonce,
+                        ciphertext,
+                    },
+                )
+            })
+            .collect())
     }
 
     /// Records that the dashboard removed the project's service

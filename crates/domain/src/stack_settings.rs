@@ -343,6 +343,19 @@ impl EnvFile {
         }
     }
 
+    /// Every variable with its raw values as written, in line order; a
+    /// variable set on several lines has several. Comments are skipped.
+    pub fn raw_values(&self) -> std::collections::BTreeMap<&str, Vec<&str>> {
+        let mut values: std::collections::BTreeMap<&str, Vec<&str>> = Default::default();
+        for (name, value) in self.lines.iter().filter_map(|line| Self::entry(line)) {
+            values
+                .entry(name)
+                .or_default()
+                .push(value.trim_end_matches('\r'));
+        }
+        values
+    }
+
     pub fn to_text(&self) -> String {
         let mut text = self.lines.join("\n");
         if !text.is_empty() {
@@ -387,6 +400,8 @@ pub struct StackSettingsView {
     pub settings: Vec<StackSettingView>,
     /// An action on the stack is unfinished, so changes are refused.
     pub busy: bool,
+    /// Variables edited in Dokploy since the dashboard wrote them.
+    pub tracking: EnvTracking,
 }
 
 /// What applying the submitted settings would change.
@@ -402,9 +417,48 @@ pub struct StackConfigPreview {
     pub base: String,
 }
 
+/// Variables changed in Dokploy since the dashboard last wrote the
+/// stack's variables, by name. Values are never included.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvChanges {
+    /// Set by the dashboard and changed since, sorted.
+    pub changed: Vec<String>,
+    /// Not set by the dashboard, sorted.
+    pub added: Vec<String>,
+    /// Set by the dashboard and no longer set, sorted.
+    pub removed: Vec<String>,
+}
+
+impl EnvChanges {
+    pub fn is_empty(&self) -> bool {
+        self.changed.is_empty() && self.added.is_empty() && self.removed.is_empty()
+    }
+}
+
+/// Whether variables were edited in Dokploy, as far as the dashboard
+/// can tell.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EnvTracking {
+    /// The dashboard keeps no record of what it wrote, as for stacks
+    /// provisioned before it kept one.
+    NotRecorded,
+    /// The record is sealed under a credential key this server lacks.
+    Unreadable,
+    Compared(EnvChanges),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_values_keep_every_line_of_a_variable() {
+        let env = EnvFile::parse("# note\nA=1\r\nexport B = \"x\"\nA=2\nnot a line\n");
+        let values = env.raw_values();
+        assert_eq!(values.get("A"), Some(&vec!["1", "2"]));
+        assert_eq!(values.get("B"), Some(&vec![" \"x\""]));
+        assert_eq!(values.len(), 2);
+    }
 
     #[test]
     fn values_are_normalized_or_refused() {

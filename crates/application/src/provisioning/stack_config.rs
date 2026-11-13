@@ -195,6 +195,9 @@ impl ProvisioningService {
             .last_action(project_id)
             .await?
             .is_some_and(|last| !last.state.is_finished());
+        let env = EnvFile::parse(config.env.expose_secret());
+        let tracking =
+            super::env_record::tracking(&self.db, self.cipher.as_ref(), project_id, &env).await?;
         Ok(Some(StackSettingsView {
             settings: read_settings(&config)
                 .into_iter()
@@ -208,6 +211,7 @@ impl ProvisioningService {
                 })
                 .collect(),
             busy,
+            tracking,
         }))
     }
 

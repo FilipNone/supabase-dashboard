@@ -66,6 +66,7 @@ use crate::{
     dokploy::{DokployService, is_transient},
     jobs::{ClaimedJob, JobHandler, StepFuture, StepOutcome},
     organizations::event,
+    secrets::CredentialCipher,
 };
 
 /// The job's saved state. Holds no secret.
@@ -307,15 +308,24 @@ fn action_summary(job: StoredJob) -> Option<StackActionSummary> {
 /// Runs stop, start, and redeploy jobs.
 pub struct StackActionHandler {
     db: Database,
+    /// Opens the record of the stack's variables, kept current when a
+    /// settings change is written.
+    cipher: Option<CredentialCipher>,
     dokploy: Arc<DokployService>,
     compose: Arc<dyn ComposeApi>,
     timings: ProvisionTimings,
 }
 
 impl StackActionHandler {
-    pub fn new(db: Database, dokploy: Arc<DokployService>, compose: Arc<dyn ComposeApi>) -> Self {
+    pub fn new(
+        db: Database,
+        cipher: Option<CredentialCipher>,
+        dokploy: Arc<DokployService>,
+        compose: Arc<dyn ComposeApi>,
+    ) -> Self {
         Self {
             db,
+            cipher,
             dokploy,
             compose,
             timings: ProvisionTimings::default(),
@@ -503,7 +513,9 @@ impl ActionStep<'_> {
             now.as_ref()
                 .is_ok_and(|now| now.as_deref() == Some(change.value.as_str()))
         });
+        let names: Vec<&str> = data.settings.iter().map(|c| c.name.as_str()).collect();
         if applied {
+            self.record_written(data, &env, &names).await;
             return Ok(Then::Next("act"));
         }
         let edited: Vec<&str> = data
@@ -533,7 +545,21 @@ impl ActionStep<'_> {
         }
         let text = SecretString::from(env.to_text());
         api.update_compose_env(&url, &key, &compose, &text).await?;
+        self.record_written(data, &env, &names).await;
         Ok(Then::Next("act"))
+    }
+
+    /// Notes the variables this job wrote, so they do not show as edited
+    /// in Dokploy.
+    async fn record_written(&self, data: &ActionData, env: &EnvFile, names: &[&str]) {
+        super::env_record::record_written(
+            &self.handler.db,
+            self.handler.cipher.as_ref(),
+            data.project_id,
+            env,
+            names,
+        )
+        .await;
     }
 
     async fn dokploy(&self) -> Result<(DokployUrl, SecretString), Stop> {

@@ -10,7 +10,8 @@
 use leptos::{form::ActionForm, prelude::*};
 
 use supabase_dashboard_domain::stack_settings::{
-    SettingKind, SettingState, StackConfigPreview, StackSettingView, StackSettingsView,
+    EnvChanges, EnvTracking, SettingKind, SettingState, StackConfigPreview, StackSettingView,
+    StackSettingsView,
 };
 
 use crate::{
@@ -92,6 +93,7 @@ fn section(
             .and_then(Result::err)
             .map(|err| view! { <p class="form-error" role="alert">{err.to_string()}</p> })
     };
+    let tracking = tracking_view(view.tracking);
     let fields = view.settings.into_iter().map(field_view).collect_view();
     let summary = move || {
         if !reviewing.get() {
@@ -106,6 +108,7 @@ fn section(
             <p class="section-text">
                 "These are variables of the stack's service in Dokploy. Applying a change writes them there and redeploys the stack; only the services that read a changed setting restart. A setting changed in Dokploy meanwhile stops the change before anything is written."
             </p>
+            {tracking}
             <ActionForm action=review attr:class="stacked-form settings-form">
                 <input type="hidden" name="id" value=project.to_string()/>
                 // A review describes the values it was made from; changing
@@ -125,6 +128,60 @@ fn section(
             })}
             <div aria-live="polite">{summary}</div>
         </section>
+    }
+}
+
+/// Which variables were edited in Dokploy since the dashboard wrote
+/// them, by name.
+fn tracking_view(tracking: EnvTracking) -> impl IntoView {
+    match tracking {
+        EnvTracking::Compared(changes) if changes.is_empty() => view! {
+            <p class="field-hint">
+                "No variable of this service was changed in Dokploy since the dashboard last wrote them."
+            </p>
+        }
+        .into_any(),
+        EnvTracking::Compared(changes) => changes_view(changes).into_any(),
+        EnvTracking::NotRecorded => view! {
+            <p class="field-hint">
+                "The dashboard has no record of the variables it wrote to this service, so it cannot tell which ones were changed in Dokploy."
+            </p>
+        }
+        .into_any(),
+        EnvTracking::Unreadable => view! {
+            <p class="field-hint">
+                "The record of the variables the dashboard wrote is encrypted with a credential key this server does not have, so changes made in Dokploy cannot be shown."
+            </p>
+        }
+        .into_any(),
+    }
+}
+
+fn changes_view(changes: EnvChanges) -> impl IntoView {
+    let names = |names: Vec<String>| {
+        names
+            .into_iter()
+            .map(|name| view! { <li><code class="url-text">{name}</code></li> })
+            .collect_view()
+    };
+    let group = |title: &'static str, list: Vec<String>| {
+        (!list.is_empty()).then(|| {
+            view! {
+                <p>{title}</p>
+                <ul class="plain-list">{names(list)}</ul>
+            }
+        })
+    };
+    view! {
+        <div class="form-warning env-changes">
+            <p>
+                <strong>"Variables were changed in Dokploy"</strong>
+                " since the dashboard last wrote them. The dashboard keeps these edits; the settings below show the values in effect. Values are not shown here."
+            </p>
+            {group("Changed:", changes.changed)}
+            {group("Added:", changes.added)}
+            {group("Removed:", changes.removed)}
+        </div>
     }
 }
 

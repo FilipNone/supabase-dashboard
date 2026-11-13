@@ -260,6 +260,7 @@ impl Database {
                  SELECT key_id FROM project_credentials \
                  UNION ALL SELECT key_id FROM dokploy_connection \
                  UNION ALL SELECT key_id FROM job_secrets \
+                 UNION ALL SELECT key_id FROM project_dokploy_env_records \
              ) stored GROUP BY key_id ORDER BY key_id",
         )
         .fetch_all(&self.pool)

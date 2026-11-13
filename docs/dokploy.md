@@ -150,6 +150,12 @@ The section reads the variables and compose file with `compose.one` each time th
 
 In the browser, changing a field withdraws the review, and the section reads the settings again only when the job finishes, so focus stays on the Apply button while it runs. A locked setting shows no value, because the one Dokploy holds may not be the one in effect.
 
+### Variables edited in Dokploy
+
+The dashboard keeps a record of the variables it wrote to each provisioned service: the provisioning job records every variable it set when it registers the project, and a settings job updates the entries for the variables it wrote. The record holds a SHA-256 digest of each variable's value by name, never the value, and is stored in `project_dokploy_env_records`, sealed with the credential key and bound to the project. `rotate-secret-key` reseals it with the other stored keys.
+
+When the Stack settings section loads, the server compares the variables Dokploy has with the record and lists, by name only, the variables changed, added, or removed in Dokploy since. The dashboard keeps such edits and does not write them back. The section says so when a stack has no record (stacks provisioned before the record existed) or when the record is sealed under a key the server does not have. A settings job only refreshes the entries for the variables it wrote, so an edit to another variable stays listed. Nothing marks an edit as accepted yet, so a variable added in Dokploy is listed for as long as it exists.
+
 A removed project stays registered. Its section says when the service was removed and whether the volumes went with it; owners and admins get the volumes' name prefix to delete them on the server later. No further action can be asked for, and unregistering under Settings stays a separate step.
 
 The job gives each service the description `Supabase stack <name>, project <project ID> in supabase-dashboard`, so the service in Dokploy points to its dashboard project.

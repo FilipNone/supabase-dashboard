@@ -246,6 +246,33 @@ impl CredentialCipher {
         self.reseal_bound(&dokploy_associated_data(dokploy_url), sealed)
     }
 
+    /// Seals the record of the variables the dashboard wrote to a
+    /// project's Dokploy service, bound to the project.
+    pub fn seal_env_record(
+        &self,
+        project_id: Uuid,
+        value: &SecretString,
+    ) -> Result<Sealed, CipherError> {
+        self.seal_bound(&env_record_associated_data(project_id), value)
+    }
+
+    pub fn open_env_record(
+        &self,
+        project_id: Uuid,
+        sealed: &Sealed,
+    ) -> Result<SecretString, CipherError> {
+        self.open_bound(&env_record_associated_data(project_id), sealed)
+    }
+
+    /// [`Self::reseal`] for a project's variable record.
+    pub fn reseal_env_record(
+        &self,
+        project_id: Uuid,
+        sealed: &Sealed,
+    ) -> Result<Option<Sealed>, CipherError> {
+        self.reseal_bound(&env_record_associated_data(project_id), sealed)
+    }
+
     fn seal_bound(&self, aad: &str, value: &SecretString) -> Result<Sealed, CipherError> {
         let mut nonce_bytes = [0u8; NONCE_LEN];
         getrandom::fill(&mut nonce_bytes).map_err(|_| CipherError::Randomness)?;
@@ -310,6 +337,10 @@ fn associated_data(project_id: Uuid, kind: CredentialKind) -> String {
 
 fn job_associated_data(job_id: Uuid) -> String {
     format!("supabase-dashboard:job-secrets:v1:{job_id}")
+}
+
+fn env_record_associated_data(project_id: Uuid) -> String {
+    format!("supabase-dashboard:dokploy-env-record:v1:{project_id}")
 }
 
 fn dokploy_associated_data(dokploy_url: &str) -> String {

@@ -18,6 +18,7 @@ use supabase_dashboard_application::{
         TargetsFuture,
     },
     jobs::{JobHandler, JobRunner, RunResult, RunnerSettings},
+    key_rotation::reseal_credentials,
     provisioning::{
         ComposeApi, ComposeConfig, DokployFuture, ProvisionError, ProvisionRequest,
         ProvisionStackHandler, ProvisionTimings, ProvisioningService, StackActionHandler,
@@ -45,7 +46,7 @@ use supabase_dashboard_domain::{
     provisioning::{
         ProvisionStep, ProvisionTargets, StackAction, StackDeploymentView, TargetChoice,
     },
-    stack_settings::SettingState,
+    stack_settings::{EnvChanges, EnvTracking, SettingState},
 };
 use supabase_dashboard_persistence::{Database, accounts::AccountRecord};
 use uuid::Uuid;
@@ -629,7 +630,8 @@ async fn setup(scratch: &ScratchDb) -> Fixture {
         .with_timings(timings),
     );
     let actions: Arc<dyn JobHandler> = Arc::new(
-        StackActionHandler::new(db.clone(), dokploy.clone(), compose.clone()).with_timings(timings),
+        StackActionHandler::new(db.clone(), Some(cipher()), dokploy.clone(), compose.clone())
+            .with_timings(timings),
     );
     let runner = JobRunner::new(
         db.clone(),
@@ -720,6 +722,25 @@ async fn run_all(f: &Fixture) {
         }
     }
     panic!("the job did not finish");
+}
+
+/// Whether the owner sees variables edited in Dokploy.
+async fn tracking(f: &Fixture, project: Uuid) -> EnvTracking {
+    f.service
+        .stack_settings(&f.owner, project)
+        .await
+        .unwrap()
+        .unwrap()
+        .tracking
+}
+
+/// The key the project's variable record is sealed under.
+async fn record_key(f: &Fixture, project: Uuid) -> String {
+    sqlx::query_scalar("SELECT key_id FROM project_dokploy_env_records WHERE project_id = $1")
+        .bind(project)
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap()
 }
 
 async fn count(db: &Database, sql: &'static str) -> i64 {
@@ -1654,6 +1675,8 @@ async fn owners_change_settings_and_edits_in_dokploy_stop_the_change() {
         .unwrap();
     assert_eq!(view.settings.len(), 7);
     assert!(!view.busy);
+    // The provisioning job recorded what it wrote.
+    assert_eq!(view.tracking, EnvTracking::Compared(EnvChanges::default()));
     let value = |name: &str| {
         view.settings
             .iter()
@@ -1770,6 +1793,11 @@ async fn owners_change_settings_and_edits_in_dokploy_stop_the_change() {
         assert_eq!(state.count("update_compose_env"), 1);
         assert_eq!(state.count("redeploy_compose"), 1);
     }
+    // The dashboard's own change is not reported as an edit in Dokploy.
+    assert_eq!(
+        tracking(&f, project).await,
+        EnvTracking::Compared(EnvChanges::default())
+    );
 
     // A variable edited in Dokploy between the review and applying it
     // is not overwritten: applying is refused.
@@ -1782,6 +1810,14 @@ async fn owners_change_settings_and_edits_in_dokploy_stop_the_change() {
     if let Some((_, env)) = f.compose.state.lock().unwrap().configured.as_mut() {
         env.push_str("PGRST_DB_SCHEMAS=public\n");
     }
+    // The edit shows by name, without its value.
+    assert_eq!(
+        tracking(&f, project).await,
+        EnvTracking::Compared(EnvChanges {
+            added: vec!["PGRST_DB_SCHEMAS".to_owned()],
+            ..EnvChanges::default()
+        })
+    );
     assert!(matches!(
         f.service
             .queue_settings(&f.owner, project, &schemas, &reviewed.base, ctx())
@@ -1846,6 +1882,52 @@ async fn owners_change_settings_and_edits_in_dokploy_stop_the_change() {
             .await,
         Err(ProvisionError::SettingUnavailable(_))
     ));
+
+    // A secret changed in Dokploy is reported by name.
+    if let Some((_, env)) = f.compose.state.lock().unwrap().configured.as_mut() {
+        *env = env.replace(&format!("JWT_SECRET={secret}\n"), "JWT_SECRET=rotated\n");
+    }
+    let EnvTracking::Compared(changes) = tracking(&f, project).await else {
+        panic!("the record should be readable");
+    };
+    assert_eq!(changes.changed, ["JWT_SECRET"]);
+    assert!(changes.removed.is_empty());
+
+    // Rotating the credential key reseals the record, and rotating back
+    // leaves it readable.
+    const KEY_B: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+    let rotate = |to: &str, from: &str| {
+        let mut cipher = CredentialCipher::from_base64(&SecretString::from(to.to_owned())).unwrap();
+        cipher
+            .add_previous_keys(&SecretString::from(from.to_owned()))
+            .unwrap();
+        cipher
+    };
+    let rotated = rotate(KEY_B, KEY_A);
+    let summary = reseal_credentials(&f.db, &rotated).await.unwrap();
+    assert_eq!(summary.unreadable, 0);
+    assert_eq!(record_key(&f, project).await, rotated.key_id());
+    let back = rotate(KEY_A, KEY_B);
+    reseal_credentials(&f.db, &back).await.unwrap();
+    assert_eq!(record_key(&f, project).await, back.key_id());
+    let EnvTracking::Compared(again) = tracking(&f, project).await else {
+        panic!("the resealed record should open");
+    };
+    assert_eq!(again, changes);
+
+    // A record under a key this server lacks is reported as such.
+    sqlx::query("UPDATE project_dokploy_env_records SET key_id = 'gone'")
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(tracking(&f, project).await, EnvTracking::Unreadable);
+
+    // A stack provisioned before the record existed has none.
+    sqlx::query("DELETE FROM project_dokploy_env_records")
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(tracking(&f, project).await, EnvTracking::NotRecorded);
 
     let audited = count(
         &f.db,
