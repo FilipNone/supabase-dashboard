@@ -37,10 +37,11 @@ The client in `crates/adapters/src/dokploy.rs` uses the same connection rules as
 | `compose.deploy` | POST | `composeId`, `title` | Queue a deployment |
 | `deployment.allByCompose` | GET | `composeId` | Poll a service's deployments |
 | `domain.create` | POST | `host`, `composeId`, `domainType: compose`, `serviceName`, `port`, `https`, `certificateType`, `path` | Route a host to one service of a stack |
+| `compose.one` | GET | `composeId` | A provisioned stack's service for its project overview: name, status, project, environment, server, and deployments; 404 means Dokploy has no such service |
 
 Every list is read with a 4 MiB body bound and at most 10,000 entries. An entry that does not parse, a service type other than application or compose, an ID outside `[A-Za-z0-9_-]{1,64}`, and an empty or overlong host are skipped one at a time, so one odd entry does not hide the rest.
 
-The compose calls are in `crates/adapters/src/dokploy/compose.rs`. They are called by nothing yet; the provisioning job will use them. What they rely on, checked on the fixture with Dokploy v0.31.1:
+The compose calls are in `crates/adapters/src/dokploy/compose.rs`, used by the provisioning job and the project overview. What they rely on, checked on the fixture with Dokploy v0.31.1:
 
 - Creating a service, a mount, a domain, or a deployment is not idempotent: each repeated request makes another one, and Dokploy has no idempotency key. These requests are sent once and never retried, and a job looks the object up first.
 - Dokploy appends `-` and six random characters to the requested `appName`, so the name on disk is known only from the answer. A job finds its service again by its exact `name` in its environment. `compose.search` matches names as case-insensitive substrings and treats `%` and `_` as wildcards, so the dashboard's names use only lowercase letters, digits, and `-`, and the comparison is repeated on the dashboard's side. The search lists only services the key's member can access.
@@ -62,7 +63,6 @@ These are the calls the M4 roadmap items need, with their required inputs in v0.
 | `environment.one` | GET | `environmentId` | Environment details |
 | `compose.move` | POST | `composeId`, `targetEnvironmentId` | Not planned for the dashboard; the browser check uses it to move a service and show the Moved state |
 | `compose.search` | GET | `q`, `environmentId` | Find existing Supabase stacks to adopt |
-| `compose.one` | GET | `composeId` | Read a stack's service and status |
 | `compose.redeploy` | POST | `composeId` | Redeploy |
 | `compose.stop`, `compose.start` | POST | `composeId` | Stop and start |
 | `compose.delete` | POST | `composeId`, `deleteVolumes` | Remove a stack, keeping or destroying its volumes |
@@ -100,6 +100,19 @@ When Dokploy does not answer, the step runs again after 30 seconds, up to ten ti
 After queuing, the browser goes to the job's page (`/dashboard/org/<organization>/provisioning/<job>`), which any member of the organization can open. It shows the name, the address, the state, each step above as done, in progress, pending, failed, or not run, the job's message, and a link to the project once it is registered. While the job is unfinished the page reloads it every five seconds, and stops when it finishes or the job turns out to be missing or not allowed; a failed reload is tried again. The Projects page lists the organization's 20 latest jobs with their state. None of these show the job's saved data or secrets.
 
 Tests with a fake Dokploy cover a full run, lost answers to the create and deploy requests, a failed deployment, a stack that never answers, and an account that loses its role while the job waits.
+
+### The service on the project overview
+
+A provisioned project's overview has a **Dokploy service** section. Each time the page loads, the server reads the service with `compose.one`, by the `composeId` the job recorded, and shows:
+
+- the service name and its status in Dokploy (not deployed, deploying, deployed, or last deployment failed);
+- the five newest deployments, with their title, status, start and finish times in UTC, and whether this dashboard started them or someone started them in Dokploy (the dashboard's deployment titles start with `supabase-dashboard `);
+- a notice when the service is in another environment or on another server than the job created it in, which means it was moved in Dokploy;
+- for owners and admins, who choose where stacks go: the Dokploy project, environment, server, the service's name on the server, and a link to the service's page in Dokploy (`/dashboard/project/<project>/environment/<environment>/services/compose/<compose>`, checked on v0.31.1). The link is left out when the dashboard reaches Dokploy at a single-label host such as `http://dokploy:3000`, which a browser cannot open.
+
+When Dokploy has no service with the recorded ID, the section says it was deleted or moved out of the key's reach, and gives owners and admins the name the job gave it. When Dokploy does not answer or refuses the key, the section says so and points to the health check, which asks the stack directly. When Dokploy is no longer connected, it says that. The section is left out for registered projects. Nothing is changed in Dokploy or in the dashboard by reading it: the dashboard shows what changed instead of putting it back. Variable edits made in Dokploy are not detected yet.
+
+The job gives each service the description `Supabase stack <name>, project <project ID> in supabase-dashboard`, so the service in Dokploy points to its dashboard project.
 
 ## Connecting
 

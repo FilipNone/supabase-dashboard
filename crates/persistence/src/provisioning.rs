@@ -22,6 +22,18 @@ pub struct NewDokployService<'a> {
     pub job_id: Uuid,
 }
 
+/// The recorded Dokploy service of a provisioned project, as it was when
+/// the job created it.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct StoredDokployService {
+    pub compose_id: String,
+    pub app_name: String,
+    pub environment_id: String,
+    pub server_id: Option<String>,
+    pub job_id: Uuid,
+    pub created_at: time::OffsetDateTime,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegisterProvisionedOutcome {
     Created,
@@ -140,6 +152,22 @@ impl Database {
         )
         .bind(job_ids)
         .fetch_all(&self.pool)
+        .await
+        .map_err(query_err)
+    }
+
+    /// The Dokploy service recorded for a project, or `None` for a project
+    /// the dashboard did not provision.
+    pub async fn find_project_dokploy_service(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Option<StoredDokployService>, PersistenceError> {
+        sqlx::query_as(
+            "SELECT compose_id, app_name, environment_id, server_id, job_id, created_at \
+             FROM project_dokploy_services WHERE project_id = $1",
+        )
+        .bind(project_id)
+        .fetch_optional(&self.pool)
         .await
         .map_err(query_err)
     }

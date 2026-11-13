@@ -36,14 +36,18 @@ use supabase_dashboard_domain::{
     connection::{CredentialKind, ServiceStatus, StackService, check_studio_login},
     dokploy::{DokployError, DokployUrl},
     dokploy_compose::{
-        DeploymentStatus, NewCompose, NewComposeDomain, check_stack_host, compose_name_for_job,
+        ComposeDetails, DASHBOARD_DEPLOYMENT_TITLE_PREFIX, DeploymentStatus, NewCompose,
+        NewComposeDomain, check_stack_host, compose_name_for_job, is_dashboard_deployment,
     },
     dokploy_placement::DokployId,
     dokploy_target::{DefaultTarget, StackTarget},
     job::JobKind,
     job::JobState,
     project::{MAX_PROJECTS_PER_ORGANIZATION, ProjectInputError, ProjectName, ProjectUrl},
-    provisioning::{ProvisionJobSummary, ProvisionStep, ProvisionTargets, TargetChoice},
+    provisioning::{
+        ProvisionJobSummary, ProvisionStep, ProvisionTargets, StackDeployment, StackDeploymentRun,
+        StackDeploymentView, StackLocation, TargetChoice,
+    },
 };
 use supabase_dashboard_persistence::{
     Database, PersistenceError,
@@ -51,7 +55,7 @@ use supabase_dashboard_persistence::{
     connections::NewCredential,
     jobs::{NewJob, SealedJobSecrets, StoredJob},
     projects::NewProject,
-    provisioning::{NewDokployService, RegisterProvisionedOutcome},
+    provisioning::{NewDokployService, RegisterProvisionedOutcome, StoredDokployService},
 };
 use uuid::Uuid;
 
@@ -190,7 +194,7 @@ impl JobData {
     }
 
     fn deploy_title(job_id: Uuid) -> String {
-        format!("supabase-dashboard provision {job_id}")
+        format!("{DASHBOARD_DEPLOYMENT_TITLE_PREFIX}provision {job_id}")
     }
 }
 
@@ -199,6 +203,9 @@ pub struct ProvisioningService {
     db: Database,
     cipher: Option<CredentialCipher>,
     dokploy: Arc<DokployService>,
+    /// Reads provisioned stacks' services. `None` until the server wires
+    /// the Dokploy client in.
+    compose: Option<Arc<dyn ComposeApi>>,
 }
 
 impl ProvisioningService {
@@ -211,7 +218,15 @@ impl ProvisioningService {
             db,
             cipher,
             dokploy,
+            compose: None,
         }
+    }
+
+    /// Lets the service read provisioned stacks' services from Dokploy.
+    #[must_use]
+    pub fn with_compose(mut self, compose: Arc<dyn ComposeApi>) -> Self {
+        self.compose = Some(compose);
+        self
     }
 
     /// Queues a new stack in `organization_id` and returns the job's ID.
@@ -398,6 +413,66 @@ impl ProvisioningService {
             .collect())
     }
 
+    /// The Dokploy service behind a project the dashboard provisioned, as
+    /// Dokploy reports it now, for members of the project's organization.
+    /// Where the service is and the link to it are for owners and admins,
+    /// who choose where stacks go. Dokploy is asked on every call, so
+    /// redeploys, moves, and deletions made in Dokploy show up; a failed
+    /// call is reported in the answer, not as an error.
+    pub async fn deployment(
+        &self,
+        current: &CurrentSession,
+        project_id: Uuid,
+    ) -> Result<StackDeploymentView, ProvisionError> {
+        let access = self
+            .db
+            .find_project_access(project_id, current.account.id)
+            .await?
+            .ok_or(ProvisionError::NotFound)?;
+        if !access.role.allows(Permission::ProjectRead) {
+            return Err(ProvisionError::Forbidden);
+        }
+        let manager = access.role.allows(Permission::ProjectRegister);
+        let Some(stored) = self.db.find_project_dokploy_service(project_id).await? else {
+            return Ok(StackDeploymentView::NotProvisioned);
+        };
+        let credentials = match self.dokploy.credentials().await {
+            Ok(Some(credentials)) => credentials,
+            Ok(None) | Err(DokployServiceError::NotConnected) => {
+                return Ok(StackDeploymentView::NotConnected);
+            }
+            Err(err) => return Err(err.into()),
+        };
+        let Some(compose) = self.compose.as_ref() else {
+            return Ok(StackDeploymentView::Unavailable {
+                reason: "This server does not read Dokploy services.".to_owned(),
+            });
+        };
+        let compose_id = DokployId::parse(&stored.compose_id)
+            .map_err(|_| ProvisionError::Internal("unreadable Dokploy service ID".to_owned()))?;
+        let details = match compose
+            .compose_details(&credentials.url, &credentials.key, &compose_id)
+            .await
+        {
+            Ok(Some(details)) => details,
+            Ok(None) => {
+                return Ok(StackDeploymentView::Missing {
+                    compose_name: manager.then(|| compose_name_for_job(stored.job_id)),
+                });
+            }
+            Err(err) => {
+                return Ok(StackDeploymentView::Unavailable {
+                    reason: err.to_string(),
+                });
+            }
+        };
+        Ok(StackDeploymentView::Found(Box::new(stack_deployment(
+            &stored,
+            details,
+            manager.then_some(&credentials.url),
+        ))))
+    }
+
     /// The operator's membership allows `permission`. A non-member gets
     /// [`ProvisionError::NotFound`].
     async fn require(
@@ -436,6 +511,55 @@ fn summary(job: StoredJob, project_id: Option<Uuid>) -> Option<ProvisionJobSumma
         updated_at: job.updated_at,
         finished_at: job.finished_at,
     })
+}
+
+/// Most deployments listed for a provisioned project.
+const MAX_LISTED_DEPLOYMENTS: usize = 5;
+
+/// What members see of a service Dokploy reported. `dokploy_url` is set
+/// for owners and admins, who also see where the service is.
+fn stack_deployment(
+    stored: &StoredDokployService,
+    details: ComposeDetails,
+    dokploy_url: Option<&DokployUrl>,
+) -> StackDeployment {
+    let moved = details.environment_id.as_str() != stored.environment_id
+        || details.server_id.as_ref().map(DokployId::as_str) != stored.server_id.as_deref();
+    let location = dokploy_url.map(|url| StackLocation {
+        dokploy_link: (!url.is_internal_name()).then(|| {
+            url.compose_page(
+                &details.project_id,
+                &details.environment_id,
+                &details.compose_id,
+            )
+        }),
+        project_name: details.project_name.clone(),
+        environment_name: details.environment_name.clone(),
+        server_name: details.server_name.clone(),
+        compose_id: details.compose_id.as_str().to_owned(),
+        app_name: details.app_name.clone(),
+    });
+    let more_deployments = details.deployments.len() > MAX_LISTED_DEPLOYMENTS;
+    let deployments = details
+        .deployments
+        .into_iter()
+        .take(MAX_LISTED_DEPLOYMENTS)
+        .map(|run| StackDeploymentRun {
+            from_dashboard: is_dashboard_deployment(run.title.as_deref()),
+            title: run.title,
+            status: run.status,
+            created_at: run.created_at,
+            finished_at: run.finished_at,
+        })
+        .collect();
+    StackDeployment {
+        name: details.name,
+        status: details.status,
+        moved,
+        location,
+        deployments,
+        more_deployments,
+    }
 }
 
 fn target_allowed(targets: &EffectiveTargets, target: &StackTarget) -> bool {
@@ -735,7 +859,12 @@ impl Step<'_> {
                         })?),
                         None => None,
                     };
-                let description = format!("Supabase stack {} (supabase-dashboard)", data.name);
+                // Points back to the dashboard project the stack will be
+                // registered as, whose ID is fixed when the job is queued.
+                let description = format!(
+                    "Supabase stack {}, project {} in supabase-dashboard",
+                    data.name, data.project_id
+                );
                 api.create_compose(
                     &url,
                     &key,

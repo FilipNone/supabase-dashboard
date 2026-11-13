@@ -26,6 +26,7 @@ use crate::{
     pages::{
         project_connect::ConnectPanel,
         project_connection::{ApiKeysPanel, HealthPanel, StudioAccessPanel, StudioLoginPanel},
+        project_deployment::DeploymentPanel,
         project_trust::AuthoritiesPanel,
     },
     server_fns::{
@@ -560,6 +561,7 @@ pub fn ProjectOverviewPage() -> impl IntoView {
                 </section>
                 {view! { <SetupChecklist project=project.clone()/> }.into_any()}
                 {view! { <HealthPanel project=project.clone()/> }.into_any()}
+                {view! { <DeploymentPanel project=project.clone()/> }.into_any()}
                 {view! { <ConnectPanel project=project.clone()/> }.into_any()}
             }
             .into_any()

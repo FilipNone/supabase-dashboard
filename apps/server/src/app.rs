@@ -193,9 +193,9 @@ mod tests {
             ClearDokployPlacement, ConfirmDokployPlacement, ConnectDokploy, CreateInvitation,
             CreateOrganization, DisconnectDokploy, GetCurrentAccount, GetDokployConnection,
             GetDokployPlacement, GetInstallationHealth, GetOrganization, GetProject,
-            GetProjectAuthorities, GetProjectCredentials, GetProjectHealth, GetProvisionJob,
-            GetProvisionTargets, GetStudioAccessLog, ListOrganizations, ListProjects,
-            ListProvisionJobs, ListSessions, PreviewInvitation, RegisterProject,
+            GetProjectAuthorities, GetProjectCredentials, GetProjectDeployment, GetProjectHealth,
+            GetProvisionJob, GetProvisionTargets, GetStudioAccessLog, ListOrganizations,
+            ListProjects, ListProvisionJobs, ListSessions, PreviewInvitation, RegisterProject,
             RemoveProjectAuthorities, RemoveProjectCredential, RenameOrganization,
             ReplaceDokployKey, ReplaceProjectAuthorities, ReplaceProjectCredential,
             ReplaceStudioLogin, RevokeSession, SignUpWithInvitation, StartProvisioning,
@@ -1007,6 +1007,90 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(jobs, 1);
+
+        db.close().await;
+        scratch.drop().await;
+    }
+
+    #[tokio::test]
+    async fn the_dokploy_service_panel_follows_membership() {
+        let Some(scratch) = ScratchDb::create("http_project_deployment").await else {
+            return;
+        };
+        let db = Database::connect(&scratch.settings).await.unwrap();
+        db.migrate().await.unwrap();
+        let router = router_with_cipher(db.clone(), Some(test_cipher())).await;
+        let (alice, bob) = admin_and_member(&db, &router).await;
+        let call = |body: String, cookie: &str| {
+            send(
+                &router,
+                form_post(GetProjectDeployment::PATH, &body, Some(cookie)),
+            )
+        };
+        let (_, body) = send(
+            &router,
+            form_post(CreateOrganization::PATH, "name=Acme", Some(&alice)),
+        )
+        .await;
+        let org: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let org_id = org["id"].as_str().unwrap().to_owned();
+        // One registered project and one the dashboard provisioned.
+        let registered = uuid::Uuid::now_v7().to_string();
+        let provisioned = uuid::Uuid::now_v7().to_string();
+        for (id, name) in [(&registered, "Registered"), (&provisioned, "Provisioned")] {
+            sqlx::query(
+                "INSERT INTO projects (id, organization_id, name, api_url) \
+                 VALUES ($1::uuid, $2::uuid, $3, 'https://stack.example.test')",
+            )
+            .bind(id)
+            .bind(&org_id)
+            .bind(name)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO project_dokploy_services \
+             (project_id, compose_id, app_name, environment_id, job_id) \
+             VALUES ($1::uuid, 'composeMarker1', 'sd-app-marker', 'envMarker1', $2)",
+        )
+        .bind(&provisioned)
+        .bind(uuid::Uuid::now_v7())
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        // Bob is not a member: the project answers as a made-up one would.
+        for id in [provisioned.clone(), uuid::Uuid::now_v7().to_string()] {
+            let (parts, body) = call(format!("id={id}"), &bob).await;
+            assert_eq!(parts.status, StatusCode::NOT_FOUND, "{body}");
+            assert!(!body.contains("Marker"), "{body}");
+        }
+
+        // As a viewer he sees the service's state. Dokploy is not
+        // connected here, so there is nothing to read from it.
+        sqlx::query(
+            "INSERT INTO organization_members (organization_id, account_id, role) \
+             SELECT $1::uuid, id, 'viewer' FROM accounts WHERE email = 'bob@example.test'",
+        )
+        .bind(&org_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let (parts, body) = call(format!("id={provisioned}"), &bob).await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        assert_eq!(body, r#"{"kind":"not_connected"}"#);
+        let (parts, body) = call(format!("id={registered}"), &bob).await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        assert_eq!(body, r#"{"kind":"not_provisioned"}"#);
+
+        let page = format!("/dashboard/org/{org_id}/projects/{provisioned}");
+        // The panel loads after the page; the page itself carries none of
+        // the recorded service's IDs.
+        let (parts, body) = send(&router, get_with_cookie(&page, &bob)).await;
+        assert_eq!(parts.status, StatusCode::OK);
+        assert!(body.contains("Loading the Dokploy service"), "{body}");
+        assert!(!body.contains("Marker"), "{body}");
 
         db.close().await;
         scratch.drop().await;

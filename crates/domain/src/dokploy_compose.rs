@@ -6,6 +6,9 @@
 //! service. The dashboard reads only the fields below and never keeps the
 //! rest.
 
+use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
+
 use crate::dokploy_placement::DokployId;
 
 /// Longest compose service name the dashboard gives, within Dokploy's 63.
@@ -42,7 +45,8 @@ pub struct FileMount {
     pub content: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DeploymentStatus {
     Running,
     Done,
@@ -64,7 +68,92 @@ impl DeploymentStatus {
     pub fn is_finished(self) -> bool {
         !matches!(self, Self::Running)
     }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Running => "Running",
+            Self::Done => "Done",
+            Self::Error => "Failed",
+            Self::Cancelled => "Cancelled",
+        }
+    }
 }
+
+/// What Dokploy reports about a compose service as a whole: the outcome
+/// of its latest deployment, or `Idle` before the first one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComposeStatus {
+    Idle,
+    Running,
+    Done,
+    Error,
+}
+
+impl ComposeStatus {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "idle" => Some(Self::Idle),
+            "running" => Some(Self::Running),
+            "done" => Some(Self::Done),
+            "error" => Some(Self::Error),
+            _ => None,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "Not deployed",
+            Self::Running => "Deploying",
+            Self::Done => "Deployed",
+            Self::Error => "Last deployment failed",
+        }
+    }
+}
+
+/// How the dashboard titles the deployments it starts. Deployments with
+/// other titles were started in Dokploy, by a person or a webhook.
+pub const DASHBOARD_DEPLOYMENT_TITLE_PREFIX: &str = "supabase-dashboard ";
+
+/// Whether a deployment title is one the dashboard gives.
+pub fn is_dashboard_deployment(title: Option<&str>) -> bool {
+    title.is_some_and(|title| title.starts_with(DASHBOARD_DEPLOYMENT_TITLE_PREFIX))
+}
+
+/// One deployment as `compose.one` lists it, with its times.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentRecord {
+    pub deployment_id: DokployId,
+    pub title: Option<String>,
+    pub status: DeploymentStatus,
+    pub created_at: Option<OffsetDateTime>,
+    pub finished_at: Option<OffsetDateTime>,
+}
+
+/// A compose service as `compose.one` describes it: where it is, its
+/// status, and its deployments. The answer also carries the service's
+/// variables and compose file; those are never read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposeDetails {
+    pub compose_id: DokployId,
+    pub name: String,
+    pub app_name: String,
+    pub description: Option<String>,
+    /// `None` for a status this version does not know.
+    pub status: Option<ComposeStatus>,
+    pub environment_id: DokployId,
+    pub environment_name: String,
+    pub project_id: DokployId,
+    pub project_name: String,
+    /// `None` for Dokploy's own server.
+    pub server_id: Option<DokployId>,
+    pub server_name: Option<String>,
+    /// Newest first, at most [`MAX_DEPLOYMENTS_READ`].
+    pub deployments: Vec<DeploymentRecord>,
+}
+
+/// Most deployments read from one `compose.one` answer.
+pub const MAX_DEPLOYMENTS_READ: usize = 10;
 
 /// One deployment of a compose service. Dokploy queues a deployment
 /// without returning an ID, and the row appears only once it starts, so a

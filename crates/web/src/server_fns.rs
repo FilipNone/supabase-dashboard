@@ -23,7 +23,7 @@ use supabase_dashboard_domain::{
     invitation::{InvitationCode, InvitationPreview, InvitationSummary, IssuedInvitation},
     organization::{MemberSummary, OrganizationSummary},
     project::ProjectSummary,
-    provisioning::{ProvisionJobSummary, ProvisionTargets},
+    provisioning::{ProvisionJobSummary, ProvisionTargets, StackDeploymentView},
     studio_access::StudioAccessLog,
 };
 use uuid::Uuid;
@@ -450,6 +450,17 @@ pub async fn start_provisioning(
 pub async fn get_provision_job(id: Uuid) -> Result<ProvisionJobSummary, AppError> {
     let session = org_context::session()?;
     Ok(org_context::provisioning()?.job(&session, id).await?)
+}
+
+/// The Dokploy service behind a provisioned project, as Dokploy reports
+/// it now. Members of the project's organization; only owners and admins
+/// see where it runs.
+#[server]
+pub async fn get_project_deployment(id: Uuid) -> Result<StackDeploymentView, AppError> {
+    let session = org_context::session()?;
+    Ok(org_context::provisioning()?
+        .deployment(&session, id)
+        .await?)
 }
 
 /// An organization's latest provisioning jobs, newest first.

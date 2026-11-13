@@ -14,7 +14,8 @@ use serde::Deserialize;
 use supabase_dashboard_domain::{
     dokploy::{DokployError, DokployUrl},
     dokploy_compose::{
-        ComposeDomain, ComposeService, DeploymentInfo, DeploymentStatus, FileMount, NewCompose,
+        ComposeDetails, ComposeDomain, ComposeService, ComposeStatus, DeploymentInfo,
+        DeploymentRecord, DeploymentStatus, FileMount, MAX_DEPLOYMENTS_READ, NewCompose,
         NewComposeDomain, is_dashboard_compose_name, is_file_mount_path,
     },
     dokploy_placement::DokployId,
@@ -287,6 +288,39 @@ impl DokployClient {
             .collect())
     }
 
+    /// Where `compose_id` is, its status, and its latest deployments
+    /// (`compose.one`), or `None` when Dokploy has no such service. The
+    /// answer also holds the service's variables and compose file in plain
+    /// text; only the fields of [`ComposeDetails`] are read.
+    pub async fn compose_details(
+        &self,
+        url: &DokployUrl,
+        key: &SecretString,
+        compose_id: &DokployId,
+    ) -> Result<Option<ComposeDetails>, DokployError> {
+        let body = match self
+            .send(
+                url,
+                "compose.one",
+                key,
+                Input::Get(&[("composeId", compose_id.as_str())]),
+                MAX_LIST_BODY_BYTES,
+            )
+            .await
+        {
+            Ok(body) => body,
+            Err(DokployError::Http(404)) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let raw: RawComposeOne =
+            serde_json::from_slice(&body).map_err(|_| DokployError::InvalidResponse)?;
+        let details = raw.into_details().ok_or(DokployError::InvalidResponse)?;
+        if details.compose_id != *compose_id {
+            return Err(DokployError::InvalidResponse);
+        }
+        Ok(Some(details))
+    }
+
     /// The domains of `compose_id` (`domain.byComposeId`).
     pub async fn compose_domains(
         &self,
@@ -371,6 +405,98 @@ impl RawCompose {
             app_name: bounded(self.app_name)?,
         })
     }
+}
+
+/// The fields of a `compose.one` answer the dashboard reads, as of
+/// Dokploy v0.31.1. The variables and the compose file are not among them.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawComposeOne {
+    compose_id: String,
+    name: String,
+    app_name: String,
+    description: Option<String>,
+    compose_status: Option<String>,
+    environment_id: String,
+    server_id: Option<String>,
+    environment: RawEnvironment,
+    server: Option<RawNamed>,
+    #[serde(default)]
+    deployments: Vec<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawEnvironment {
+    name: String,
+    project_id: String,
+    project: RawNamed,
+}
+
+#[derive(Deserialize)]
+struct RawNamed {
+    name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawDeploymentRow {
+    deployment_id: String,
+    title: Option<String>,
+    status: String,
+    created_at: Option<String>,
+    finished_at: Option<String>,
+}
+
+impl RawComposeOne {
+    fn into_details(self) -> Option<ComposeDetails> {
+        let mut deployments: Vec<DeploymentRecord> = self
+            .deployments
+            .into_iter()
+            .filter_map(|row| serde_json::from_value::<RawDeploymentRow>(row).ok())
+            .filter_map(RawDeploymentRow::into_record)
+            .collect();
+        // Newest first, whatever order Dokploy sends them in; rows without
+        // a time go last.
+        deployments.sort_by_key(|run| std::cmp::Reverse(run.created_at));
+        deployments.truncate(MAX_DEPLOYMENTS_READ);
+        Some(ComposeDetails {
+            compose_id: DokployId::parse(&self.compose_id).ok()?,
+            name: bounded(self.name)?,
+            app_name: bounded(self.app_name)?,
+            description: self.description.and_then(bounded),
+            status: self
+                .compose_status
+                .as_deref()
+                .and_then(ComposeStatus::parse),
+            environment_id: DokployId::parse(&self.environment_id).ok()?,
+            environment_name: bounded(self.environment.name)?,
+            project_id: DokployId::parse(&self.environment.project_id).ok()?,
+            project_name: bounded(self.environment.project.name)?,
+            server_id: match self.server_id.as_deref() {
+                Some(raw) => Some(DokployId::parse(raw).ok()?),
+                None => None,
+            },
+            server_name: self.server.and_then(|server| bounded(server.name)),
+            deployments,
+        })
+    }
+}
+
+impl RawDeploymentRow {
+    fn into_record(self) -> Option<DeploymentRecord> {
+        Some(DeploymentRecord {
+            deployment_id: DokployId::parse(&self.deployment_id).ok()?,
+            title: self.title.and_then(bounded),
+            status: DeploymentStatus::parse(&self.status)?,
+            created_at: self.created_at.as_deref().and_then(parse_time),
+            finished_at: self.finished_at.as_deref().and_then(parse_time),
+        })
+    }
+}
+
+fn parse_time(raw: &str) -> Option<time::OffsetDateTime> {
+    time::OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339).ok()
 }
 
 #[derive(Deserialize)]
@@ -572,5 +698,14 @@ impl ComposeApi for DokployClient {
         compose_id: &'a DokployId,
     ) -> DokployFuture<'a, Vec<DeploymentInfo>> {
         Box::pin(DokployClient::deployments(self, url, key, compose_id))
+    }
+
+    fn compose_details<'a>(
+        &'a self,
+        url: &'a DokployUrl,
+        key: &'a SecretString,
+        compose_id: &'a DokployId,
+    ) -> DokployFuture<'a, Option<ComposeDetails>> {
+        Box::pin(DokployClient::compose_details(self, url, key, compose_id))
     }
 }

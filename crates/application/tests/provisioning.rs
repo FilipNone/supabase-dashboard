@@ -32,8 +32,8 @@ use supabase_dashboard_domain::{
     connection::{ServiceCheck, ServiceStatus, StackService, UnreachableReason},
     dokploy::{DokployError, DokployUrl, TESTED_DOKPLOY_VERSION},
     dokploy_compose::{
-        ComposeDomain, ComposeService, DeploymentInfo, DeploymentStatus, FileMount, NewCompose,
-        NewComposeDomain,
+        ComposeDetails, ComposeDomain, ComposeService, ComposeStatus, DeploymentInfo,
+        DeploymentRecord, DeploymentStatus, FileMount, NewCompose, NewComposeDomain,
     },
     dokploy_placement::{
         DokployDomainInfo, DokployId, DokployInventory, DokployServiceInfo, DokployServiceKind,
@@ -42,7 +42,7 @@ use supabase_dashboard_domain::{
     dokploy_target::{DokployEnvironmentInfo, DokployTargetInventory},
     job::JobState,
     project::ProjectUrl,
-    provisioning::{ProvisionStep, ProvisionTargets, TargetChoice},
+    provisioning::{ProvisionStep, ProvisionTargets, StackDeploymentView, TargetChoice},
 };
 use supabase_dashboard_persistence::{Database, accounts::AccountRecord};
 use uuid::Uuid;
@@ -158,6 +158,10 @@ struct ComposeState {
     lose_create_answer: bool,
     /// Queue the deployment, then answer as if the connection dropped.
     lose_deploy_answer: bool,
+    /// What `compose_details` answers with instead of the service.
+    details_error: Option<DokployError>,
+    /// The description each service was created with.
+    descriptions: Vec<String>,
     next_id: u32,
 }
 
@@ -215,6 +219,7 @@ impl ComposeApi for FakeCompose {
             environment_id: new.environment_id.clone(),
         };
         state.services.push(service.clone());
+        state.descriptions.push(new.description.to_owned());
         let answer = if state.lose_create_answer {
             state.lose_create_answer = false;
             Err(lost())
@@ -357,6 +362,48 @@ impl ComposeApi for FakeCompose {
         }
         Box::pin(async move { Ok(answer) })
     }
+
+    fn compose_details<'a>(
+        &'a self,
+        _url: &'a DokployUrl,
+        key: &'a SecretString,
+        compose_id: &'a DokployId,
+    ) -> DokployFuture<'a, Option<ComposeDetails>> {
+        let mut state = self.state.lock().unwrap();
+        state.call("compose_details", key);
+        let answer = match state.details_error.clone() {
+            Some(err) => Err(err),
+            None => Ok(state
+                .services
+                .iter()
+                .find(|s| &s.compose_id == compose_id)
+                .map(|s| ComposeDetails {
+                    compose_id: s.compose_id.clone(),
+                    name: s.name.clone(),
+                    app_name: s.app_name.clone(),
+                    description: state.descriptions.first().cloned(),
+                    status: Some(ComposeStatus::Done),
+                    environment_id: s.environment_id.clone(),
+                    environment_name: s.environment_id.as_str().to_owned(),
+                    project_id: id("proj1"),
+                    project_name: "Infra".to_owned(),
+                    server_id: None,
+                    server_name: None,
+                    deployments: state
+                        .deployments
+                        .iter()
+                        .map(|d| DeploymentRecord {
+                            deployment_id: d.deployment_id.clone(),
+                            title: d.title.clone(),
+                            status: d.status,
+                            created_at: None,
+                            finished_at: None,
+                        })
+                        .collect(),
+                })),
+        };
+        Box::pin(async move { answer })
+    }
 }
 
 /// Answers health checks, and records the URL and key of each.
@@ -461,7 +508,8 @@ async fn setup(scratch: &ScratchDb) -> Fixture {
             idle_poll: Duration::from_millis(10),
         },
     );
-    let service = ProvisioningService::new(db.clone(), Some(cipher()), dokploy);
+    let service =
+        ProvisioningService::new(db.clone(), Some(cipher()), dokploy).with_compose(compose.clone());
     let owner = account(&db, "Olivia", false).await;
     let organization = Uuid::now_v7();
     sqlx::query("INSERT INTO organizations (id, name) VALUES ($1, 'Acme')")
@@ -919,4 +967,160 @@ async fn members_see_targets_and_progress_by_their_role() {
         f.service.job(&f.owner, Uuid::now_v7()).await,
         Err(ProvisionError::NotFound)
     ));
+}
+
+#[tokio::test]
+async fn members_see_the_service_as_dokploy_reports_it_now() {
+    let Some(scratch) = ScratchDb::create("provision_deployment").await else {
+        return;
+    };
+    let f = setup(&scratch).await;
+    let dev = account(&f.db, "Dev", false).await;
+    add_member(&f.db, f.organization, &dev, OrgRole::Developer).await;
+    let stranger = account(&f.db, "Stranger", false).await;
+
+    // A registered project has no Dokploy service.
+    let registered = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO projects (id, organization_id, name, api_url) \
+         VALUES ($1, $2, 'Old', 'https://old.example.test')",
+    )
+    .bind(registered)
+    .bind(f.organization)
+    .execute(f.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        f.service.deployment(&dev, registered).await.unwrap(),
+        StackDeploymentView::NotProvisioned
+    );
+
+    let job = f
+        .service
+        .start(&f.owner, f.organization, shop(), ctx())
+        .await
+        .unwrap();
+    run_all(&f).await;
+    let project = f
+        .service
+        .job(&f.owner, job)
+        .await
+        .unwrap()
+        .project_id
+        .unwrap();
+    let compose_id = f.compose.state.lock().unwrap().services[0]
+        .compose_id
+        .clone();
+
+    let StackDeploymentView::Found(owner_view) =
+        f.service.deployment(&f.owner, project).await.unwrap()
+    else {
+        panic!("the owner should see the service");
+    };
+    assert_eq!(owner_view.name, format!("sd-{}", job.simple()));
+    assert_eq!(owner_view.status, Some(ComposeStatus::Done));
+    assert!(!owner_view.moved);
+    let location = owner_view.location.clone().unwrap();
+    assert_eq!(location.project_name, "Infra");
+    assert_eq!(location.environment_name, "prod");
+    assert_eq!(location.compose_id, compose_id.as_str());
+    assert_eq!(
+        location.dokploy_link.as_deref(),
+        Some(
+            format!(
+                "{URL}/dashboard/project/proj1/environment/prod/services/compose/{}",
+                compose_id.as_str()
+            )
+            .as_str()
+        )
+    );
+    assert_eq!(owner_view.deployments.len(), 1);
+    assert!(owner_view.deployments[0].from_dashboard);
+    assert!(!owner_view.more_deployments);
+
+    // Developers see the status and deployments, not where it runs.
+    let StackDeploymentView::Found(dev_view) = f.service.deployment(&dev, project).await.unwrap()
+    else {
+        panic!("a developer should see the service");
+    };
+    assert_eq!(dev_view.location, None);
+    assert_eq!(dev_view.deployments, owner_view.deployments);
+    assert!(matches!(
+        f.service.deployment(&stranger, project).await,
+        Err(ProvisionError::NotFound)
+    ));
+
+    // A redeploy in Dokploy and a move to another environment show up.
+    {
+        let mut state = f.compose.state.lock().unwrap();
+        state.deployments.insert(
+            0,
+            DeploymentInfo {
+                deployment_id: id("manual1"),
+                title: Some("Manual deployment".to_owned()),
+                status: DeploymentStatus::Error,
+            },
+        );
+        state.services[0].environment_id = id("stacks");
+    }
+    let StackDeploymentView::Found(changed) =
+        f.service.deployment(&f.owner, project).await.unwrap()
+    else {
+        panic!("the service should still be found");
+    };
+    assert!(changed.moved);
+    assert_eq!(changed.location.unwrap().environment_name, "stacks");
+    assert!(!changed.deployments[0].from_dashboard);
+    assert_eq!(changed.deployments[0].status, DeploymentStatus::Error);
+    assert!(changed.deployments[1].from_dashboard);
+
+    // Dokploy refusing the key is reported, not raised.
+    f.compose.state.lock().unwrap().details_error = Some(DokployError::KeyRejected);
+    let StackDeploymentView::Unavailable { reason } =
+        f.service.deployment(&dev, project).await.unwrap()
+    else {
+        panic!("a refused key should be reported");
+    };
+    assert!(reason.contains("refused the API key"));
+    assert!(!reason.contains(DOKPLOY_KEY));
+
+    // A service deleted in Dokploy is reported; owners get its name.
+    {
+        let mut state = f.compose.state.lock().unwrap();
+        state.details_error = None;
+        state.services.clear();
+    }
+    assert_eq!(
+        f.service.deployment(&f.owner, project).await.unwrap(),
+        StackDeploymentView::Missing {
+            compose_name: Some(format!("sd-{}", job.simple()))
+        }
+    );
+    assert_eq!(
+        f.service.deployment(&dev, project).await.unwrap(),
+        StackDeploymentView::Missing { compose_name: None }
+    );
+
+    // Without the connection there is nothing to ask.
+    let admin = account(&f.db, "Admin2", true).await;
+    let dokploy = DokployService::new(
+        f.db.clone(),
+        Some(CredentialCipher::from_base64(&SecretString::from(KEY_A)).unwrap()),
+        Arc::new(FakeConnector),
+    );
+    dokploy.remove(&admin, ctx()).await.unwrap();
+    assert_eq!(
+        f.service.deployment(&dev, project).await.unwrap(),
+        StackDeploymentView::NotConnected
+    );
+    // The key was only ever sent to Dokploy, never shown.
+    assert!(
+        f.compose
+            .state
+            .lock()
+            .unwrap()
+            .keys
+            .iter()
+            .all(|key| key == DOKPLOY_KEY)
+    );
 }

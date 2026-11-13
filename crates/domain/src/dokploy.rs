@@ -12,7 +12,10 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use crate::{account::DisplayName, connection::UnreachableReason, project::ProjectUrl};
+use crate::{
+    account::DisplayName, connection::UnreachableReason, dokploy_placement::DokployId,
+    project::ProjectUrl,
+};
 
 /// The Dokploy release the provider tests run against
 /// (`tests/fixtures/dokploy`).
@@ -70,6 +73,33 @@ impl DokployUrl {
     /// The URL of one API call, such as `settings.getDokployVersion`.
     pub fn api(&self, call: &str) -> String {
         format!("{}/api/{call}", self.as_str())
+    }
+
+    /// The page of a compose service in Dokploy's UI, as of v0.31.1.
+    pub fn compose_page(
+        &self,
+        project_id: &DokployId,
+        environment_id: &DokployId,
+        compose_id: &DokployId,
+    ) -> String {
+        format!(
+            "{}/dashboard/project/{}/environment/{}/services/compose/{}",
+            self.as_str(),
+            project_id.as_str(),
+            environment_id.as_str(),
+            compose_id.as_str()
+        )
+    }
+
+    /// Whether the host is a single-label name other than `localhost`,
+    /// such as `dokploy` on `dokploy-network`: an address only containers
+    /// on that network resolve, so a browser link to it would not work.
+    pub fn is_internal_name(&self) -> bool {
+        let host = self.host();
+        !host.is_empty()
+            && !host.contains('.')
+            && !host.contains(':')
+            && !host.eq_ignore_ascii_case("localhost")
     }
 }
 
@@ -243,6 +273,37 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn compose_pages_and_internal_names() {
+        let id = |raw: &str| DokployId::parse(raw).unwrap();
+        let url = DokployUrl::parse("https://dokploy.example.com").unwrap();
+        assert_eq!(
+            url.compose_page(&id("p1"), &id("e1"), &id("c1")),
+            "https://dokploy.example.com/dashboard/project/p1/environment/e1/services/compose/c1"
+        );
+        assert!(!url.is_internal_name());
+        assert!(
+            DokployUrl::parse("http://dokploy:3000")
+                .unwrap()
+                .is_internal_name()
+        );
+        assert!(
+            !DokployUrl::parse("http://localhost:3000")
+                .unwrap()
+                .is_internal_name()
+        );
+        assert!(
+            !DokployUrl::parse("http://127.0.0.1:3000")
+                .unwrap()
+                .is_internal_name()
+        );
+        assert!(
+            !DokployUrl::parse("http://[::1]:3000")
+                .unwrap()
+                .is_internal_name()
+        );
+    }
 
     #[test]
     fn versions_are_read_with_or_without_the_v() {

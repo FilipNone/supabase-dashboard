@@ -245,7 +245,7 @@ async fn fixture_dokploy_lists_environments_and_servers_and_creates_an_environme
 async fn fixture_dokploy_creates_configures_and_deploys_a_compose_service() {
     use std::time::Duration;
     use supabase_dashboard_domain::{
-        dokploy_compose::{DeploymentStatus, NewCompose, NewComposeDomain},
+        dokploy_compose::{ComposeStatus, DeploymentStatus, NewCompose, NewComposeDomain},
         dokploy_placement::DokployId,
     };
 
@@ -353,12 +353,43 @@ async fn fixture_dokploy_creates_configures_and_deploys_a_compose_service() {
     }
     assert_eq!(status, Some(DeploymentStatus::Done));
 
+    // The service's place and history, as the project overview reads them.
+    let details = client
+        .compose_details(&url, &key, &compose)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(details.name, name);
+    assert_eq!(details.app_name, service.app_name);
+    assert_eq!(
+        details.description.as_deref(),
+        Some("Synthetic compose probe")
+    );
+    assert_eq!(details.status, Some(ComposeStatus::Done));
+    assert_eq!(details.environment_id, environment);
+    assert_eq!(details.project_id.as_str(), project_id);
+    assert_eq!(details.project_name, "compose-probe");
+    assert_eq!(details.server_id, None);
+    let run = &details.deployments[0];
+    assert_eq!(run.title.as_deref(), Some("sd compose probe 1"));
+    assert_eq!(run.status, DeploymentStatus::Done);
+    assert!(run.created_at.is_some() && run.finished_at >= run.created_at);
+    let made_up = DokployId::parse("noSuchCompose1").unwrap();
+    assert_eq!(
+        client.compose_details(&url, &key, &made_up).await.unwrap(),
+        None
+    );
+
     post(
         &url,
         "compose.delete",
         serde_json::json!({ "composeId": compose.as_str(), "deleteVolumes": true }),
     )
     .await;
+    assert_eq!(
+        client.compose_details(&url, &key, &compose).await.unwrap(),
+        None
+    );
     post(
         &url,
         "project.remove",

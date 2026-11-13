@@ -486,7 +486,7 @@ async fn run() -> Result<(), StartupError> {
         db.clone(),
         cipher.clone(),
         Arc::clone(&dokploy),
-        dokploy_client as Arc<dyn ComposeApi>,
+        Arc::clone(&dokploy_client) as Arc<dyn ComposeApi>,
         Arc::clone(&probe),
     ));
     let runner = JobRunner::new(db.clone(), vec![provision], RunnerSettings::default());
@@ -499,11 +499,10 @@ async fn run() -> Result<(), StartupError> {
             })
             .await;
     });
-    let provisioning = Arc::new(ProvisioningService::new(
-        db.clone(),
-        cipher.clone(),
-        Arc::clone(&dokploy),
-    ));
+    let provisioning = Arc::new(
+        ProvisioningService::new(db.clone(), cipher.clone(), Arc::clone(&dokploy))
+            .with_compose(dokploy_client as Arc<dyn ComposeApi>),
+    );
     let connections = Arc::new(ConnectionService::new(db.clone(), cipher, probe));
     match config.health_check_interval {
         Some(interval) => {

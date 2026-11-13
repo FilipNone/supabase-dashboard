@@ -7,7 +7,8 @@ use secrecy::SecretString;
 use supabase_dashboard_domain::{
     dokploy::{DokployError, DokployUrl},
     dokploy_compose::{
-        ComposeDomain, ComposeService, DeploymentInfo, FileMount, NewCompose, NewComposeDomain,
+        ComposeDetails, ComposeDomain, ComposeService, DeploymentInfo, FileMount, NewCompose,
+        NewComposeDomain,
     },
     dokploy_placement::DokployId,
 };
@@ -101,4 +102,13 @@ pub trait ComposeApi: Send + Sync {
         key: &'a SecretString,
         compose_id: &'a DokployId,
     ) -> DokployFuture<'a, Vec<DeploymentInfo>>;
+
+    /// Where the service is, its status, and its latest deployments, or
+    /// `None` when Dokploy has no service with this ID.
+    fn compose_details<'a>(
+        &'a self,
+        url: &'a DokployUrl,
+        key: &'a SecretString,
+        compose_id: &'a DokployId,
+    ) -> DokployFuture<'a, Option<ComposeDetails>>;
 }
