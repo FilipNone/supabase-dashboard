@@ -13,6 +13,13 @@ use supabase_dashboard_domain::{
     dokploy_placement::DokployId,
 };
 
+/// A compose service's variables and compose file, as Dokploy keeps them.
+/// The variables hold the stack's secrets: they stay on the server.
+pub struct ComposeConfig {
+    pub env: SecretString,
+    pub compose_file: String,
+}
+
 pub type DokployFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, DokployError>> + Send + 'a>>;
 
 /// Compose service calls. Implementations enforce the same outbound policy
@@ -147,5 +154,24 @@ pub trait ComposeApi: Send + Sync {
         key: &'a SecretString,
         compose_id: &'a DokployId,
         title: &'a str,
+    ) -> DokployFuture<'a, ()>;
+
+    /// The service's variables and compose file (`compose.one`), or `None`
+    /// when Dokploy has no service with this ID.
+    fn compose_config<'a>(
+        &'a self,
+        url: &'a DokployUrl,
+        key: &'a SecretString,
+        compose_id: &'a DokployId,
+    ) -> DokployFuture<'a, Option<ComposeConfig>>;
+
+    /// Replaces the service's variables and nothing else
+    /// (`compose.update`). Safe to repeat.
+    fn update_compose_env<'a>(
+        &'a self,
+        url: &'a DokployUrl,
+        key: &'a SecretString,
+        compose_id: &'a DokployId,
+        env: &'a SecretString,
     ) -> DokployFuture<'a, ()>;
 }

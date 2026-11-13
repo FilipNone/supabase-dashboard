@@ -24,6 +24,7 @@ use supabase_dashboard_domain::{
     organization::{MemberSummary, OrganizationSummary},
     project::ProjectSummary,
     provisioning::{ProvisionJobSummary, ProvisionTargets, StackAction, StackDeploymentView},
+    stack_settings::{StackConfigPreview, StackSettingsView},
     studio_access::StudioAccessLog,
 };
 use uuid::Uuid;
@@ -499,6 +500,84 @@ pub async fn queue_stack_removal(
     let audit = org_context::AuditContext::current();
     Ok(org_context::provisioning()?
         .queue_removal(&session, id, action, &name, audit.get())
+        .await?)
+}
+
+/// A provisioned stack's settings, read from Dokploy, or `None` for a
+/// project the dashboard did not provision or whose service it removed.
+/// Owners and admins.
+#[server]
+pub async fn get_stack_settings(id: Uuid) -> Result<Option<StackSettingsView>, AppError> {
+    let session = org_context::session()?;
+    Ok(org_context::provisioning()?
+        .stack_settings(&session, id)
+        .await?)
+}
+
+/// The settings a form submitted, one optional field per setting, named
+/// after its variable in lowercase. A field the form left out (a disabled
+/// input) is not changed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SettingsFields {
+    pub site_url: Option<String>,
+    pub additional_redirect_urls: Option<String>,
+    pub disable_signup: Option<String>,
+    pub enable_email_autoconfirm: Option<String>,
+    pub enable_anonymous_users: Option<String>,
+    pub jwt_expiry: Option<String>,
+    pub pgrst_db_schemas: Option<String>,
+}
+
+impl SettingsFields {
+    #[cfg(feature = "ssr")]
+    fn submitted(&self) -> Vec<(&'static str, &str)> {
+        [
+            ("SITE_URL", &self.site_url),
+            ("ADDITIONAL_REDIRECT_URLS", &self.additional_redirect_urls),
+            ("DISABLE_SIGNUP", &self.disable_signup),
+            ("ENABLE_EMAIL_AUTOCONFIRM", &self.enable_email_autoconfirm),
+            ("ENABLE_ANONYMOUS_USERS", &self.enable_anonymous_users),
+            ("JWT_EXPIRY", &self.jwt_expiry),
+            ("PGRST_DB_SCHEMAS", &self.pgrst_db_schemas),
+        ]
+        .into_iter()
+        .filter_map(|(name, value)| value.as_deref().map(|value| (name, value)))
+        .collect()
+    }
+}
+
+/// What applying the submitted settings would change. Nothing is
+/// written. Owners and admins.
+#[server]
+pub async fn preview_stack_settings(
+    id: Uuid,
+    #[server(flatten)] fields: SettingsFields,
+) -> Result<(SettingsFields, StackConfigPreview), AppError> {
+    let session = org_context::session()?;
+    let preview = org_context::provisioning()?
+        .preview_settings(&session, id, &fields.submitted())
+        .await?;
+    Ok((fields, preview))
+}
+
+/// Queues writing the submitted settings and redeploying, and returns
+/// the job's ID. `reviewed` is the comma-separated variable names the
+/// preview listed; the server refuses when the stack changed since.
+/// Owners and admins.
+#[server]
+pub async fn queue_stack_settings(
+    id: Uuid,
+    #[server(flatten)] fields: SettingsFields,
+    reviewed: String,
+) -> Result<Uuid, AppError> {
+    let reviewed: Vec<&str> = reviewed
+        .split(',')
+        .filter(|name| !name.is_empty())
+        .collect();
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    Ok(org_context::provisioning()?
+        .queue_settings(&session, id, &fields.submitted(), &reviewed, audit.get())
         .await?)
 }
 

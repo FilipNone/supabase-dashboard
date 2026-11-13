@@ -215,15 +215,18 @@ pub enum StackAction {
     Redeploy,
     Remove,
     Destroy,
+    /// Changes the stack's settings, then redeploys it.
+    Configure,
 }
 
 impl StackAction {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Stop,
         Self::Start,
         Self::Redeploy,
         Self::Remove,
         Self::Destroy,
+        Self::Configure,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -233,6 +236,7 @@ impl StackAction {
             Self::Redeploy => "redeploy",
             Self::Remove => "remove",
             Self::Destroy => "destroy",
+            Self::Configure => "configure",
         }
     }
 
@@ -240,7 +244,7 @@ impl StackAction {
     /// for and again when its job runs.
     pub const fn permission(self) -> Permission {
         match self {
-            Self::Stop | Self::Start | Self::Redeploy => Permission::StackOperate,
+            Self::Stop | Self::Start | Self::Redeploy | Self::Configure => Permission::StackOperate,
             Self::Remove => Permission::StackRemove,
             Self::Destroy => Permission::StackDestroy,
         }
@@ -263,6 +267,7 @@ impl StackAction {
             Self::Redeploy => "Redeploy",
             Self::Remove => "Remove from Dokploy",
             Self::Destroy => "Destroy stack and data",
+            Self::Configure => "Change settings",
         }
     }
 
@@ -274,6 +279,7 @@ impl StackAction {
             Self::Redeploy => "stack.redeploy",
             Self::Remove => "stack.remove",
             Self::Destroy => "stack.destroy",
+            Self::Configure => "stack.configure",
         }
     }
 }

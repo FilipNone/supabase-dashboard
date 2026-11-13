@@ -21,7 +21,7 @@ use supabase_dashboard_domain::{
     dokploy_placement::DokployId,
 };
 
-use supabase_dashboard_application::provisioning::{ComposeApi, DokployFuture};
+use supabase_dashboard_application::provisioning::{ComposeApi, ComposeConfig, DokployFuture};
 
 use super::{DokployClient, Input, MAX_LIST_BODY_BYTES, MAX_SMALL_BODY_BYTES, parse_list};
 
@@ -427,6 +427,73 @@ impl DokployClient {
         Ok(Some(details))
     }
 
+    /// The variables and compose file of `compose_id` (`compose.one`), or
+    /// `None` when Dokploy has no such service.
+    pub async fn compose_config(
+        &self,
+        url: &DokployUrl,
+        key: &SecretString,
+        compose_id: &DokployId,
+    ) -> Result<Option<ComposeConfig>, DokployError> {
+        let body = match self
+            .send(
+                url,
+                "compose.one",
+                key,
+                Input::Get(&[("composeId", compose_id.as_str())]),
+                MAX_LIST_BODY_BYTES,
+            )
+            .await
+        {
+            Ok(body) => body,
+            Err(DokployError::Http(404)) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let raw: RawComposeConfig =
+            serde_json::from_slice(&body).map_err(|_| DokployError::InvalidResponse)?;
+        if raw.compose_id != compose_id.as_str() {
+            return Err(DokployError::InvalidResponse);
+        }
+        Ok(Some(ComposeConfig {
+            env: SecretString::from(raw.env.unwrap_or_default()),
+            compose_file: raw.compose_file.unwrap_or_default(),
+        }))
+    }
+
+    /// Replaces the variables of `compose_id` and nothing else
+    /// (`compose.update`). Repeating it sets the same values. `env` must
+    /// not contain `${`, which Dokploy leaves unescaped.
+    pub async fn update_compose_env(
+        &self,
+        url: &DokployUrl,
+        key: &SecretString,
+        compose_id: &DokployId,
+        env: &SecretString,
+    ) -> Result<(), DokployError> {
+        if env.expose_secret().contains("${") {
+            return Err(DokployError::InvalidResponse);
+        }
+        let body = serde_json::json!({
+            "composeId": compose_id.as_str(),
+            "env": env.expose_secret(),
+        });
+        let answer = self
+            .send(
+                url,
+                "compose.update",
+                key,
+                Input::Post(&body),
+                MAX_LIST_BODY_BYTES,
+            )
+            .await?;
+        let updated: RawComposeId =
+            serde_json::from_slice(&answer).map_err(|_| DokployError::InvalidResponse)?;
+        if updated.compose_id != compose_id.as_str() {
+            return Err(DokployError::InvalidResponse);
+        }
+        Ok(())
+    }
+
     /// The domains of `compose_id` (`domain.byComposeId`).
     pub async fn compose_domains(
         &self,
@@ -529,6 +596,15 @@ struct RawComposeOne {
     server: Option<RawNamed>,
     #[serde(default)]
     deployments: Vec<serde_json::Value>,
+}
+
+/// Only the fields [`ComposeConfig`] needs from `compose.one`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawComposeConfig {
+    compose_id: String,
+    env: Option<String>,
+    compose_file: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -864,6 +940,27 @@ impl ComposeApi for DokployClient {
             key,
             compose_id,
             delete_volumes,
+        ))
+    }
+
+    fn compose_config<'a>(
+        &'a self,
+        url: &'a DokployUrl,
+        key: &'a SecretString,
+        compose_id: &'a DokployId,
+    ) -> DokployFuture<'a, Option<ComposeConfig>> {
+        Box::pin(DokployClient::compose_config(self, url, key, compose_id))
+    }
+
+    fn update_compose_env<'a>(
+        &'a self,
+        url: &'a DokployUrl,
+        key: &'a SecretString,
+        compose_id: &'a DokployId,
+        env: &'a SecretString,
+    ) -> DokployFuture<'a, ()> {
+        Box::pin(DokployClient::update_compose_env(
+            self, url, key, compose_id, env,
         ))
     }
 }

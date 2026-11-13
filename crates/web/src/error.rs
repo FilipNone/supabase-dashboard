@@ -237,7 +237,15 @@ mod server {
                 | ProvisionError::Busy
                 | ProvisionError::AlreadyRemoved
                 | ProvisionError::NameMismatch
-                | ProvisionError::NotConfirmed => Self::Rejected(sentence(&err.to_string())),
+                | ProvisionError::NotConfirmed
+                | ProvisionError::Setting(_)
+                | ProvisionError::SettingUnavailable(_)
+                | ProvisionError::NoChanges
+                | ProvisionError::PreviewOutdated
+                | ProvisionError::ServiceMissing
+                | ProvisionError::DokployUnavailable(_) => {
+                    Self::Rejected(sentence(&err.to_string()))
+                }
                 ProvisionError::Internal(err) => {
                     tracing::error!(error = %err, "provisioning operation failed");
                     Self::Unavailable

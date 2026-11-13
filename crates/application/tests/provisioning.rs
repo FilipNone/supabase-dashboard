@@ -19,8 +19,8 @@ use supabase_dashboard_application::{
     },
     jobs::{JobHandler, JobRunner, RunResult, RunnerSettings},
     provisioning::{
-        ComposeApi, DokployFuture, ProvisionError, ProvisionRequest, ProvisionStackHandler,
-        ProvisionTimings, ProvisioningService, StackActionHandler,
+        ComposeApi, ComposeConfig, DokployFuture, ProvisionError, ProvisionRequest,
+        ProvisionStackHandler, ProvisionTimings, ProvisioningService, StackActionHandler,
     },
     secrets::CredentialCipher,
     stack_template::{GATEWAY_PORT, GATEWAY_SERVICE, STACK_FILES},
@@ -45,6 +45,7 @@ use supabase_dashboard_domain::{
     provisioning::{
         ProvisionStep, ProvisionTargets, StackAction, StackDeploymentView, TargetChoice,
     },
+    stack_settings::SettingState,
 };
 use supabase_dashboard_persistence::{Database, accounts::AccountRecord};
 use uuid::Uuid;
@@ -172,6 +173,8 @@ struct ComposeState {
     deletes: Vec<bool>,
     /// Delete the service, then answer as if the connection dropped.
     lose_delete_answer: bool,
+    /// Replace the variables, then answer as if the connection dropped.
+    lose_env_answer: bool,
     next_id: u32,
 }
 
@@ -485,6 +488,47 @@ impl ComposeApi for FakeCompose {
         state.deployments.insert(0, deployment);
         let answer = if state.lose_deploy_answer {
             state.lose_deploy_answer = false;
+            Err(lost())
+        } else {
+            Ok(())
+        };
+        Box::pin(async move { answer })
+    }
+
+    fn compose_config<'a>(
+        &'a self,
+        _url: &'a DokployUrl,
+        key: &'a SecretString,
+        compose_id: &'a DokployId,
+    ) -> DokployFuture<'a, Option<ComposeConfig>> {
+        let mut state = self.state.lock().unwrap();
+        state.call("compose_config", key);
+        let exists = state.services.iter().any(|s| s.compose_id == *compose_id);
+        let answer = state
+            .configured
+            .clone()
+            .filter(|_| exists)
+            .map(|(compose_file, env)| ComposeConfig {
+                env: SecretString::from(env),
+                compose_file,
+            });
+        Box::pin(async move { Ok(answer) })
+    }
+
+    fn update_compose_env<'a>(
+        &'a self,
+        _url: &'a DokployUrl,
+        key: &'a SecretString,
+        _compose_id: &'a DokployId,
+        env: &'a SecretString,
+    ) -> DokployFuture<'a, ()> {
+        let mut state = self.state.lock().unwrap();
+        state.call("update_compose_env", key);
+        if let Some((_, stored)) = state.configured.as_mut() {
+            *stored = env.expose_secret().to_owned();
+        }
+        let answer = if state.lose_env_answer {
+            state.lose_env_answer = false;
             Err(lost())
         } else {
             Ok(())
@@ -1592,4 +1636,209 @@ async fn destroying_deletes_the_volumes_and_a_vanished_service_is_not_deleted() 
         panic!("the removal should show");
     };
     assert!(volumes_deleted);
+}
+
+#[tokio::test]
+async fn owners_change_settings_and_edits_in_dokploy_stop_the_change() {
+    let Some(scratch) = ScratchDb::create("stack_settings").await else {
+        return;
+    };
+    let f = setup(&scratch).await;
+    let (_, project) = provisioned(&f).await;
+
+    let view = f
+        .service
+        .stack_settings(&f.owner, project)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(view.settings.len(), 7);
+    assert!(!view.busy);
+    let value = |name: &str| {
+        view.settings
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| (s.value.clone(), s.state.clone()))
+            .unwrap()
+    };
+    assert_eq!(
+        value("SITE_URL"),
+        (
+            Some("https://shop.example.test".to_owned()),
+            SettingState::Editable
+        )
+    );
+    assert_eq!(
+        value("DISABLE_SIGNUP"),
+        (Some("true".to_owned()), SettingState::Editable)
+    );
+
+    // Developers neither read nor change settings, and the refusal is
+    // audited.
+    let developer = account(&f.db, "Dev", false).await;
+    add_member(&f.db, f.organization, &developer, OrgRole::Developer).await;
+    assert!(matches!(
+        f.service.stack_settings(&developer, project).await,
+        Err(ProvisionError::Forbidden)
+    ));
+    assert!(matches!(
+        f.service
+            .queue_settings(
+                &developer,
+                project,
+                &[("DISABLE_SIGNUP", "false")],
+                &["DISABLE_SIGNUP"],
+                ctx()
+            )
+            .await,
+        Err(ProvisionError::Forbidden)
+    ));
+    let denied = count(
+        &f.db,
+        "SELECT count(*) FROM audit_events WHERE outcome = 'denied' AND action = 'stack.configure'",
+    )
+    .await;
+    assert_eq!(denied, 1);
+
+    // Only real changes are listed, with the services that restart.
+    let submitted = [
+        ("DISABLE_SIGNUP", "false"),
+        ("JWT_EXPIRY", "3600"),
+        ("SITE_URL", "https://shop.example.test"),
+    ];
+    let preview = f
+        .service
+        .preview_settings(&f.owner, project, &submitted)
+        .await
+        .unwrap();
+    assert_eq!(preview.changed, ["DISABLE_SIGNUP"]);
+    assert_eq!(preview.restarts, ["auth"]);
+    assert!(matches!(
+        f.service
+            .preview_settings(&f.owner, project, &[("JWT_EXPIRY", "10")])
+            .await,
+        Err(ProvisionError::Setting(_))
+    ));
+    assert!(matches!(
+        f.service
+            .preview_settings(&f.owner, project, &[("JWT_EXPIRY", "3600")])
+            .await,
+        Err(ProvisionError::NoChanges)
+    ));
+    assert!(matches!(
+        f.service
+            .preview_settings(&f.owner, project, &[("JWT_SECRET", "x")])
+            .await,
+        Err(ProvisionError::SettingUnavailable(_))
+    ));
+    // What was reviewed must still be what would change.
+    assert!(matches!(
+        f.service
+            .queue_settings(&f.owner, project, &submitted, &["JWT_EXPIRY"], ctx())
+            .await,
+        Err(ProvisionError::PreviewOutdated)
+    ));
+
+    // A lost answer to the update is followed by a read, not a second
+    // update; the stack is redeployed once.
+    let secret = variable(&f, "JWT_SECRET");
+    f.compose.state.lock().unwrap().lose_env_answer = true;
+    let job = f
+        .service
+        .queue_settings(&f.owner, project, &submitted, &["DISABLE_SIGNUP"], ctx())
+        .await
+        .unwrap();
+    assert!(
+        f.service
+            .stack_settings(&f.owner, project)
+            .await
+            .unwrap()
+            .unwrap()
+            .busy
+    );
+    run_all(&f).await;
+    let stored = f.db.get_job(job).await.unwrap().unwrap();
+    assert_eq!(stored.state, "succeeded", "{:?}", stored.message);
+    assert_eq!(
+        stored.message.as_deref(),
+        Some("Settings changed and the stack redeployed.")
+    );
+    assert_eq!(variable(&f, "DISABLE_SIGNUP"), "false");
+    assert_eq!(variable(&f, "JWT_SECRET"), secret);
+    {
+        let state = f.compose.state.lock().unwrap();
+        assert_eq!(state.count("update_compose_env"), 1);
+        assert_eq!(state.count("redeploy_compose"), 1);
+    }
+
+    // A variable edited in Dokploy after the change was queued stops it
+    // before anything is written.
+    let job = f
+        .service
+        .queue_settings(
+            &f.owner,
+            project,
+            &[("PGRST_DB_SCHEMAS", "public, api")],
+            &["PGRST_DB_SCHEMAS"],
+            ctx(),
+        )
+        .await
+        .unwrap();
+    if let Some((_, env)) = f.compose.state.lock().unwrap().configured.as_mut() {
+        env.push_str("PGRST_DB_SCHEMAS=public\n");
+    }
+    run_all(&f).await;
+    let stored = f.db.get_job(job).await.unwrap().unwrap();
+    assert_eq!(stored.state, "failed");
+    assert!(
+        stored
+            .message
+            .as_deref()
+            .unwrap()
+            .starts_with("PGRST_DB_SCHEMAS changed in Dokploy"),
+        "{:?}",
+        stored.message
+    );
+    assert_eq!(
+        f.compose.state.lock().unwrap().count("update_compose_env"),
+        1
+    );
+
+    // A compose file that does not read a variable makes it read-only.
+    if let Some((file, _)) = f.compose.state.lock().unwrap().configured.as_mut() {
+        *file = file.replace("${JWT_EXPIRY:-3600}", "3600");
+    }
+    let view = f
+        .service
+        .stack_settings(&f.owner, project)
+        .await
+        .unwrap()
+        .unwrap();
+    let jwt = view
+        .settings
+        .iter()
+        .find(|s| s.name == "JWT_EXPIRY")
+        .unwrap();
+    assert_eq!(jwt.state, SettingState::NotInComposeFile);
+    assert!(matches!(
+        f.service
+            .preview_settings(&f.owner, project, &[("JWT_EXPIRY", "7200")])
+            .await,
+        Err(ProvisionError::SettingUnavailable(_))
+    ));
+
+    let audited = count(
+        &f.db,
+        "SELECT count(*) FROM audit_events WHERE outcome = 'success' AND action = 'stack.configure'",
+    )
+    .await;
+    assert_eq!(audited, 2);
+    let leaked: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM jobs WHERE kind = 'stack_action' AND data::text LIKE '%' || $1 || '%'",
+    )
+    .bind(&secret)
+    .fetch_one(f.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(leaked, 0);
 }

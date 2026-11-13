@@ -6,7 +6,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use supabase_dashboard_adapters::{
     dokploy::{DokployClient, DokployError, DokploySettings},
     net::TargetPolicy,
@@ -65,7 +65,6 @@ async fn fixture_dokploy_rejects_an_unknown_key() {
 /// Calls a Dokploy mutation directly, to create synthetic records the
 /// client only reads.
 async fn post(url: &DokployUrl, call: &str, body: serde_json::Value) -> serde_json::Value {
-    use secrecy::ExposeSecret;
     // reqwest is built without a default TLS provider; the fixture is
     // plain HTTP, but the client still needs one to build.
     let tls = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
@@ -306,6 +305,39 @@ async fn fixture_dokploy_creates_configures_and_deploys_a_compose_service() {
         )
         .await
         .unwrap();
+    // Replacing the variables alone keeps the compose file.
+    let config = client
+        .compose_config(&url, &key, &compose)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(config.env.expose_secret(), "GREETING=hello-synthetic\n");
+    client
+        .update_compose_env(
+            &url,
+            &key,
+            &compose,
+            &SecretString::from("GREETING=hello-synthetic\nEXTRA=1\n"),
+        )
+        .await
+        .unwrap();
+    let config = client
+        .compose_config(&url, &key, &compose)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        config.env.expose_secret(),
+        "GREETING=hello-synthetic\nEXTRA=1\n"
+    );
+    assert_eq!(config.compose_file, compose_file);
+    assert!(
+        client
+            .compose_config(&url, &key, &DokployId::parse("noSuchCompose1").unwrap())
+            .await
+            .unwrap()
+            .is_none()
+    );
     let mount = client
         .create_file_mount(&url, &key, &compose, "probe/hello.txt", "first\n")
         .await

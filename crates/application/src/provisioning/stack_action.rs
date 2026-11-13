@@ -26,9 +26,20 @@
 //! 4. `confirm_removed`: waits until Dokploy no longer lists the service,
 //!    then records the removal on the project.
 //!
+//! Changing settings runs `check`, then:
+//!
+//! 2. `update`: reads the service's variables. While every changed
+//!    variable still has the value it had when the change was asked for,
+//!    writes the new values with `compose.update`; when they already have
+//!    the new values, an earlier answer was lost and nothing is sent.
+//!    Anything else means they were edited in Dokploy meanwhile, and the
+//!    job stops without changing anything.
+//! 3. `act` and `wait`: redeploys as above, so Docker Compose recreates
+//!    the containers that read the variables.
+//!
 //! No action unregisters the project; that stays a separate operation.
 
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use supabase_dashboard_domain::{
     dokploy::{DokployError, DokployUrl},
@@ -36,6 +47,7 @@ use supabase_dashboard_domain::{
     dokploy_placement::DokployId,
     job::{JobKind, JobState},
     provisioning::{StackAction, StackActionSummary},
+    stack_settings::{EnvFile, EnvValue, stack_setting},
 };
 use supabase_dashboard_persistence::{
     Database,
@@ -71,6 +83,20 @@ struct ActionData {
     /// Dokploy answered the delete request.
     #[serde(default)]
     delete_answered: bool,
+    /// The variables a settings change writes.
+    #[serde(default)]
+    settings: Vec<SettingChange>,
+}
+
+/// One variable a settings change writes. The settings the dashboard
+/// changes hold no secret.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct SettingChange {
+    pub(super) name: String,
+    pub(super) value: String,
+    /// The variable's value when the change was asked for; `None` when
+    /// it was not set.
+    pub(super) previous: Option<String>,
 }
 
 /// How the operator confirmed an action.
@@ -80,6 +106,8 @@ enum Confirmation<'a> {
     Given(bool),
     /// The project's name as typed, needed to remove or destroy.
     TypedName(&'a str),
+    /// A reviewed settings change, with the variables it writes.
+    Settings,
 }
 
 fn redeploy_title(job_id: Uuid) -> String {
@@ -104,6 +132,7 @@ impl ProvisioningService {
             project_id,
             action,
             Confirmation::Given(confirmed),
+            Vec::new(),
             ctx,
         )
         .await
@@ -125,6 +154,27 @@ impl ProvisioningService {
             project_id,
             action,
             Confirmation::TypedName(typed_name),
+            Vec::new(),
+            ctx,
+        )
+        .await
+    }
+
+    /// Queues writing `settings` and redeploying. The caller read them
+    /// from the service and checked the operator's role.
+    pub(super) async fn queue_settings_job(
+        &self,
+        current: &CurrentSession,
+        project_id: Uuid,
+        settings: Vec<SettingChange>,
+        ctx: RequestContext<'_>,
+    ) -> Result<Uuid, ProvisionError> {
+        self.queue(
+            current,
+            project_id,
+            StackAction::Configure,
+            Confirmation::Settings,
+            settings,
             ctx,
         )
         .await
@@ -136,6 +186,7 @@ impl ProvisioningService {
         project_id: Uuid,
         action: StackAction,
         confirmation: Confirmation<'_>,
+        settings: Vec<SettingChange>,
         ctx: RequestContext<'_>,
     ) -> Result<Uuid, ProvisionError> {
         let audit = action.audit_action();
@@ -174,6 +225,8 @@ impl ProvisioningService {
             (StackAction::Stop, Confirmation::Given(false)) => {
                 return Err(ProvisionError::NotConfirmed);
             }
+            (StackAction::Configure, Confirmation::Settings) if !settings.is_empty() => {}
+            (StackAction::Configure, _) => return Err(ProvisionError::NoChanges),
             _ => {}
         }
         let job_id = Uuid::now_v7();
@@ -184,6 +237,7 @@ impl ProvisioningService {
             requested_at: None,
             transient_errors: 0,
             delete_answered: false,
+            settings,
         })
         .map_err(|err| ProvisionError::Internal(err.to_string()))?;
         let queued = self
@@ -346,6 +400,7 @@ fn action_step_name(step: &str) -> &'static str {
         "wait" => "wait",
         "remove" => "remove",
         "confirm_removed" => "confirm_removed",
+        "update" => "update",
         _ => "check",
     }
 }
@@ -363,6 +418,7 @@ impl ActionStep<'_> {
             "wait" => self.wait(data).await,
             "remove" => self.remove(data).await,
             "confirm_removed" => self.confirm_removed(data).await,
+            "update" => self.update(data).await,
             other => Err(Stop::Fail(format!("Unknown step {other}."))),
         }
     }
@@ -414,6 +470,69 @@ impl ActionStep<'_> {
                 ));
             }
         }
+        if data.action == StackAction::Configure {
+            Ok(Then::Next("update"))
+        } else {
+            Ok(Then::Next("act"))
+        }
+    }
+
+    /// Writes the changed variables while they still have the values they
+    /// had when the change was asked for. Safe to repeat.
+    async fn update(&self, data: &ActionData) -> Result<Then, Stop> {
+        let (url, key) = self.dokploy().await?;
+        let compose = Self::compose_id(data)?;
+        let api = &self.handler.compose;
+        let Some(config) = api.compose_config(&url, &key, &compose).await? else {
+            return Err(Stop::Fail(
+                "Dokploy no longer has this service, so nothing was changed.".to_owned(),
+            ));
+        };
+        let mut env = EnvFile::parse(config.env.expose_secret());
+        let value_of = |env: &EnvFile, name: &str| match env.get(name) {
+            EnvValue::Missing => Ok(None),
+            EnvValue::Set(value) => Ok(Some(value.to_owned())),
+            EnvValue::Unreadable => Err(()),
+        };
+        let current: Vec<Result<Option<String>, ()>> = data
+            .settings
+            .iter()
+            .map(|change| value_of(&env, &change.name))
+            .collect();
+        let applied = data.settings.iter().zip(&current).all(|(change, now)| {
+            now.as_ref()
+                .is_ok_and(|now| now.as_deref() == Some(change.value.as_str()))
+        });
+        if applied {
+            return Ok(Then::Next("act"));
+        }
+        let edited: Vec<&str> = data
+            .settings
+            .iter()
+            .zip(&current)
+            .filter(|(change, now)| now.as_ref().map_or(true, |now| *now != change.previous))
+            .map(|(change, _)| change.name.as_str())
+            .collect();
+        if !edited.is_empty() {
+            return Err(Stop::Fail(format!(
+                "{} changed in Dokploy after this was asked for, so nothing was changed. Review the settings again.",
+                edited.join(", ")
+            )));
+        }
+        for change in &data.settings {
+            if !stack_setting(&change.name)
+                .is_some_and(|setting| setting.read_by(&config.compose_file))
+            {
+                return Err(Stop::Fail(format!(
+                    "The service's compose file no longer reads {}, so nothing was changed.",
+                    change.name
+                )));
+            }
+            env.set(&change.name, &change.value)
+                .map_err(|_| Stop::Fail(format!("{} cannot be rewritten safely.", change.name)))?;
+        }
+        let text = SecretString::from(env.to_text());
+        api.update_compose_env(&url, &key, &compose, &text).await?;
         Ok(Then::Next("act"))
     }
 
@@ -459,7 +578,9 @@ impl ActionStep<'_> {
                     "Started. The health check shows when the services answer.".to_owned(),
                 ))
             }
-            StackAction::Redeploy => self.redeploy(data, &url, &key, &compose).await,
+            StackAction::Redeploy | StackAction::Configure => {
+                self.redeploy(data, &url, &key, &compose).await
+            }
         }
     }
 
@@ -603,7 +724,13 @@ impl ActionStep<'_> {
             i64::try_from(self.handler.timings.deploy_deadline.as_secs()).unwrap_or(i64::MAX);
         let poll = self.handler.timings.deploy_poll;
         match status {
-            Some(DeploymentStatus::Done) => Ok(Then::Succeed("Redeployed.".to_owned())),
+            Some(DeploymentStatus::Done) => {
+                Ok(Then::Succeed(if data.action == StackAction::Configure {
+                    "Settings changed and the stack redeployed.".to_owned()
+                } else {
+                    "Redeployed.".to_owned()
+                }))
+            }
             Some(DeploymentStatus::Error) => Err(Stop::Fail(
                 "The redeployment failed. Its log in Dokploy says why.".to_owned(),
             )),

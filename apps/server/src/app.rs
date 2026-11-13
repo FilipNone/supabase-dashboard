@@ -194,12 +194,13 @@ mod tests {
             CreateOrganization, DisconnectDokploy, GetCurrentAccount, GetDokployConnection,
             GetDokployPlacement, GetInstallationHealth, GetOrganization, GetProject,
             GetProjectAuthorities, GetProjectCredentials, GetProjectDeployment, GetProjectHealth,
-            GetProvisionJob, GetProvisionTargets, GetStudioAccessLog, ListOrganizations,
-            ListProjects, ListProvisionJobs, ListSessions, PreviewInvitation, QueueStackAction,
-            QueueStackRemoval, RegisterProject, RemoveProjectAuthorities, RemoveProjectCredential,
-            RenameOrganization, ReplaceDokployKey, ReplaceProjectAuthorities,
-            ReplaceProjectCredential, ReplaceStudioLogin, RevokeSession, SignUpWithInvitation,
-            StartProvisioning, UnregisterProject, UpdateProfile,
+            GetProvisionJob, GetProvisionTargets, GetStackSettings, GetStudioAccessLog,
+            ListOrganizations, ListProjects, ListProvisionJobs, ListSessions, PreviewInvitation,
+            PreviewStackSettings, QueueStackAction, QueueStackRemoval, QueueStackSettings,
+            RegisterProject, RemoveProjectAuthorities, RemoveProjectCredential, RenameOrganization,
+            ReplaceDokployKey, ReplaceProjectAuthorities, ReplaceProjectCredential,
+            ReplaceStudioLogin, RevokeSession, SignUpWithInvitation, StartProvisioning,
+            UnregisterProject, UpdateProfile,
         },
     };
     use tower::ServiceExt;
@@ -1177,6 +1178,33 @@ mod tests {
         let (parts, body) = call(format!("id={provisioned}&action=delete"), &alice).await;
         // An action that does not exist is refused when decoded.
         assert_ne!(parts.status, StatusCode::OK, "{body}");
+        assert_eq!(jobs().await, 0);
+
+        // Settings change only through their own endpoint, for owners and
+        // admins, and only on a stack the dashboard created.
+        let (parts, body) = call(format!("id={provisioned}&action=configure"), &alice).await;
+        assert_eq!(parts.status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        let settings = |path: &str, body: String, cookie: &str| {
+            send(&router, form_post(path, &body, Some(cookie)))
+        };
+        let change = format!("id={provisioned}&disable_signup=false&reviewed=DISABLE_SIGNUP");
+        let (parts, body) = settings(QueueStackSettings::PATH, change.clone(), &bob).await;
+        assert_eq!(parts.status, StatusCode::FORBIDDEN, "{body}");
+        let (parts, body) =
+            settings(GetStackSettings::PATH, format!("id={provisioned}"), &bob).await;
+        assert_eq!(parts.status, StatusCode::FORBIDDEN, "{body}");
+        let (parts, body) = settings(
+            PreviewStackSettings::PATH,
+            format!("id={registered}&jwt_expiry=7200"),
+            &alice,
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(body.contains("did not create"), "{body}");
+        // Dokploy is not connected in this test.
+        let (parts, body) = settings(QueueStackSettings::PATH, change, &alice).await;
+        assert_eq!(parts.status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(body.contains("not connected"), "{body}");
         assert_eq!(jobs().await, 0);
 
         // Removal needs its own endpoint, the role, and the exact name.

@@ -72,8 +72,9 @@ use crate::{
 
 mod port;
 mod stack_action;
+mod stack_config;
 
-pub use port::{ComposeApi, DokployFuture};
+pub use port::{ComposeApi, ComposeConfig, DokployFuture};
 pub use stack_action::StackActionHandler;
 
 /// How long the job waits at each point. The defaults suit a real
@@ -149,6 +150,20 @@ pub enum ProvisionError {
     NameMismatch,
     #[error("confirm that the stack stops answering until it is started again")]
     NotConfirmed,
+    #[error(transparent)]
+    Setting(#[from] supabase_dashboard_domain::stack_settings::SettingError),
+    /// A submitted setting the stack cannot take; the message names it.
+    #[error("{0}")]
+    SettingUnavailable(String),
+    #[error("nothing to change: every setting already has that value")]
+    NoChanges,
+    #[error("the stack's settings changed since the preview; review the changes again")]
+    PreviewOutdated,
+    #[error("Dokploy no longer has this stack's service")]
+    ServiceMissing,
+    /// Dokploy did not answer or refused; the message says which.
+    #[error("{0}")]
+    DokployUnavailable(String),
     /// Internal failure. The message is for server logs only.
     #[error("{0}")]
     Internal(String),

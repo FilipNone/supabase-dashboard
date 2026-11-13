@@ -15,4 +15,5 @@ mod project_deployment;
 mod project_trust;
 pub mod provision;
 pub mod sign_in;
+mod stack_settings;
 pub mod status;

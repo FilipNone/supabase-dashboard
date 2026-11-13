@@ -18,5 +18,6 @@ pub mod job;
 pub mod organization;
 pub mod project;
 pub mod provisioning;
+pub mod stack_settings;
 pub mod studio_access;
 pub mod theme;

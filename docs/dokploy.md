@@ -31,13 +31,14 @@ The client in `crates/adapters/src/dokploy.rs` uses the same connection rules as
 | `compose.search` | GET | `name`, `environmentId`, `limit` | Find a provisioning job's service by its exact name before creating it |
 | `compose.create` | POST | `name`, `appName`, `environmentId`, `serverId` (remote server only), `sourceType: raw`, `composeFile` | Create a stack's compose service |
 | `compose.update` | POST | `composeId`, `sourceType: raw`, `composeFile`, `env`, `isolatedDeployment: true` | Set a stack's compose file and variables |
+| `compose.update` | POST | `composeId`, `env` | Replace a stack's variables when its settings change; the fixture test checks that the compose file is kept |
 | `mounts.listByServiceId` | GET | `serviceId`, `serviceType: compose` | A service's file mounts |
 | `mounts.create` | POST | `type: file`, `serviceType: compose`, `serviceId`, `filePath`, `mountPath`, `content` | Write a file the compose file mounts |
 | `mounts.update` | POST | `mountId`, `content` | Replace a mounted file |
 | `compose.deploy` | POST | `composeId`, `title` | Queue a deployment |
 | `deployment.allByCompose` | GET | `composeId` | Poll a service's deployments |
 | `domain.create` | POST | `host`, `composeId`, `domainType: compose`, `serviceName`, `port`, `https`, `certificateType`, `path` | Route a host to one service of a stack |
-| `compose.one` | GET | `composeId` | A provisioned stack's service for its project overview: name, status, project, environment, server, and deployments; 404 means Dokploy has no such service |
+| `compose.one` | GET | `composeId` | A provisioned stack's service for its project overview: name, status, project, environment, server, and deployments; 404 means Dokploy has no such service. Read separately for a stack's settings, keeping only `env` and `composeFile` on the server |
 | `compose.stop` | POST | `composeId` | Stop a provisioned stack's containers; answers `true` once they are down, and sets the status to `idle` |
 | `compose.start` | POST | `composeId` | Start them again; answers `true` |
 | `compose.delete` | POST | `composeId`, `deleteVolumes` | Remove a provisioned stack's service, keeping (`false`) or deleting (`true`) its named volumes; answers with the deleted service, of which only `composeId` is read, and 404 once it is gone |
@@ -49,7 +50,7 @@ The compose calls are in `crates/adapters/src/dokploy/compose.rs`, used by the p
 
 - Creating a service, a mount, a domain, or a deployment is not idempotent: each repeated request makes another one, and Dokploy has no idempotency key. These requests are sent once and never retried, and a job looks the object up first.
 - Dokploy appends `-` and six random characters to the requested `appName`, so the name on disk is known only from the answer. A job finds its service again by its exact `name` in its environment. `compose.search` matches names as case-insensitive substrings and treats `%` and `_` as wildcards, so the dashboard's names use only lowercase letters, digits, and `-`, and the comparison is repeated on the dashboard's side. The search lists only services the key's member can access.
-- `compose.one`, `compose.update`, `compose.delete`, and the mount calls answer with the service's variables, compose file, or file contents in plain text. The adapter reads only the IDs and names it needs from those answers. Anyone with a Dokploy key that can see a stack's service can read its secrets this way.
+- `compose.one`, `compose.update`, `compose.delete`, and the mount calls answer with the service's variables, compose file, or file contents in plain text. The adapter reads only the IDs and names it needs from those answers, except when reading a stack's settings, where it reads the variables and compose file and keeps them on the server. Anyone with a Dokploy key that can see a stack's service can read its secrets this way.
 - Dokploy writes the variables to a `.env` file next to the compose file, each value in double quotes, and escapes every `$` except at the start of `${`, so a value containing `${` would be expanded by Docker Compose. The adapter refuses such variables before sending them. The variables only fill `${…}` references in the compose file; a container receives nothing the compose file does not pass to it.
 - A file mount is written to the server at once, at `/etc/dokploy/compose/<appName>/files/<filePath>`, and the compose file refers to it as `../files/<filePath>`. Dokploy requires `mountPath` even though compose services ignore it. Paths outside the files folder are refused by both Dokploy and the adapter.
 - `compose.stop` waits for the containers to stop before it answers (about 10 seconds for a stack on the fixture; the client's 15-second timeout can cut a larger one short). Stopping a stopped service and starting a running one change nothing, so a stop or start whose answer was lost is sent again. `compose.redeploy` is like `compose.deploy`: it is not idempotent and returns no deployment ID. Both keep the named volumes.
@@ -135,6 +136,17 @@ Below the deployments, a **Remove the stack** area offers two separate actions, 
 - **Destroy stack and data** (`StackDestroy`: owners only) sends `deleteVolumes: true`, which deletes those volumes. It cannot be undone.
 
 Both are `stack_action` jobs, audited as `stack.remove` and `stack.destroy`, and share the one-unfinished-action rule. After `check`, the job reads the service; if Dokploy no longer has it, the job fails and changes nothing. Otherwise it saves the time it asks before asking, then in `remove` reads the service again and sends the delete only while Dokploy still lists it. If the answer is lost, `confirm_removed` polls `compose.one` until the service is gone, for at most 30 minutes, and never asks again. The removal is then recorded on the project (`removed_at`, and `volumes_deleted` for destroy). For the moment between Dokploy deleting the service and the job recording it, the section says the service is being removed and keeps following the job rather than reporting a missing service.
+
+### Stack settings
+
+Owners and admins see a **Stack settings** section on a provisioned project's overview. It lists the variables the dashboard may change (`STACK_SETTINGS` in `crates/domain/src/stack_settings.rs`): the site URL, additional redirect URLs, whether sign-ups are disabled, automatic email confirmation, anonymous sign-ins, the access token lifetime, and the schemas the REST API serves. None holds a secret. The pinned compose file reads each as `${NAME:-default}` with the value earlier stacks had built in, so a stack without the variable behaves as before. The access token lifetime reaches Auth only; the database's own `JWT_EXP`, used when it is first initialized, stays fixed, so changing it never restarts the database.
+
+The section reads the variables and compose file with `compose.one` each time the page loads. A setting whose variable the compose file does not read (stacks created before this) or whose value is set more than once, quoted with escapes, or uses `$` is shown but cannot be changed. Values are checked on the server and are written unquoted, without spaces, quotes, `$`, `#`, or `\`.
+
+"Review changes" lists the variables that would change and the compose services Docker Compose recreates; values are not repeated. "Apply and redeploy" sends the reviewed names with the values. The server reads the service again and refuses if a different set of variables would change, then queues a `stack_action` job audited as `stack.configure`. The job saves the variables' previous values, never secrets. After `check` it runs:
+
+1. `update`: reads the variables. If every changed variable still has its previous value, the job sets them and sends the whole variable text back with `compose.update` (only `composeId` and `env`). Every other line is kept as it was. If they already have the new values, an earlier answer was lost and nothing is sent. Anything else means they were edited in Dokploy meanwhile: the job fails, naming them, and writes nothing.
+2. `act` and `wait`: a redeployment, as for Redeploy.
 
 A removed project stays registered. Its section says when the service was removed and whether the volumes went with it; owners and admins get the volumes' name prefix to delete them on the server later. No further action can be asked for, and unregistering under Settings stays a separate step.
 

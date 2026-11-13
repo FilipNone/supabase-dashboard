@@ -23,8 +23,9 @@ use supabase_dashboard_domain::{
 
 use crate::{
     components::page::{StatePanel, StateTone},
+    pages::stack_settings::StackSettingsSection,
     pages::{account::utc_minutes, provision::poll_every},
-    server_fns::{QueueStackAction, QueueStackRemoval, get_project_deployment},
+    server_fns::{QueueStackAction, QueueStackRemoval, QueueStackSettings, get_project_deployment},
 };
 
 /// How often the panel asks again while an action runs.
@@ -36,6 +37,7 @@ pub fn DeploymentPanel(project: ProjectSummary) -> impl IntoView {
     let name = project.name.as_str().to_owned();
     let act = ServerAction::<QueueStackAction>::new();
     let remove = ServerAction::<QueueStackRemoval>::new();
+    let apply = ServerAction::<QueueStackSettings>::new();
     // The Stop confirmation is cleared after each request, so every stop
     // is confirmed again: the panel re-renders into the same elements.
     let confirmed = RwSignal::new(false);
@@ -49,8 +51,15 @@ pub fn DeploymentPanel(project: ProjectSummary) -> impl IntoView {
         confirmed,
     };
     let deployment = Resource::new(
-        move || (id, act.version().get(), remove.version().get()),
-        |(id, _, _)| get_project_deployment(id),
+        move || {
+            (
+                id,
+                act.version().get(),
+                remove.version().get(),
+                apply.version().get(),
+            )
+        },
+        |(id, _, _, _)| get_project_deployment(id),
     );
     // Keeps running for the page's life: a new action can start at any
     // time, and only an unfinished one triggers a request.
@@ -99,6 +108,9 @@ pub fn DeploymentPanel(project: ProjectSummary) -> impl IntoView {
                 .into_any(),
             })}
         </Transition>
+        // Outside the panel's Transition, so polling while an action runs
+        // does not reset what is typed into the form.
+        <StackSettingsSection project=id apply=apply/>
     }
 }
 

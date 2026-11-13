@@ -61,7 +61,7 @@ pub struct PublicUrlError;
 /// The values hold no `$`, quote, `#`, `\`, or whitespace, so Dokploy and
 /// Docker Compose read every one as written.
 pub fn stack_env(secrets: &StackSecrets, public_url: &str) -> Result<SecretString, PublicUrlError> {
-    if !is_plain_public_url(public_url) {
+    if !supabase_dashboard_domain::stack_settings::is_plain_url(public_url) {
         return Err(PublicUrlError);
     }
     let variables: [(&str, &str); 11] = [
@@ -99,21 +99,6 @@ pub fn stack_env(secrets: &StackSecrets, public_url: &str) -> Result<SecretStrin
     Ok(SecretString::from(env))
 }
 
-/// An `http://` or `https://` URL made of visible ASCII characters other
-/// than `$`, quotes, `#`, `\`, and backtick, with something after the
-/// scheme and no trailing slash.
-fn is_plain_public_url(url: &str) -> bool {
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"));
-    matches!(rest, Some(rest) if !rest.is_empty())
-        && url.len() <= 2048
-        && !url.ends_with('/')
-        && url.bytes().all(|b| {
-            b.is_ascii_graphic() && !matches!(b, b'$' | b'"' | b'\'' | b'#' | b'\\' | b'`')
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -132,13 +117,36 @@ mod tests {
             .collect()
     }
 
-    /// The `${NAME}` variables the compose file reads.
+    /// The `${NAME}` variables the compose file reads without a default.
     fn compose_variables() -> BTreeSet<&'static str> {
         COMPOSE_FILE
             .split("${")
             .skip(1)
             .filter_map(|rest| rest.split('}').next())
+            .filter(|variable| !variable.contains(":-"))
             .collect()
+    }
+
+    /// The `${NAME:-default}` variables, with the services reading each.
+    fn defaulted_variables() -> Vec<(&'static str, &'static str, &'static str)> {
+        let mut service = "";
+        let mut found = Vec::new();
+        for line in COMPOSE_FILE.lines() {
+            if let Some(name) = line.strip_prefix("  ").and_then(|l| l.strip_suffix(':'))
+                && !name.starts_with(' ')
+            {
+                service = name;
+            }
+            for rest in line.split("${").skip(1) {
+                let Some(variable) = rest.split('}').next() else {
+                    continue;
+                };
+                if let Some((name, default)) = variable.split_once(":-") {
+                    found.push((name, default, service));
+                }
+            }
+        }
+        found
     }
 
     fn env_names(env: &str) -> BTreeSet<&str> {
@@ -193,6 +201,41 @@ mod tests {
         )));
         assert!(env.contains("DASHBOARD_USERNAME=supabase\n"));
         assert!(env.contains("SUPABASE_PUBLIC_URL=https://shop.example.test\n"));
+    }
+
+    #[test]
+    fn every_setting_is_a_defaulted_variable_of_the_services_it_names() {
+        use supabase_dashboard_domain::stack_settings::STACK_SETTINGS;
+        let defaulted = defaulted_variables();
+        for setting in STACK_SETTINGS {
+            assert!(setting.read_by(COMPOSE_FILE), "{}", setting.name);
+            let uses: Vec<_> = defaulted
+                .iter()
+                .filter(|(name, _, _)| *name == setting.name)
+                .collect();
+            let mut services: Vec<&str> = uses.iter().map(|(_, _, service)| *service).collect();
+            services.sort_unstable();
+            services.dedup();
+            match setting.default {
+                Some(default) => {
+                    assert!(!uses.is_empty(), "{} has no default", setting.name);
+                    assert!(
+                        uses.iter().all(|(_, d, _)| *d == default),
+                        "{}",
+                        setting.name
+                    );
+                    assert_eq!(services, setting.services, "{}", setting.name);
+                    assert_eq!(setting.normalize(default).as_deref(), Ok(default));
+                }
+                None => assert!(uses.is_empty(), "{}", setting.name),
+            }
+        }
+        for (name, _, _) in defaulted {
+            assert!(
+                STACK_SETTINGS.iter().any(|s| s.name == name),
+                "{name} is not a setting"
+            );
+        }
     }
 
     #[test]
