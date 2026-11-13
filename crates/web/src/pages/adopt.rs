@@ -319,10 +319,10 @@ fn AdoptForm(organization_id: Uuid, preview: AdoptionPreview) -> impl IntoView {
                 <select class="input url-text" name="api_url" required aria-describedby="adopt-url-hint">
                     {urls}
                 </select>
-                <span class="field-hint" id="adopt-url-hint">
-                    "The domains Dokploy routes to the stack's API gateway. Health checks and Studio go through this URL."
-                </span>
             </label>
+            <p class="field-hint" id="adopt-url-hint">
+                "The domains Dokploy routes to the stack's API gateway. Health checks and Studio go through this URL."
+            </p>
             {any_key.then(|| view! {
                 <label class="checkbox-field">
                     <input type="checkbox" name="copy_keys" value="true" aria-describedby="adopt-keys-hint"/>

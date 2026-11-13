@@ -169,7 +169,7 @@ Owners and admins can register a Supabase stack that already runs in Dokploy, fo
 
 The page lists the compose services in the Dokploy environments an installation administrator allowed for the organization on the administrator page, read with `compose.search` by environment, at most 200 in all, without the services a project already runs as. The default target is shared by every organization without targets of its own, so an organization with no allowed environment gets nothing listed. Allowing an environment for an organization therefore also lets its owners and admins adopt the unregistered Supabase services in it. Listing reads no compose file or variables.
 
-Choosing a service reads it with `compose.one`. A service outside the allowed environments, one a project already runs as, and an unknown ID get the same refusal, before the server reads the compose file or variables. The preview then shows:
+Choosing a service reads it with `compose.one`. A service outside the allowed environments and an unknown ID get the same refusal. A service in an allowed environment that a project already runs as is refused as already adopted. Both happen before the server reads the compose file or variables. The preview then shows:
 
 - whether it runs Supabase: its compose file needs `image:` lines for `supabase/studio` and for `supabase/gotrue` or `supabase/auth`, with any registry and tag;
 - the URLs of its Dokploy domains routed to the API gateway (a service named `kong`, `envoy`, `api-gw`, or `supabase-kong`, or port 8000), read with `domain.byComposeId`; a host the dashboard would not provision, such as an IP address, is left out. One of them becomes the project's API URL;
