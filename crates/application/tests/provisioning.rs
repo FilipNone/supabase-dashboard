@@ -41,7 +41,7 @@ use supabase_dashboard_domain::{
         DokployServiceRef,
     },
     dokploy_target::{DokployEnvironmentInfo, DokployTargetInventory},
-    job::JobState,
+    job::{JobKind, JobState},
     project::ProjectUrl,
     provisioning::{
         ProvisionStep, ProvisionTargets, StackAction, StackDeploymentView, TargetChoice,
@@ -936,6 +936,19 @@ async fn a_failed_deployment_fails_the_job_and_leaves_the_service() {
         "{:?}",
         stored.message
     );
+    // The administrator view lists it under the name it was given.
+    let listed = f.db.list_registered_resources(500).await.unwrap();
+    assert!(!listed.failed_jobs_truncated);
+    let [failed] = listed.failed_jobs.as_slice() else {
+        panic!("one failed job: {:?}", listed.failed_jobs);
+    };
+    assert_eq!(
+        (failed.id, failed.kind, failed.action),
+        (job, JobKind::ProvisionStack, None)
+    );
+    assert_eq!(failed.project_id, None);
+    assert_eq!(failed.project_name.as_deref(), Some("Shop"));
+    assert_eq!(failed.message, stored.message);
     // Nothing registered, nothing removed, and the secrets kept for the
     // stack that may already use them.
     assert_eq!(count(&f.db, "SELECT count(*) FROM projects").await, 0);
@@ -1626,6 +1639,21 @@ async fn destroying_deletes_the_volumes_and_a_vanished_service_is_not_deleted() 
     assert_eq!(stored.state, "failed");
     assert!(stored.message.unwrap().contains("nothing was changed"));
     assert!(f.compose.state.lock().unwrap().deletes.is_empty());
+    let listed = f.db.list_registered_resources(500).await.unwrap();
+    let failed = listed
+        .failed_jobs
+        .iter()
+        .find(|failed| failed.id == job)
+        .expect("the failed removal is listed");
+    assert_eq!(
+        (failed.kind, failed.action, failed.project_id),
+        (
+            JobKind::StackAction,
+            Some(StackAction::Destroy),
+            Some(project)
+        )
+    );
+    assert_eq!(failed.project_name.as_deref(), Some("Shop"));
 
     // The owner destroys it with its data.
     f.compose.state.lock().unwrap().services = saved.clone();

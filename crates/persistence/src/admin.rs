@@ -2,10 +2,15 @@
 //! layer checks that the caller is an installation administrator first.
 
 use supabase_dashboard_domain::{
-    admin::{AdminOrganizationSummary, AdminProjectSummary, RegisteredResources},
+    admin::{
+        ADMIN_FAILED_JOB_DAYS, ADMIN_FAILED_JOB_LIMIT, AdminFailedJob, AdminOrganizationSummary,
+        AdminProjectSummary, RegisteredResources,
+    },
     connection::{HealthDigest, HealthReport, ServiceCheck},
+    job::JobKind,
     organization::OrganizationName,
     project::{ProjectName, ProjectUrl},
+    provisioning::StackAction,
 };
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -116,12 +121,76 @@ impl Database {
                 })
             })
             .collect::<Result<_, PersistenceError>>()?;
+        let (failed_jobs, failed_jobs_truncated) = self.list_failed_jobs().await?;
         Ok(RegisteredResources {
             organizations,
             organizations_truncated,
             projects,
             projects_truncated,
+            failed_jobs,
+            failed_jobs_truncated,
         })
+    }
+
+    /// Jobs that failed in the last [`ADMIN_FAILED_JOB_DAYS`] days, newest
+    /// first, at most [`ADMIN_FAILED_JOB_LIMIT`].
+    async fn list_failed_jobs(&self) -> Result<(Vec<AdminFailedJob>, bool), PersistenceError> {
+        #[derive(sqlx::FromRow)]
+        struct JobRow {
+            id: Uuid,
+            kind: String,
+            action: Option<String>,
+            organization_id: Uuid,
+            organization_name: String,
+            project_id: Option<Uuid>,
+            project_name: Option<String>,
+            job_name: Option<String>,
+            message: Option<String>,
+            failed_at: OffsetDateTime,
+        }
+        let fetch = i64::try_from(ADMIN_FAILED_JOB_LIMIT.saturating_add(1)).unwrap_or(i64::MAX);
+        // The job's project ID is read from its data only when it is a
+        // well-formed UUID, so a malformed row cannot fail the listing.
+        let rows: Vec<JobRow> = sqlx::query_as(
+            "SELECT j.id, j.kind, j.data->>'action' AS action, j.organization_id, \
+                    o.name AS organization_name, p.id AS project_id, p.name AS project_name, \
+                    j.data->>'name' AS job_name, j.message, \
+                    COALESCE(j.finished_at, j.updated_at) AS failed_at \
+             FROM jobs j JOIN organizations o ON o.id = j.organization_id \
+             LEFT JOIN projects p ON p.organization_id = j.organization_id \
+                 AND p.id = CASE WHEN j.data->>'project_id' ~* \
+                     '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' \
+                     THEN (j.data->>'project_id')::uuid END \
+             WHERE j.state = 'failed' \
+               AND COALESCE(j.finished_at, j.updated_at) > now() - make_interval(days => $1) \
+             ORDER BY failed_at DESC, j.id DESC LIMIT $2",
+        )
+        .bind(i32::try_from(ADMIN_FAILED_JOB_DAYS).unwrap_or(i32::MAX))
+        .bind(fetch)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(query_err)?;
+        let (rows, truncated) = cut(rows, ADMIN_FAILED_JOB_LIMIT);
+        let jobs = rows
+            .into_iter()
+            .map(|row| {
+                let action = row.action.as_deref().and_then(StackAction::parse);
+                Ok(AdminFailedJob {
+                    id: row.id,
+                    kind: JobKind::parse(&row.kind)
+                        .ok_or(PersistenceError::InvalidRow("jobs.kind"))?,
+                    action,
+                    organization_id: row.organization_id,
+                    organization_name: OrganizationName::parse(&row.organization_name)
+                        .map_err(|_| PersistenceError::InvalidRow("organizations.name"))?,
+                    project_id: row.project_id,
+                    project_name: row.project_name.or(row.job_name),
+                    message: row.message,
+                    failed_at: row.failed_at,
+                })
+            })
+            .collect::<Result<_, PersistenceError>>()?;
+        Ok((jobs, truncated))
     }
 }
 

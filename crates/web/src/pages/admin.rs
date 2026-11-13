@@ -9,15 +9,19 @@ use leptos::{form::ActionForm, prelude::*};
 use leptos_meta::Title;
 use supabase_dashboard_domain::{
     account::AdminAccountSummary,
-    admin::{ADMIN_RESOURCE_LIST_LIMIT, AdminOrganizationSummary, AdminProjectSummary},
+    admin::{
+        ADMIN_FAILED_JOB_DAYS, ADMIN_FAILED_JOB_LIMIT, ADMIN_RESOURCE_LIST_LIMIT, AdminFailedJob,
+        AdminOrganizationSummary, AdminProjectSummary,
+    },
     connection::KeyExpiry,
+    job::JobKind,
 };
 
 use crate::{
     components::dialog::{ConfirmDialog, DialogCancel},
     components::page::{PageHeader, StatePanel, StateTone},
     error::AppError,
-    pages::{admin_dokploy::DokployPanel, organization::health_badges},
+    pages::{account::utc_minutes, admin_dokploy::DokployPanel, organization::health_badges},
     server_fns::{AdminSetAccountDisabled, admin_list_accounts, admin_list_resources},
 };
 
@@ -92,6 +96,8 @@ fn RegisteredResources() -> impl IntoView {
                             <OrganizationTable list=found.organizations truncated=found.organizations_truncated/>
                             <h3 class="subsection-title">"Projects"</h3>
                             <ProjectTable list=found.projects truncated=found.projects_truncated/>
+                            <h3 class="subsection-title">"Failed jobs"</h3>
+                            <FailedJobTable list=found.failed_jobs truncated=found.failed_jobs_truncated/>
                         }
                         .into_any(),
                         Err(AppError::Forbidden) => ().into_any(),
@@ -170,6 +176,75 @@ fn truncation_note(truncated: bool, what: &'static str) -> Option<impl IntoView>
             </p>
         }
     })
+}
+
+/// What a failed job was asked to do.
+fn job_label(job: &AdminFailedJob) -> &'static str {
+    match (job.kind, job.action) {
+        (JobKind::ProvisionStack, _) => "Create stack",
+        (JobKind::StackAction, Some(action)) => action.label(),
+        (JobKind::StackAction, None) => "Stack action",
+    }
+}
+
+#[component]
+fn FailedJobTable(list: Vec<AdminFailedJob>, truncated: bool) -> impl IntoView {
+    if list.is_empty() {
+        return view! {
+            <StatePanel
+                tone=StateTone::Empty
+                title="No failed jobs".to_string()
+                detail=format!("No background job failed in the last {ADMIN_FAILED_JOB_DAYS} days.")
+            />
+        }
+        .into_any();
+    }
+    let rows = list
+        .into_iter()
+        .map(|job| {
+            let label = job_label(&job);
+            let project = match (job.project_name, job.project_id) {
+                (Some(name), Some(_)) => name,
+                (Some(name), None) => format!("{name} (not registered)"),
+                (None, _) => "Unregistered project".to_owned(),
+            };
+            view! {
+                <tr>
+                    <td>{label}</td>
+                    <td>{project}</td>
+                    <td>{job.organization_name.as_str().to_owned()}</td>
+                    <td class="wrap-text">{job.message.unwrap_or_else(|| "No reason was recorded.".to_owned())}</td>
+                    <td class="nowrap">{utc_minutes(job.failed_at)}</td>
+                </tr>
+            }
+        })
+        .collect_view();
+    view! {
+        <p class="field-hint">
+            {format!("Jobs that failed in the last {ADMIN_FAILED_JOB_DAYS} days, newest first. Members of each organization see the same reasons on their project pages.")}
+        </p>
+        <div class="table-wrap" role="region" aria-label="Failed jobs" tabindex="0">
+            <table class="data-table">
+                <caption class="visually-hidden">"Failed jobs"</caption>
+                <thead>
+                    <tr>
+                        <th scope="col">"Job"</th>
+                        <th scope="col">"Project"</th>
+                        <th scope="col">"Organization"</th>
+                        <th scope="col">"Reason"</th>
+                        <th scope="col">"Failed (UTC)"</th>
+                    </tr>
+                </thead>
+                <tbody>{rows}</tbody>
+            </table>
+        </div>
+        {truncated.then(|| view! {
+            <p class="field-hint" role="note">
+                {format!("Showing the newest {ADMIN_FAILED_JOB_LIMIT}. More failed in that period.")}
+            </p>
+        })}
+    }
+    .into_any()
 }
 
 #[component]
@@ -360,6 +435,33 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    #[test]
+    fn failed_jobs_are_labelled_by_what_they_did() {
+        let job = |kind, action| AdminFailedJob {
+            id: Uuid::nil(),
+            kind,
+            action,
+            organization_id: Uuid::nil(),
+            organization_name: OrganizationName::parse("Acme").unwrap(),
+            project_id: None,
+            project_name: None,
+            message: None,
+            failed_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        assert_eq!(
+            job_label(&job(JobKind::ProvisionStack, None)),
+            "Create stack"
+        );
+        assert_eq!(
+            job_label(&job(
+                JobKind::StackAction,
+                Some(supabase_dashboard_domain::provisioning::StackAction::Configure)
+            )),
+            "Change settings"
+        );
+        assert_eq!(job_label(&job(JobKind::StackAction, None)), "Stack action");
+    }
 
     fn project(health: Option<(Vec<StackService>, bool)>) -> AdminProjectSummary {
         let id = Uuid::nil();
