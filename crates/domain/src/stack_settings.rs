@@ -100,7 +100,7 @@ pub const STACK_SETTINGS: [StackSetting; 7] = [
     StackSetting {
         name: "PGRST_DB_SCHEMAS",
         label: "Exposed schemas",
-        help: "Comma-separated schemas the REST API serves. Studio's API docs read the same list.",
+        help: "Comma-separated schemas the REST API serves. Studio's API docs read the same list. Each must exist in the database: the REST API does not start with one that does not.",
         kind: SettingKind::SchemaList,
         default: Some("public,storage,graphql_public"),
         services: &["rest", "studio"],

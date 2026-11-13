@@ -416,6 +416,10 @@ fn review_view(
     })
     .collect_view();
     let base = preview.base;
+    let schemas_changed = preview
+        .changed
+        .iter()
+        .any(|name| name == "PGRST_DB_SCHEMAS");
     let count = preview.changed.len();
     let title = if count == 1 {
         "1 setting changes".to_owned()
@@ -427,6 +431,16 @@ fn review_view(
         .into_iter()
         .map(|name| view! { <li><code class="url-text">{name}</code></li> })
         .collect_view();
+    // The dashboard cannot see the stack's database, so it cannot check
+    // that the schemas exist; PostgREST refuses to start when one does
+    // not, and the redeployment fails.
+    let schemas = schemas_changed.then(|| {
+            view! {
+                <p class="form-warning">
+                    "Check that every exposed schema exists in the database first. The dashboard cannot check it, and with a schema that does not exist the REST API does not start and the redeployment fails."
+                </p>
+            }
+        });
     let restarts = preview.restarts.join(", ");
     view! {
         <div class="settings-review">
@@ -436,6 +450,7 @@ fn review_view(
                 "Applying redeploys the stack. Docker Compose recreates: " {restarts}
                 ". They stop answering for a few seconds while they restart."
             </p>
+            {schemas}
             <ActionForm action=apply attr:class="inline-form">
                 <input type="hidden" name="id" value=project.to_string()/>
                 {hidden}

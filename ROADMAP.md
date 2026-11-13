@@ -211,6 +211,7 @@ Release checks include a fresh installation, Studio access tests for each role, 
 
 ## Revision history
 
+- 2026-11-13: Stack settings warn that every exposed schema must exist: a redeploy with a missing schema leaves PostgREST unhealthy and fails, which a browser check hit by editing the variable in Dokploy.
 - 2026-11-13: M4 Studio hosts on Dokploy: `domain.create` refuses wildcard hosts in v0.31.1; documented a Traefik dynamic file instead, not yet tried end to end.
 - 2026-11-13: Accepting Dokploy edits browser-checked. The settings section now follows actions started in the service panel, so its buttons are disabled while one runs, and an action's refusal clears when the action ends.
 - 2026-11-13: M4 Dokploy link: owners and admins can accept variables edited in Dokploy so they stop being listed, or record the variables of a stack that has no readable record.
