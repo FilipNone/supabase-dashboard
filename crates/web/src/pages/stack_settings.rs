@@ -32,6 +32,9 @@ pub fn StackSettingsSection(
     apply: ServerAction<QueueStackSettings>,
     /// Counts the stack's actions that finished while the page was open.
     finished: Signal<u32>,
+    /// Whether an action on the stack runs now, as the deployment panel
+    /// last read it.
+    running: Signal<bool>,
 ) -> impl IntoView {
     let review = ServerAction::<PreviewStackSettings>::new();
     let accept = ServerAction::<AcceptStackVariables>::new();
@@ -82,6 +85,9 @@ pub fn StackSettingsSection(
         if previous.is_some_and(|previous| previous != now) {
             reviewing.set(false);
             queued.set(false);
+            // A refusal because the action ran no longer holds.
+            apply.value().set(None);
+            accept.value().set(None);
         }
         now
     });
@@ -92,7 +98,8 @@ pub fn StackSettingsSection(
                     // Not the first reading: the values on screen are stale.
                     let reread = finished.get_untracked() > 0 || reloads.get_untracked() > 0;
                     let actions = Actions { review, apply, accept };
-                    section(view, project, actions, reviewing, queued, reread).into_any()
+                    let state = State { reviewing, queued, running };
+                    section(view, project, actions, state, reread).into_any()
                 }
                 // Not provisioned, removed, or not an owner or admin.
                 Ok(None) | Err(AppError::Forbidden) | Err(AppError::NotFound) => ().into_any(),
@@ -115,6 +122,16 @@ struct Actions {
     accept: ServerAction<AcceptStackVariables>,
 }
 
+#[derive(Clone, Copy)]
+struct State {
+    /// The review shows.
+    reviewing: RwSignal<bool>,
+    /// A change was queued from this page and has not finished.
+    queued: RwSignal<bool>,
+    /// An action on the stack runs, as the deployment panel last read it.
+    running: Signal<bool>,
+}
+
 fn section(
     view: StackSettingsView,
     project: uuid::Uuid,
@@ -123,8 +140,11 @@ fn section(
         apply,
         accept,
     }: Actions,
-    reviewing: RwSignal<bool>,
-    queued: RwSignal<bool>,
+    State {
+        reviewing,
+        queued,
+        running: action_running,
+    }: State,
     reread: bool,
 ) -> impl IntoView {
     let form = NodeRef::<leptos::html::Form>::new();
@@ -154,7 +174,7 @@ fn section(
             .map(|err| view! { <p class="form-error" role="alert">{err.to_string()}</p> })
     };
     let running = view.busy;
-    let busy = move || running || queued.get();
+    let busy = move || running || queued.get() || action_running.get();
     let disabled = move || (busy() || review.pending().get()).then_some("true");
     let review_error = move || {
         review
@@ -221,7 +241,7 @@ fn tracking_view(
         accept.value().get().map(|result| match result {
             Ok(()) => view! {
                 <p class="form-ok" role="status">
-                    "Accepted. Later edits in Dokploy are listed against the variables as they were just read."
+                    "Recorded the variables as Dokploy has them now. Later edits there are listed against these."
                 </p>
             }
             .into_any(),
