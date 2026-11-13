@@ -23,7 +23,7 @@ use supabase_dashboard_domain::{
     invitation::{InvitationCode, InvitationPreview, InvitationSummary, IssuedInvitation},
     organization::{MemberSummary, OrganizationSummary},
     project::ProjectSummary,
-    provisioning::{ProvisionJobSummary, ProvisionTargets, StackDeploymentView},
+    provisioning::{ProvisionJobSummary, ProvisionTargets, StackAction, StackDeploymentView},
     studio_access::StudioAccessLog,
 };
 use uuid::Uuid;
@@ -460,6 +460,28 @@ pub async fn get_project_deployment(id: Uuid) -> Result<StackDeploymentView, App
     let session = org_context::session()?;
     Ok(org_context::provisioning()?
         .deployment(&session, id)
+        .await?)
+}
+
+/// Queues a stop, start, or redeploy of a provisioned project's Dokploy
+/// service and returns the job's ID. Owners and admins. Stopping takes the
+/// stack offline, so it must be confirmed.
+#[server]
+pub async fn queue_stack_action(
+    id: Uuid,
+    action: StackAction,
+    // Set by a checkbox, so it is absent when unchecked.
+    #[server(default)] confirm: bool,
+) -> Result<Uuid, AppError> {
+    if action == StackAction::Stop && !confirm {
+        return Err(AppError::Rejected(
+            "Confirm that the stack stops answering until it is started again.".to_string(),
+        ));
+    }
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    Ok(org_context::provisioning()?
+        .queue_action(&session, id, action, audit.get())
         .await?)
 }
 

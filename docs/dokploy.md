@@ -38,6 +38,9 @@ The client in `crates/adapters/src/dokploy.rs` uses the same connection rules as
 | `deployment.allByCompose` | GET | `composeId` | Poll a service's deployments |
 | `domain.create` | POST | `host`, `composeId`, `domainType: compose`, `serviceName`, `port`, `https`, `certificateType`, `path` | Route a host to one service of a stack |
 | `compose.one` | GET | `composeId` | A provisioned stack's service for its project overview: name, status, project, environment, server, and deployments; 404 means Dokploy has no such service |
+| `compose.stop` | POST | `composeId` | Stop a provisioned stack's containers; answers `true` once they are down, and sets the status to `idle` |
+| `compose.start` | POST | `composeId` | Start them again; answers `true` |
+| `compose.redeploy` | POST | `composeId`, `title` | Queue a redeployment from the stored compose file and variables; answers `{"success":true,"message":"Redeployment queued","composeId":…}` |
 
 Every list is read with a 4 MiB body bound and at most 10,000 entries. An entry that does not parse, a service type other than application or compose, an ID outside `[A-Za-z0-9_-]{1,64}`, and an empty or overlong host are skipped one at a time, so one odd entry does not hide the rest.
 
@@ -48,6 +51,7 @@ The compose calls are in `crates/adapters/src/dokploy/compose.rs`, used by the p
 - `compose.one`, `compose.update`, `compose.delete`, and the mount calls answer with the service's variables, compose file, or file contents in plain text. The adapter reads only the IDs and names it needs from those answers. Anyone with a Dokploy key that can see a stack's service can read its secrets this way.
 - Dokploy writes the variables to a `.env` file next to the compose file, each value in double quotes, and escapes every `$` except at the start of `${`, so a value containing `${` would be expanded by Docker Compose. The adapter refuses such variables before sending them. The variables only fill `${…}` references in the compose file; a container receives nothing the compose file does not pass to it.
 - A file mount is written to the server at once, at `/etc/dokploy/compose/<appName>/files/<filePath>`, and the compose file refers to it as `../files/<filePath>`. Dokploy requires `mountPath` even though compose services ignore it. Paths outside the files folder are refused by both Dokploy and the adapter.
+- `compose.stop` waits for the containers to stop before it answers (about 10 seconds for a stack on the fixture; the client's 15-second timeout can cut a larger one short). Stopping a stopped service and starting a running one change nothing, so a stop or start whose answer was lost is sent again. `compose.redeploy` is like `compose.deploy`: it is not idempotent and returns no deployment ID. Both keep the named volumes.
 - `compose.deploy` queues the deployment and returns no ID. Its row in `deployment.allByCompose` appears only once a worker starts it (status `running`, then `done`, `error`, or `cancelled`), and deployments run one at a time. The adapter therefore sends a title unique to the job and finds the deployment by it. `errorMessage` stayed empty on failed compose deployments; the reason is only in the deployment log.
 - Domains become proxy labels when Dokploy deploys, so a domain added or removed after a deployment takes effect at the next one. `domain.create` answers every error with 400, including an unknown service, and checks neither `serviceName` nor the certificate type, so the adapter always sends both.
 - Dokploy answers 401 for a server ID the key may not use, not only for a refused key. The adapter reports both as a refused key; the job checks the target against `server.all` first.
@@ -63,8 +67,6 @@ These are the calls the M4 roadmap items need, with their required inputs in v0.
 | `environment.one` | GET | `environmentId` | Environment details |
 | `compose.move` | POST | `composeId`, `targetEnvironmentId` | Not planned for the dashboard; the browser check uses it to move a service and show the Moved state |
 | `compose.search` | GET | `q`, `environmentId` | Find existing Supabase stacks to adopt |
-| `compose.redeploy` | POST | `composeId` | Redeploy |
-| `compose.stop`, `compose.start` | POST | `composeId` | Stop and start |
 | `compose.delete` | POST | `composeId`, `deleteVolumes` | Remove a stack, keeping or destroying its volumes |
 | `domain.delete` | POST | `domainId` | Remove a domain |
 | `user.get` | GET | none | The key's user |
@@ -111,6 +113,18 @@ A provisioned project's overview has a **Dokploy service** section. Each time th
 - for owners and admins, who choose where stacks go: the Dokploy project, environment, server, the service's name on the server, and a link to the service's page in Dokploy (`/dashboard/project/<project>/environment/<environment>/services/compose/<compose>`, checked on v0.31.1). The link is left out when the dashboard reaches Dokploy at a single-label host such as `http://dokploy:3000`, which a browser cannot open.
 
 When Dokploy has no service with the recorded ID, the section says it was deleted or moved out of the key's reach, and gives owners and admins the name the job gave it. When Dokploy does not answer or refuses the key, the section says so and points to the health check, which asks the stack directly. When Dokploy is no longer connected, it says that. The section is left out for registered projects. Nothing is changed in Dokploy or in the dashboard by reading it: the dashboard shows what changed instead of putting it back. Variable edits made in Dokploy are not detected yet.
+
+### Stop, start, and redeploy
+
+Owners and admins (the `StackOperate` permission) see **Stop**, **Start**, and **Redeploy** buttons in the section. Stopping asks for a confirmation naming the stack, because its API, Auth, Storage, and Studio stop answering until it is started again; the server refuses an unconfirmed stop. Each button queues a `stack_action` job and records `stack.stop`, `stack.start`, or `stack.redeploy` in the audit log; a refused attempt is recorded as denied. A project has at most one unfinished action, enforced by a unique index, so a second click while one runs is refused. Developers and viewers see the last action and its outcome but no buttons. Only projects the dashboard provisioned can be operated.
+
+The job runs these steps:
+
+1. `check`: the account that asked is still active and may still operate the project, and the project still has the Dokploy service the job was queued for.
+2. `act`: reads the service with `compose.one` and fails if Dokploy no longer has it. Then it calls `compose.stop` or `compose.start`, sent again if Dokploy did not answer, or queues a redeployment titled `supabase-dashboard redeploy <job ID>`. Before a redeployment it looks for that title, and it records when it asked before asking, so a redeployment whose answer was lost is never asked for twice.
+3. `wait`: for a redeployment, polls the deployments until the titled one finishes, fails, or is cancelled, for at most 30 minutes.
+
+While an action runs, the section asks the server again every four seconds. None of these actions removes the service, its volumes, or the project. Removing and destroying a stack are separate actions that are not built yet.
 
 The job gives each service the description `Supabase stack <name>, project <project ID> in supabase-dashboard`, so the service in Dokploy points to its dashboard project.
 

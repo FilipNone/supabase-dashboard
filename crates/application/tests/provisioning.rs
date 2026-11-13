@@ -20,7 +20,7 @@ use supabase_dashboard_application::{
     jobs::{JobHandler, JobRunner, RunResult, RunnerSettings},
     provisioning::{
         ComposeApi, DokployFuture, ProvisionError, ProvisionRequest, ProvisionStackHandler,
-        ProvisionTimings, ProvisioningService,
+        ProvisionTimings, ProvisioningService, StackActionHandler,
     },
     secrets::CredentialCipher,
     stack_template::{GATEWAY_PORT, GATEWAY_SERVICE, STACK_FILES},
@@ -42,7 +42,9 @@ use supabase_dashboard_domain::{
     dokploy_target::{DokployEnvironmentInfo, DokployTargetInventory},
     job::JobState,
     project::ProjectUrl,
-    provisioning::{ProvisionStep, ProvisionTargets, StackDeploymentView, TargetChoice},
+    provisioning::{
+        ProvisionStep, ProvisionTargets, StackAction, StackDeploymentView, TargetChoice,
+    },
 };
 use supabase_dashboard_persistence::{Database, accounts::AccountRecord};
 use uuid::Uuid;
@@ -162,6 +164,10 @@ struct ComposeState {
     details_error: Option<DokployError>,
     /// The description each service was created with.
     descriptions: Vec<String>,
+    /// The service's containers were stopped and not started again.
+    stopped: bool,
+    /// Stop the containers, then answer as if the connection dropped.
+    lose_stop_answer: bool,
     next_id: u32,
 }
 
@@ -404,6 +410,60 @@ impl ComposeApi for FakeCompose {
         };
         Box::pin(async move { answer })
     }
+
+    fn stop_compose<'a>(
+        &'a self,
+        _url: &'a DokployUrl,
+        key: &'a SecretString,
+        _compose_id: &'a DokployId,
+    ) -> DokployFuture<'a, ()> {
+        let mut state = self.state.lock().unwrap();
+        state.call("stop_compose", key);
+        state.stopped = true;
+        let answer = if state.lose_stop_answer {
+            state.lose_stop_answer = false;
+            Err(lost())
+        } else {
+            Ok(())
+        };
+        Box::pin(async move { answer })
+    }
+
+    fn start_compose<'a>(
+        &'a self,
+        _url: &'a DokployUrl,
+        key: &'a SecretString,
+        _compose_id: &'a DokployId,
+    ) -> DokployFuture<'a, ()> {
+        let mut state = self.state.lock().unwrap();
+        state.call("start_compose", key);
+        state.stopped = false;
+        Box::pin(async { Ok(()) })
+    }
+
+    fn redeploy_compose<'a>(
+        &'a self,
+        _url: &'a DokployUrl,
+        key: &'a SecretString,
+        _compose_id: &'a DokployId,
+        title: &'a str,
+    ) -> DokployFuture<'a, ()> {
+        let mut state = self.state.lock().unwrap();
+        state.call("redeploy_compose", key);
+        let deployment = DeploymentInfo {
+            deployment_id: state.new_id("dep"),
+            title: Some(title.to_owned()),
+            status: DeploymentStatus::Running,
+        };
+        state.deployments.insert(0, deployment);
+        let answer = if state.lose_deploy_answer {
+            state.lose_deploy_answer = false;
+            Err(lost())
+        } else {
+            Ok(())
+        };
+        Box::pin(async move { answer })
+    }
 }
 
 /// Answers health checks, and records the URL and key of each.
@@ -479,6 +539,14 @@ async fn setup(scratch: &ScratchDb) -> Fixture {
         .unwrap();
     let compose = Arc::new(FakeCompose::default());
     let probe = Arc::new(FakeProbe::default());
+    let timings = ProvisionTimings {
+        deploy_poll: Duration::ZERO,
+        deploy_deadline: Duration::from_secs(600),
+        transient_retry: Duration::ZERO,
+        max_transient_errors: 3,
+        health_attempts: 3,
+        health_poll: Duration::ZERO,
+    };
     let handler: Arc<dyn JobHandler> = Arc::new(
         ProvisionStackHandler::new(
             db.clone(),
@@ -487,18 +555,14 @@ async fn setup(scratch: &ScratchDb) -> Fixture {
             compose.clone(),
             probe.clone(),
         )
-        .with_timings(ProvisionTimings {
-            deploy_poll: Duration::ZERO,
-            deploy_deadline: Duration::from_secs(600),
-            transient_retry: Duration::ZERO,
-            max_transient_errors: 3,
-            health_attempts: 3,
-            health_poll: Duration::ZERO,
-        }),
+        .with_timings(timings),
+    );
+    let actions: Arc<dyn JobHandler> = Arc::new(
+        StackActionHandler::new(db.clone(), dokploy.clone(), compose.clone()).with_timings(timings),
     );
     let runner = JobRunner::new(
         db.clone(),
-        vec![handler],
+        vec![handler, actions],
         RunnerSettings {
             lease: Duration::from_secs(10),
             step_timeout: Duration::from_secs(5),
@@ -1123,4 +1187,206 @@ async fn members_see_the_service_as_dokploy_reports_it_now() {
             .iter()
             .all(|key| key == DOKPLOY_KEY)
     );
+}
+
+/// Provisions the Shop stack and returns its job and project IDs.
+async fn provisioned(f: &Fixture) -> (Uuid, Uuid) {
+    let job = f
+        .service
+        .start(&f.owner, f.organization, shop(), ctx())
+        .await
+        .unwrap();
+    run_all(f).await;
+    let project = f
+        .service
+        .job(&f.owner, job)
+        .await
+        .unwrap()
+        .project_id
+        .unwrap();
+    (job, project)
+}
+
+#[tokio::test]
+async fn owners_stop_start_and_redeploy_a_provisioned_stack() {
+    let Some(scratch) = ScratchDb::create("stack_actions").await else {
+        return;
+    };
+    let f = setup(&scratch).await;
+    let (_, project) = provisioned(&f).await;
+    f.compose.state.lock().unwrap().lose_stop_answer = true;
+
+    // Stop; a second action waits for the first. A lost answer to stop
+    // is followed by another stop, which is harmless.
+    let stop = f
+        .service
+        .queue_action(&f.owner, project, StackAction::Stop, ctx())
+        .await
+        .unwrap();
+    assert!(matches!(
+        f.service
+            .queue_action(&f.owner, project, StackAction::Start, ctx())
+            .await,
+        Err(ProvisionError::Busy)
+    ));
+    run_all(&f).await;
+    let stored = f.db.get_job(stop).await.unwrap().unwrap();
+    assert_eq!(stored.state, "succeeded", "{:?}", stored.message);
+    {
+        let state = f.compose.state.lock().unwrap();
+        assert!(state.stopped);
+        assert_eq!(state.count("stop_compose"), 2);
+    }
+    let StackDeploymentView::Found(view) = f.service.deployment(&f.owner, project).await.unwrap()
+    else {
+        panic!("the owner should see the service");
+    };
+    assert!(view.can_operate);
+    let last = view.last_action.unwrap();
+    assert_eq!(
+        (last.id, last.action, last.state),
+        (stop, StackAction::Stop, JobState::Succeeded)
+    );
+
+    // Start.
+    let start = f
+        .service
+        .queue_action(&f.owner, project, StackAction::Start, ctx())
+        .await
+        .unwrap();
+    run_all(&f).await;
+    assert_eq!(
+        f.db.get_job(start).await.unwrap().unwrap().state,
+        "succeeded"
+    );
+    assert!(!f.compose.state.lock().unwrap().stopped);
+
+    // Redeploy: a lost answer is followed by a lookup, never a second
+    // request.
+    f.compose.state.lock().unwrap().lose_deploy_answer = true;
+    let redeploy = f
+        .service
+        .queue_action(&f.owner, project, StackAction::Redeploy, ctx())
+        .await
+        .unwrap();
+    run_all(&f).await;
+    let stored = f.db.get_job(redeploy).await.unwrap().unwrap();
+    assert_eq!(stored.state, "succeeded", "{:?}", stored.message);
+    assert_eq!(f.compose.state.lock().unwrap().count("redeploy_compose"), 1);
+    let StackDeploymentView::Found(view) = f.service.deployment(&f.owner, project).await.unwrap()
+    else {
+        panic!("the owner should see the service");
+    };
+    let newest = &view.deployments[0];
+    assert_eq!(
+        newest.title.as_deref(),
+        Some(format!("supabase-dashboard redeploy {redeploy}").as_str())
+    );
+    assert!(newest.from_dashboard);
+
+    let audited = count(
+        &f.db,
+        "SELECT count(*) FROM audit_events WHERE outcome = 'success' \
+         AND action IN ('stack.stop', 'stack.start', 'stack.redeploy')",
+    )
+    .await;
+    assert_eq!(audited, 3);
+    let leaked = count(
+        &f.db,
+        "SELECT count(*) FROM jobs WHERE kind = 'stack_action' \
+         AND data::text LIKE '%dokploy-key-marker%'",
+    )
+    .await;
+    assert_eq!(leaked, 0);
+}
+
+#[tokio::test]
+async fn only_owners_and_admins_operate_and_the_job_checks_again() {
+    let Some(scratch) = ScratchDb::create("stack_actions_authz").await else {
+        return;
+    };
+    let f = setup(&scratch).await;
+    let (_, project) = provisioned(&f).await;
+    let dev = account(&f.db, "Dev", false).await;
+    add_member(&f.db, f.organization, &dev, OrgRole::Developer).await;
+    let stranger = account(&f.db, "Stranger", false).await;
+
+    assert!(matches!(
+        f.service
+            .queue_action(&dev, project, StackAction::Stop, ctx())
+            .await,
+        Err(ProvisionError::Forbidden)
+    ));
+    assert!(matches!(
+        f.service
+            .queue_action(&stranger, project, StackAction::Stop, ctx())
+            .await,
+        Err(ProvisionError::NotFound)
+    ));
+    let denied = count(
+        &f.db,
+        "SELECT count(*) FROM audit_events WHERE action = 'stack.stop' AND outcome = 'denied'",
+    )
+    .await;
+    assert_eq!(denied, 1);
+    let StackDeploymentView::Found(view) = f.service.deployment(&dev, project).await.unwrap()
+    else {
+        panic!("a developer should see the service");
+    };
+    assert!(!view.can_operate);
+
+    // Only stacks the dashboard provisioned can be operated.
+    let registered = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO projects (id, organization_id, name, api_url) \
+         VALUES ($1, $2, 'Old', 'https://old.example.test')",
+    )
+    .bind(registered)
+    .bind(f.organization)
+    .execute(f.db.pool())
+    .await
+    .unwrap();
+    assert!(matches!(
+        f.service
+            .queue_action(&f.owner, registered, StackAction::Stop, ctx())
+            .await,
+        Err(ProvisionError::NotProvisioned)
+    ));
+
+    // An admin asks, then loses the role before the job runs.
+    let admin = account(&f.db, "Ada", false).await;
+    add_member(&f.db, f.organization, &admin, OrgRole::Admin).await;
+    let job = f
+        .service
+        .queue_action(&admin, project, StackAction::Stop, ctx())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE organization_members SET role = 'developer' WHERE account_id = $1")
+        .bind(admin.account.id)
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    run_all(&f).await;
+    let stored = f.db.get_job(job).await.unwrap().unwrap();
+    assert_eq!(stored.state, "failed");
+    assert!(stored.message.unwrap().contains("may no longer operate"));
+    assert_eq!(f.compose.state.lock().unwrap().count("stop_compose"), 0);
+
+    // A service deleted in Dokploy fails the job before anything is sent.
+    f.compose.state.lock().unwrap().services.clear();
+    let job = f
+        .service
+        .queue_action(&f.owner, project, StackAction::Redeploy, ctx())
+        .await
+        .unwrap();
+    run_all(&f).await;
+    let stored = f.db.get_job(job).await.unwrap().unwrap();
+    assert_eq!(stored.state, "failed");
+    assert!(
+        stored
+            .message
+            .unwrap()
+            .contains("no longer has this service")
+    );
+    assert_eq!(f.compose.state.lock().unwrap().count("redeploy_compose"), 0);
 }

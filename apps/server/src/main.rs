@@ -33,7 +33,7 @@ use supabase_dashboard_application::{
     key_rotation::{RotationError, key_usage, reseal_credentials},
     organizations::OrganizationService,
     projects::ProjectService,
-    provisioning::{ComposeApi, ProvisionStackHandler, ProvisioningService},
+    provisioning::{ComposeApi, ProvisionStackHandler, ProvisioningService, StackActionHandler},
     secrets::{CredentialCipher, KeyError},
     studio::StudioService,
     studio_access::{StudioAccessRecorder, StudioAccessService},
@@ -489,7 +489,16 @@ async fn run() -> Result<(), StartupError> {
         Arc::clone(&dokploy_client) as Arc<dyn ComposeApi>,
         Arc::clone(&probe),
     ));
-    let runner = JobRunner::new(db.clone(), vec![provision], RunnerSettings::default());
+    let actions: Arc<dyn JobHandler> = Arc::new(StackActionHandler::new(
+        db.clone(),
+        Arc::clone(&dokploy),
+        Arc::clone(&dokploy_client) as Arc<dyn ComposeApi>,
+    ));
+    let runner = JobRunner::new(
+        db.clone(),
+        vec![provision, actions],
+        RunnerSettings::default(),
+    );
     let (stop_jobs, mut jobs_stopped) = tokio::sync::watch::channel(false);
     let jobs = tokio::spawn(async move {
         runner

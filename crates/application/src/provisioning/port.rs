@@ -111,4 +111,30 @@ pub trait ComposeApi: Send + Sync {
         key: &'a SecretString,
         compose_id: &'a DokployId,
     ) -> DokployFuture<'a, Option<ComposeDetails>>;
+
+    /// Stops the containers; Dokploy answers once they stopped. Safe to
+    /// repeat.
+    fn stop_compose<'a>(
+        &'a self,
+        url: &'a DokployUrl,
+        key: &'a SecretString,
+        compose_id: &'a DokployId,
+    ) -> DokployFuture<'a, ()>;
+
+    /// Starts the containers. Safe to repeat.
+    fn start_compose<'a>(
+        &'a self,
+        url: &'a DokployUrl,
+        key: &'a SecretString,
+        compose_id: &'a DokployId,
+    ) -> DokployFuture<'a, ()>;
+
+    /// Queues a redeployment titled `title`. Not idempotent.
+    fn redeploy_compose<'a>(
+        &'a self,
+        url: &'a DokployUrl,
+        key: &'a SecretString,
+        compose_id: &'a DokployId,
+        title: &'a str,
+    ) -> DokployFuture<'a, ()>;
 }

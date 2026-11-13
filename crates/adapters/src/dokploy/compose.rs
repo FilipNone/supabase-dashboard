@@ -265,6 +265,77 @@ impl DokployClient {
         }
     }
 
+    /// Stops the service's containers (`compose.stop`). Dokploy answers
+    /// once they have stopped. Stopping a stopped service changes nothing.
+    pub async fn stop_compose(
+        &self,
+        url: &DokployUrl,
+        key: &SecretString,
+        compose_id: &DokployId,
+    ) -> Result<(), DokployError> {
+        self.compose_switch(url, key, "compose.stop", compose_id)
+            .await
+    }
+
+    /// Starts the service's containers again (`compose.start`). Starting a
+    /// running service changes nothing.
+    pub async fn start_compose(
+        &self,
+        url: &DokployUrl,
+        key: &SecretString,
+        compose_id: &DokployId,
+    ) -> Result<(), DokployError> {
+        self.compose_switch(url, key, "compose.start", compose_id)
+            .await
+    }
+
+    async fn compose_switch(
+        &self,
+        url: &DokployUrl,
+        key: &SecretString,
+        call: &str,
+        compose_id: &DokployId,
+    ) -> Result<(), DokployError> {
+        let body = serde_json::json!({ "composeId": compose_id.as_str() });
+        let answer = self
+            .send(url, call, key, Input::Post(&body), MAX_LIST_BODY_BYTES)
+            .await?;
+        // v0.31.1 answers `true`.
+        match serde_json::from_slice::<serde_json::Value>(&answer) {
+            Ok(serde_json::Value::Bool(true)) => Ok(()),
+            _ => Err(DokployError::InvalidResponse),
+        }
+    }
+
+    /// Queues a redeployment titled `title` (`compose.redeploy`), which
+    /// rebuilds the containers from the stored compose file and variables
+    /// and keeps the volumes. Not idempotent, like [`Self::deploy_compose`].
+    pub async fn redeploy_compose(
+        &self,
+        url: &DokployUrl,
+        key: &SecretString,
+        compose_id: &DokployId,
+        title: &str,
+    ) -> Result<(), DokployError> {
+        let body = serde_json::json!({ "composeId": compose_id.as_str(), "title": title });
+        let answer = self
+            .send(
+                url,
+                "compose.redeploy",
+                key,
+                Input::Post(&body),
+                MAX_SMALL_BODY_BYTES,
+            )
+            .await?;
+        let queued: RawQueued =
+            serde_json::from_slice(&answer).map_err(|_| DokployError::InvalidResponse)?;
+        if queued.success && queued.compose_id.as_deref() == Some(compose_id.as_str()) {
+            Ok(())
+        } else {
+            Err(DokployError::InvalidResponse)
+        }
+    }
+
     /// The deployments of `compose_id` that have started, newest first
     /// (`deployment.allByCompose`).
     pub async fn deployments(
@@ -707,5 +778,35 @@ impl ComposeApi for DokployClient {
         compose_id: &'a DokployId,
     ) -> DokployFuture<'a, Option<ComposeDetails>> {
         Box::pin(DokployClient::compose_details(self, url, key, compose_id))
+    }
+
+    fn stop_compose<'a>(
+        &'a self,
+        url: &'a DokployUrl,
+        key: &'a SecretString,
+        compose_id: &'a DokployId,
+    ) -> DokployFuture<'a, ()> {
+        Box::pin(DokployClient::stop_compose(self, url, key, compose_id))
+    }
+
+    fn start_compose<'a>(
+        &'a self,
+        url: &'a DokployUrl,
+        key: &'a SecretString,
+        compose_id: &'a DokployId,
+    ) -> DokployFuture<'a, ()> {
+        Box::pin(DokployClient::start_compose(self, url, key, compose_id))
+    }
+
+    fn redeploy_compose<'a>(
+        &'a self,
+        url: &'a DokployUrl,
+        key: &'a SecretString,
+        compose_id: &'a DokployId,
+        title: &'a str,
+    ) -> DokployFuture<'a, ()> {
+        Box::pin(DokployClient::redeploy_compose(
+            self, url, key, compose_id, title,
+        ))
     }
 }

@@ -298,7 +298,7 @@ fn job_badge(job: &ProvisionJobSummary) -> (&'static str, &'static str) {
 /// server rendering starts nothing. The handle is kept in thread-safe
 /// storage: on the server the owner can be cleaned up on another thread
 /// than the one that rendered it, where local storage would panic.
-fn poll_every(interval: Duration, tick: impl Fn() -> bool + 'static) {
+pub(crate) fn poll_every(interval: Duration, tick: impl Fn() -> bool + 'static) {
     let poll = StoredValue::new(None::<IntervalHandle>);
     let stop = move || {
         if let Some(handle) = poll.try_update_value(Option::take).flatten() {

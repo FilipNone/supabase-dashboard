@@ -8,18 +8,22 @@ use serde::{Deserialize, Serialize};
 pub enum JobKind {
     /// Provision a new stack through the deployment provider.
     ProvisionStack,
+    /// Stop, start, or redeploy a provisioned stack's service.
+    StackAction,
 }
 
 impl JobKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ProvisionStack => "provision_stack",
+            Self::StackAction => "stack_action",
         }
     }
 
     pub fn parse(raw: &str) -> Option<Self> {
         match raw {
             "provision_stack" => Some(Self::ProvisionStack),
+            "stack_action" => Some(Self::StackAction),
             _ => None,
         }
     }

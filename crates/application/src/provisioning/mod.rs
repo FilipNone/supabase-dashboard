@@ -71,8 +71,10 @@ use crate::{
 };
 
 mod port;
+mod stack_action;
 
 pub use port::{ComposeApi, DokployFuture};
+pub use stack_action::StackActionHandler;
 
 /// How long the job waits at each point. The defaults suit a real
 /// Dokploy; tests shorten them.
@@ -137,6 +139,12 @@ pub enum ProvisionError {
     NoCipher,
     #[error("this organization already has the maximum number of projects")]
     LimitReached,
+    #[error("the dashboard did not create this project's stack, so it cannot operate it")]
+    NotProvisioned,
+    #[error(
+        "an earlier stop, start, or redeploy of this stack is still running; wait for it to finish"
+    )]
+    Busy,
     /// Internal failure. The message is for server logs only.
     #[error("{0}")]
     Internal(String),
@@ -466,11 +474,10 @@ impl ProvisioningService {
                 });
             }
         };
-        Ok(StackDeploymentView::Found(Box::new(stack_deployment(
-            &stored,
-            details,
-            manager.then_some(&credentials.url),
-        ))))
+        let mut found = stack_deployment(&stored, details, manager.then_some(&credentials.url));
+        found.can_operate = access.role.allows(Permission::StackOperate);
+        found.last_action = self.last_action(project_id).await?;
+        Ok(StackDeploymentView::Found(Box::new(found)))
     }
 
     /// The operator's membership allows `permission`. A non-member gets
@@ -559,6 +566,8 @@ fn stack_deployment(
         location,
         deployments,
         more_deployments,
+        can_operate: false,
+        last_action: None,
     }
 }
 

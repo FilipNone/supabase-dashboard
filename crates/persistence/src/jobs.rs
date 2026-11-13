@@ -139,6 +139,42 @@ impl Database {
         tx.commit().await.map_err(query_err)
     }
 
+    /// Queues a stop, start, or redeploy job for `project_id` with its
+    /// audit event, unless the project already has one unfinished. Returns
+    /// `false`, writing nothing, in that case.
+    pub async fn insert_stack_action_job(
+        &self,
+        job: &NewJob<'_>,
+        audit: &AuditEvent<'_>,
+    ) -> Result<bool, PersistenceError> {
+        match self.insert_job(job, audit).await {
+            Ok(()) => Ok(true),
+            Err(PersistenceError::Query(sqlx::Error::Database(err)))
+                if err.is_unique_violation() =>
+            {
+                Ok(false)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// The newest stop, start, or redeploy job of a project.
+    pub async fn latest_stack_action_job(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Option<StoredJob>, PersistenceError> {
+        sqlx::query_as(concat!(
+            "SELECT ",
+            job_columns!(),
+            " FROM jobs WHERE kind = 'stack_action' AND data ->> 'project_id' = $1 \
+             ORDER BY created_at DESC, id DESC LIMIT 1"
+        ))
+        .bind(project_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(query_err)
+    }
+
     /// Claims the next due job for `owner`: a queued job whose `run_after`
     /// has passed, or a running job whose lease ran out, which counts as an
     /// interruption.

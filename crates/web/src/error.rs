@@ -232,7 +232,9 @@ mod server {
                 | ProvisionError::TargetNotAllowed
                 | ProvisionError::NotConnected
                 | ProvisionError::NoCipher
-                | ProvisionError::LimitReached => Self::Rejected(sentence(&err.to_string())),
+                | ProvisionError::LimitReached
+                | ProvisionError::NotProvisioned
+                | ProvisionError::Busy => Self::Rejected(sentence(&err.to_string())),
                 ProvisionError::Internal(err) => {
                     tracing::error!(error = %err, "provisioning operation failed");
                     Self::Unavailable

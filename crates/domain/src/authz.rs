@@ -65,6 +65,7 @@ impl OrgRole {
                 | P::ProjectUpdate
                 | P::ProjectCredentialsReplace
                 | P::ProjectUnregister
+                | P::StackOperate
                 | P::StudioOpen => true,
             },
             Self::Developer => match permission {
@@ -76,7 +77,8 @@ impl OrgRole {
                 | P::ProjectRegister
                 | P::ProjectUpdate
                 | P::ProjectCredentialsReplace
-                | P::ProjectUnregister => false,
+                | P::ProjectUnregister
+                | P::StackOperate => false,
             },
             Self::Viewer => match permission {
                 P::OrgRead | P::MembersRead | P::ProjectRead => true,
@@ -90,7 +92,8 @@ impl OrgRole {
                 | P::ProjectRegister
                 | P::ProjectUpdate
                 | P::ProjectCredentialsReplace
-                | P::ProjectUnregister => false,
+                | P::ProjectUnregister
+                | P::StackOperate => false,
             },
         }
     }
@@ -115,6 +118,9 @@ pub enum Permission {
     ProjectCredentialsReplace,
     /// Remove the registry entry only; never deletes the stack or its data.
     ProjectUnregister,
+    /// Stop, start, or redeploy the Dokploy service of a stack the
+    /// dashboard provisioned. Never removes the service or its data.
+    StackOperate,
     /// Open the project's Supabase Studio through the dashboard. Studio has
     /// no roles, so this grants full database access and shows the stack's
     /// API keys and JWT secret.
@@ -122,7 +128,7 @@ pub enum Permission {
 }
 
 impl Permission {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::OrgRead,
         Self::OrgUpdate,
         Self::OrgDelete,
@@ -134,6 +140,7 @@ impl Permission {
         Self::ProjectUpdate,
         Self::ProjectCredentialsReplace,
         Self::ProjectUnregister,
+        Self::StackOperate,
         Self::StudioOpen,
     ];
 }
@@ -209,6 +216,7 @@ mod tests {
                 P::ProjectUpdate,
                 P::ProjectCredentialsReplace,
                 P::ProjectUnregister,
+                P::StackOperate,
                 P::StudioOpen,
             ],
             Developer => &[P::OrgRead, P::MembersRead, P::ProjectRead, P::StudioOpen],

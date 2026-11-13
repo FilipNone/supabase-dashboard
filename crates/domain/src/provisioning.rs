@@ -160,6 +160,64 @@ pub struct StackDeployment {
     pub deployments: Vec<StackDeploymentRun>,
     /// More deployments exist than are listed.
     pub more_deployments: bool,
+    /// The operator may stop, start, and redeploy the service.
+    pub can_operate: bool,
+    /// The newest stop, start, or redeploy asked for, if any.
+    pub last_action: Option<StackActionSummary>,
+}
+
+/// An operation on a provisioned stack's service. None of them removes
+/// the service or its data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StackAction {
+    Stop,
+    Start,
+    Redeploy,
+}
+
+impl StackAction {
+    pub const ALL: [Self; 3] = [Self::Stop, Self::Start, Self::Redeploy];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Start => "start",
+            Self::Redeploy => "redeploy",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|action| action.as_str() == raw)
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Stop => "Stop",
+            Self::Start => "Start",
+            Self::Redeploy => "Redeploy",
+        }
+    }
+
+    /// The audit action recorded when it is asked for.
+    pub const fn audit_action(self) -> &'static str {
+        match self {
+            Self::Stop => "stack.stop",
+            Self::Start => "stack.start",
+            Self::Redeploy => "stack.redeploy",
+        }
+    }
+}
+
+/// What members see of a stop, start, or redeploy job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackActionSummary {
+    pub id: Uuid,
+    pub action: StackAction,
+    pub state: JobState,
+    pub message: Option<String>,
+    pub created_at: OffsetDateTime,
+    pub finished_at: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

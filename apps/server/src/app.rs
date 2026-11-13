@@ -195,8 +195,8 @@ mod tests {
             GetDokployPlacement, GetInstallationHealth, GetOrganization, GetProject,
             GetProjectAuthorities, GetProjectCredentials, GetProjectDeployment, GetProjectHealth,
             GetProvisionJob, GetProvisionTargets, GetStudioAccessLog, ListOrganizations,
-            ListProjects, ListProvisionJobs, ListSessions, PreviewInvitation, RegisterProject,
-            RemoveProjectAuthorities, RemoveProjectCredential, RenameOrganization,
+            ListProjects, ListProvisionJobs, ListSessions, PreviewInvitation, QueueStackAction,
+            RegisterProject, RemoveProjectAuthorities, RemoveProjectCredential, RenameOrganization,
             ReplaceDokployKey, ReplaceProjectAuthorities, ReplaceProjectCredential,
             ReplaceStudioLogin, RevokeSession, SignUpWithInvitation, StartProvisioning,
             UnregisterProject, UpdateProfile,
@@ -1091,6 +1091,104 @@ mod tests {
         assert_eq!(parts.status, StatusCode::OK);
         assert!(body.contains("Loading the Dokploy service"), "{body}");
         assert!(!body.contains("Marker"), "{body}");
+
+        db.close().await;
+        scratch.drop().await;
+    }
+
+    #[tokio::test]
+    async fn only_owners_and_admins_queue_stack_actions() {
+        let Some(scratch) = ScratchDb::create("http_stack_actions").await else {
+            return;
+        };
+        let db = Database::connect(&scratch.settings).await.unwrap();
+        db.migrate().await.unwrap();
+        let router = router_with_cipher(db.clone(), Some(test_cipher())).await;
+        let (alice, bob) = admin_and_member(&db, &router).await;
+        let call = |body: String, cookie: &str| {
+            send(
+                &router,
+                form_post(QueueStackAction::PATH, &body, Some(cookie)),
+            )
+        };
+        let (_, body) = send(
+            &router,
+            form_post(CreateOrganization::PATH, "name=Acme", Some(&alice)),
+        )
+        .await;
+        let org: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let org_id = org["id"].as_str().unwrap().to_owned();
+        let registered = uuid::Uuid::now_v7().to_string();
+        let provisioned = uuid::Uuid::now_v7().to_string();
+        for (id, name) in [(&registered, "Registered"), (&provisioned, "Provisioned")] {
+            sqlx::query(
+                "INSERT INTO projects (id, organization_id, name, api_url) \
+                 VALUES ($1::uuid, $2::uuid, $3, 'https://stack.example.test')",
+            )
+            .bind(id)
+            .bind(&org_id)
+            .bind(name)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO project_dokploy_services \
+             (project_id, compose_id, app_name, environment_id, job_id) \
+             VALUES ($1::uuid, 'composeMarker1', 'sd-app-marker', 'envMarker1', $2)",
+        )
+        .bind(&provisioned)
+        .bind(uuid::Uuid::now_v7())
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let jobs = || async {
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs WHERE kind = 'stack_action'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap()
+        };
+
+        // Not a member, then a viewer: neither may operate the stack.
+        let stop = format!("id={provisioned}&action=stop&confirm=true");
+        let (parts, body) = call(stop.clone(), &bob).await;
+        assert_eq!(parts.status, StatusCode::NOT_FOUND, "{body}");
+        sqlx::query(
+            "INSERT INTO organization_members (organization_id, account_id, role) \
+             SELECT $1::uuid, id, 'viewer' FROM accounts WHERE email = 'bob@example.test'",
+        )
+        .bind(&org_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let (parts, body) = call(stop.clone(), &bob).await;
+        assert_eq!(parts.status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(jobs().await, 0);
+
+        // Stopping must be confirmed; a registered stack is not operated.
+        let (parts, body) = call(format!("id={provisioned}&action=stop"), &alice).await;
+        assert_eq!(parts.status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        let (parts, body) = call(format!("id={registered}&action=redeploy"), &alice).await;
+        assert_eq!(parts.status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(body.contains("did not create"), "{body}");
+        let (parts, body) = call(format!("id={provisioned}&action=delete"), &alice).await;
+        // An action that does not exist is refused when decoded.
+        assert_ne!(parts.status, StatusCode::OK, "{body}");
+        assert_eq!(jobs().await, 0);
+
+        // The owner queues one action; a second waits for it.
+        let (parts, body) = call(stop, &alice).await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        let (parts, body) = call(format!("id={provisioned}&action=start"), &alice).await;
+        assert_eq!(parts.status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(body.contains("still running"), "{body}");
+        assert_eq!(jobs().await, 1);
+        let audited: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE action = 'stack.stop'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(audited, 2, "one denied, one queued");
 
         db.close().await;
         scratch.drop().await;

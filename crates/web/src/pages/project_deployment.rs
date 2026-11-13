@@ -4,32 +4,60 @@
 //! Dokploy is asked each time the page loads, so a redeploy, a move, or a
 //! deletion made in Dokploy shows here instead of being overwritten. The
 //! panel is left out for projects that were registered, not provisioned.
+//! Owners and admins can stop, start, and redeploy the service from here;
+//! while such an action runs, the panel polls until it finishes.
 
-use leptos::prelude::*;
+use std::time::Duration;
+
+use leptos::{form::ActionForm, prelude::*};
 
 use supabase_dashboard_domain::{
     dokploy_compose::{ComposeStatus, DeploymentStatus},
+    job::JobState,
     project::ProjectSummary,
-    provisioning::{StackDeployment, StackDeploymentRun, StackDeploymentView, StackLocation},
+    provisioning::{
+        StackAction, StackActionSummary, StackDeployment, StackDeploymentRun, StackDeploymentView,
+        StackLocation,
+    },
 };
 
 use crate::{
     components::page::{StatePanel, StateTone},
-    pages::account::utc_minutes,
-    server_fns::get_project_deployment,
+    pages::{account::utc_minutes, provision::poll_every},
+    server_fns::{QueueStackAction, get_project_deployment},
 };
+
+/// How often the panel asks again while an action runs.
+const ACTION_POLL: Duration = Duration::from_secs(4);
 
 #[component]
 pub fn DeploymentPanel(project: ProjectSummary) -> impl IntoView {
     let id = project.id;
-    let deployment = Resource::new(move || id, get_project_deployment);
+    let act = ServerAction::<QueueStackAction>::new();
+    let deployment = Resource::new(
+        move || (id, act.version().get()),
+        |(id, _)| get_project_deployment(id),
+    );
+    // Keeps running for the page's life: a new action can start at any
+    // time, and only an unfinished one triggers a request.
+    poll_every(ACTION_POLL, move || {
+        let running = matches!(
+            deployment.get_untracked(),
+            Some(Ok(StackDeploymentView::Found(found)))
+                if found.last_action.as_ref().is_some_and(|last| !last.state.is_finished())
+        );
+        if running {
+            deployment.refetch();
+        }
+        true
+    });
     view! {
         <Transition fallback=|| view! {
             <p class="loading" role="status">"Loading the Dokploy service…"</p>
         }>
             {move || deployment.get().map(|result| match result {
                 Ok(StackDeploymentView::NotProvisioned) => ().into_any(),
-                Ok(view) => panel(state_view(view)).into_any(),
+                Ok(view) => panel(state_view(view, act, id)).into_any(),
                 Err(err) => panel(
                     view! {
                         <StatePanel
@@ -55,7 +83,11 @@ fn panel(body: AnyView) -> impl IntoView {
     }
 }
 
-fn state_view(view: StackDeploymentView) -> AnyView {
+fn state_view(
+    view: StackDeploymentView,
+    act: ServerAction<QueueStackAction>,
+    project: uuid::Uuid,
+) -> AnyView {
     match view {
         StackDeploymentView::NotProvisioned => ().into_any(),
         StackDeploymentView::NotConnected => view! {
@@ -90,7 +122,7 @@ fn state_view(view: StackDeploymentView) -> AnyView {
             }
             .into_any()
         }
-        StackDeploymentView::Found(found) => found_view(*found),
+        StackDeploymentView::Found(found) => found_view(*found, act, project),
     }
 }
 
@@ -113,8 +145,20 @@ fn run_badge(status: DeploymentStatus) -> &'static str {
     }
 }
 
-fn found_view(found: StackDeployment) -> AnyView {
+fn found_view(
+    found: StackDeployment,
+    act: ServerAction<QueueStackAction>,
+    project: uuid::Uuid,
+) -> AnyView {
     let (class, label) = status_badge(found.status);
+    let last = found.last_action.clone().map(last_action_view);
+    let busy = found
+        .last_action
+        .as_ref()
+        .is_some_and(|last| !last.state.is_finished());
+    let controls = found
+        .can_operate
+        .then(|| controls_view(act, project, &found.name, busy).into_any());
     let moved = found.moved.then(|| {
         view! {
             <p class="form-error" role="status">
@@ -135,8 +179,10 @@ fn found_view(found: StackDeployment) -> AnyView {
                 <dd><span class=class>{label}</span></dd>
             </div>
             {location}
+            {last}
         </dl>
         {moved}
+        {controls}
         {deployments}
     }
     .into_any()
@@ -230,10 +276,92 @@ fn run_row(run: StackDeploymentRun) -> impl IntoView {
     view! {
         <tr>
             <td>{run.title.unwrap_or_else(|| "Untitled".to_owned())}</td>
-            <td>{by}</td>
-            <td><span class=run_badge(run.status)>{run.status.label()}</span></td>
-            <td>{time(run.created_at)}</td>
-            <td>{time(run.finished_at)}</td>
+            <td class="nowrap">{by}</td>
+            <td class="nowrap"><span class=run_badge(run.status)>{run.status.label()}</span></td>
+            <td class="nowrap">{time(run.created_at)}</td>
+            <td class="nowrap">{time(run.finished_at)}</td>
         </tr>
+    }
+}
+
+fn action_badge(state: JobState) -> (&'static str, &'static str) {
+    match state {
+        JobState::Queued => ("badge badge-current", "Queued"),
+        JobState::Running => ("badge badge-current", "Running"),
+        JobState::Succeeded => ("badge badge-ok", "Done"),
+        JobState::Failed => ("badge badge-error", "Failed"),
+    }
+}
+
+fn last_action_view(last: StackActionSummary) -> impl IntoView {
+    let (class, label) = action_badge(last.state);
+    let when = format!("Asked {} (UTC)", utc_minutes(last.created_at));
+    view! {
+        <div>
+            <dt>"Last action"</dt>
+            <dd>
+                {last.action.label()} " " <span class=class>{label}</span>
+                {last.message.map(|message| view! { <span class="field-hint">" " {message}</span> })}
+                <span class="field-hint">" " {when}</span>
+            </dd>
+        </div>
+    }
+}
+
+/// Stop, start, and redeploy. Each queues a job; the panel follows it.
+/// Stopping takes the stack offline, so it asks for a confirmation.
+fn controls_view(
+    act: ServerAction<QueueStackAction>,
+    project: uuid::Uuid,
+    name: &str,
+    busy: bool,
+) -> impl IntoView {
+    let project = project.to_string();
+    let stop_project = project.clone();
+    let start_project = project.clone();
+    let error = move || {
+        act.value()
+            .get()
+            .and_then(Result::err)
+            .map(|err| view! { <p class="form-error" role="alert">{err.to_string()}</p> })
+    };
+    let disabled = move || busy || act.pending().get();
+    let button = |action: StackAction, project: String, class: &'static str| {
+        view! {
+            <ActionForm action=act attr:class="inline-form compact">
+                <input type="hidden" name="id" value=project/>
+                <input type="hidden" name="action" value=action.as_str()/>
+                <button type="submit" class=class disabled=disabled>
+                    {action.label()}
+                </button>
+            </ActionForm>
+        }
+    };
+    let confirm_label = format!(
+        "Stop {name}: its API, Auth, Storage, and Studio stop answering until it is started again. The volumes and data are kept."
+    );
+    view! {
+        <div class="stack-actions" role="group" aria-label="Operate the Dokploy service">
+            <ActionForm action=act attr:class="inline-form">
+                <input type="hidden" name="id" value=stop_project/>
+                <input type="hidden" name="action" value=StackAction::Stop.as_str()/>
+                <label class="checkbox-field">
+                    <input type="checkbox" name="confirm" value="true" required/>
+                    <span>{confirm_label}</span>
+                </label>
+                <button type="submit" class="button button-danger" disabled=disabled>
+                    {StackAction::Stop.label()}
+                </button>
+            </ActionForm>
+            {button(StackAction::Start, start_project, "button")}
+            {button(StackAction::Redeploy, project, "button")}
+        </div>
+        {busy.then(|| view! {
+            <p class="field-hint" role="status">"An action is running; the buttons come back when it finishes."</p>
+        })}
+        {error}
+        <p class="field-hint">
+            "Redeploy rebuilds the containers from the compose file and variables Dokploy holds, so changes made in Dokploy apply. None of these remove the service or its data."
+        </p>
     }
 }

@@ -380,6 +380,39 @@ async fn fixture_dokploy_creates_configures_and_deploys_a_compose_service() {
         None
     );
 
+    // Stop and start answer once Dokploy has done them; stopping twice is
+    // harmless. A redeployment is queued under its title.
+    client.stop_compose(&url, &key, &compose).await.unwrap();
+    client.stop_compose(&url, &key, &compose).await.unwrap();
+    let stopped = client
+        .compose_details(&url, &key, &compose)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stopped.status, Some(ComposeStatus::Idle));
+    client.start_compose(&url, &key, &compose).await.unwrap();
+    client
+        .redeploy_compose(&url, &key, &compose, "sd compose redeploy 1")
+        .await
+        .unwrap();
+    let mut status = None;
+    for _ in 0..120 {
+        let deployments = client.deployments(&url, &key, &compose).await.unwrap();
+        status = deployments
+            .iter()
+            .find(|d| d.title.as_deref() == Some("sd compose redeploy 1"))
+            .map(|d| d.status);
+        if status.is_some_and(DeploymentStatus::is_finished) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert_eq!(status, Some(DeploymentStatus::Done));
+    assert!(matches!(
+        client.stop_compose(&url, &key, &made_up).await,
+        Err(DokployError::Http(_))
+    ));
+
     post(
         &url,
         "compose.delete",
