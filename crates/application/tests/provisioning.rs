@@ -1167,7 +1167,7 @@ async fn members_see_the_service_as_dokploy_reports_it_now() {
 
     // Dokploy refusing the key is reported, not raised.
     f.compose.state.lock().unwrap().details_error = Some(DokployError::KeyRejected);
-    let StackDeploymentView::Unavailable { reason } =
+    let StackDeploymentView::Unavailable { reason, .. } =
         f.service.deployment(&dev, project).await.unwrap()
     else {
         panic!("a refused key should be reported");
@@ -1184,12 +1184,16 @@ async fn members_see_the_service_as_dokploy_reports_it_now() {
     assert_eq!(
         f.service.deployment(&f.owner, project).await.unwrap(),
         StackDeploymentView::Missing {
-            compose_name: Some(format!("sd-{}", job.simple()))
+            compose_name: Some(format!("sd-{}", job.simple())),
+            last_action: None,
         }
     );
     assert_eq!(
         f.service.deployment(&dev, project).await.unwrap(),
-        StackDeploymentView::Missing { compose_name: None }
+        StackDeploymentView::Missing {
+            compose_name: None,
+            last_action: None,
+        }
     );
 
     // Without the connection there is nothing to ask.
@@ -1559,12 +1563,23 @@ async fn destroying_deletes_the_volumes_and_a_vanished_service_is_not_deleted() 
     assert!(f.compose.state.lock().unwrap().deletes.is_empty());
 
     // The owner destroys it with its data.
-    f.compose.state.lock().unwrap().services = saved;
+    f.compose.state.lock().unwrap().services = saved.clone();
     let job = f
         .service
         .queue_removal(&f.owner, project, StackAction::Destroy, "Shop", ctx())
         .await
         .unwrap();
+    // Between Dokploy deleting the service and the job recording it, the
+    // panel still sees the running removal, so it keeps following it.
+    f.compose.state.lock().unwrap().services.clear();
+    let view = f.service.deployment(&f.owner, project).await.unwrap();
+    let StackDeploymentView::Missing { last_action, .. } = &view else {
+        panic!("a vanished service should show as missing: {view:?}");
+    };
+    let last = last_action.as_ref().expect("the removal is reported");
+    assert_eq!((last.id, last.action), (job, StackAction::Destroy));
+    assert!(view.action_running());
+    f.compose.state.lock().unwrap().services = saved;
     run_all(&f).await;
     let stored = f.db.get_job(job).await.unwrap().unwrap();
     assert_eq!(stored.state, "succeeded", "{:?}", stored.message);

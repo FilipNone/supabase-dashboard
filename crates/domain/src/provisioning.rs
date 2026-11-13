@@ -136,11 +136,15 @@ pub enum StackDeploymentView {
     /// address, key, or response text.
     Unavailable {
         reason: String,
+        last_action: Option<StackActionSummary>,
     },
     /// Dokploy has no service with the recorded ID: it was deleted in
-    /// Dokploy, or the key's member can no longer see it.
+    /// Dokploy, or the key's member can no longer see it. Also seen for a
+    /// moment while a removal runs, between Dokploy deleting the service
+    /// and the job recording it; `last_action` then is that removal.
     Missing {
         compose_name: Option<String>,
+        last_action: Option<StackActionSummary>,
     },
     Found(Box<StackDeployment>),
     /// The dashboard removed the service from Dokploy. With
@@ -152,6 +156,26 @@ pub enum StackDeploymentView {
         app_name: Option<String>,
         last_action: Option<StackActionSummary>,
     },
+}
+
+impl StackDeploymentView {
+    /// The newest stop, start, redeploy, remove, or destroy on the
+    /// project, where this state reports one.
+    pub fn last_action(&self) -> Option<&StackActionSummary> {
+        match self {
+            Self::Found(found) => found.last_action.as_ref(),
+            Self::Unavailable { last_action, .. }
+            | Self::Missing { last_action, .. }
+            | Self::Removed { last_action, .. } => last_action.as_ref(),
+            Self::NotProvisioned | Self::NotConnected => None,
+        }
+    }
+
+    /// An action on the project is queued or running.
+    pub fn action_running(&self) -> bool {
+        self.last_action()
+            .is_some_and(|last| !last.state.is_finished())
+    }
 }
 
 /// The provisioned project's service as Dokploy reports it now.

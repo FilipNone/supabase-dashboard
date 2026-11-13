@@ -335,7 +335,8 @@ code { font-family: var(--font-mono); font-size: var(--text-sm); }
   display: grid; gap: var(--space-4); margin-top: var(--space-4); padding: var(--space-4);
   border: 1px solid var(--color-error-text); border-radius: var(--radius-md);
 }
-.danger-zone .stacked-form { max-width: 36rem; }
+.danger-zone .stacked-form { max-width: 36rem; gap: var(--space-3); }
+.danger-zone .subsection-title { margin: 0; color: var(--color-text); }
 .field-hint { margin: 0; font-size: var(--text-sm); color: var(--color-text-muted); }
 .form-ok {
   margin: 0; padding: var(--space-3); border-radius: var(--radius-md);

@@ -55,14 +55,8 @@ pub fn DeploymentPanel(project: ProjectSummary) -> impl IntoView {
     // Keeps running for the page's life: a new action can start at any
     // time, and only an unfinished one triggers a request.
     poll_every(ACTION_POLL, move || {
-        let unfinished = |last: &Option<StackActionSummary>| {
-            last.as_ref().is_some_and(|last| !last.state.is_finished())
-        };
-        let running = match deployment.get_untracked() {
-            Some(Ok(StackDeploymentView::Found(found))) => unfinished(&found.last_action),
-            Some(Ok(StackDeploymentView::Removed { last_action, .. })) => unfinished(&last_action),
-            _ => false,
-        };
+        let running = deployment
+            .with_untracked(|view| matches!(view, Some(Ok(view)) if view.action_running()));
         if running {
             deployment.refetch();
         }
@@ -71,11 +65,10 @@ pub fn DeploymentPanel(project: ProjectSummary) -> impl IntoView {
     // One live region beside the re-rendered panel, so an action's
     // progress and outcome are announced.
     let announcement = move || {
-        let last = match deployment.get() {
-            Some(Ok(StackDeploymentView::Found(found))) => found.last_action,
-            Some(Ok(StackDeploymentView::Removed { last_action, .. })) => last_action,
+        let last = deployment.with(|view| match view {
+            Some(Ok(view)) => view.last_action().cloned(),
             _ => None,
-        }?;
+        })?;
         let (_, label) = action_badge(&last);
         Some(format!(
             "{}: {label}. {}",
@@ -142,15 +135,34 @@ fn state_view(
             />
         }
         .into_any(),
-        StackDeploymentView::Unavailable { reason } => view! {
+        StackDeploymentView::Unavailable {
+            reason,
+            last_action,
+        } => view! {
             <StatePanel
                 tone=StateTone::Error
                 title="Dokploy did not answer".to_string()
                 detail=format!("{reason} The stack itself may still be running; the health check above asks it directly.")
             />
+            <dl class="detail-list">{last_action.map(last_action_view)}</dl>
         }
         .into_any(),
-        StackDeploymentView::Missing { compose_name } => {
+        StackDeploymentView::Missing {
+            last_action: Some(last),
+            ..
+        } if last.action.deletes_service() && !last.state.is_finished() => view! {
+            <StatePanel
+                tone=StateTone::Empty
+                title="Removing the service from Dokploy".to_string()
+                detail="Dokploy no longer lists the service. The dashboard is recording the removal; this section updates when it has.".to_string()
+            />
+            <dl class="detail-list">{last_action_view(last)}</dl>
+        }
+        .into_any(),
+        StackDeploymentView::Missing {
+            compose_name,
+            last_action,
+        } => {
             let detail = match compose_name {
                 Some(name) => format!(
                     "Dokploy has no service with the ID the dashboard recorded. It was deleted or moved out of reach of the dashboard's API key in Dokploy. The dashboard named it {name}. The project stays registered; unregister it under Settings if the stack is gone."
@@ -163,6 +175,7 @@ fn state_view(
                     title="Service not found in Dokploy".to_string()
                     detail=detail
                 />
+                <dl class="detail-list">{last_action.map(last_action_view)}</dl>
             }
             .into_any()
         }
@@ -173,18 +186,33 @@ fn state_view(
             app_name,
             last_action,
         } => {
-            let detail = match (volumes_deleted, app_name) {
-                (true, _) => "The dashboard deleted this stack's Dokploy service and its data volumes. Nothing of it is left to start again.".to_owned(),
-                (false, Some(app)) => format!(
-                    "The dashboard deleted this stack's Dokploy service and kept its data volumes on the server. Their names start with {app}_; delete them on the server when the data is no longer needed."
-                ),
-                (false, None) => "The dashboard deleted this stack's Dokploy service and kept its data volumes on the server. Ask an owner or admin about them.".to_owned(),
+            let detail = if volumes_deleted {
+                "The dashboard deleted this stack's Dokploy service and its data volumes. Nothing of it is left to start again."
+            } else {
+                "The dashboard deleted this stack's Dokploy service and kept its data volumes on the server."
             };
-            let title = format!("Removed from Dokploy {} (UTC)", utc_minutes(removed_at));
-            view! {
-                <StatePanel tone=StateTone::Empty title=title detail=detail/>
-                <dl class="detail-list">{last_action.map(last_action_view)}</dl>
+            let volumes = (!volumes_deleted).then(|| match app_name {
+                Some(app) => view! {
+                    <p class="section-text">
+                        "The volumes' names start with " <code class="url-text">{format!("{app}_")}</code>
+                        ". Delete them on the server when the data is no longer needed."
+                    </p>
+                }
+                .into_any(),
+                None => view! { <p class="section-text">"Ask an owner or admin about the volumes."</p> }.into_any(),
+            });
+            let verb = if volumes_deleted { "Destroyed" } else { "Removed from Dokploy" };
+            let title = format!("{verb} {} (UTC)", utc_minutes(removed_at));
+            // The removal's own message already says the project stays
+            // registered.
+            let hint = last_action.is_none().then(|| view! {
                 <p class="field-hint">"The project stays registered until it is unregistered under Settings."</p>
+            });
+            view! {
+                <StatePanel tone=StateTone::Empty title=title detail=detail.to_owned()/>
+                {volumes}
+                <dl class="detail-list">{last_action.map(last_action_view)}</dl>
+                {hint}
             }
             .into_any()
         }
@@ -464,26 +492,64 @@ fn removal_view(
     busy: bool,
 ) -> impl IntoView {
     let disabled = move || (busy || remove.pending().get()).then_some("true");
-    let error = move || {
-        remove
-            .value()
-            .get()
-            .and_then(Result::err)
-            .map(|err| view! { <p class="form-error" role="alert">{err.to_string()}</p> })
-    };
-    let form = move |action: StackAction, id: &'static str, text: String| {
-        let label = format!("Type {name} to confirm");
+    // Which form was sent last, so its refusal shows beside it. Pressing
+    // Enter in a field clicks the form's submit button too.
+    let sent = RwSignal::new(None::<StackAction>);
+    let form = move |action: StackAction, id: &'static str, purpose: &str, text: String| {
+        let label = format!("Type {name} to {purpose}");
+        let text_id = format!("{id}-text");
+        let error_id = format!("{id}-error");
+        let error_text = move || {
+            (sent.get() == Some(action))
+                .then(|| remove.value().get().and_then(Result::err))
+                .flatten()
+                .map(|err| err.to_string())
+        };
+        let described = {
+            let text_id = text_id.clone();
+            let error_id = error_id.clone();
+            move || match error_text() {
+                Some(_) => format!("{text_id} {error_id}"),
+                None => text_id.clone(),
+            }
+        };
+        let invalid = move || error_text().map(|_| "true");
+        let error = {
+            let error_id = error_id.clone();
+            move || {
+                error_text().map(|err| {
+                    view! { <p class="form-error" id=error_id.clone() role="alert">{err}</p> }
+                })
+            }
+        };
         view! {
             <ActionForm action=remove attr:class="stacked-form">
-                <p class="section-text">{text}</p>
+                <h4 class="subsection-title">{action.label()}</h4>
+                <p class="section-text" id=text_id>{text}</p>
                 <input type="hidden" name="id" value=project.to_string()/>
                 <input type="hidden" name="action" value=action.as_str()/>
                 <div class="field">
                     <label for=id>{label}</label>
-                    <input class="input" id=id name="name" type="text" required autocomplete="off" spellcheck="false"/>
+                    <input
+                        class="input"
+                        id=id
+                        name="name"
+                        type="text"
+                        required
+                        autocomplete="off"
+                        spellcheck="false"
+                        aria-describedby=described
+                        aria-invalid=invalid
+                    />
                 </div>
+                {error}
                 <div>
-                    <button type="submit" class="button button-danger" aria-disabled=disabled>
+                    <button
+                        type="submit"
+                        class="button button-danger"
+                        aria-disabled=disabled
+                        on:click=move |_| sent.set(Some(action))
+                    >
                         {action.label()}
                     </button>
                 </div>
@@ -495,9 +561,10 @@ fn removal_view(
     view! {
         <div class="danger-zone" role="group" aria-labelledby="danger-title">
             <h3 class="section-title" id="danger-title">"Remove the stack"</h3>
-            {form(StackAction::Remove, "remove-name", remove_text)}
-            {can_destroy.then(|| form(StackAction::Destroy, "destroy-name", destroy_text))}
-            {error}
+            {form(StackAction::Remove, "remove-name", "remove its service", remove_text)}
+            {can_destroy.then(|| {
+                form(StackAction::Destroy, "destroy-name", "destroy the stack and its data", destroy_text)
+            })}
         </div>
     }
 }

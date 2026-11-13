@@ -448,12 +448,13 @@ impl ProvisioningService {
         let Some(stored) = self.db.find_project_dokploy_service(project_id).await? else {
             return Ok(StackDeploymentView::NotProvisioned);
         };
+        let last_action = self.last_action(project_id).await?;
         if let Some(removed_at) = stored.removed_at {
             return Ok(StackDeploymentView::Removed {
                 removed_at,
                 volumes_deleted: stored.volumes_deleted,
                 app_name: manager.then(|| stored.app_name.clone()),
-                last_action: self.last_action(project_id).await?,
+                last_action,
             });
         }
         let credentials = match self.dokploy.credentials().await {
@@ -466,6 +467,7 @@ impl ProvisioningService {
         let Some(compose) = self.compose.as_ref() else {
             return Ok(StackDeploymentView::Unavailable {
                 reason: "This server does not read Dokploy services.".to_owned(),
+                last_action,
             });
         };
         let compose_id = DokployId::parse(&stored.compose_id)
@@ -478,11 +480,13 @@ impl ProvisioningService {
             Ok(None) => {
                 return Ok(StackDeploymentView::Missing {
                     compose_name: manager.then(|| compose_name_for_job(stored.job_id)),
+                    last_action,
                 });
             }
             Err(err) => {
                 return Ok(StackDeploymentView::Unavailable {
                     reason: err.to_string(),
+                    last_action,
                 });
             }
         };
@@ -490,7 +494,7 @@ impl ProvisioningService {
         found.can_operate = access.role.allows(Permission::StackOperate);
         found.can_remove = access.role.allows(Permission::StackRemove);
         found.can_destroy = access.role.allows(Permission::StackDestroy);
-        found.last_action = self.last_action(project_id).await?;
+        found.last_action = last_action;
         Ok(StackDeploymentView::Found(Box::new(found)))
     }
 
