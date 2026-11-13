@@ -27,11 +27,14 @@ pub fn StackSettingsSection(
     finished: Signal<u32>,
 ) -> impl IntoView {
     let review = ServerAction::<PreviewStackSettings>::new();
+    // Counts refused applies: the settings are read again, because the
+    // refusal usually means they changed in Dokploy since the review.
+    let refused = RwSignal::new(0u32);
     // Read again once a queued change has been written, not when it is
     // queued: the section keeps its elements, and focus, until then.
     let settings = Resource::new(
-        move || (project, finished.get()),
-        |(id, _)| get_stack_settings(id),
+        move || (project, finished.get(), refused.get()),
+        |(id, _, _)| get_stack_settings(id),
     );
     // The review shows until a field changes or the stack's action ends.
     let reviewing = RwSignal::new(false);
@@ -43,8 +46,19 @@ pub fn StackSettingsSection(
         }
     });
     Effect::new(move |_| {
-        if apply.value().with(|value| matches!(value, Some(Ok(_)))) {
-            queued.set(true);
+        apply.value().with(|value| match value {
+            Some(Ok(_)) => queued.set(true),
+            Some(Err(_)) => {
+                reviewing.set(false);
+                refused.update(|n| *n += 1);
+            }
+            None => {}
+        });
+    });
+    // A new review replaces the outcome of the last apply.
+    Effect::new(move |_| {
+        if review.pending().get() {
+            apply.value().set(None);
         }
     });
     Effect::new(move |previous: Option<u32>| {
@@ -59,7 +73,9 @@ pub fn StackSettingsSection(
         <Transition fallback=|| ()>
             {move || settings.get().map(|result| match result {
                 Ok(Some(view)) => {
-                    section(view, project, review, apply, reviewing, queued).into_any()
+                    // Not the first reading: the values on screen are stale.
+                    let reread = finished.get_untracked() > 0 || refused.get_untracked() > 0;
+                    section(view, project, review, apply, reviewing, queued, reread).into_any()
                 }
                 // Not provisioned, removed, or not an owner or admin.
                 Ok(None) | Err(AppError::Forbidden) | Err(AppError::NotFound) => ().into_any(),
@@ -82,7 +98,34 @@ fn section(
     apply: ServerAction<QueueStackSettings>,
     reviewing: RwSignal<bool>,
     queued: RwSignal<bool>,
+    reread: bool,
 ) -> impl IntoView {
+    let form = NodeRef::<leptos::html::Form>::new();
+    let heading = NodeRef::<leptos::html::H2>::new();
+    if reread {
+        // The section's elements are updated in place, which leaves what
+        // was typed in a field; resetting the form shows the values just
+        // read. The review and its Apply button are gone, so focus moves
+        // to the heading instead of the page.
+        Effect::new(move |_| {
+            if let Some(form) = form.get() {
+                form.reset();
+            }
+            let lost = document()
+                .active_element()
+                .is_none_or(|active| document().body().is_some_and(|body| *body == active));
+            if lost && let Some(heading) = heading.get() {
+                let _ = heading.focus();
+            }
+        });
+    }
+    let apply_error = move || {
+        apply
+            .value()
+            .get()
+            .and_then(Result::err)
+            .map(|err| view! { <p class="form-error" role="alert">{err.to_string()}</p> })
+    };
     let running = view.busy;
     let busy = move || running || queued.get();
     let disabled = move || (busy() || review.pending().get()).then_some("true");
@@ -104,12 +147,12 @@ fn section(
     };
     view! {
         <section class="panel" aria-labelledby="stack-settings-title">
-            <h2 class="section-title" id="stack-settings-title">"Stack settings"</h2>
+            <h2 class="section-title" id="stack-settings-title" tabindex="-1" node_ref=heading>"Stack settings"</h2>
             <p class="section-text">
                 "These are variables of the stack's service in Dokploy. Applying a change writes them there and redeploys the stack; only the services that read a changed setting restart. A setting changed in Dokploy meanwhile stops the change before anything is written."
             </p>
             {tracking}
-            <ActionForm action=review attr:class="stacked-form settings-form">
+            <ActionForm action=review node_ref=form attr:class="stacked-form settings-form">
                 <input type="hidden" name="id" value=project.to_string()/>
                 // A review describes the values it was made from; changing
                 // a field withdraws it.
@@ -125,6 +168,12 @@ fn section(
             </ActionForm>
             {move || busy().then(|| view! {
                 <p class="field-hint">"An action on this stack is running; wait for it to finish before changing settings."</p>
+            })}
+            {apply_error}
+            {move || queued.get().then(|| view! {
+                <p class="form-ok" role="status">
+                    "Queued. The Dokploy service section follows the change; these settings are read again when it finishes."
+                </p>
             })}
             <div aria-live="polite">{summary}</div>
         </section>
@@ -257,20 +306,6 @@ fn review_view(
     queued: RwSignal<bool>,
 ) -> impl IntoView {
     let disabled = move || (queued.get() || apply.pending().get()).then_some("true");
-    let queued_note = move || {
-        queued.get().then(|| view! {
-            <p class="form-ok" role="status">
-                "Queued. The Dokploy service section follows the change; these settings are read again when it finishes."
-            </p>
-        })
-    };
-    let error = move || {
-        apply
-            .value()
-            .get()
-            .and_then(Result::err)
-            .map(|err| view! { <p class="form-error" role="alert">{err.to_string()}</p> })
-    };
     let hidden = [
         ("site_url", fields.site_url),
         ("additional_redirect_urls", fields.additional_redirect_urls),
@@ -314,8 +349,6 @@ fn review_view(
                     "Apply and redeploy"
                 </button>
             </ActionForm>
-            {error}
-            {queued_note}
         </div>
     }
 }

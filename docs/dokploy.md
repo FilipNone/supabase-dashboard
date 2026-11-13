@@ -148,7 +148,7 @@ The section reads the variables and compose file with `compose.one` each time th
 1. `update`: reads the variables. If every changed variable still has its previous value, the job sets them and sends the whole variable text back with `compose.update` (only `composeId` and `env`). Every other line is kept as it was. If they already have the new values, an earlier answer was lost and nothing is sent. Anything else means they were edited in Dokploy meanwhile: the job fails, naming them, and writes nothing.
 2. `act` and `wait`: a redeployment, as for Redeploy.
 
-In the browser, changing a field withdraws the review, and the section reads the settings again only when the job finishes, so focus stays on the Apply button while it runs. A locked setting shows no value, because the one Dokploy holds may not be the one in effect.
+In the browser, changing a field withdraws the review, and the section reads the settings again only when the job finishes, so focus stays on the Apply button while it runs. A refused apply also withdraws the review and reads the settings again, so a second review starts from what Dokploy has now rather than from the values loaded with the page. Each time the settings are read again the form is reset to them, discarding anything typed meanwhile, and focus moves to the section's heading if it was on the removed Apply button. A locked setting shows no value, because the one Dokploy holds may not be the one in effect.
 
 ### Variables edited in Dokploy
 
