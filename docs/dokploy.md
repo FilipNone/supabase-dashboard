@@ -226,6 +226,30 @@ Audit events for the placement have target type `dokploy_service` and the target
 
 Denied attempts are recorded with target type `dokploy` and no target, like the connection's.
 
+### Studio hosts on Dokploy
+
+When the dashboard runs as a Dokploy service, the Studio hosts under `SUPABASE_DASHBOARD_STUDIO_DOMAIN` must reach it too. The dashboard does not set this up; it is a one-time step for whoever runs Dokploy.
+
+Dokploy cannot do it with a domain. In v0.31.1, `domain.create` refuses a wildcard host such as `*.studio.example.com` ("Invalid domain name. Use only letters, numbers, hyphens and dots"), which was checked against the fixture on 2026-11-13. A domain for each project would work, but a compose service's domains become Traefik labels only when it is deployed, so every new project would mean redeploying the dashboard itself. The dashboard also would need a Dokploy key that may change its own service.
+
+Instead, add a file under `dynamic/` in Traefik's configuration, which Dokploy can edit on its Traefik file system page (or `/etc/dokploy/traefik/dynamic/` on the Dokploy server). Traefik reads it without a restart. Studio hosts are the project ID in hex, 32 characters, so the rule can be exact:
+
+```yaml
+http:
+  routers:
+    supabase-dashboard-studio:
+      rule: "HostRegexp(`^[0-9a-f]{32}\\.studio\\.example\\.com$`)"
+      entryPoints: [websecure]
+      service: <the dashboard's Traefik service>@docker
+      tls: {}
+```
+
+The service name is the one in the `traefik.http.services.<name>` label Dokploy writes for the dashboard's own domain; the compose file Dokploy converts for the service (`compose.getConvertedCompose`) shows it. Routing to that service keeps the container's address out of the file.
+
+Traefik cannot obtain a certificate for every name a regular expression matches, so HTTPS needs a wildcard certificate for `*.studio.example.com`: either uploaded under Certificates in Dokploy, or obtained by a certificate resolver that uses the DNS challenge, configured in Dokploy's Traefik settings with the DNS provider's credentials. The tls block then names that resolver and the domain.
+
+This has not been tried end to end: the Dokploy fixture runs no Traefik. Doing it once, with a real wildcard certificate, is open in the roadmap.
+
 ### Where stacks go
 
 A new stack goes into a Dokploy environment, on Dokploy's own server or on one of its remote servers. Dashboard organizations and Dokploy organizations are separate, so an installation administrator chooses in the Dokploy section which of these targets each dashboard organization may use. Creating stacks is not built yet; the next roadmap item uses these targets.
