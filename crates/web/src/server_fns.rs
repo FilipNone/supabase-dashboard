@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use supabase_dashboard_domain::{
     account::{AccountSummary, AdminAccountSummary, SessionSummary},
     admin::RegisteredResources,
+    adoption::{AdoptableServices, AdoptionPreview},
     authority::ProjectTrust,
     authz::OrgRole,
     connection::{
@@ -443,6 +444,55 @@ pub async fn start_provisioning(
     };
     Ok(org_context::provisioning()?
         .start(&session, organization_id, request, audit.get())
+        .await?)
+}
+
+/// The Dokploy compose services an organization's owners and admins may
+/// adopt as projects.
+#[server]
+pub async fn get_adoptable_services(organization_id: Uuid) -> Result<AdoptableServices, AppError> {
+    let session = org_context::session()?;
+    Ok(org_context::provisioning()?
+        .adoptable(&session, organization_id)
+        .await?)
+}
+
+/// What adopting a compose service would register: its gateway URLs and
+/// which keys its variables hold, by name. Owners and admins only.
+#[server]
+pub async fn get_adoption_preview(
+    organization_id: Uuid,
+    compose_id: String,
+) -> Result<AdoptionPreview, AppError> {
+    let session = org_context::session()?;
+    Ok(org_context::provisioning()?
+        .adoption_preview(&session, organization_id, &compose_id)
+        .await?)
+}
+
+/// Registers a Supabase stack running in Dokploy as a project and returns
+/// the project's ID. The keys and the Studio login are copied from the
+/// service's variables only with `copy_keys`. Owners and admins only.
+#[server]
+pub async fn adopt_dokploy_service(
+    organization_id: Uuid,
+    compose_id: String,
+    name: String,
+    api_url: String,
+    // Set by a checkbox, so it is absent when unchecked.
+    #[server(default)] copy_keys: bool,
+) -> Result<Uuid, AppError> {
+    use supabase_dashboard_application::provisioning::AdoptRequest;
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    let request = AdoptRequest {
+        compose_id: &compose_id,
+        name: &name,
+        api_url: &api_url,
+        copy_keys,
+    };
+    Ok(org_context::provisioning()?
+        .adopt(&session, organization_id, request, audit.get())
         .await?)
 }
 

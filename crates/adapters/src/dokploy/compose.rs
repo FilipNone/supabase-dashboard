@@ -67,6 +67,38 @@ impl DokployClient {
             .collect())
     }
 
+    /// The compose services in `environment_id` the key's member can see,
+    /// at most [`SEARCH_LIMIT`] (`compose.search`). The answer holds no
+    /// compose file and no variables.
+    pub async fn list_compose(
+        &self,
+        url: &DokployUrl,
+        key: &SecretString,
+        environment_id: &DokployId,
+    ) -> Result<Vec<ComposeService>, DokployError> {
+        let body = self
+            .send(
+                url,
+                "compose.search",
+                key,
+                Input::Get(&[
+                    ("environmentId", environment_id.as_str()),
+                    ("limit", SEARCH_LIMIT),
+                ]),
+                MAX_LIST_BODY_BYTES,
+            )
+            .await?;
+        let page: RawSearchPage =
+            serde_json::from_slice(&body).map_err(|_| DokployError::InvalidResponse)?;
+        Ok(page
+            .items
+            .into_iter()
+            .filter_map(|item| serde_json::from_value::<RawCompose>(item).ok())
+            .filter_map(RawCompose::into_service)
+            .filter(|service| service.environment_id == *environment_id)
+            .collect())
+    }
+
     /// Creates a compose service with a raw compose file
     /// (`compose.create`). Not idempotent; see the module documentation.
     pub async fn create_compose(
@@ -783,6 +815,15 @@ impl ComposeApi for DokployClient {
             environment_id,
             name,
         ))
+    }
+
+    fn list_compose<'a>(
+        &'a self,
+        url: &'a DokployUrl,
+        key: &'a SecretString,
+        environment_id: &'a DokployId,
+    ) -> DokployFuture<'a, Vec<ComposeService>> {
+        Box::pin(DokployClient::list_compose(self, url, key, environment_id))
     }
 
     fn create_compose<'a>(

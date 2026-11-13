@@ -189,18 +189,19 @@ mod tests {
     use supabase_dashboard_web::{
         app::SIGN_IN_PATH,
         server_fns::{
-            AcceptStackVariables, AdminListAccounts, AdminSetAccountDisabled, ChangePassword,
-            CheckProjectHealth, ClearDokployPlacement, ConfirmDokployPlacement, ConnectDokploy,
-            CreateInvitation, CreateOrganization, DisconnectDokploy, GetCurrentAccount,
-            GetDokployConnection, GetDokployPlacement, GetInstallationHealth, GetOrganization,
-            GetProject, GetProjectAuthorities, GetProjectCredentials, GetProjectDeployment,
-            GetProjectHealth, GetProvisionJob, GetProvisionTargets, GetStackSettings,
-            GetStudioAccessLog, ListOrganizations, ListProjects, ListProvisionJobs, ListSessions,
-            PreviewInvitation, PreviewStackSettings, QueueStackAction, QueueStackRemoval,
-            QueueStackSettings, RegisterProject, RemoveProjectAuthorities, RemoveProjectCredential,
-            RenameOrganization, ReplaceDokployKey, ReplaceProjectAuthorities,
-            ReplaceProjectCredential, ReplaceStudioLogin, RevokeSession, SignUpWithInvitation,
-            StartProvisioning, UnregisterProject, UpdateProfile,
+            AcceptStackVariables, AdminListAccounts, AdminSetAccountDisabled, AdoptDokployService,
+            ChangePassword, CheckProjectHealth, ClearDokployPlacement, ConfirmDokployPlacement,
+            ConnectDokploy, CreateInvitation, CreateOrganization, DisconnectDokploy,
+            GetAdoptableServices, GetAdoptionPreview, GetCurrentAccount, GetDokployConnection,
+            GetDokployPlacement, GetInstallationHealth, GetOrganization, GetProject,
+            GetProjectAuthorities, GetProjectCredentials, GetProjectDeployment, GetProjectHealth,
+            GetProvisionJob, GetProvisionTargets, GetStackSettings, GetStudioAccessLog,
+            ListOrganizations, ListProjects, ListProvisionJobs, ListSessions, PreviewInvitation,
+            PreviewStackSettings, QueueStackAction, QueueStackRemoval, QueueStackSettings,
+            RegisterProject, RemoveProjectAuthorities, RemoveProjectCredential, RenameOrganization,
+            ReplaceDokployKey, ReplaceProjectAuthorities, ReplaceProjectCredential,
+            ReplaceStudioLogin, RevokeSession, SignUpWithInvitation, StartProvisioning,
+            UnregisterProject, UpdateProfile,
         },
     };
     use tower::ServiceExt;
@@ -1265,6 +1266,75 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(audited, 3, "two denied, one queued");
+
+        db.close().await;
+        scratch.drop().await;
+    }
+
+    #[tokio::test]
+    async fn only_owners_and_admins_adopt_dokploy_services() {
+        let Some(scratch) = ScratchDb::create("http_adopt").await else {
+            return;
+        };
+        let db = Database::connect(&scratch.settings).await.unwrap();
+        db.migrate().await.unwrap();
+        let router = router_with_cipher(db.clone(), Some(test_cipher())).await;
+        let (alice, bob) = admin_and_member(&db, &router).await;
+        let (_, body) = send(
+            &router,
+            form_post(CreateOrganization::PATH, "name=Acme", Some(&alice)),
+        )
+        .await;
+        let org: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let org_id = org["id"].as_str().unwrap().to_owned();
+        let call = |path: &str, body: String, cookie: &str| {
+            send(&router, form_post(path, &body, Some(cookie)))
+        };
+        let list = format!("organization_id={org_id}");
+        let preview = format!("organization_id={org_id}&compose_id=composeMarker1");
+        let adopt = format!(
+            "organization_id={org_id}&compose_id=composeMarker1&name=Shop&api_url=https%3A%2F%2Fdb.example.test&copy_keys=true"
+        );
+
+        // Not a member, then a viewer: neither may list or adopt.
+        let (parts, body) = call(GetAdoptableServices::PATH, list.clone(), &bob).await;
+        assert_eq!(parts.status, StatusCode::NOT_FOUND, "{body}");
+        sqlx::query(
+            "INSERT INTO organization_members (organization_id, account_id, role) \
+             SELECT $1::uuid, id, 'viewer' FROM accounts WHERE email = 'bob@example.test'",
+        )
+        .bind(&org_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        for (path, body) in [
+            (GetAdoptableServices::PATH, list.clone()),
+            (GetAdoptionPreview::PATH, preview.clone()),
+            (AdoptDokployService::PATH, adopt.clone()),
+        ] {
+            let (parts, answer) = call(path, body, &bob).await;
+            assert_eq!(parts.status, StatusCode::FORBIDDEN, "{path}: {answer}");
+        }
+
+        // The owner is told Dokploy is not connected in this test.
+        let (parts, body) = call(GetAdoptableServices::PATH, list, &alice).await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        assert!(body.contains("NotConnected"), "{body}");
+        let (parts, body) = call(AdoptDokployService::PATH, adopt, &alice).await;
+        assert_eq!(parts.status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(body.contains("not connected"), "{body}");
+        let projects: i64 = sqlx::query_scalar("SELECT count(*) FROM projects")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(projects, 0);
+        let denied: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_events WHERE action = 'project.adopt' AND outcome = 'denied'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(denied, 1);
 
         db.close().await;
         scratch.drop().await;

@@ -293,6 +293,9 @@ async fn fixture_dokploy_creates_configures_and_deploys_a_compose_service() {
         .await
         .unwrap();
     assert_eq!(found, vec![service.clone()]);
+    // Listed with the environment's other services, as adoption lists them.
+    let listed = client.list_compose(&url, &key, &environment).await.unwrap();
+    assert_eq!(listed, vec![service.clone()]);
 
     let compose = service.compose_id.clone();
     client

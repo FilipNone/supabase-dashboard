@@ -238,6 +238,10 @@ mod server {
                 | ProvisionError::AlreadyRemoved
                 | ProvisionError::NameMismatch
                 | ProvisionError::NotConfirmed
+                | ProvisionError::AdoptionNotAllowed
+                | ProvisionError::AlreadyAdopted
+                | ProvisionError::NotAdoptable(_)
+                | ProvisionError::UrlNotOffered
                 | ProvisionError::Setting(_)
                 | ProvisionError::SettingUnavailable(_)
                 | ProvisionError::NoChanges

@@ -20,14 +20,16 @@ use supabase_dashboard_application::{
     jobs::{JobHandler, JobRunner, RunResult, RunnerSettings},
     key_rotation::reseal_credentials,
     provisioning::{
-        ComposeApi, ComposeConfig, DokployFuture, ProvisionError, ProvisionRequest,
+        AdoptRequest, ComposeApi, ComposeConfig, DokployFuture, ProvisionError, ProvisionRequest,
         ProvisionStackHandler, ProvisionTimings, ProvisioningService, StackActionHandler,
     },
     secrets::CredentialCipher,
+    stack_secrets::StackSecrets,
     stack_template::{GATEWAY_PORT, GATEWAY_SERVICE, STACK_FILES},
 };
 use supabase_dashboard_domain::{
     account::{DisplayName, Email},
+    adoption::{AdoptableServices, AdoptionRefusal, KeyState},
     authority::{AuthorityError, AuthorityInfo, ProjectAuthorities},
     authz::OrgRole,
     connection::{ServiceCheck, ServiceStatus, StackService, UnreachableReason},
@@ -176,6 +178,9 @@ struct ComposeState {
     lose_delete_answer: bool,
     /// Replace the variables, then answer as if the connection dropped.
     lose_env_answer: bool,
+    /// (service, compose file, variables) of services made in Dokploy,
+    /// which `compose_config` answers with instead of `configured`.
+    made_in_dokploy: Vec<(DokployId, String, String)>,
     next_id: u32,
 }
 
@@ -213,6 +218,23 @@ impl ComposeApi for FakeCompose {
             .services
             .iter()
             .filter(|s| s.name == name && &s.environment_id == environment_id)
+            .cloned()
+            .collect();
+        Box::pin(async move { Ok(found) })
+    }
+
+    fn list_compose<'a>(
+        &'a self,
+        _url: &'a DokployUrl,
+        key: &'a SecretString,
+        environment_id: &'a DokployId,
+    ) -> DokployFuture<'a, Vec<ComposeService>> {
+        let mut state = self.state.lock().unwrap();
+        state.call("list_compose", key);
+        let found = state
+            .services
+            .iter()
+            .filter(|s| &s.environment_id == environment_id)
             .cloned()
             .collect();
         Box::pin(async move { Ok(found) })
@@ -505,9 +527,13 @@ impl ComposeApi for FakeCompose {
         let mut state = self.state.lock().unwrap();
         state.call("compose_config", key);
         let exists = state.services.iter().any(|s| s.compose_id == *compose_id);
-        let answer = state
-            .configured
-            .clone()
+        let made = state
+            .made_in_dokploy
+            .iter()
+            .find(|(id, _, _)| id == compose_id)
+            .map(|(_, file, env)| (file.clone(), env.clone()));
+        let answer = made
+            .or_else(|| state.configured.clone())
             .filter(|_| exists)
             .map(|(compose_file, env)| ComposeConfig {
                 env: SecretString::from(env),
@@ -2105,4 +2131,312 @@ async fn owners_accept_variables_edited_in_dokploy() {
     };
     assert_eq!(audited("success").await.unwrap(), 3);
     assert_eq!(audited("denied").await.unwrap(), 1);
+}
+
+/// A compose file like Dokploy's Supabase template: Studio, Auth, and a
+/// Kong gateway.
+const TEMPLATE_COMPOSE: &str = "services:\n  studio:\n    image: supabase/studio:2026.11.02\n  auth:\n    image: supabase/gotrue:v2.197.0\n  kong:\n    image: kong:2.8.1\n";
+const STUDIO_PASSWORD_MARKER: &str = "studio-password-marker-adopt";
+
+/// Adds a service made in Dokploy, not by the dashboard, and returns its
+/// ID.
+fn made_in_dokploy(f: &Fixture, name: &str, environment: &str, file: &str, env: &str) -> String {
+    let mut state = f.compose.state.lock().unwrap();
+    let compose_id = state.new_id("tpl");
+    state.services.push(ComposeService {
+        compose_id: compose_id.clone(),
+        name: name.to_owned(),
+        app_name: format!("{name}-xyz789"),
+        environment_id: id(environment),
+    });
+    state
+        .made_in_dokploy
+        .push((compose_id.clone(), file.to_owned(), env.to_owned()));
+    compose_id.as_str().to_owned()
+}
+
+fn template_env(keys: &StackSecrets) -> String {
+    format!(
+        "ANON_KEY={}\nSERVICE_ROLE_KEY={}\nDASHBOARD_USERNAME=supabase\nDASHBOARD_PASSWORD={STUDIO_PASSWORD_MARKER}\nPOSTGRES_PASSWORD=pw\n",
+        keys.anon_key.expose_secret(),
+        keys.service_role_key.expose_secret(),
+    )
+}
+
+fn adopt_request<'a>(compose_id: &'a str, name: &'a str, copy_keys: bool) -> AdoptRequest<'a> {
+    AdoptRequest {
+        compose_id,
+        name,
+        api_url: "https://db.example.test",
+        copy_keys,
+    }
+}
+
+#[tokio::test]
+async fn owners_adopt_supabase_services_from_allowed_environments() {
+    let Some(scratch) = ScratchDb::create("provision_adopt").await else {
+        return;
+    };
+    let f = setup(&scratch).await;
+    let developer = account(&f.db, "Dev", false).await;
+    add_member(&f.db, f.organization, &developer, OrgRole::Developer).await;
+    let keys = StackSecrets::generate().unwrap();
+    let env = template_env(&keys);
+    let shop = made_in_dokploy(&f, "shop", "stacks", TEMPLATE_COMPOSE, &env);
+    let blog = made_in_dokploy(
+        &f,
+        "blog",
+        "stacks",
+        "services:\n  web:\n    image: nginx:1\n",
+        "",
+    );
+    let outside = made_in_dokploy(&f, "outside", "prod", TEMPLATE_COMPOSE, &env);
+    let broken = made_in_dokploy(
+        &f,
+        "broken",
+        "stacks",
+        TEMPLATE_COMPOSE,
+        &format!(
+            "ANON_KEY={}\nSERVICE_ROLE_KEY={}\nDASHBOARD_USERNAME=supabase\n",
+            keys.service_role_key.expose_secret(),
+            keys.anon_key.expose_secret()
+        ),
+    );
+    f.compose.state.lock().unwrap().domains = vec![ComposeDomain {
+        domain_id: id("dom9"),
+        host: "db.example.test".to_owned(),
+        service_name: Some("kong".to_owned()),
+        port: 8000,
+        https: true,
+    }];
+
+    // Developers may neither list nor adopt.
+    assert!(matches!(
+        f.service.adoptable(&developer, f.organization).await,
+        Err(ProvisionError::Forbidden)
+    ));
+    assert!(matches!(
+        f.service
+            .adopt(
+                &developer,
+                f.organization,
+                adopt_request(&shop, "Shop", true),
+                ctx()
+            )
+            .await,
+        Err(ProvisionError::Forbidden)
+    ));
+
+    // The default environment, shared by every organization without
+    // targets, is not searched.
+    assert_eq!(
+        f.service.adoptable(&f.owner, f.organization).await.unwrap(),
+        AdoptableServices::NoTarget
+    );
+    sqlx::query(
+        "INSERT INTO dokploy_stack_targets \
+         (id, organization_id, project_id, project_name, environment_id, environment_name) \
+         VALUES ($1, $2, 'proj1', 'Infra', 'stacks', 'stacks')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(f.organization)
+    .execute(f.db.pool())
+    .await
+    .unwrap();
+    let AdoptableServices::Found {
+        services,
+        truncated,
+        unavailable,
+    } = f.service.adoptable(&f.owner, f.organization).await.unwrap()
+    else {
+        panic!("expected services");
+    };
+    let names: Vec<&str> = services.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, ["blog", "broken", "shop"]);
+    assert_eq!(services[2].location, "Infra / stacks");
+    assert!(!truncated && unavailable.is_empty());
+
+    // A service outside the allowed environments is refused before its
+    // variables are read.
+    let reads = f.compose.state.lock().unwrap().count("compose_config");
+    assert!(matches!(
+        f.service
+            .adoption_preview(&f.owner, f.organization, &outside)
+            .await,
+        Err(ProvisionError::AdoptionNotAllowed)
+    ));
+    assert!(matches!(
+        f.service
+            .adoption_preview(&f.owner, f.organization, "no such id!")
+            .await,
+        Err(ProvisionError::AdoptionNotAllowed)
+    ));
+    assert_eq!(
+        f.compose.state.lock().unwrap().count("compose_config"),
+        reads
+    );
+
+    let not_supabase = f
+        .service
+        .adoption_preview(&f.owner, f.organization, &blog)
+        .await
+        .unwrap();
+    assert_eq!(not_supabase.refusal, Some(AdoptionRefusal::NotSupabase));
+    assert!(matches!(
+        f.service
+            .adopt(
+                &f.owner,
+                f.organization,
+                adopt_request(&blog, "Blog", false),
+                ctx()
+            )
+            .await,
+        Err(ProvisionError::NotAdoptable(AdoptionRefusal::NotSupabase))
+    ));
+
+    let preview = f
+        .service
+        .adoption_preview(&f.owner, f.organization, &shop)
+        .await
+        .unwrap();
+    assert_eq!(preview.refusal, None);
+    assert_eq!(preview.urls, ["https://db.example.test"]);
+    assert_eq!(preview.suggested_name.as_deref(), Some("shop"));
+    assert!(preview.keys.iter().all(|k| k.state == KeyState::Found));
+    let shown = format!("{preview:?}");
+    assert!(!shown.contains(keys.anon_key.expose_secret()));
+    assert!(!shown.contains(STUDIO_PASSWORD_MARKER));
+
+    let broken_keys = f
+        .service
+        .adoption_preview(&f.owner, f.organization, &broken)
+        .await
+        .unwrap()
+        .keys;
+    assert!(matches!(broken_keys[0].state, KeyState::Invalid(_)));
+    assert!(matches!(broken_keys[1].state, KeyState::Invalid(_)));
+    assert_eq!(broken_keys[2].state, KeyState::Missing);
+    let shown = format!("{broken_keys:?}");
+    assert!(!shown.contains(keys.anon_key.expose_secret()));
+    assert!(!shown.contains(keys.service_role_key.expose_secret()));
+
+    let mut elsewhere = adopt_request(&shop, "Shop", true);
+    elsewhere.api_url = "https://evil.example.test";
+    assert!(matches!(
+        f.service
+            .adopt(&f.owner, f.organization, elsewhere, ctx())
+            .await,
+        Err(ProvisionError::UrlNotOffered)
+    ));
+
+    // Adopting without copying the keys stores none.
+    let without = f
+        .service
+        .adopt(
+            &f.owner,
+            f.organization,
+            adopt_request(&broken, "Broken", true),
+            ctx(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        count(&f.db, "SELECT count(*) FROM project_credentials").await,
+        0,
+        "the broken service has no usable key"
+    );
+    let project = f
+        .service
+        .adopt(
+            &f.owner,
+            f.organization,
+            adopt_request(&shop, "Shop", true),
+            ctx(),
+        )
+        .await
+        .unwrap();
+    let kinds: Vec<String> = sqlx::query_scalar(
+        "SELECT kind FROM project_credentials WHERE project_id = $1 ORDER BY kind",
+    )
+    .bind(project)
+    .fetch_all(f.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(kinds, ["anon_key", "service_role_key", "studio_login"]);
+    let stored: Option<Uuid> =
+        sqlx::query_scalar("SELECT job_id FROM project_dokploy_services WHERE project_id = $1")
+            .bind(project)
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(stored, None);
+
+    // Adopting changes nothing in Dokploy, and the stack works like a
+    // provisioned one: its service is read, and its variables are tracked.
+    {
+        let state = f.compose.state.lock().unwrap();
+        for call in [
+            "create_compose",
+            "configure_compose",
+            "update_compose_env",
+            "deploy_compose",
+            "create_compose_domain",
+        ] {
+            assert_eq!(state.count(call), 0, "{call}");
+        }
+    }
+    assert!(matches!(
+        f.service.deployment(&f.owner, project).await.unwrap(),
+        StackDeploymentView::Found(_)
+    ));
+    assert_eq!(
+        tracking(&f, project).await,
+        EnvTracking::Compared(EnvChanges::default())
+    );
+    assert_ne!(without, project);
+
+    // An adopted service is listed no more and cannot be adopted twice.
+    let AdoptableServices::Found { services, .. } =
+        f.service.adoptable(&f.owner, f.organization).await.unwrap()
+    else {
+        panic!("expected services");
+    };
+    let names: Vec<&str> = services.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, ["blog"]);
+    assert!(matches!(
+        f.service
+            .adopt(
+                &f.owner,
+                f.organization,
+                adopt_request(&shop, "Shop again", false),
+                ctx()
+            )
+            .await,
+        Err(ProvisionError::AlreadyAdopted)
+    ));
+
+    assert_eq!(
+        count(
+            &f.db,
+            "SELECT count(*) FROM audit_events WHERE action = 'project.adopt' AND outcome = 'success'"
+        )
+        .await,
+        2
+    );
+    assert_eq!(
+        count(
+            &f.db,
+            "SELECT count(*) FROM audit_events WHERE action = 'project.adopt' AND outcome = 'denied'"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        count(
+            &f.db,
+            "SELECT count(*) FROM audit_events WHERE action = 'project.adopt_keys'"
+        )
+        .await,
+        1
+    );
 }

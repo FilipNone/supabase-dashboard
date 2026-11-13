@@ -29,6 +29,7 @@ use crate::{
     error::AppError,
     pages::{
         account::utc_minutes,
+        adopt::adopt_stack_path,
         project::{project_entry, project_path},
         provision::{RecentStacks, new_stack_path},
     },
@@ -151,12 +152,14 @@ pub fn OrganizationProjectsPage() -> impl IntoView {
         move || loaded_org(ctx).is_some_and(|org| org.role.allows(Permission::ProjectRegister));
     let new_href = move || ctx.id.get().map(|id| format!("/dashboard/new/{id}"));
     let stack_href = move || ctx.id.get().map(new_stack_path);
+    let adopt_href = move || ctx.id.get().map(adopt_stack_path);
     view! {
         <div class="section-header">
             <h2 class="section-title">"Projects"</h2>
             {move || can_register().then(|| view! {
                 <div class="page-actions">
                     <a class="button button-primary" href=stack_href()>"Create a new stack"</a>
+                    <a class="button" href=adopt_href()>"Adopt from Dokploy"</a>
                     <a class="button" href=new_href()>"Register existing project"</a>
                 </div>
             })}

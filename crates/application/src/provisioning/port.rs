@@ -36,6 +36,14 @@ pub trait ComposeApi: Send + Sync {
         name: &'a str,
     ) -> DokployFuture<'a, Vec<ComposeService>>;
 
+    /// The compose services in `environment_id`, at most 100.
+    fn list_compose<'a>(
+        &'a self,
+        url: &'a DokployUrl,
+        key: &'a SecretString,
+        environment_id: &'a DokployId,
+    ) -> DokployFuture<'a, Vec<ComposeService>>;
+
     fn create_compose<'a>(
         &'a self,
         url: &'a DokployUrl,

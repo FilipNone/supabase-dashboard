@@ -10,6 +10,7 @@ use crate::components::layout::DashboardLayout;
 use crate::pages::{
     account::{AccountLayout, AccountProfilePage, AccountSecurityPage},
     admin::AdminPage,
+    adopt::AdoptStackPage,
     invite::InvitePage,
     not_found::NotFound,
     organization::{
@@ -133,6 +134,7 @@ pub fn App() -> impl IntoView {
                     </ParentRoute>
                     <Route path=path!("new/:org_id") view=NewProjectPage/>
                     <Route path=path!("new/:org_id/stack") view=NewStackPage/>
+                    <Route path=path!("new/:org_id/adopt") view=AdoptStackPage/>
                 </ParentRoute>
             </Routes>
         </Router>

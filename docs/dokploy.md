@@ -29,6 +29,7 @@ The client in `crates/adapters/src/dokploy.rs` uses the same connection rules as
 | `server.all` | GET | none | Dokploy's remote servers; only active deploy servers are kept, and only their ID and name are read |
 | `environment.create` | POST | `name`, `projectId` | Create an environment for stacks, sent once and never retried |
 | `compose.search` | GET | `name`, `environmentId`, `limit` | Find a provisioning job's service by its exact name before creating it |
+| `compose.search` | GET | `environmentId`, `limit: 100` | List the compose services in an allowed environment for adopting; each item has the ID, name, `appName`, status, and environment, never the compose file or variables |
 | `compose.create` | POST | `name`, `appName`, `environmentId`, `serverId` (remote server only), `sourceType: raw`, `composeFile` | Create a stack's compose service |
 | `compose.update` | POST | `composeId`, `sourceType: raw`, `composeFile`, `env`, `isolatedDeployment: true` | Set a stack's compose file and variables |
 | `compose.update` | POST | `composeId`, `env` | Replace a stack's variables when its settings change; the fixture test checks that the compose file is kept |
@@ -38,7 +39,8 @@ The client in `crates/adapters/src/dokploy.rs` uses the same connection rules as
 | `compose.deploy` | POST | `composeId`, `title` | Queue a deployment |
 | `deployment.allByCompose` | GET | `composeId` | Poll a service's deployments |
 | `domain.create` | POST | `host`, `composeId`, `domainType: compose`, `serviceName`, `port`, `https`, `certificateType`, `path` | Route a host to one service of a stack |
-| `compose.one` | GET | `composeId` | A provisioned stack's service for its project overview: name, status, project, environment, server, and deployments; 404 means Dokploy has no such service. Read separately for a stack's settings, keeping only `env` and `composeFile` on the server |
+| `compose.one` | GET | `composeId` | A provisioned stack's service for its project overview: name, status, project, environment, server, and deployments; 404 means Dokploy has no such service. Read separately for a stack's settings and for adopting, keeping only `env` and `composeFile` on the server |
+| `domain.byComposeId` | GET | `composeId` | A service's domains, with host, service name, port, and HTTPS; read for adopting and for routing Studio hosts |
 | `compose.stop` | POST | `composeId` | Stop a provisioned stack's containers; answers `true` once they are down, and sets the status to `idle` |
 | `compose.start` | POST | `composeId` | Start them again; answers `true` |
 | `compose.delete` | POST | `composeId`, `deleteVolumes` | Remove a provisioned stack's service, keeping (`false`) or deleting (`true`) its named volumes; answers with the deleted service, of which only `composeId` is read, and 404 once it is gone |
@@ -69,7 +71,6 @@ These are the calls the M4 roadmap items need, with their required inputs in v0.
 | `project.one` | GET | `projectId` | One project's environments and services |
 | `environment.one` | GET | `environmentId` | Environment details |
 | `compose.move` | POST | `composeId`, `targetEnvironmentId` | Not planned for the dashboard; the browser check uses it to move a service and show the Moved state |
-| `compose.search` | GET | `q`, `environmentId` | Find existing Supabase stacks to adopt |
 | `domain.delete` | POST | `domainId` | Remove a domain |
 | `user.get` | GET | none | The key's user |
 
@@ -161,6 +162,22 @@ Owners and admins can accept the listed edits with "Accept these edits". The ser
 A removed project stays registered. Its section says when the service was removed and whether the volumes went with it; owners and admins get the volumes' name prefix to delete them on the server later. No further action can be asked for, and unregistering under Settings stays a separate step.
 
 The job gives each service the description `Supabase stack <name>, project <project ID> in supabase-dashboard`, so the service in Dokploy points to its dashboard project.
+
+### Adopting a stack from Dokploy
+
+Owners and admins can register a Supabase stack that already runs in Dokploy, for example one made from Dokploy's Supabase template, with "Adopt from Dokploy" on the organization page (`/dashboard/new/:org_id/adopt`). Adopting writes nothing to Dokploy.
+
+The page lists the compose services in the Dokploy environments an installation administrator allowed for the organization on the administrator page, read with `compose.search` by environment, at most 200 in all, without the services a project already runs as. The default target is shared by every organization without targets of its own, so an organization with no allowed environment gets nothing listed. Allowing an environment for an organization therefore also lets its owners and admins adopt the unregistered Supabase services in it. Listing reads no compose file or variables.
+
+Choosing a service reads it with `compose.one`. A service outside the allowed environments, one a project already runs as, and an unknown ID get the same refusal, before the server reads the compose file or variables. The preview then shows:
+
+- whether it runs Supabase: its compose file needs `image:` lines for `supabase/studio` and for `supabase/gotrue` or `supabase/auth`, with any registry and tag;
+- the URLs of its Dokploy domains routed to the API gateway (a service named `kong`, `envoy`, `api-gw`, or `supabase-kong`, or port 8000), read with `domain.byComposeId`; a host the dashboard would not provision, such as an IP address, is left out. One of them becomes the project's API URL;
+- for `ANON_KEY`, `SERVICE_ROLE_KEY`, and `DASHBOARD_USERNAME` with `DASHBOARD_PASSWORD`, whether each is set and passes the checks the setup page applies, by name only. A JWT signed for the wrong role is refused.
+
+"Adopt stack" sends the name, the chosen URL, and whether to copy the keys. The server reads the service again, repeats every check, and refuses a URL that is not one of the offered ones. The keys and the Studio login are copied into the dashboard's sealed credentials only when that box is ticked; otherwise they can be added later on the project's setup page. The variables record described above is always written, so later edits in Dokploy are listed under Stack settings. The project is registered with the service's `composeId` and no provisioning job (`adopted_at` is set instead), and gets the same overview section, actions, and settings as a provisioned stack. Adopting is audited as `project.adopt`, copying keys as `project.adopt_keys`, and a refusal for a member without the role as a denied `project.adopt`.
+
+Stack settings check the adopted service's own compose file, so a setting whose variable that file does not read is locked, as for stacks created before settings existed. A setting whose variable it reads but which is not set is shown with the pinned compose file's default, which may not be the one the adopted file uses.
 
 ## Connecting
 

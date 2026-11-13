@@ -5,6 +5,7 @@
 
 pub mod account;
 pub mod admin;
+pub mod adoption;
 pub mod authority;
 pub mod authz;
 pub mod connection;

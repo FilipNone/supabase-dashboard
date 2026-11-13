@@ -12,15 +12,17 @@ use crate::{
     projects::NewProject,
 };
 
-/// The Dokploy compose service a provisioned project runs as.
+/// The Dokploy compose service a provisioned or adopted project runs as.
 #[derive(Debug, Clone, Copy)]
 pub struct NewDokployService<'a> {
     pub compose_id: &'a str,
     pub app_name: &'a str,
     pub environment_id: &'a str,
     pub server_id: Option<&'a str>,
-    pub job_id: Uuid,
-    /// The sealed record of the variables the job wrote.
+    /// The job that created the service, or `None` for an adopted one.
+    pub job_id: Option<Uuid>,
+    /// The sealed record of the variables the job wrote, or that the
+    /// service had when it was adopted.
     pub env_record: Option<&'a SealedEnvRecord>,
 }
 
@@ -41,16 +43,19 @@ impl std::fmt::Debug for SealedEnvRecord {
     }
 }
 
-/// The recorded Dokploy service of a provisioned project, as it was when
-/// the job created it.
+/// The recorded Dokploy service of a provisioned or adopted project, as it
+/// was when the job created it or it was adopted.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct StoredDokployService {
     pub compose_id: String,
     pub app_name: String,
     pub environment_id: String,
     pub server_id: Option<String>,
-    pub job_id: Uuid,
+    /// `None` for an adopted service.
+    pub job_id: Option<Uuid>,
     pub created_at: time::OffsetDateTime,
+    /// When the service was adopted; `None` for a provisioned one.
+    pub adopted_at: Option<time::OffsetDateTime>,
     /// Set once the dashboard removed the service from Dokploy.
     pub removed_at: Option<time::OffsetDateTime>,
     /// The removal deleted the data volumes too.
@@ -62,22 +67,25 @@ pub enum RegisterProvisionedOutcome {
     Created,
     /// The job registered it before; nothing was written.
     AlreadyRegistered,
+    /// Another project already runs as this Dokploy service.
+    ServiceTaken,
     OrganizationNotFound,
     LimitReached,
 }
 
 impl Database {
-    /// Registers a provisioned project with its keys and its Dokploy
-    /// service in one transaction, unless the organization already has
-    /// `max_projects`. A job that runs this again after an interruption
-    /// finds its own row and writes nothing.
+    /// Registers a provisioned or adopted project with its keys and its
+    /// Dokploy service in one transaction, unless the organization already
+    /// has `max_projects` or another project runs as the service. A job
+    /// that runs this again after an interruption finds its own row and
+    /// writes nothing.
     pub async fn register_provisioned_project(
         &self,
         project: &NewProject<'_>,
         service: &NewDokployService<'_>,
         credentials: &[NewCredential<'_>],
         max_projects: usize,
-        audit: &AuditEvent<'_>,
+        audits: &[AuditEvent<'_>],
     ) -> Result<RegisterProvisionedOutcome, PersistenceError> {
         let mut tx = self.pool.begin().await.map_err(query_err)?;
         let exists: Option<i32> =
@@ -89,14 +97,25 @@ impl Database {
         if exists.is_none() {
             return Ok(RegisterProvisionedOutcome::OrganizationNotFound);
         }
-        let registered: Option<i32> =
-            sqlx::query_scalar("SELECT 1 FROM project_dokploy_services WHERE job_id = $1")
-                .bind(service.job_id)
+        if let Some(job_id) = service.job_id {
+            let registered: Option<i32> =
+                sqlx::query_scalar("SELECT 1 FROM project_dokploy_services WHERE job_id = $1")
+                    .bind(job_id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(query_err)?;
+            if registered.is_some() {
+                return Ok(RegisterProvisionedOutcome::AlreadyRegistered);
+            }
+        }
+        let taken: Option<i32> =
+            sqlx::query_scalar("SELECT 1 FROM project_dokploy_services WHERE compose_id = $1")
+                .bind(service.compose_id)
                 .fetch_optional(&mut *tx)
                 .await
                 .map_err(query_err)?;
-        if registered.is_some() {
-            return Ok(RegisterProvisionedOutcome::AlreadyRegistered);
+        if taken.is_some() {
+            return Ok(RegisterProvisionedOutcome::ServiceTaken);
         }
         let count: i64 =
             sqlx::query_scalar("SELECT count(*) FROM projects WHERE organization_id = $1")
@@ -119,10 +138,10 @@ impl Database {
         .execute(&mut *tx)
         .await
         .map_err(query_err)?;
-        sqlx::query(
+        let inserted = sqlx::query(
             "INSERT INTO project_dokploy_services \
-             (project_id, compose_id, app_name, environment_id, server_id, job_id) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
+             (project_id, compose_id, app_name, environment_id, server_id, job_id, adopted_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, CASE WHEN $6::uuid IS NULL THEN now() END)",
         )
         .bind(project.id)
         .bind(service.compose_id)
@@ -131,8 +150,15 @@ impl Database {
         .bind(service.server_id)
         .bind(service.job_id)
         .execute(&mut *tx)
-        .await
-        .map_err(query_err)?;
+        .await;
+        match inserted {
+            Ok(_) => {}
+            // Adopted by another organization at the same moment.
+            Err(sqlx::Error::Database(err)) if err.is_unique_violation() => {
+                return Ok(RegisterProvisionedOutcome::ServiceTaken);
+            }
+            Err(err) => return Err(query_err(err)),
+        }
         if let Some(record) = service.env_record {
             sqlx::query(
                 "INSERT INTO project_dokploy_env_records (project_id, key_id, nonce, ciphertext) \
@@ -162,7 +188,9 @@ impl Database {
             .await
             .map_err(query_err)?;
         }
-        insert_audit_event(&mut *tx, audit).await?;
+        for audit in audits {
+            insert_audit_event(&mut *tx, audit).await?;
+        }
         tx.commit().await.map_err(query_err)?;
         Ok(RegisterProvisionedOutcome::Created)
     }
@@ -200,11 +228,25 @@ impl Database {
     ) -> Result<Option<StoredDokployService>, PersistenceError> {
         sqlx::query_as(
             "SELECT compose_id, app_name, environment_id, server_id, job_id, created_at, \
-             removed_at, volumes_deleted \
+             adopted_at, removed_at, volumes_deleted \
              FROM project_dokploy_services WHERE project_id = $1",
         )
         .bind(project_id)
         .fetch_optional(&self.pool)
+        .await
+        .map_err(query_err)
+    }
+
+    /// Which of `compose_ids` a project already runs as.
+    pub async fn registered_compose_ids(
+        &self,
+        compose_ids: &[String],
+    ) -> Result<Vec<String>, PersistenceError> {
+        sqlx::query_scalar(
+            "SELECT compose_id FROM project_dokploy_services WHERE compose_id = ANY($1)",
+        )
+        .bind(compose_ids)
+        .fetch_all(&self.pool)
         .await
         .map_err(query_err)
     }

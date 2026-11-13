@@ -71,11 +71,13 @@ use crate::{
     stack_template::{COMPOSE_FILE, GATEWAY_PORT, GATEWAY_SERVICE, STACK_FILES, stack_env},
 };
 
+mod adopt;
 mod env_record;
 mod port;
 mod stack_action;
 mod stack_config;
 
+pub use adopt::AdoptRequest;
 pub use port::{ComposeApi, ComposeConfig, DokployFuture};
 pub use stack_action::StackActionHandler;
 
@@ -169,6 +171,16 @@ pub enum ProvisionError {
     EditsOutdated,
     #[error("Dokploy no longer has this stack's service")]
     ServiceMissing,
+    #[error(
+        "this organization may not adopt that service: it is not in a Dokploy environment an installation administrator allowed for it"
+    )]
+    AdoptionNotAllowed,
+    #[error("another project already runs as this Dokploy service")]
+    AlreadyAdopted,
+    #[error("{}", .0.message())]
+    NotAdoptable(supabase_dashboard_domain::adoption::AdoptionRefusal),
+    #[error("choose one of the URLs Dokploy routes to the stack's gateway")]
+    UrlNotOffered,
     /// Dokploy did not answer or refused; the message says which.
     #[error("{0}")]
     DokployUnavailable(String),
@@ -502,7 +514,11 @@ impl ProvisioningService {
             Ok(Some(details)) => details,
             Ok(None) => {
                 return Ok(StackDeploymentView::Missing {
-                    compose_name: manager.then(|| compose_name_for_job(stored.job_id)),
+                    compose_name: manager.then(|| {
+                        stored
+                            .job_id
+                            .map_or_else(|| stored.app_name.clone(), compose_name_for_job)
+                    }),
                     last_action,
                 });
             }
@@ -1144,19 +1160,19 @@ impl Step<'_> {
                     app_name: &app_name,
                     environment_id: &data.environment_id,
                     server_id: data.server_id.as_deref(),
-                    job_id: self.job.id,
+                    job_id: Some(self.job.id),
                     env_record: Some(&env_record),
                 },
                 &credentials,
                 MAX_PROJECTS_PER_ORGANIZATION,
-                &AuditEvent {
+                &[AuditEvent {
                     actor_account_id: Some(account),
                     action: "project.provisioned",
                     target_type: Some("project"),
                     target_id: Some(project_id.to_string()),
                     outcome: AuditOutcome::Success,
                     request_id: None,
-                },
+                }],
             )
             .await
             .map_err(|err| internal("register the project", err))?;
@@ -1166,6 +1182,10 @@ impl Step<'_> {
             }
             RegisterProvisionedOutcome::OrganizationNotFound => Err(Stop::Fail(
                 "The organization was deleted. The stack stays in Dokploy.".to_owned(),
+            )),
+            RegisterProvisionedOutcome::ServiceTaken => Err(Stop::Fail(
+                "Another project already runs as this Dokploy service. The stack stays in Dokploy."
+                    .to_owned(),
             )),
             RegisterProvisionedOutcome::LimitReached => Err(Stop::Fail(
                 "The organization reached its project limit. The stack stays in Dokploy; register it once there is room."
