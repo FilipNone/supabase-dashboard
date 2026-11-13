@@ -71,6 +71,17 @@ pub fn DeploymentPanel(project: ProjectSummary) -> impl IntoView {
         }
         true
     });
+    // Counts actions that finished while the page was open, so the
+    // settings section reads the stack again after a change is written.
+    let finished = RwSignal::new(0u32);
+    Effect::new(move |previous: Option<bool>| {
+        let running =
+            deployment.with(|view| matches!(view, Some(Ok(view)) if view.action_running()));
+        if previous == Some(true) && !running {
+            finished.update(|count| *count += 1);
+        }
+        running
+    });
     // One live region beside the re-rendered panel, so an action's
     // progress and outcome are announced.
     let announcement = move || {
@@ -110,7 +121,7 @@ pub fn DeploymentPanel(project: ProjectSummary) -> impl IntoView {
         </Transition>
         // Outside the panel's Transition, so polling while an action runs
         // does not reset what is typed into the form.
-        <StackSettingsSection project=id apply=apply/>
+        <StackSettingsSection project=id apply=apply finished=finished.into()/>
     }
 }
 

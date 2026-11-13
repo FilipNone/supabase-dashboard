@@ -57,7 +57,7 @@ fn read_settings(config: &ComposeConfig) -> Vec<Current> {
                 }
             };
             let effective = match state {
-                SettingState::Unreadable => None,
+                SettingState::Unreadable | SettingState::NotInComposeFile => None,
                 _ => raw.clone().or_else(|| setting.default.map(str::to_owned)),
             };
             Current {
@@ -127,7 +127,39 @@ fn plan(
     Ok(changes)
 }
 
-fn preview_of(changes: &[(&'static StackSetting, SettingChange)]) -> StackConfigPreview {
+/// A digest of every setting's state and raw value, so a review can be
+/// checked against the stack when it is applied.
+fn base_of(current: &[Current]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    for now in current {
+        let state = match now.state {
+            SettingState::Editable => "e",
+            SettingState::NotInComposeFile => "n",
+            SettingState::Unreadable => "u",
+        };
+        hash.update(now.setting.name.as_bytes());
+        hash.update([0]);
+        hash.update(state.as_bytes());
+        match &now.raw {
+            Some(raw) => {
+                hash.update([1]);
+                hash.update(raw.as_bytes());
+            }
+            None => hash.update([2]),
+        }
+        hash.update([0]);
+    }
+    hash.finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn preview_of(
+    current: &[Current],
+    changes: &[(&'static StackSetting, SettingChange)],
+) -> StackConfigPreview {
     let mut restarts: Vec<String> = changes
         .iter()
         .flat_map(|(setting, _)| setting.services.iter().map(|s| (*s).to_owned()))
@@ -140,6 +172,7 @@ fn preview_of(changes: &[(&'static StackSetting, SettingChange)]) -> StackConfig
             .map(|(setting, _)| setting.name.to_owned())
             .collect(),
         restarts,
+        base: base_of(current),
     }
 }
 
@@ -186,22 +219,23 @@ impl ProvisioningService {
         submitted: &[SubmittedSetting<'_>],
     ) -> Result<StackConfigPreview, ProvisionError> {
         let config = self.read_config(current, project_id).await?;
-        let changes = plan(&read_settings(&config), submitted)?;
+        let now = read_settings(&config);
+        let changes = plan(&now, submitted)?;
         if changes.is_empty() {
             return Err(ProvisionError::NoChanges);
         }
-        Ok(preview_of(&changes))
+        Ok(preview_of(&now, &changes))
     }
 
     /// Queues writing `submitted` and redeploying, and returns the job's
-    /// ID. `reviewed` names the variables the preview listed; when the
-    /// stack changed since, nothing is queued.
+    /// ID. `base` is the preview's [`StackConfigPreview::base`]; when any
+    /// setting changed since the preview, nothing is queued.
     pub async fn queue_settings(
         &self,
         current: &CurrentSession,
         project_id: Uuid,
         submitted: &[SubmittedSetting<'_>],
-        reviewed: &[&str],
+        base: &str,
         ctx: RequestContext<'_>,
     ) -> Result<Uuid, ProvisionError> {
         let config = match self.read_config(current, project_id).await {
@@ -220,17 +254,13 @@ impl ProvisioningService {
             }
             other => other?,
         };
-        let changes = plan(&read_settings(&config), submitted)?;
+        let now = read_settings(&config);
+        if base_of(&now) != base {
+            return Err(ProvisionError::PreviewOutdated);
+        }
+        let changes = plan(&now, submitted)?;
         if changes.is_empty() {
             return Err(ProvisionError::NoChanges);
-        }
-        let preview = preview_of(&changes);
-        let mut reviewed: Vec<&str> = reviewed.to_vec();
-        reviewed.sort_unstable();
-        let mut changed: Vec<&str> = preview.changed.iter().map(String::as_str).collect();
-        changed.sort_unstable();
-        if reviewed != changed {
-            return Err(ProvisionError::PreviewOutdated);
         }
         let settings = changes.into_iter().map(|(_, change)| change).collect();
         self.queue_settings_job(current, project_id, settings, ctx)

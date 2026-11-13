@@ -375,7 +375,8 @@ pub struct StackSettingView {
     pub help: String,
     pub kind: SettingKind,
     /// The value in effect: the variable's, or the compose file's
-    /// default when it is not set.
+    /// default when it is not set. `None` when not known, such as a
+    /// value the compose file sets itself.
     pub value: Option<String>,
     pub state: SettingState,
 }
@@ -396,6 +397,9 @@ pub struct StackConfigPreview {
     pub changed: Vec<String>,
     /// The compose services Docker Compose recreates, sorted.
     pub restarts: Vec<String>,
+    /// A digest of the settings' current values; applying is refused
+    /// when they changed since. Settings hold no secret.
+    pub base: String,
 }
 
 #[cfg(test)]

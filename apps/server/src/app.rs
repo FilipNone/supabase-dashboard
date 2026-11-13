@@ -1187,7 +1187,7 @@ mod tests {
         let settings = |path: &str, body: String, cookie: &str| {
             send(&router, form_post(path, &body, Some(cookie)))
         };
-        let change = format!("id={provisioned}&disable_signup=false&reviewed=DISABLE_SIGNUP");
+        let change = format!("id={provisioned}&disable_signup=false&base=0");
         let (parts, body) = settings(QueueStackSettings::PATH, change.clone(), &bob).await;
         assert_eq!(parts.status, StatusCode::FORBIDDEN, "{body}");
         let (parts, body) =

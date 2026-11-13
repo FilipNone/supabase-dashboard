@@ -561,23 +561,19 @@ pub async fn preview_stack_settings(
 }
 
 /// Queues writing the submitted settings and redeploying, and returns
-/// the job's ID. `reviewed` is the comma-separated variable names the
-/// preview listed; the server refuses when the stack changed since.
+/// the job's ID. `base` is the preview's digest of the settings it saw;
+/// the server refuses when any of them changed since.
 /// Owners and admins.
 #[server]
 pub async fn queue_stack_settings(
     id: Uuid,
     #[server(flatten)] fields: SettingsFields,
-    reviewed: String,
+    base: String,
 ) -> Result<Uuid, AppError> {
-    let reviewed: Vec<&str> = reviewed
-        .split(',')
-        .filter(|name| !name.is_empty())
-        .collect();
     let session = org_context::session()?;
     let audit = org_context::AuditContext::current();
     Ok(org_context::provisioning()?
-        .queue_settings(&session, id, &fields.submitted(), &reviewed, audit.get())
+        .queue_settings(&session, id, &fields.submitted(), &base, audit.get())
         .await?)
 }
 

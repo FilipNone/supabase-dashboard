@@ -1687,7 +1687,7 @@ async fn owners_change_settings_and_edits_in_dokploy_stop_the_change() {
                 &developer,
                 project,
                 &[("DISABLE_SIGNUP", "false")],
-                &["DISABLE_SIGNUP"],
+                "any",
                 ctx()
             )
             .await,
@@ -1731,10 +1731,10 @@ async fn owners_change_settings_and_edits_in_dokploy_stop_the_change() {
             .await,
         Err(ProvisionError::SettingUnavailable(_))
     ));
-    // What was reviewed must still be what would change.
+    // The settings must still be what the review saw.
     assert!(matches!(
         f.service
-            .queue_settings(&f.owner, project, &submitted, &["JWT_EXPIRY"], ctx())
+            .queue_settings(&f.owner, project, &submitted, "stale", ctx())
             .await,
         Err(ProvisionError::PreviewOutdated)
     ));
@@ -1745,7 +1745,7 @@ async fn owners_change_settings_and_edits_in_dokploy_stop_the_change() {
     f.compose.state.lock().unwrap().lose_env_answer = true;
     let job = f
         .service
-        .queue_settings(&f.owner, project, &submitted, &["DISABLE_SIGNUP"], ctx())
+        .queue_settings(&f.owner, project, &submitted, &preview.base, ctx())
         .await
         .unwrap();
     assert!(
@@ -1771,21 +1771,41 @@ async fn owners_change_settings_and_edits_in_dokploy_stop_the_change() {
         assert_eq!(state.count("redeploy_compose"), 1);
     }
 
-    // A variable edited in Dokploy after the change was queued stops it
-    // before anything is written.
-    let job = f
+    // A variable edited in Dokploy between the review and applying it
+    // is not overwritten: applying is refused.
+    let schemas = [("PGRST_DB_SCHEMAS", "public, api")];
+    let reviewed = f
         .service
-        .queue_settings(
-            &f.owner,
-            project,
-            &[("PGRST_DB_SCHEMAS", "public, api")],
-            &["PGRST_DB_SCHEMAS"],
-            ctx(),
-        )
+        .preview_settings(&f.owner, project, &schemas)
         .await
         .unwrap();
     if let Some((_, env)) = f.compose.state.lock().unwrap().configured.as_mut() {
         env.push_str("PGRST_DB_SCHEMAS=public\n");
+    }
+    assert!(matches!(
+        f.service
+            .queue_settings(&f.owner, project, &schemas, &reviewed.base, ctx())
+            .await,
+        Err(ProvisionError::PreviewOutdated)
+    ));
+
+    // One edited after the change was queued stops the job before
+    // anything is written.
+    let reviewed = f
+        .service
+        .preview_settings(&f.owner, project, &schemas)
+        .await
+        .unwrap();
+    let job = f
+        .service
+        .queue_settings(&f.owner, project, &schemas, &reviewed.base, ctx())
+        .await
+        .unwrap();
+    if let Some((_, env)) = f.compose.state.lock().unwrap().configured.as_mut() {
+        *env = env.replace(
+            "PGRST_DB_SCHEMAS=public\n",
+            "PGRST_DB_SCHEMAS=public,storage\n",
+        );
     }
     run_all(&f).await;
     let stored = f.db.get_job(job).await.unwrap().unwrap();

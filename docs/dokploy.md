@@ -143,10 +143,12 @@ Owners and admins see a **Stack settings** section on a provisioned project's ov
 
 The section reads the variables and compose file with `compose.one` each time the page loads. A setting whose variable the compose file does not read (stacks created before this) or whose value is set more than once, quoted with escapes, or uses `$` is shown but cannot be changed. Values are checked on the server and are written unquoted, without spaces, quotes, `$`, `#`, or `\`.
 
-"Review changes" lists the variables that would change and the compose services Docker Compose recreates; values are not repeated. "Apply and redeploy" sends the reviewed names with the values. The server reads the service again and refuses if a different set of variables would change, then queues a `stack_action` job audited as `stack.configure`. The job saves the variables' previous values, never secrets. After `check` it runs:
+"Review changes" lists the variables that would change and the compose services Docker Compose recreates; values are not repeated. The review also carries a digest of every setting's state and value as the server read them. "Apply and redeploy" sends the values with that digest; the server reads the service again and refuses, asking for a new review, if any setting changed since, then queues a `stack_action` job audited as `stack.configure`. The job saves the variables' previous values, never secrets. After `check` it runs:
 
 1. `update`: reads the variables. If every changed variable still has its previous value, the job sets them and sends the whole variable text back with `compose.update` (only `composeId` and `env`). Every other line is kept as it was. If they already have the new values, an earlier answer was lost and nothing is sent. Anything else means they were edited in Dokploy meanwhile: the job fails, naming them, and writes nothing.
 2. `act` and `wait`: a redeployment, as for Redeploy.
+
+In the browser, changing a field withdraws the review, and the section reads the settings again only when the job finishes, so focus stays on the Apply button while it runs. A locked setting shows no value, because the one Dokploy holds may not be the one in effect.
 
 A removed project stays registered. Its section says when the service was removed and whether the volumes went with it; owners and admins get the volumes' name prefix to delete them on the server later. No further action can be asked for, and unregistering under Settings stays a separate step.
 

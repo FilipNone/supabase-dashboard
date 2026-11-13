@@ -22,14 +22,20 @@ use crate::{
 pub fn StackSettingsSection(
     project: uuid::Uuid,
     apply: ServerAction<QueueStackSettings>,
+    /// Counts the stack's actions that finished while the page was open.
+    finished: Signal<u32>,
 ) -> impl IntoView {
     let review = ServerAction::<PreviewStackSettings>::new();
+    // Read again once a queued change has been written, not when it is
+    // queued: the section keeps its elements, and focus, until then.
     let settings = Resource::new(
-        move || (project, apply.version().get()),
+        move || (project, finished.get()),
         |(id, _)| get_stack_settings(id),
     );
-    // The review shows until the change it describes is queued.
+    // The review shows until a field changes or the stack's action ends.
     let reviewing = RwSignal::new(false);
+    // A change was queued from this page and has not finished.
+    let queued = RwSignal::new(false);
     Effect::new(move |_| {
         if review.value().with(|value| matches!(value, Some(Ok(_)))) {
             reviewing.set(true);
@@ -37,13 +43,23 @@ pub fn StackSettingsSection(
     });
     Effect::new(move |_| {
         if apply.value().with(|value| matches!(value, Some(Ok(_)))) {
-            reviewing.set(false);
+            queued.set(true);
         }
+    });
+    Effect::new(move |previous: Option<u32>| {
+        let now = finished.get();
+        if previous.is_some_and(|previous| previous != now) {
+            reviewing.set(false);
+            queued.set(false);
+        }
+        now
     });
     view! {
         <Transition fallback=|| ()>
             {move || settings.get().map(|result| match result {
-                Ok(Some(view)) => section(view, project, review, apply, reviewing).into_any(),
+                Ok(Some(view)) => {
+                    section(view, project, review, apply, reviewing, queued).into_any()
+                }
                 // Not provisioned, removed, or not an owner or admin.
                 Ok(None) | Err(AppError::Forbidden) | Err(AppError::NotFound) => ().into_any(),
                 Err(err) => view! {
@@ -64,9 +80,11 @@ fn section(
     review: ServerAction<PreviewStackSettings>,
     apply: ServerAction<QueueStackSettings>,
     reviewing: RwSignal<bool>,
+    queued: RwSignal<bool>,
 ) -> impl IntoView {
-    let busy = view.busy;
-    let disabled = move || (busy || review.pending().get()).then_some("true");
+    let running = view.busy;
+    let busy = move || running || queued.get();
+    let disabled = move || (busy() || review.pending().get()).then_some("true");
     let review_error = move || {
         review
             .value()
@@ -80,7 +98,7 @@ fn section(
             return None;
         }
         let (fields, preview) = review.value().get()?.ok()?;
-        Some(review_view(project, fields, preview, apply, busy))
+        Some(review_view(project, fields, preview, apply, queued))
     };
     view! {
         <section class="panel" aria-labelledby="stack-settings-title">
@@ -90,13 +108,19 @@ fn section(
             </p>
             <ActionForm action=review attr:class="stacked-form settings-form">
                 <input type="hidden" name="id" value=project.to_string()/>
-                {fields}
+                // A review describes the values it was made from; changing
+                // a field withdraws it.
+                <div class="settings-fields"
+                    on:input=move |_| reviewing.set(false)
+                    on:change=move |_| reviewing.set(false)>
+                    {fields}
+                </div>
                 {review_error}
                 <div>
                     <button type="submit" class="button" aria-disabled=disabled>"Review changes"</button>
                 </div>
             </ActionForm>
-            {busy.then(|| view! {
+            {move || busy().then(|| view! {
                 <p class="field-hint">"An action on this stack is running; wait for it to finish before changing settings."</p>
             })}
             <div aria-live="polite">{summary}</div>
@@ -173,9 +197,16 @@ fn review_view(
     fields: SettingsFields,
     preview: StackConfigPreview,
     apply: ServerAction<QueueStackSettings>,
-    busy: bool,
+    queued: RwSignal<bool>,
 ) -> impl IntoView {
-    let disabled = move || (busy || apply.pending().get()).then_some("true");
+    let disabled = move || (queued.get() || apply.pending().get()).then_some("true");
+    let queued_note = move || {
+        queued.get().then(|| view! {
+            <p class="form-ok" role="status">
+                "Queued. The Dokploy service section follows the change; these settings are read again when it finishes."
+            </p>
+        })
+    };
     let error = move || {
         apply
             .value()
@@ -197,7 +228,7 @@ fn review_view(
         value.map(|value| view! { <input type="hidden" name=name value=value/> })
     })
     .collect_view();
-    let reviewed = preview.changed.join(",");
+    let base = preview.base;
     let count = preview.changed.len();
     let title = if count == 1 {
         "1 setting changes".to_owned()
@@ -221,12 +252,13 @@ fn review_view(
             <ActionForm action=apply attr:class="inline-form">
                 <input type="hidden" name="id" value=project.to_string()/>
                 {hidden}
-                <input type="hidden" name="reviewed" value=reviewed/>
+                <input type="hidden" name="base" value=base/>
                 <button type="submit" class="button button-primary" aria-disabled=disabled>
                     "Apply and redeploy"
                 </button>
             </ActionForm>
             {error}
+            {queued_note}
         </div>
     }
 }
