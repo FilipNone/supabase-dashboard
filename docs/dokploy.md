@@ -202,14 +202,20 @@ What you need: a Dokploy v0.31.x instance with its Traefik running, a DNS name f
 5. **Deploy.** The database starts first; the dashboard waits for its health check, applies migrations, and listens on port 3000. Dokploy's log for the service shows `listening` with the public URL, and `https://dashboard.example.com/readyz` answers 200.
 
    If the deploy log says `Detected: 0 mounts` and ends with `bind source path does not exist: /etc/dokploy/compose/<appName>/files/secret.key`, the file mount from step 3 is missing or its File Path is not exactly `secret.key`. Add or fix it on the Advanced tab and deploy again; the log should then say `Detected: 1 mounts`. The database container and volume from the failed attempt are reused.
-6. **Create the first operator.** There is no default account. On the Dokploy server, Compose names the container `<appName>-dashboard-1`, where `<appName>` is the name Dokploy shows for the service (for example `supabase-dashboard-sxem4i`):
+6. **Create the first operator.** There is no default account. The simplest way is Dokploy's own terminal: open the service, find the `dashboard` container in its container list, open its terminal (Bash), and run:
+
+   ```sh
+   supabase-dashboard-server create-owner --email you@example.com --name "Your Name"
+   ```
+
+   Or, from a shell on the Dokploy server: Compose names the container `<appName>-dashboard-1`, where `<appName>` is the name Dokploy shows for the service (for example `supabase-dashboard-sxem4i`):
 
    ```sh
    docker ps --filter name=-dashboard-1 --format '{{.Names}}'
    docker exec -it <appName>-dashboard-1 supabase-dashboard-server create-owner --email you@example.com --name "Your Name"
    ```
 
-   It asks for the password twice (at least 12 characters). This account is the installation administrator.
+   It asks for the password twice (at least 12 characters), then prints the sign-in address. This account is the installation administrator. Both ways were used on a real Dokploy on 2026-11-15: the container terminal by an operator, `docker exec` in the fixture check below.
 7. **Connect Dokploy.** Sign in at `https://dashboard.example.com/dashboard/sign-in`, open Admin in the sidebar (`/dashboard/admin`), and in the Dokploy section connect with `http://dokploy:3000` and an API key (see "Connecting" and "The API key" below). The dashboard is on `dokploy-network`, where Dokploy's API answers at that address. Create the key for a Dokploy member made for the dashboard, with access to the dashboard's own service and the environments stacks should go to, and with the rate limit off.
 8. **Confirm the placement.** The section then reads Dokploy's domains, finds the one routed to this service, and offers it: "Dokploy routes dashboard.example.com to <project> / <environment> / <service> (Compose)". Confirm it (see "Where the dashboard runs"). Without a confirmed placement there is no default target for new stacks.
 
@@ -260,7 +266,7 @@ On 2026-11-15, against the Dokploy fixture (v0.31.1) with Traefik v3.6.25 starte
 - Connecting at `http://dokploy:3000` with the fixture's key worked from the administrator page, which marked it as plain HTTP. The placement section found the service from the domain and offered it, and confirming it showed it as Current, with the default target for new stacks.
 - Supplying the connection from the deployment as above, then redeploying, kept the database (account, connection, and placement were still there), took over the administrator's connection, and logged at startup that the placement was where it was confirmed.
 
-Not tested: a real certificate from Let's Encrypt, Dokploy's web UI for these steps (the check used the API calls behind them), Dokploy's container terminal for `create-owner`, an upgrade between two releases, a key rotation, and a backup and restore on Dokploy.
+Not tested: a real certificate from Let's Encrypt, Dokploy's web UI for these steps (the check used the API calls behind them), an upgrade between two releases, a key rotation, and a backup and restore on Dokploy.
 
 ## Connecting
 
