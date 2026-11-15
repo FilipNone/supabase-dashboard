@@ -211,6 +211,7 @@ Release checks include a fresh installation, Studio access tests for each role, 
 
 ## Revision history
 
+- 2026-11-15: released `v0.3.0-dev.3` with API tokens, the read-only `/api/v1/` API, and the guide to installing the dashboard on Dokploy.
 - 2026-11-15: M6 API tokens: scoped, read-only, revocable dashboard API tokens and the `/api/v1/` organizations and projects API.
 - 2026-11-15: released `v0.3.0-dev.2` with the organization and account audit logs and the Integrations tab.
 - 2026-11-15: M6 audit views: organization and account audit logs. M6 integrations: the organization's Integrations tab shows Dokploy and the organization's targets.
