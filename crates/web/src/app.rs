@@ -86,11 +86,16 @@ const RETURN_PATH_MAX_LEN: usize = 2048;
 /// another page (`?next=`). Only dashboard pages on this host qualify, in
 /// printable ASCII without a backslash, so `next` cannot point the browser at
 /// another site (`//host`, `/\host`) or put odd bytes in a `Location` header.
+/// A fragment (`#`) is refused too: the invitation and reset pages keep their
+/// codes there, and a code must never travel in `next`, which the server
+/// receives.
 pub fn sign_in_return_path(raw: &str) -> Option<&str> {
     let safe = raw.len() <= RETURN_PATH_MAX_LEN
         && raw.starts_with("/dashboard/")
         && !raw.starts_with(SIGN_IN_PATH)
-        && raw.bytes().all(|b| b.is_ascii_graphic() && b != b'\\');
+        && raw
+            .bytes()
+            .all(|b| b.is_ascii_graphic() && b != b'\\' && b != b'#');
     safe.then_some(raw)
 }
 
@@ -174,6 +179,8 @@ mod tests {
             "/dashboard/organizations",
             "/dashboard/project/01a1c0a7-db5e-72a1-a5f2-6614555142e3?path=%2Fproject%2Fdefault",
             "/dashboard/org/x/projects/y/settings",
+            INVITE_PATH,
+            "/dashboard/project/x?path=%2Fa%23b",
         ] {
             assert_eq!(sign_in_return_path(ok), Some(ok), "{ok}");
         }
@@ -192,6 +199,8 @@ mod tests {
             "/dashboard/a\r\nSet-Cookie: x=1",
             "/dashboard/\\evil.test",
             "/dashboard/é",
+            "/dashboard/invite#abcdef",
+            "/dashboard/reset-password#0123",
             long.as_str(),
         ] {
             assert_eq!(sign_in_return_path(bad), None, "{bad}");

@@ -4,6 +4,15 @@
 //! not send to the server or in `Referer` headers. After hydration the page
 //! reads the code, removes it from the address bar, and asks the server what
 //! it is for. Someone without a link can paste one instead.
+//!
+//! An invitee who has to sign in first (or sign out of another account)
+//! leaves through the sign-in page with `next` naming this page, never the
+//! code. Just before leaving, the page puts the code in the tab's
+//! `sessionStorage`, and on return it takes it back out and deletes it. The
+//! code never goes into a query string, `next`, a `Referer`, or a request
+//! to the server other than the preview and accept calls. When storage is
+//! unavailable (blocked, or a private window that refuses it), the invitee
+//! opens the link again, as before.
 
 use leptos::{form::ActionForm, prelude::*};
 use leptos_meta::Title;
@@ -14,12 +23,22 @@ use supabase_dashboard_domain::{
 };
 
 use crate::{
-    app::SIGN_IN_PATH,
+    app::{INVITE_PATH, SIGN_IN_PATH},
     error::AppError,
     server_fns::{AcceptInvitation, InvitationPageData, SignUpWithInvitation, preview_invitation},
 };
 
 const CODE_LEN: usize = 64;
+
+/// The sign-in page, returning here afterwards. `next` names this page
+/// only; the code stays in the browser.
+pub const SIGN_IN_TO_ACCEPT: &str = "/dashboard/sign-in?next=%2Fdashboard%2Finvite";
+
+/// The `sessionStorage` key that carries a code across sign-in. Session
+/// storage belongs to this origin and this tab, and goes when the tab
+/// closes.
+#[cfg(feature = "hydrate")]
+const STORED_CODE_KEY: &str = "sd-invitation-code";
 
 /// Pulls an invitation code out of a pasted link or bare code. Returns
 /// `None` unless it is exactly 64 hex characters.
@@ -42,13 +61,43 @@ fn take_code_from_fragment() -> Option<String> {
     Some(code)
 }
 
+/// Keeps the code in this tab's session storage while the invitee signs
+/// in. Returns whether it was stored; failures are left to the fallback of
+/// opening the link again.
+#[cfg(feature = "hydrate")]
+fn keep_code_for_sign_in(code: &str) -> bool {
+    if extract_code(code).is_none() {
+        return false;
+    }
+    match window().session_storage() {
+        Ok(Some(storage)) => storage.set_item(STORED_CODE_KEY, code).is_ok(),
+        _ => false,
+    }
+}
+
+/// Takes a code kept by [`keep_code_for_sign_in`] and deletes it, so it is
+/// read once.
+#[cfg(feature = "hydrate")]
+fn take_kept_code() -> Option<String> {
+    let storage = window().session_storage().ok()??;
+    let stored = storage.get_item(STORED_CODE_KEY).ok().flatten();
+    // Deleted even when unreadable or malformed.
+    let _ = storage.remove_item(STORED_CODE_KEY);
+    extract_code(&stored?)
+}
+
 #[component]
 pub fn InvitePage() -> impl IntoView {
     let code = RwSignal::new(None::<String>);
     Effect::new(move |_| {
         #[cfg(feature = "hydrate")]
-        if let Some(found) = take_code_from_fragment() {
-            code.set(Some(found));
+        {
+            // A link opened now wins over a code kept from earlier; the
+            // kept one is deleted either way.
+            let kept = take_kept_code();
+            if let Some(found) = take_code_from_fragment().or(kept) {
+                code.set(Some(found));
+            }
         }
     });
     let data = LocalResource::new(move || {
@@ -155,6 +204,17 @@ fn InvitationDetails(
         invitation.role.label(),
         invitation.expires_at.date(),
     );
+    // Runs as the invitee leaves for the sign-in page, before the browser
+    // navigates.
+    let keep = {
+        let code = code.clone();
+        move || {
+            #[cfg(feature = "hydrate")]
+            keep_code_for_sign_in(&code);
+            #[cfg(not(feature = "hydrate"))]
+            let _ = &code;
+        }
+    };
     let next_step = match signed_in_email {
         Some(current) if current == invitation.email => {
             view! { <AcceptForm code/> }.into_any()
@@ -162,20 +222,25 @@ fn InvitationDetails(
         Some(current) => view! {
             <p class="auth-note">
                 {format!(
-                    "You are signed in as {}. Sign out, sign in as {email}, then open the invitation link again.",
+                    "You are signed in as {}. Sign out, then sign in as {email}; you will come back here to accept. \
+                     If you do not, open the invitation link again.",
                     current.as_str()
                 )}
             </p>
-            <form method="post" action="/auth/sign-out">
+            <form method="post" action="/auth/sign-out" on:submit=move |_| keep()>
+                <input type="hidden" name="next" value=INVITE_PATH/>
                 <button type="submit" class="button">"Sign out"</button>
             </form>
         }
         .into_any(),
         None if invitation.account_exists => view! {
             <p class="auth-note">
-                {format!("An account for {email} already exists. Sign in with it, then open the invitation link again.")}
+                {format!(
+                    "An account for {email} already exists. Sign in with it and you will come back here to accept. \
+                     If you do not, open the invitation link again."
+                )}
             </p>
-            <a class="button button-primary" href=SIGN_IN_PATH>"Sign in"</a>
+            <a class="button button-primary" href=SIGN_IN_TO_ACCEPT on:click=move |_| keep()>"Sign in"</a>
         }
         .into_any(),
         None => view! { <SignUpForm code email=email.clone() organization=organization.clone()/> }.into_any(),
@@ -283,6 +348,17 @@ fn action_error<T>(value: Option<Result<T, AppError>>) -> Option<impl IntoView> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_sign_in_link_returns_here_without_a_code() {
+        let (path, query) = SIGN_IN_TO_ACCEPT.split_once('?').unwrap();
+        assert_eq!(path, SIGN_IN_PATH);
+        assert_eq!(query, "next=%2Fdashboard%2Finvite");
+        assert_eq!(
+            crate::app::sign_in_return_path(INVITE_PATH),
+            Some(INVITE_PATH)
+        );
+    }
 
     #[test]
     fn codes_are_taken_from_links_or_pasted_alone() {

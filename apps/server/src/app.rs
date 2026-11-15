@@ -191,17 +191,17 @@ mod tests {
     };
     use supabase_dashboard_persistence::{Database, DatabaseSettings};
     use supabase_dashboard_web::{
-        app::SIGN_IN_PATH,
+        app::{INVITE_PATH, SIGN_IN_PATH},
         server_fns::{
-            AcceptStackVariables, AdminListAccounts, AdminSetAccountDisabled, AdoptDokployService,
-            ChangePassword, CheckProjectHealth, ClearDokployPlacement, CompletePasswordReset,
-            ConfirmDokployPlacement, ConnectDokploy, CreateApiToken, CreateInvitation,
-            CreateOrganization, DisconnectDokploy, GetAdoptableServices, GetAdoptionPreview,
-            GetCurrentAccount, GetDokployConnection, GetDokployPlacement, GetInstallationHealth,
-            GetOrganization, GetOrganizationAuditLog, GetProject, GetProjectAuthorities,
-            GetProjectCredentials, GetProjectDeployment, GetProjectHealth, GetProvisionJob,
-            GetProvisionTargets, GetStackSettings, GetStudioAccessLog, ListApiTokens,
-            ListOrganizations, ListProjects, ListProvisionJobs, ListSessions,
+            AcceptInvitation, AcceptStackVariables, AdminListAccounts, AdminSetAccountDisabled,
+            AdoptDokployService, ChangePassword, CheckProjectHealth, ClearDokployPlacement,
+            CompletePasswordReset, ConfirmDokployPlacement, ConnectDokploy, CreateApiToken,
+            CreateInvitation, CreateOrganization, DisconnectDokploy, GetAdoptableServices,
+            GetAdoptionPreview, GetCurrentAccount, GetDokployConnection, GetDokployPlacement,
+            GetInstallationHealth, GetOrganization, GetOrganizationAuditLog, GetProject,
+            GetProjectAuthorities, GetProjectCredentials, GetProjectDeployment, GetProjectHealth,
+            GetProvisionJob, GetProvisionTargets, GetStackSettings, GetStudioAccessLog,
+            ListApiTokens, ListOrganizations, ListProjects, ListProvisionJobs, ListSessions,
             PasswordResetAvailable, PreviewInvitation, PreviewPasswordReset, PreviewStackSettings,
             QueueStackAction, QueueStackRemoval, QueueStackSettings, RegisterProject,
             RemoveProjectAuthorities, RemoveProjectCredential, RenameOrganization,
@@ -3006,6 +3006,117 @@ mod tests {
         .await;
         assert!(body.contains(r#""invitation":null"#), "{body}");
         assert!(body.contains("carol@example.test"), "{body}");
+
+        // Carol now has an account. A second invitation reaches her while
+        // she is signed out: signing in, and switching accounts, lead back
+        // to the invitation page, which `next` names without the code.
+        let (_, body) = send(
+            &router,
+            form_post(CreateOrganization::PATH, "name=Beta", Some(&alice)),
+        )
+        .await;
+        let beta: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let beta_id = beta["id"].as_str().unwrap().to_owned();
+        let (_, body) = send(
+            &router,
+            form_post(
+                CreateInvitation::PATH,
+                &format!("organization_id={beta_id}&email=carol%40example.test&role=viewer"),
+                Some(&alice),
+            ),
+        )
+        .await;
+        let issued: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let second = issued["code"].as_str().unwrap().to_owned();
+        let (_, body) = send(
+            &router,
+            form_post(PreviewInvitation::PATH, &format!("code={second}"), None),
+        )
+        .await;
+        assert!(body.contains(r#""account_exists":true"#), "{body}");
+
+        let (_, body) = send(
+            &router,
+            get("/dashboard/sign-in?next=%2Fdashboard%2Finvite"),
+        )
+        .await;
+        assert!(
+            body.contains(r#"name="next" value="/dashboard/invite""#),
+            "{body}"
+        );
+        // Alice, signed in as the wrong account, signs out towards it.
+        let (parts, _) = send(
+            &router,
+            form_post("/auth/sign-out", "next=%2Fdashboard%2Finvite", Some(&alice)),
+        )
+        .await;
+        assert_eq!(
+            location(&parts),
+            "/dashboard/sign-in?next=%2Fdashboard%2Finvite"
+        );
+        let carol_sign_in = |next: &str| {
+            format!("email=carol%40example.test&password=correct+horse+battery+staple&next={next}")
+        };
+        let (parts, _) = send(
+            &router,
+            form_post(
+                "/auth/sign-in",
+                &carol_sign_in("%2Fdashboard%2Finvite"),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(location(&parts), INVITE_PATH);
+        let set_cookie = parts.headers[header::SET_COOKIE].to_str().unwrap();
+        let carol = set_cookie.split(';').next().unwrap().to_owned();
+        // Already signed in, the sign-in page forwards there too.
+        let (parts, _) = send(
+            &router,
+            get_with_cookie("/dashboard/sign-in?next=%2Fdashboard%2Finvite", &carol),
+        )
+        .await;
+        assert_eq!(location(&parts), INVITE_PATH);
+        let (parts, body) = send(
+            &router,
+            form_post(
+                AcceptInvitation::PATH,
+                &format!("code={second}"),
+                Some(&carol),
+            ),
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        assert!(body.contains(&beta_id), "{body}");
+
+        // A code in `next` is never carried: not by sign-in, not by the
+        // sign-in page, and not by sign-out.
+        let with_code = format!("%2Fdashboard%2Finvite%23{second}");
+        let (parts, _) = send(
+            &router,
+            form_post("/auth/sign-in", &carol_sign_in(&with_code), None),
+        )
+        .await;
+        assert_eq!(location(&parts), HOME_PATH);
+        let (_, body) = send(
+            &router,
+            get(&format!("/dashboard/sign-in?next={with_code}")),
+        )
+        .await;
+        assert!(!body.contains(&second), "{body}");
+        let (parts, _) = send(
+            &router,
+            form_post("/auth/sign-out", &format!("next={with_code}"), Some(&carol)),
+        )
+        .await;
+        assert_eq!(location(&parts), SIGN_IN_PATH);
+        // Sign-out without a body still works.
+        let bare = Request::post("/auth/sign-out")
+            .header(header::HOST, HOST)
+            .header(header::ORIGIN, ORIGIN)
+            .body(Body::empty())
+            .unwrap();
+        let (parts, _) = send(&router, bare).await;
+        assert_eq!(location(&parts), SIGN_IN_PATH);
 
         db.close().await;
         scratch.drop().await;

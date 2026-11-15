@@ -4,6 +4,7 @@
 
 use axum::{
     Form,
+    body::Bytes,
     extract::{Request, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware::Next,
@@ -252,6 +253,13 @@ fn query_value(query: Option<&str>, name: &str) -> Option<String> {
         .map(|(_, value)| value.into_owned())
 }
 
+/// The first value of `name` in a URL-encoded form body.
+fn form_value(body: &[u8], name: &str) -> Option<String> {
+    url::form_urlencoded::parse(body)
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.into_owned())
+}
+
 /// The page to open after signing in: `next` when it is a safe dashboard
 /// page, home otherwise.
 fn after_sign_in(next: Option<&str>) -> &str {
@@ -316,14 +324,18 @@ pub async fn sign_in(
 }
 
 /// `POST /auth/sign-out`. Revokes the server-side session and clears the
-/// cookie. Succeeds even without a valid session.
-pub async fn sign_out(State(state): State<AppState>, headers: HeaderMap) -> Response {
+/// cookie. Succeeds even without a valid session. An optional form field
+/// `next` names a safe dashboard page that the sign-in page passes on, so
+/// someone switching accounts comes back to where they were. The body is
+/// read leniently: a missing or unreadable body signs out all the same.
+pub async fn sign_out(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     if let Some(value) = state.cookie.read(&headers)
         && let Err(err) = state.auth.sign_out(value, request_context(&headers)).await
     {
         tracing::error!(error = %err, "sign-out could not revoke the session");
     }
-    let mut response = Redirect::to(SIGN_IN_PATH).into_response();
+    let next = form_value(&body, "next");
+    let mut response = Redirect::to(&sign_in_url(next.as_deref(), None)).into_response();
     if let Some(cookie) = state.cookie.clear() {
         response.headers_mut().insert(header::SET_COOKIE, cookie);
     }
