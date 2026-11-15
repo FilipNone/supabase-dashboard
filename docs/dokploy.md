@@ -215,7 +215,7 @@ What you need: a Dokploy v0.31.x instance with its Traefik running, a DNS name f
    docker exec -it <appName>-dashboard-1 supabase-dashboard-server create-owner --email you@example.com --name "Your Name"
    ```
 
-   It asks for the password twice (at least 12 characters), then prints the sign-in address. This account is the installation administrator. Both ways were used on a real Dokploy on 2026-11-15: the container terminal by an operator, `docker exec` in the fixture check below.
+   It asks for the password twice (at least 12 characters), then prints the sign-in address. This account is the installation administrator. On 2026-11-15 an operator used the container terminal on a real Dokploy; `docker exec` was used in the fixture check below.
 7. **Connect Dokploy.** Sign in at `https://dashboard.example.com/dashboard/sign-in`, open Admin in the sidebar (`/dashboard/admin`), and in the Dokploy section connect with `http://dokploy:3000` and an API key (see "Connecting" and "The API key" below). The dashboard is on `dokploy-network`, where Dokploy's API answers at that address. Create the key for a Dokploy member made for the dashboard, with access to the dashboard's own service and the environments stacks should go to, and with the rate limit off.
 8. **Confirm the placement.** The section then reads Dokploy's domains, finds the one routed to this service, and offers it: "Dokploy routes dashboard.example.com to <project> / <environment> / <service> (Compose)". Confirm it (see "Where the dashboard runs"). Without a confirmed placement there is no default target for new stacks.
 
