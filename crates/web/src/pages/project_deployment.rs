@@ -61,16 +61,6 @@ pub fn DeploymentPanel(project: ProjectSummary) -> impl IntoView {
         },
         |(id, _, _, _)| get_project_deployment(id),
     );
-    // Keeps running for the page's life: a new action can start at any
-    // time, and only an unfinished one triggers a request.
-    poll_every(ACTION_POLL, move || {
-        let running = deployment
-            .with_untracked(|view| matches!(view, Some(Ok(view)) if view.action_running()));
-        if running {
-            deployment.refetch();
-        }
-        true
-    });
     // Counts actions that finished while the page was open, so the
     // settings section reads the stack again after a change is written.
     let finished = RwSignal::new(0u32);
@@ -85,6 +75,16 @@ pub fn DeploymentPanel(project: ProjectSummary) -> impl IntoView {
         }
         action_running.set(running);
         running
+    });
+    // Keeps running for the page's life: a new action can start at any
+    // time, and only an unfinished one triggers a request. It reads the
+    // signal the effect above keeps, since reading the resource outside
+    // its Transition warns in the browser.
+    poll_every(ACTION_POLL, move || {
+        if action_running.get_untracked() {
+            deployment.refetch();
+        }
+        true
     });
     // One live region beside the re-rendered panel, so an action's
     // progress and outcome are announced.
