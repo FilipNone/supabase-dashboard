@@ -354,6 +354,14 @@ http:
 
 The service name is the one in the `traefik.http.services.<name>` label Dokploy writes for the dashboard's own domain; the compose file Dokploy converts for the service (`compose.getConvertedCompose`) shows it. Routing to that service keeps the container's address out of the file.
 
+With a flat pattern such as `SUPABASE_DASHBOARD_STUDIO_DOMAIN=*-studio.example.com`, the rule matches one level under the parent domain instead:
+
+```yaml
+      rule: "HostRegexp(`^[0-9a-f]{32}-studio\\.example\\.com$`)"
+```
+
+and a wildcard certificate for `*.example.com` covers the Studio hosts, so a proxy or CDN whose free certificate covers one level (such as Cloudflare's Universal SSL) can sit in front of them.
+
 Traefik cannot obtain a certificate for every name a regular expression matches, so HTTPS needs a wildcard certificate for `*.studio.example.com`: either uploaded under Certificates in Dokploy, or obtained by a certificate resolver that uses the DNS challenge, configured in Dokploy's Traefik settings with the DNS provider's credentials. The tls block then names that resolver and the domain.
 
 Dokploy names the service after the domain it was created for, as `<appName>-<number>-websecure` for the HTTPS router (and `-web` for the plain HTTP one that redirects), for example `supabase-dashboard-sxem4i-72-websecure`. The file then names `supabase-dashboard-sxem4i-72-websecure@docker`.
