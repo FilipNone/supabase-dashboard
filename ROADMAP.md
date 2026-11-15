@@ -211,6 +211,7 @@ Release checks include a fresh installation, Studio access tests for each role, 
 
 ## Revision history
 
+- 2026-11-15: released `v0.3.0-dev.4` with invitation emails over SMTP and the Integrations tab's target list fix.
 - 2026-11-15: M6 integrations: the Integrations tab's list of Dokploy targets browser-checked against the Dokploy fixture.
 - 2026-11-15: M6 email delivery started: organization invitations are emailed over SMTP when a mail server is configured.
 - 2026-11-15: released `v0.3.0-dev.3` with API tokens, the read-only `/api/v1/` API, and the guide to installing the dashboard on Dokploy.
