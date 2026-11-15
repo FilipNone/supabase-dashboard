@@ -194,19 +194,20 @@ mod tests {
         app::SIGN_IN_PATH,
         server_fns::{
             AcceptStackVariables, AdminListAccounts, AdminSetAccountDisabled, AdoptDokployService,
-            ChangePassword, CheckProjectHealth, ClearDokployPlacement, ConfirmDokployPlacement,
-            ConnectDokploy, CreateApiToken, CreateInvitation, CreateOrganization,
-            DisconnectDokploy, GetAdoptableServices, GetAdoptionPreview, GetCurrentAccount,
-            GetDokployConnection, GetDokployPlacement, GetInstallationHealth, GetOrganization,
-            GetOrganizationAuditLog, GetProject, GetProjectAuthorities, GetProjectCredentials,
-            GetProjectDeployment, GetProjectHealth, GetProvisionJob, GetProvisionTargets,
-            GetStackSettings, GetStudioAccessLog, ListApiTokens, ListOrganizations, ListProjects,
-            ListProvisionJobs, ListSessions, PreviewInvitation, PreviewStackSettings,
+            ChangePassword, CheckProjectHealth, ClearDokployPlacement, CompletePasswordReset,
+            ConfirmDokployPlacement, ConnectDokploy, CreateApiToken, CreateInvitation,
+            CreateOrganization, DisconnectDokploy, GetAdoptableServices, GetAdoptionPreview,
+            GetCurrentAccount, GetDokployConnection, GetDokployPlacement, GetInstallationHealth,
+            GetOrganization, GetOrganizationAuditLog, GetProject, GetProjectAuthorities,
+            GetProjectCredentials, GetProjectDeployment, GetProjectHealth, GetProvisionJob,
+            GetProvisionTargets, GetStackSettings, GetStudioAccessLog, ListApiTokens,
+            ListOrganizations, ListProjects, ListProvisionJobs, ListSessions,
+            PasswordResetAvailable, PreviewInvitation, PreviewPasswordReset, PreviewStackSettings,
             QueueStackAction, QueueStackRemoval, QueueStackSettings, RegisterProject,
             RemoveProjectAuthorities, RemoveProjectCredential, RenameOrganization,
             ReplaceDokployKey, ReplaceProjectAuthorities, ReplaceProjectCredential,
-            ReplaceStudioLogin, RevokeApiToken, RevokeSession, SignUpWithInvitation,
-            StartProvisioning, UnregisterProject, UpdateProfile,
+            ReplaceStudioLogin, RequestPasswordReset, RevokeApiToken, RevokeSession,
+            SignUpWithInvitation, StartProvisioning, UnregisterProject, UpdateProfile,
         },
     };
     use tower::ServiceExt;
@@ -2567,6 +2568,84 @@ mod tests {
         // Neither key comes back in the report.
         assert!(!body.contains("sb_publishable_"), "{body}");
         assert!(!body.contains("sb_secret_"), "{body}");
+
+        db.close().await;
+        scratch.drop().await;
+    }
+
+    #[tokio::test]
+    async fn password_reset_pages_work_without_a_session() {
+        use supabase_dashboard_web::app::{
+            FORGOT_PASSWORD_PATH, PASSWORD_RESET_FN_PATHS, RESET_PASSWORD_PATH,
+        };
+        // The session guard lets exactly these server functions through.
+        assert_eq!(
+            PASSWORD_RESET_FN_PATHS,
+            [
+                PasswordResetAvailable::PATH,
+                RequestPasswordReset::PATH,
+                PreviewPasswordReset::PATH,
+                CompletePasswordReset::PATH,
+            ]
+        );
+        let Some(scratch) = ScratchDb::create("http_password_reset").await else {
+            return;
+        };
+        let db = Database::connect(&scratch.settings).await.unwrap();
+        db.migrate().await.unwrap();
+        let router = router_for(db.clone()).await;
+
+        for page in [FORGOT_PASSWORD_PATH, RESET_PASSWORD_PATH] {
+            let (parts, _) = send(&router, get(page)).await;
+            assert_eq!(parts.status, StatusCode::OK, "{page}");
+            assert_eq!(parts.headers[header::CACHE_CONTROL], "no-store", "{page}");
+        }
+        // This router has no mail server, which the page is told.
+        let (parts, body) = send(&router, form_post(PasswordResetAvailable::PATH, "", None)).await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        assert_eq!(body, "false");
+        let (parts, body) = send(
+            &router,
+            form_post(RequestPasswordReset::PATH, "email=ops%40example.test", None),
+        )
+        .await;
+        assert!(parts.status.is_client_error(), "{body}");
+        assert!(body.contains("not set up"), "{body}");
+        let (parts, body) = send(
+            &router,
+            form_post(
+                PreviewPasswordReset::PATH,
+                &format!("code={}", "0".repeat(64)),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        assert_eq!(body, "null");
+        let (parts, body) = send(
+            &router,
+            form_post(
+                CompletePasswordReset::PATH,
+                &format!(
+                    "code={}&password=correct+horse+battery+staple\
+                     &password_confirmation=correct+horse+battery+staple",
+                    "0".repeat(64)
+                ),
+                None,
+            ),
+        )
+        .await;
+        assert!(parts.status.is_client_error(), "{body}");
+        assert!(body.contains("link is not valid"), "{body}");
+        // A cross-site form cannot set a password.
+        let forged = Request::post(CompletePasswordReset::PATH)
+            .header(header::HOST, HOST)
+            .header(header::ORIGIN, "https://evil.example")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(format!("code={}", "0".repeat(64))))
+            .unwrap();
+        let (parts, _) = send(&router, forged).await;
+        assert_eq!(parts.status, StatusCode::FORBIDDEN);
 
         db.close().await;
         scratch.drop().await;

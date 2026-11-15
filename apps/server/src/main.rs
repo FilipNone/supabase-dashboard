@@ -34,7 +34,7 @@ use supabase_dashboard_application::{
     dokploy::{DokployConnector, DokployCredentials, DokployService},
     jobs::{JobHandler, JobRunner, RunnerSettings},
     key_rotation::{RotationError, key_usage, reseal_credentials},
-    mail::InvitationMail,
+    mail::{InvitationMail, Mailer, PasswordResetMail},
     organizations::OrganizationService,
     projects::ProjectService,
     provisioning::{ComposeApi, ProvisionStackHandler, ProvisioningService, StackActionHandler},
@@ -173,15 +173,24 @@ fn deployment_dokploy(config: &Config) -> Result<Option<DokployCredentials>, Sta
 /// Largest SMTP password file read, so a wrong path fails fast.
 const MAX_SMTP_PASSWORD_FILE_BYTES: u64 = 4096;
 
-/// Sets up invitation email, if the deployment configured a mail server.
+/// The dashboard's own outgoing mail: invitation and password reset links.
+struct OutgoingMail {
+    invitations: InvitationMail,
+    password_resets: PasswordResetMail,
+}
+
+/// Sets up outgoing email, if the deployment configured a mail server.
 /// The password file is read once, its size checked first, and a final
 /// newline ignored; nothing from it appears in an error.
-fn invitation_mail(
+fn outgoing_mail(
     config: &Config,
     extra_roots: &ExtraRoots,
-) -> Result<Option<InvitationMail>, StartupError> {
+) -> Result<Option<OutgoingMail>, StartupError> {
     let (Some(mail), Some(public_url)) = (&config.mail, &config.public_url) else {
-        tracing::info!("outgoing mail is off; invitation links are shown, not emailed");
+        tracing::info!(
+            "outgoing mail is off; invitation links are shown, not emailed, \
+             and passwords are reset on the server"
+        );
         return Ok(None);
     };
     let credentials = match &mail.credentials {
@@ -228,15 +237,22 @@ fn invitation_mail(
         host = %mail.endpoint.host,
         port = mail.endpoint.port,
         security = ?mail.endpoint.security,
-        "invitation links are emailed"
+        "invitation and password reset links are emailed"
     );
-    Ok(Some(InvitationMail {
-        mailer: Arc::new(mailer),
-        invite_page_url: format!(
-            "{}{}",
-            public_url.origin().ascii_serialization(),
-            supabase_dashboard_web::app::INVITE_PATH
-        ),
+    let mailer: Arc<dyn Mailer> = Arc::new(mailer);
+    let origin = public_url.origin().ascii_serialization();
+    Ok(Some(OutgoingMail {
+        invitations: InvitationMail {
+            mailer: Arc::clone(&mailer),
+            invite_page_url: format!("{origin}{}", supabase_dashboard_web::app::INVITE_PATH),
+        },
+        password_resets: PasswordResetMail {
+            mailer,
+            reset_page_url: format!(
+                "{origin}{}",
+                supabase_dashboard_web::app::RESET_PASSWORD_PATH
+            ),
+        },
     }))
 }
 
@@ -468,7 +484,16 @@ async fn run() -> Result<(), StartupError> {
     db.migrate().await?;
     tracing::info!("metadata database migrations are up to date");
 
-    let auth = Arc::new(AuthService::new(db.clone(), auth_config(&config)).await?);
+    let extra_roots = extra_roots(&config)?;
+    let (invitation_mail, reset_mail) = match outgoing_mail(&config, &extra_roots)? {
+        Some(mail) => (Some(mail.invitations), Some(mail.password_resets)),
+        None => (None, None),
+    };
+    let auth = AuthService::new(db.clone(), auth_config(&config)).await?;
+    let auth = Arc::new(match reset_mail {
+        Some(mail) => auth.with_password_reset_mail(mail),
+        None => auth,
+    });
     if !auth.is_initialized().await? {
         tracing::warn!(
             "no operator account exists; create one with `supabase-dashboard-server create-owner`"
@@ -496,7 +521,6 @@ async fn run() -> Result<(), StartupError> {
     let policy = TargetPolicy {
         allow_loopback: config.allow_loopback_targets,
     };
-    let extra_roots = extra_roots(&config)?;
     let probe = GatewayProbe::shared(GatewaySettings {
         policy,
         extra_roots: extra_roots.clone(),
@@ -616,7 +640,7 @@ async fn run() -> Result<(), StartupError> {
         .as_ref()
         .is_some_and(|u| u.scheme() == "https");
     let organizations = OrganizationService::new(db.clone());
-    let organizations = Arc::new(match invitation_mail(&config, &extra_roots)? {
+    let organizations = Arc::new(match invitation_mail {
         Some(mail) => organizations.with_invitation_mail(mail),
         None => organizations,
     });

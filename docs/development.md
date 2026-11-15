@@ -86,7 +86,7 @@ All settings are environment variables. Invalid values stop the server at startu
 | `SUPABASE_DASHBOARD_EXTRA_CA_FILE` | unset | Path to a PEM file of certificate authorities to trust for service checks and Studio traffic, on top of the bundled Mozilla roots, for every project. Authorities for one project are stored on that project's settings page. Up to 1 MiB; it may hold only `CERTIFICATE` blocks. The server refuses to start if the file is missing, empty, or holds anything else, and logs how many it loaded |
 | `SUPABASE_DASHBOARD_DOKPLOY_URL` | unset | Dokploy's address, as an administrator would enter it on the administrator page. Needs `SUPABASE_DASHBOARD_DOKPLOY_API_KEY_FILE` and an encryption key. See "Supplied by the deployment" in [docs/dokploy.md](dokploy.md) |
 | `SUPABASE_DASHBOARD_DOKPLOY_API_KEY_FILE` | unset | Path to a file holding the Dokploy API key alone (surrounding whitespace is ignored, at most 4 KiB). Read once at startup; the server refuses to start if it is missing or the key is malformed. Needs `SUPABASE_DASHBOARD_DOKPLOY_URL` |
-| `SUPABASE_DASHBOARD_SMTP_URL` | unset | Mail server for the dashboard's own email (invitation links), as `smtps://host[:port]` (TLS from the start, port 465 by default) or `smtp://host[:port]` (STARTTLS required, port 587 by default). No credentials, path, or query. Needs `SUPABASE_DASHBOARD_PUBLIC_URL` and `SUPABASE_DASHBOARD_MAIL_FROM`. Unset sends no email; see "Invitation email" below |
+| `SUPABASE_DASHBOARD_SMTP_URL` | unset | Mail server for the dashboard's own email (invitation and password reset links), as `smtps://host[:port]` (TLS from the start, port 465 by default) or `smtp://host[:port]` (STARTTLS required, port 587 by default). No credentials, path, or query. Needs `SUPABASE_DASHBOARD_PUBLIC_URL` and `SUPABASE_DASHBOARD_MAIL_FROM`. Unset sends no email; see "Invitation email" below |
 | `SUPABASE_DASHBOARD_MAIL_FROM` | unset | From address, as `dashboard@example.com` or `Dashboard <dashboard@example.com>`. Needs `SUPABASE_DASHBOARD_SMTP_URL` |
 | `SUPABASE_DASHBOARD_SMTP_USERNAME` | unset | Login for the mail server. Set together with one of the two password settings |
 | `SUPABASE_DASHBOARD_SMTP_PASSWORD_FILE` | unset | Path to a file holding the SMTP password (a final newline is ignored, at most 4 KiB). Read once at startup |
@@ -120,7 +120,7 @@ With `SUPABASE_DASHBOARD_SMTP_URL` set, creating an invitation also emails its l
 
 Owners and admins can send an open invitation again with Resend on the Team page (only an owner, for an invitation to the owner role). Because only a hash of each code is stored, the old code cannot be sent again: a new invitation with a new code and a new seven-day expiry replaces it in one transaction, for the same address and role, and the old link stops working. The new link is shown once and emailed when mail is configured. The resend is audited as `organization.invitation_resend` against the new invitation, and refused when the invitation was withdrawn, accepted, expired, or already replaced in the meantime. Without mail configured, Resend still makes a new link to copy.
 
-The connection is always encrypted outside development: `smtp://` requires STARTTLS, and a server that does not offer it gets neither the login nor the message. Certificates are checked against the Mozilla roots bundled with the binary plus `SUPABASE_DASHBOARD_EXTRA_CA_FILE`. The password stays in the server process and is never logged. This mail is the dashboard's own, separate from the SMTP settings of a managed project's Auth service. Self-service password reset by email is not implemented; `reset-password` on the server is still the recovery path.
+The connection is always encrypted outside development: `smtp://` requires STARTTLS, and a server that does not offer it gets neither the login nor the message. Certificates are checked against the Mozilla roots bundled with the binary plus `SUPABASE_DASHBOARD_EXTRA_CA_FILE`. The password stays in the server process and is never logged. This mail is the dashboard's own, separate from the SMTP settings of a managed project's Auth service. The same mail server sends password reset links; see "Password reset by email" below.
 
 To try it locally, run Mailpit and point the dashboard at it:
 
@@ -133,6 +133,16 @@ SUPABASE_DASHBOARD_MAIL_FROM=Dashboard <dashboard@example.test>
 ```
 
 Messages show up at <http://127.0.0.1:8025>. The adapter tests run against `tests/fixtures/mail` (Mailpit without TLS, and Mailpit with STARTTLS and a login): run `tests/fixtures/mail/setup.sh`, then `SUPABASE_DASHBOARD_TEST_MAIL_FIXTURE=1 cargo test -p supabase-dashboard-adapters --test mail_fixture`.
+
+### Password reset by email
+
+With `SUPABASE_DASHBOARD_SMTP_URL` set, the sign-in page's "Forgot your password?" link opens `/dashboard/forgot-password`, where an operator enters their email address. Without mail, that page says passwords are reset on the server with `reset-password` and shows no form.
+
+The page answers the same way whether or not an account uses the address. The lookup, the saved request, and the email happen in a background task after the answer, so its timing does not depend on the account either; at most 8 requests are handled at once, and more are refused with "try again in a minute". An enabled account gets an email with a link to `<public URL origin>/dashboard/reset-password#<code>`; the code is in the fragment, so opening the link does not send it to the server, and the page removes it from the address bar. Only a SHA-256 hash of the code is stored, in `password_reset_requests`.
+
+A link works once, for one hour, and stops working when a newer link is sent, when the password changes in any way, or when the account is disabled. Each account gets at most 3 links per hour; further requests send nothing. Setting a new password signs the account out of every session and revokes its API tokens, like `reset-password`, and clears the sign-in throttle for the address. Requests older than a day are deleted the next time the account asks.
+
+Audit events, none with the address or the code: `account.password_reset_request` (success when a link was saved, denied for a disabled account or the hourly limit, failure with no target for an unknown address), `account.password_reset_email` (whether the mail server accepted it), and `account.password_reset` with the account as actor when the link is used, or a failure with no target for a link that is not open. The account's own Audit log page shows the ones about it.
 
 ### Studio access log
 

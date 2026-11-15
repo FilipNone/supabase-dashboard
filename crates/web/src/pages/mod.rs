@@ -12,6 +12,7 @@ pub mod invite;
 pub mod not_found;
 pub mod organization;
 pub mod organizations;
+pub mod password_reset;
 pub mod project;
 mod project_connect;
 pub mod project_connection;

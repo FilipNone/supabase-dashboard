@@ -13,6 +13,7 @@ pub mod dokploy_targets;
 pub mod invitations;
 pub mod jobs;
 pub mod organizations;
+pub mod password_resets;
 pub mod projects;
 pub mod provisioning;
 pub mod sessions;

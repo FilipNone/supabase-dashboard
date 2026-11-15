@@ -8,7 +8,10 @@ use std::fmt;
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 use supabase_dashboard_domain::{
-    account::{AccountSummary, AdminAccountSummary, SessionSummary},
+    account::{
+        AccountSummary, AdminAccountSummary, PasswordResetCode, PasswordResetPreview,
+        SessionSummary,
+    },
     admin::RegisteredResources,
     adoption::{AdoptableServices, AdoptionPreview},
     api_token::{ApiTokenSummary, IssuedApiToken},
@@ -853,6 +856,53 @@ pub async fn sign_up_with_invitation(
     let audit = org_context::AuditContext::current();
     Ok(org_context::auth()?
         .accept_invitation_with_new_account(code.expose(), &display_name, &password, audit.get())
+        .await?)
+}
+
+/// Public: whether this dashboard can email password reset links.
+#[server(prefix = "/auth/password-reset", endpoint = "available")]
+pub async fn password_reset_available() -> Result<bool, AppError> {
+    Ok(org_context::auth()?.password_reset_available())
+}
+
+/// Public: emails a password reset link if an enabled account uses `email`.
+/// The answer is the same whether or not one does.
+#[server(prefix = "/auth/password-reset", endpoint = "request")]
+pub async fn request_password_reset(email: String) -> Result<(), AppError> {
+    let audit = org_context::AuditContext::current();
+    // The link is sent in the background; the answer does not wait for it.
+    let _request = org_context::auth()?.request_password_reset(&email, audit.get())?;
+    Ok(())
+}
+
+/// Public: what a password reset link is for, or `None` when it is not
+/// open.
+#[server(prefix = "/auth/password-reset", endpoint = "preview")]
+pub async fn preview_password_reset(
+    code: PasswordResetCode,
+) -> Result<Option<PasswordResetPreview>, AppError> {
+    org_context::auth()?
+        .preview_password_reset(code.expose())
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, "password reset lookup failed");
+            AppError::Unavailable
+        })
+}
+
+/// Public: sets a new password with a reset link. Every session of the
+/// account is signed out, so the operator signs in again afterwards.
+#[server(prefix = "/auth/password-reset", endpoint = "complete")]
+pub async fn complete_password_reset(
+    code: PasswordResetCode,
+    password: PasswordInput,
+    password_confirmation: PasswordInput,
+) -> Result<(), AppError> {
+    let password = secrecy::SecretString::from(password.0);
+    let confirmation = secrecy::SecretString::from(password_confirmation.0);
+    let audit = org_context::AuditContext::current();
+    Ok(org_context::auth()?
+        .complete_password_reset(code.expose(), &password, &confirmation, audit.get())
         .await?)
 }
 

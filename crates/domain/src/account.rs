@@ -183,6 +183,42 @@ pub struct SessionSummary {
     pub is_current: bool,
 }
 
+/// How long an emailed password reset link works.
+pub const PASSWORD_RESET_LIFETIME: time::Duration = time::Duration::hours(1);
+/// Most reset emails one account can be sent per
+/// [`PASSWORD_RESET_WINDOW_SECS`].
+pub const PASSWORD_RESET_LIMIT: u32 = 3;
+pub const PASSWORD_RESET_WINDOW_SECS: u32 = 3600;
+
+/// The secret part of a password reset link. Whoever holds it can set the
+/// account's password, so it is never logged or stored in plain form.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PasswordResetCode(String);
+
+impl PasswordResetCode {
+    pub const fn new(code: String) -> Self {
+        Self(code)
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for PasswordResetCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PasswordResetCode([REDACTED])")
+    }
+}
+
+/// What the reset page shows for an open link.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PasswordResetPreview {
+    pub email: Email,
+    pub expires_at: time::OffsetDateTime,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -19,6 +19,7 @@ use crate::pages::{
         OrganizationLayout, OrganizationProjectsPage, OrganizationTeamPage,
     },
     organizations::OrganizationsPage,
+    password_reset::{ForgotPasswordPage, ResetPasswordPage},
     project::{
         NewProjectPage, ProjectLayout, ProjectOverviewPage, ProjectSettingsPage, ProjectSetupPage,
     },
@@ -102,6 +103,20 @@ pub const INVITE_PATH: &str = "/dashboard/invite";
 pub const INVITE_PREVIEW_PATH: &str = "/auth/invitation/preview";
 pub const INVITE_SIGN_UP_PATH: &str = "/auth/invitation/sign-up";
 
+/// Reachable with or without a session: asking for a password reset link,
+/// and the page the link opens, with the code in the fragment.
+pub const FORGOT_PASSWORD_PATH: &str = "/dashboard/forgot-password";
+pub const RESET_PASSWORD_PATH: &str = "/dashboard/reset-password";
+
+/// Public server functions behind those pages. They must match the
+/// `prefix` and `endpoint` of their `#[server]` attributes.
+pub const PASSWORD_RESET_FN_PATHS: [&str; 4] = [
+    "/auth/password-reset/available",
+    "/auth/password-reset/request",
+    "/auth/password-reset/preview",
+    "/auth/password-reset/complete",
+];
+
 #[component]
 pub fn App() -> impl IntoView {
     provide_meta_context();
@@ -115,6 +130,8 @@ pub fn App() -> impl IntoView {
             <Routes fallback=|| view! { <NotFound/> }>
                 <Route path=path!("/dashboard/sign-in") view=SignInPage/>
                 <Route path=path!("/dashboard/invite") view=InvitePage/>
+                <Route path=path!("/dashboard/forgot-password") view=ForgotPasswordPage/>
+                <Route path=path!("/dashboard/reset-password") view=ResetPasswordPage/>
                 <ParentRoute path=path!("/dashboard") view=DashboardLayout>
                     <Route path=path!("organizations") view=OrganizationsPage/>
                     <Route path=path!("status") view=StatusPage/>

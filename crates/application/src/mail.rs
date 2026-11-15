@@ -1,4 +1,5 @@
-//! Outgoing email from the dashboard itself, such as invitation links.
+//! Outgoing email from the dashboard itself: invitation and password reset
+//! links.
 //!
 //! This is the dashboard's own mail, separate from the SMTP settings of a
 //! managed project's Auth service. The [`Mailer`] port is implemented by an
@@ -8,7 +9,7 @@
 use std::{fmt, future::Future, pin::Pin, sync::Arc};
 
 use supabase_dashboard_domain::{
-    account::{DisplayName, Email},
+    account::{DisplayName, Email, PasswordResetCode},
     authz::OrgRole,
     invitation::InvitationCode,
     organization::OrganizationName,
@@ -122,6 +123,48 @@ impl InvitationMail {
     }
 }
 
+/// Mail for password reset links: the mailer and where the reset page
+/// lives.
+#[derive(Clone)]
+pub struct PasswordResetMail {
+    pub mailer: Arc<dyn Mailer>,
+    /// Absolute URL of the reset page, without a fragment, such as
+    /// `https://dashboard.example.com/dashboard/reset-password`. The code is
+    /// appended as the fragment, so opening the link does not send it to
+    /// the server.
+    pub reset_page_url: String,
+}
+
+impl PasswordResetMail {
+    pub fn message(
+        &self,
+        to: &Email,
+        code: &PasswordResetCode,
+        expires_at: OffsetDateTime,
+    ) -> OutgoingEmail {
+        let link = format!("{}#{}", self.reset_page_url, code.expose());
+        let body = format!(
+            "Someone asked to reset the password of the dashboard account {email}.\n\
+             \n\
+             Open this link to choose a new password:\n\
+             {link}\n\
+             \n\
+             The link works once and expires on {date} at {time} UTC. Setting a new password \
+             signs the account out everywhere and revokes its API tokens.\n\
+             \n\
+             If you did not ask for this, ignore this email; your password stays the same.\n",
+            email = to.as_str(),
+            date = expires_at.date(),
+            time = format_args!("{:02}:{:02}", expires_at.hour(), expires_at.minute()),
+        );
+        OutgoingEmail {
+            to: to.clone(),
+            subject: "Reset your dashboard password".to_owned(),
+            body,
+        }
+    }
+}
+
 /// Replaces control characters, including CR and LF, with spaces. Names are
 /// already validated without them; this keeps a header line single even if
 /// that rule changes.
@@ -186,6 +229,26 @@ mod tests {
         assert!(message.body.contains("as Developer"));
         assert!(message.body.contains("2026-11-22 at 10:30 UTC"));
         assert!(!format!("{message:?}").contains("abc123"));
+    }
+
+    #[test]
+    fn reset_message_holds_the_link() {
+        let mail = PasswordResetMail {
+            mailer: Arc::new(Never),
+            reset_page_url: "https://dash.example.test/dashboard/reset-password".into(),
+        };
+        let to = Email::parse("ops@example.test").unwrap();
+        let code = PasswordResetCode::new("cd34".into());
+        let expires_at = OffsetDateTime::from_unix_timestamp(1_795_343_415).unwrap();
+        let message = mail.message(&to, &code, expires_at);
+        assert_eq!(message.to.as_str(), "ops@example.test");
+        assert!(
+            message
+                .body
+                .contains("https://dash.example.test/dashboard/reset-password#cd34")
+        );
+        assert!(message.body.contains("2026-11-22 at 10:30 UTC"));
+        assert!(!format!("{message:?}").contains("cd34"));
     }
 
     #[test]

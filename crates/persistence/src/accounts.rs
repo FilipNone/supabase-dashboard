@@ -258,35 +258,9 @@ impl Database {
         audit: &AuditEvent<'_>,
     ) -> Result<Option<u64>, PersistenceError> {
         let mut tx = self.pool.begin().await.map_err(PersistenceError::Query)?;
-        let updated =
-            sqlx::query("UPDATE accounts SET password_hash = $2, updated_at = now(), password_changed_at = now() WHERE id = $1")
-                .bind(account_id)
-                .bind(new_hash)
-                .execute(&mut *tx)
-                .await
-                .map_err(PersistenceError::Query)?
-                .rows_affected()
-                == 1;
-        if !updated {
+        let Some(revoked) = replace_password(&mut tx, account_id, new_hash).await? else {
             return Ok(None);
-        }
-        let revoked = sqlx::query(
-            "UPDATE sessions SET revoked_at = now() WHERE account_id = $1 AND revoked_at IS NULL",
-        )
-        .bind(account_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(PersistenceError::Query)?
-        .rows_affected();
-        // A password reset is the recovery path for a lost or compromised
-        // account, so its API tokens stop working too.
-        sqlx::query(
-            "UPDATE api_tokens SET revoked_at = now() WHERE account_id = $1 AND revoked_at IS NULL",
-        )
-        .bind(account_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(PersistenceError::Query)?;
+        };
         insert_audit_event(&mut *tx, audit).await?;
         tx.commit().await.map_err(PersistenceError::Query)?;
         Ok(Some(revoked))
@@ -391,4 +365,45 @@ impl Database {
         tx.commit().await.map_err(PersistenceError::Query)?;
         Ok(SetDisabledOutcome::Changed { revoked_sessions })
     }
+}
+
+/// Sets an account's password in `tx`, signs out all of its sessions, and
+/// revokes its API tokens, because a reset is the recovery path for a lost
+/// or compromised account. Returns how many sessions were signed out, or
+/// `None` when the account does not exist.
+pub(crate) async fn replace_password(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: Uuid,
+    new_hash: &str,
+) -> Result<Option<u64>, PersistenceError> {
+    let updated = sqlx::query(
+        "UPDATE accounts SET password_hash = $2, updated_at = now(), password_changed_at = now() \
+         WHERE id = $1",
+    )
+    .bind(account_id)
+    .bind(new_hash)
+    .execute(&mut **tx)
+    .await
+    .map_err(PersistenceError::Query)?
+    .rows_affected()
+        == 1;
+    if !updated {
+        return Ok(None);
+    }
+    let revoked = sqlx::query(
+        "UPDATE sessions SET revoked_at = now() WHERE account_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(account_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(PersistenceError::Query)?
+    .rows_affected();
+    sqlx::query(
+        "UPDATE api_tokens SET revoked_at = now() WHERE account_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(account_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(PersistenceError::Query)?;
+    Ok(Some(revoked))
 }

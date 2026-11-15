@@ -73,7 +73,10 @@ impl AppError {
 mod server {
     use supabase_dashboard_application::{
         api_tokens::ApiTokenError,
-        auth::{AccountUpdateError, AdminError, AuthError, InvitationSignUpError},
+        auth::{
+            AccountUpdateError, AdminError, AuthError, CompletePasswordResetError,
+            InvitationSignUpError, PasswordResetRequestError,
+        },
         connections::ConnectionError,
         dokploy::DokployServiceError,
         organizations::OrganizationError,
@@ -145,6 +148,23 @@ mod server {
                     tracing::error!(error = %err, "invitation sign-up failed");
                     Self::Unavailable
                 }
+            }
+        }
+    }
+
+    impl From<PasswordResetRequestError> for AppError {
+        fn from(err: PasswordResetRequestError) -> Self {
+            Self::Rejected(err.to_string())
+        }
+    }
+
+    impl From<CompletePasswordResetError> for AppError {
+        fn from(err: CompletePasswordResetError) -> Self {
+            match err {
+                CompletePasswordResetError::InvalidLink
+                | CompletePasswordResetError::PasswordMismatch
+                | CompletePasswordResetError::Input(_) => Self::Rejected(err.to_string()),
+                CompletePasswordResetError::Internal(err) => err.into(),
             }
         }
     }

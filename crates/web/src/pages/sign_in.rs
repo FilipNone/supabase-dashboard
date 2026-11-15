@@ -2,7 +2,7 @@ use leptos::prelude::*;
 use leptos_meta::Title;
 use leptos_router::hooks::use_query_map;
 
-use crate::app::sign_in_return_path;
+use crate::app::{FORGOT_PASSWORD_PATH, sign_in_return_path};
 
 /// Operator sign-in. A plain HTML form posted to `/auth/sign-in`, so it
 /// works before the WASM bundle loads. The server redirects back here with a
@@ -59,6 +59,7 @@ pub fn SignInPage() -> impl IntoView {
                     </label>
                     <button type="submit" class="button button-primary">"Sign in"</button>
                 </form>
+                <p class="auth-note"><a href=FORGOT_PASSWORD_PATH>"Forgot your password?"</a></p>
                 <p class="auth-note">
                     "There is no public sign-up. To join, ask an organization owner or admin for an invitation link."
                 </p>

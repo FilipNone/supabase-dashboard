@@ -23,7 +23,14 @@ use supabase_dashboard_persistence::{
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+mod password_reset;
+
+pub use password_reset::{
+    CompletePasswordResetError, PasswordResetRequest, PasswordResetRequestError,
+};
+
 use crate::{
+    mail::PasswordResetMail,
     password::{PasswordError, PasswordHashing},
     throttle::{LoginThrottle, ThrottleConfig},
     token::{InvitationToken, RandomnessError, SessionToken},
@@ -222,6 +229,8 @@ pub struct AuthService {
     /// Verified when the email is unknown, so that response timing does not
     /// reveal whether an account exists.
     dummy_hash: String,
+    /// Emails password reset links when set.
+    reset_mail: Option<password_reset::ResetMailer>,
 }
 
 impl AuthService {
@@ -236,7 +245,15 @@ impl AuthService {
             throttle: LoginThrottle::new(config.throttle),
             config,
             dummy_hash,
+            reset_mail: None,
         })
+    }
+
+    /// Lets operators ask for a password reset link by email.
+    #[must_use]
+    pub fn with_password_reset_mail(mut self, mail: PasswordResetMail) -> Self {
+        self.reset_mail = Some(password_reset::ResetMailer::new(mail));
+        self
     }
 
     pub const fn config(&self) -> &AuthConfig {
