@@ -211,6 +211,7 @@ Release checks include a fresh installation, Studio access tests for each role, 
 
 ## Revision history
 
+- 2026-11-15: released `v0.3.0-dev.6` with single sign-on through an OpenID Connect provider (tested with Authentik), changing the sign-in email, and invitees returning to their invitation after signing in.
 - 2026-11-15: M6 single sign-on started: operators link an OpenID Connect identity under Account settings > Security and then sign in with it. Authorization code flow with PKCE, issuer-origin-only requests, audit of sign-ins, links, and unlinks, and an Authentik fixture. Updated the M6 OIDC item.
 - 2026-11-15: M1 accounts: operators change their sign-in email under Account settings, confirmed by a link to the new address when mail is set up. Wrong passwords count toward the sign-in throttle, an address in use is revealed only after the password check and at most 5 times an hour, and newer requests and password changes void open links. Updated the M1 account item.
 - 2026-11-15: M1 invitations: an invitee who has to sign in first, or sign out of another account, returns to the acceptance step without opening the link again. The code stays in the browser's session storage; `next` never carries it, and return paths with a fragment are refused. Updated the M1 organization item.

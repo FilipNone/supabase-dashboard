@@ -5,7 +5,7 @@
 # Paste this file as the service's compose file (Provider: Raw), then set
 # these variables on the service's Environment tab:
 #
-#   SUPABASE_DASHBOARD_VERSION       release tag, for example 0.3.0-dev.5
+#   SUPABASE_DASHBOARD_VERSION       release tag, for example 0.3.0-dev.6
 #   POSTGRES_PASSWORD                letters and digits only (`openssl rand -hex 32`)
 #   SUPABASE_DASHBOARD_PUBLIC_URL    https://<the domain you add in Dokploy>
 #   SUPABASE_DASHBOARD_STUDIO_DOMAIN optional, see "Studio hosts on Dokploy"
