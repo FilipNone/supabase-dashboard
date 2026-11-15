@@ -1798,6 +1798,14 @@ mod tests {
     /// A router with Studio hosts under `studio.localhost:3000` and an
     /// owner, alice, already bootstrapped.
     async fn studio_router(db: &Database) -> (Router, crate::studio_host::StudioHosts) {
+        studio_router_on(db, "studio.localhost:3000").await
+    }
+
+    /// [`studio_router`] with Studio hosts named after `studio_domain`.
+    async fn studio_router_on(
+        db: &Database,
+        studio_domain: &str,
+    ) -> (Router, crate::studio_host::StudioHosts) {
         use supabase_dashboard_adapters::studio_proxy::{StudioProxy, StudioProxySettings};
         use supabase_dashboard_application::{secrets::CredentialCipher, studio::StudioService};
 
@@ -1818,7 +1826,7 @@ mod tests {
         .await
         .unwrap();
         let public = url::Url::parse(ORIGIN).unwrap();
-        let hosts = StudioHosts::parse("studio.localhost:3000", &public).unwrap();
+        let hosts = StudioHosts::parse(studio_domain, &public).unwrap();
         let gateway = StudioGateway::new(
             hosts.clone(),
             Arc::new(StudioService::new(
@@ -1885,6 +1893,114 @@ mod tests {
         };
         let router = router(state, &test_limits());
         (router, hosts)
+    }
+
+    #[tokio::test]
+    async fn flat_studio_hosts_open_through_the_dashboard() {
+        let Some(scratch) = ScratchDb::create("http_studio_flat").await else {
+            return;
+        };
+        let db = Database::connect(&scratch.settings).await.unwrap();
+        db.migrate().await.unwrap();
+        let (router, hosts) = studio_router_on(&db, "*-studio.localhost:3000").await;
+        let alice = sign_in_cookie(&router, "alice%40example.test").await;
+        let call = |path: &'static str, body: String, cookie: &str| {
+            send(&router, form_post(path, &body, Some(cookie)))
+        };
+        let (_, body) = call(CreateOrganization::PATH, "name=Acme".into(), &alice).await;
+        let acme: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let acme_id = acme["id"].as_str().unwrap().to_owned();
+        let gateway_url = mock_studio_gateway().await;
+        let (_, body) = call(
+            RegisterProject::PATH,
+            format!(
+                "organization_id={acme_id}&name=Main&allow_unencrypted=true&api_url={}",
+                url::form_urlencoded::byte_serialize(gateway_url.as_bytes()).collect::<String>()
+            ),
+            &alice,
+        )
+        .await;
+        let project: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let main = project["id"]
+            .as_str()
+            .unwrap()
+            .parse::<uuid::Uuid>()
+            .unwrap();
+        let (parts, body) = call(
+            ReplaceStudioLogin::PATH,
+            format!("id={main}&username=supabase&password=studio-password-for-tests"),
+            &alice,
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+
+        // The project's Studio host is one level under the parent domain.
+        let main_host = hosts.host(main);
+        assert_eq!(
+            main_host,
+            format!("{}-studio.localhost:3000", main.simple())
+        );
+
+        // The certificate question accepts the flat name only.
+        let ask = |domain: String| {
+            send(
+                &router,
+                get(&format!("{}?domain={domain}", crate::studio::TLS_ASK_PATH)),
+            )
+        };
+        let (parts, _) = ask(format!("{}-studio.localhost", main.simple())).await;
+        assert_eq!(parts.status, StatusCode::OK);
+        for refused in [
+            format!("{}.studio.localhost", main.simple()),
+            format!("{}-studio.localhost", uuid::Uuid::from_u128(7).simple()),
+            "-studio.localhost".to_owned(),
+        ] {
+            let (parts, _) = ask(refused.clone()).await;
+            assert_eq!(parts.status, StatusCode::NOT_FOUND, "{refused}");
+        }
+
+        // Opening Studio hands off to the flat host, and Studio answers there.
+        let (parts, _) = send(
+            &router,
+            get_with_cookie(&format!("/dashboard/project/{main}"), &alice),
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::SEE_OTHER);
+        let target = url::Url::parse(location(&parts)).unwrap();
+        assert_eq!(
+            target.host_str(),
+            Some(main_host.split(':').next().unwrap())
+        );
+        let handoff = format!("{}?{}", target.path(), target.query().unwrap());
+        let (parts, _) = send(&router, studio_get(&main_host, &handoff, None)).await;
+        assert_eq!(parts.status, StatusCode::SEE_OTHER);
+        assert_eq!(location(&parts), "/project/default");
+        let set_cookie = parts.headers[header::SET_COOKIE].to_str().unwrap();
+        let studio_cookie = set_cookie.split(';').next().unwrap().to_owned();
+        let (parts, body) = send(
+            &router,
+            studio_get(&main_host, "/project/default", Some(&studio_cookie)),
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        assert!(body.starts_with("studio page"), "{body}");
+
+        // A name matching the pattern without a project gets a plain 404,
+        // and the nested name is not a Studio host at all.
+        let (parts, _) = send(
+            &router,
+            studio_get("www-studio.localhost:3000", "/project/default", None),
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::NOT_FOUND);
+        let nested = format!("{}.studio.localhost:3000", main.simple());
+        let (parts, body) = send(
+            &router,
+            studio_get(&nested, "/project/default", Some(&studio_cookie)),
+        )
+        .await;
+        assert!(!body.starts_with("studio page"), "{body}");
+        assert_ne!(parts.status, StatusCode::OK);
     }
 
     #[tokio::test]

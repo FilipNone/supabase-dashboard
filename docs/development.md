@@ -77,7 +77,7 @@ All settings are environment variables. Invalid values stop the server at startu
 | `SUPABASE_DASHBOARD_SECRET_KEY_FILE` | unset | Path to a file holding the key that encrypts stored project API keys: 32 random bytes, base64-encoded. Without a key the server starts, but it cannot store or use API keys |
 | `SUPABASE_DASHBOARD_SECRET_KEY` | unset | The same key given directly. Set only one of the two; prefer the file, because environment variables show up in `docker inspect` and process listings |
 | `SUPABASE_DASHBOARD_PREVIOUS_SECRET_KEYS_FILE` | unset | Path to a file of retired encryption keys, one base64 key per line (blank lines and lines starting with `#` are skipped, at most 64 KiB). They only decrypt: values stored under them stay usable, and new values use the current key. Needs a current key. The server refuses to start if a line is not a valid key, and at startup it warns when stored values are still under a previous key or under a key it does not have. `rotate-secret-key` moves them to the current key |
-| `SUPABASE_DASHBOARD_STUDIO_DOMAIN` | unset | Base domain for project Studio hosts, as `host` or `host:port`, for example `studio.example.com`. Each project's Studio is served at `<project id in hex>.<domain>`. Needs `SUPABASE_DASHBOARD_PUBLIC_URL`, whose host must not be this domain or a name under it; Studio hosts use the public URL's scheme. Unset turns Studio access off |
+| `SUPABASE_DASHBOARD_STUDIO_DOMAIN` | unset | Base domain for project Studio hosts, as `host` or `host:port`, for example `studio.example.com`. Each project's Studio is served at `<project id in hex>.<domain>`. A flat pattern `*-<suffix>.<domain>[:port]`, for example `*-studio.example.com`, serves it at `<project id in hex>-<suffix>.<domain>` instead, one level under `<domain>` (see "Studio hosts" below); `*.studio.example.com` means the same as `studio.example.com`. Needs `SUPABASE_DASHBOARD_PUBLIC_URL`, whose host must not be a Studio host: not this domain or a name under it, and not a name matching the flat pattern. Studio hosts use the public URL's scheme. Unset turns Studio access off |
 | `SUPABASE_DASHBOARD_STUDIO_MAX_BODY_BYTES` | 52428800 | 1 KiB to 1 GiB; request body limit on Studio hosts |
 | `SUPABASE_DASHBOARD_STUDIO_REQUEST_TIMEOUT_SECS` | 300 | 10 to 3600; how long a Studio request may take, including Studio's own wait for long SQL queries. Slower requests get 504 |
 | `SUPABASE_DASHBOARD_HEALTH_CHECK_INTERVAL_MINS` | 15 | 0, or 5 to 1440. The server checks a project again on its own once its last check is older than this; 0 turns the server's own checks off, leaving only "Check now" |
@@ -188,7 +188,17 @@ SUPABASE_DASHBOARD_PUBLIC_URL=http://dash.localhost:3000
 SUPABASE_DASHBOARD_STUDIO_DOMAIN=studio.localhost:3000
 ```
 
-Requests are routed by their `Host` header before anything else runs: a project's Studio host goes to the Studio gateway, an unknown name under the Studio domain gets a plain 404, and every other host gets the dashboard. On a Studio host only `/__dashboard/handoff` belongs to the dashboard; every other path is forwarded to the project's registered gateway with the stored Studio login added on the server. The browser's `Authorization` header, its forwarding headers, and the dashboard's Studio cookie are not forwarded. Responses are streamed, redirects are passed back to the browser, and the gateway's own address in a `Location` header is turned into a path. A gateway on the loopback address is reached only when `SUPABASE_DASHBOARD_ALLOW_LOOPBACK_TARGETS` is on.
+The flat form puts the project label and the suffix in one DNS label, so every Studio host is one level under the parent domain:
+
+```sh
+SUPABASE_DASHBOARD_PUBLIC_URL=http://dash.localhost:3000
+SUPABASE_DASHBOARD_STUDIO_DOMAIN=*-studio.localhost:3000
+# a project's Studio: http://<project id in hex>-studio.localhost:3000
+```
+
+Use it when the certificate or proxy in front of the dashboard covers one level of names only, such as a `*.example.com` wildcard certificate or Cloudflare's free Universal SSL. The suffix starts with `-` and holds up to 30 letters, digits, and hyphens, so that it fits in one 63-character label with the 32-digit project ID. Studio hosts stay separate origins, one per project. They share the registrable domain with every other name under `<domain>`, as nested Studio hosts share it with their parent, so a cookie that another site under that domain sets for the whole domain also reaches them; the dashboard's session cookie and its Studio cookie (`__Host-sd-session`, `__Host-sd-studio`) are `__Host-` cookies, which such a cookie cannot replace.
+
+Requests are routed by their `Host` header before anything else runs: a project's Studio host goes to the Studio gateway, an unknown name under the Studio domain (or matching the flat pattern) gets a plain 404, and every other host gets the dashboard. On a Studio host only `/__dashboard/handoff` belongs to the dashboard; every other path is forwarded to the project's registered gateway with the stored Studio login added on the server. The browser's `Authorization` header, its forwarding headers, and the dashboard's Studio cookie are not forwarded. Responses are streamed, redirects are passed back to the browser, and the gateway's own address in a `Location` header is turned into a path. A gateway on the loopback address is reached only when `SUPABASE_DASHBOARD_ALLOW_LOOPBACK_TARGETS` is on.
 
 ## Checks
 

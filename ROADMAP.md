@@ -211,6 +211,7 @@ Release checks include a fresh installation, Studio access tests for each role, 
 
 ## Revision history
 
+- 2026-11-15: M3 Studio hosts: `SUPABASE_DASHBOARD_STUDIO_DOMAIN` also takes a flat pattern, `*-studio.example.com`, which serves a project's Studio at `<project id in hex>-studio.example.com`, one level under the parent domain, for certificates and CDNs that cover one level only.
 - 2026-11-15: Auth's mail server is a stack setting. Updated the M5 settings item.
 - 2026-11-15: Resend as an alternative to SMTP for the dashboard's own email. Updated the M6 email item.
 - 2026-11-15: password reset by email from the sign-in page. Updated the M6 email item.

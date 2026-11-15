@@ -785,6 +785,26 @@ mod tests {
         ])
         .unwrap_err();
         assert!(err.to_string().contains("STUDIO_DOMAIN"), "{err}");
+        // A flat pattern puts Studio hosts next to the dashboard's.
+        let hosts = load(&[
+            DB,
+            ("PUBLIC_URL", "https://dash.example.test"),
+            ("STUDIO_DOMAIN", "*-studio.example.test"),
+        ])
+        .unwrap()
+        .studio_hosts
+        .unwrap();
+        assert_eq!(
+            hosts.origin(uuid::Uuid::nil()),
+            "https://00000000000000000000000000000000-studio.example.test"
+        );
+        let err = load(&[
+            DB,
+            ("PUBLIC_URL", "https://dash-studio.example.test"),
+            ("STUDIO_DOMAIN", "*-studio.example.test"),
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("STUDIO_DOMAIN"), "{err}");
         assert!(load(&[DB, dev, ("STUDIO_REQUEST_TIMEOUT_SECS", "1")]).is_err());
     }
 
