@@ -179,6 +179,83 @@ Choosing a service reads it with `compose.one`. A service outside the allowed en
 
 Stack settings check the adopted service's own compose file, so a setting whose variable that file does not read is locked, as for stacks created before settings existed. A setting whose variable it reads but which is not set is shown with the pinned compose file's default, which may not be the one the adopted file uses.
 
+## Installing the dashboard on Dokploy
+
+The dashboard can run as a compose service in Dokploy, next to the stacks it creates. [`deploy/dokploy-compose.yaml`](../deploy/dokploy-compose.yaml) holds the dashboard and its own PostgreSQL metadata database, which is separate from every Supabase stack's database. It uses the released image `ghcr.io/filipnone/supabase-dashboard`, so Dokploy builds nothing. The release bundle does not include this file; take it from the repository at the tag of the release you install.
+
+What you need: a Dokploy v0.31.x instance with its Traefik running, a DNS name for the dashboard pointing at the Dokploy server (for example `dashboard.example.com`), and a shell on that server for creating the first account.
+
+1. **Create the service.** In the Dokploy project and environment the dashboard should live in, create a Compose service of type Docker Compose. Under General, choose Raw as the provider and paste `deploy/dokploy-compose.yaml`. Leave "Isolated deployment" off (Dokploy's default), so that the dashboard joins `dokploy-network`; the compose file also attaches it to that network explicitly.
+2. **Set the variables** on the Environment tab:
+
+   ```sh
+   SUPABASE_DASHBOARD_VERSION=<release version without the v, from the releases page>
+   POSTGRES_PASSWORD=<output of: openssl rand -hex 32>
+   SUPABASE_DASHBOARD_PUBLIC_URL=https://dashboard.example.com
+   # Optional; needs the Traefik step under "Studio hosts on Dokploy":
+   SUPABASE_DASHBOARD_STUDIO_DOMAIN=studio.example.com
+   ```
+
+   Use only letters and digits in `POSTGRES_PASSWORD`, because it goes into the database URL unescaped. Dokploy writes these to a `.env` file next to the compose file; the compose file passes each one to the containers by name. Other settings from [Configuration](development.md#configuration) go in the same way: add the variable to the dashboard's `environment` in the compose file as `NAME: ${NAME:-}`, then set it on the Environment tab. An empty value counts as unset.
+3. **Add the encryption key.** Generate it with `openssl rand -base64 32`, and on the Advanced tab add a File mount with File Path `secret.key` and the key as its content (Dokploy also asks for a Mount Path, which compose services ignore). The compose file reads it from `../files/secret.key` as a Compose secret, so the key does not appear in `docker inspect`. Keep a copy away from the database backups, as the Docker guide explains under Install, step 3.
+4. **Add the domain.** On the Domains tab, add the dashboard's host for service `dashboard`, port `3000`, path `/`, with HTTPS on and a certificate (Let's Encrypt, or one uploaded to Dokploy). The host must be the host of `SUPABASE_DASHBOARD_PUBLIC_URL`: the server refuses form submissions from any other origin, and that domain is how the dashboard later finds its own service in Dokploy.
+5. **Deploy.** The database starts first; the dashboard waits for its health check, applies migrations, and listens on port 3000. Dokploy's log for the service shows `listening` with the public URL, and `https://dashboard.example.com/readyz` answers 200.
+6. **Create the first operator.** There is no default account. On the Dokploy server, Compose names the container `<appName>-dashboard-1`, where `<appName>` is the name Dokploy shows for the service (for example `supabase-dashboard-sxem4i`):
+
+   ```sh
+   docker ps --filter name=-dashboard-1 --format '{{.Names}}'
+   docker exec -it <appName>-dashboard-1 supabase-dashboard-server create-owner --email you@example.com --name "Your Name"
+   ```
+
+   It asks for the password twice (at least 12 characters). This account is the installation administrator.
+7. **Connect Dokploy.** Sign in at `https://dashboard.example.com/dashboard/sign-in`, open Admin in the sidebar (`/dashboard/admin`), and in the Dokploy section connect with `http://dokploy:3000` and an API key (see "Connecting" and "The API key" below). The dashboard is on `dokploy-network`, where Dokploy's API answers at that address. Create the key for a Dokploy member made for the dashboard, with access to the dashboard's own service and the environments stacks should go to, and with the rate limit off.
+8. **Confirm the placement.** The section then reads Dokploy's domains, finds the one routed to this service, and offers it: "Dokploy routes dashboard.example.com to <project> / <environment> / <service> (Compose)". Confirm it (see "Where the dashboard runs"). Without a confirmed placement there is no default target for new stacks.
+
+To have the deployment supply the Dokploy connection instead of step 7 (see "Supplied by the deployment"), add a second File mount with File Path `dokploy-api-key` holding the key alone, and in the compose file add to the dashboard:
+
+```yaml
+    environment:
+      SUPABASE_DASHBOARD_DOKPLOY_URL: http://dokploy:3000
+      SUPABASE_DASHBOARD_DOKPLOY_API_KEY_FILE: /run/secrets/dokploy_api_key
+    secrets:
+      - secret_key
+      - dokploy_api_key
+```
+
+and under the top-level `secrets`:
+
+```yaml
+  dokploy_api_key:
+    file: ../files/dokploy-api-key
+```
+
+Then redeploy. A connection an administrator already made at the same URL is taken over.
+
+### Where the secrets live
+
+Dokploy keeps the service's variables and the contents of its file mounts in its own database, and writes them to the Dokploy server in plain text: the variables to the service's `.env`, the mounts to `/etc/dokploy/compose/<appName>/files/` (on v0.31.1 as root-owned files readable by every user on that server). So Dokploy holds the metadata database's password, the credential encryption key, and the Dokploy key if the deployment supplies it. Anyone who can open the dashboard's service in Dokploy, or call `mounts.listByServiceId` or `compose.one` for it with a key, can read them, and with the encryption key and a database backup can decrypt every stored stack key. That includes the dashboard's own Dokploy key, which needs access to the dashboard's service to find its placement. Limit who has access to this service in Dokploy, and keep it in a project that other Dokploy members cannot open.
+
+### Running it
+
+Of these, only redeploying was tried on Dokploy; the rest follow the Docker guide.
+
+- **Logs:** the service's Logs tab in Dokploy, or `docker logs <appName>-dashboard-1` on the server.
+- **Upgrade:** back up the metadata database, change `SUPABASE_DASHBOARD_VERSION`, and deploy again. Replace the compose file too if the release changed it. Migrations only move forward.
+- **Back up the metadata database:** `docker exec <appName>-supabase-dashboard-db-1 pg_dump -U dashboard -Fc dashboard > dashboard-$(date +%F).dump`, then treat the dump as the Docker guide's Operations section describes. The database lives in the named volume `<appName>_db-data`.
+- **Other commands** (`reset-password`, `rotate-secret-key`) run with `docker exec -it <appName>-dashboard-1 supabase-dashboard-server ...`. For a key rotation, the previous keys go in another File mount, read like `secret.key`.
+- **Remove:** deleting the service in Dokploy with "Delete volumes" off keeps the `<appName>_db-data` volume on the server; with it on, the metadata database is gone. Neither touches the stacks the dashboard created, which are separate Dokploy services.
+
+### What was tested
+
+On 2026-11-15, against the Dokploy fixture (v0.31.1) with Traefik v3.6.25 started inside it the way Dokploy's installer starts it, the released `0.3.0-dev.2` image, and a synthetic domain:
+
+- A compose service created through the API with `deploy/dokploy-compose.yaml`, the four variables, the `secret.key` file mount, and an HTTPS domain for `dashboard` on port 3000 deployed, started with both containers healthy, and answered `/readyz` with 200 through Traefik (with Traefik's default certificate, since the domain had none). Plain HTTP was redirected to HTTPS.
+- `create-owner` through `docker exec` created the account, which signed in through Traefik in Chromium.
+- Connecting at `http://dokploy:3000` with the fixture's key worked from the administrator page, which marked it as plain HTTP. The placement section found the service from the domain and offered it, and confirming it showed it as Current, with the default target for new stacks.
+- Supplying the connection from the deployment as above, then redeploying, kept the database (account, connection, and placement were still there), took over the administrator's connection, and logged at startup that the placement was where it was confirmed.
+
+Not tested: a real certificate from Let's Encrypt, Dokploy's web UI for these steps (the check used the API calls behind them), Dokploy's container terminal for `create-owner`, an upgrade between two releases, a key rotation, and a backup and restore on Dokploy.
+
 ## Connecting
 
 An installation administrator connects the dashboard to Dokploy in the Dokploy section of the administrator page (`/dashboard/admin`), with Dokploy's URL and an API key. One Dokploy connection exists per installation.
@@ -265,7 +342,9 @@ The service name is the one in the `traefik.http.services.<name>` label Dokploy 
 
 Traefik cannot obtain a certificate for every name a regular expression matches, so HTTPS needs a wildcard certificate for `*.studio.example.com`: either uploaded under Certificates in Dokploy, or obtained by a certificate resolver that uses the DNS challenge, configured in Dokploy's Traefik settings with the DNS provider's credentials. The tls block then names that resolver and the domain.
 
-This has not been tried end to end: the Dokploy fixture runs no Traefik. Doing it once, with a real wildcard certificate, is open in the roadmap.
+Dokploy names the service after the domain it was created for, as `<appName>-<number>-websecure` for the HTTPS router (and `-web` for the plain HTTP one that redirects), for example `supabase-dashboard-sxem4i-72-websecure`. The file then names `supabase-dashboard-sxem4i-72-websecure@docker`.
+
+The routing was tried on 2026-11-15 with the dashboard installed as above, on the Dokploy fixture with Traefik v3.6.25 started inside it: with this file in `dynamic/`, Traefik picked it up without a restart, a request for `<32 hex characters>.studio.fixture.test` reached the dashboard (which redirected the browser without a session to its own host, as it should), and a host that does not match the expression got Traefik's 404. That used Traefik's default self-signed certificate. Not tried: a wildcard certificate, and opening a real stack's Studio this way.
 
 ### Where stacks go
 
@@ -301,7 +380,18 @@ The Dokploy URL is the only destination the connection adds, and it is enrolled 
 
 ## Test fixture
 
-`tests/fixtures/dokploy` runs Dokploy for the provider tests. Dokploy needs Docker Swarm, and its installer turns the host's Docker into a swarm manager. The fixture avoids that by running Docker-in-Docker: a privileged `docker:28.5.0-dind` container holds the swarm, Dokploy's Postgres (`postgres:16`), and Dokploy itself, created by `setup.sh` with the service definitions of Dokploy's installer as of 2026-11-12. Dokploy's Traefik is not started yet, because nothing is deployed through it so far. `docker compose ... down -v` removes everything, including the inner volumes.
+`tests/fixtures/dokploy` runs Dokploy for the provider tests. Dokploy needs Docker Swarm, and its installer turns the host's Docker into a swarm manager. The fixture avoids that by running Docker-in-Docker: a privileged `docker:28.5.0-dind` container holds the swarm, Dokploy's Postgres (`postgres:16`), and Dokploy itself, created by `setup.sh` with the service definitions of Dokploy's installer as of 2026-11-12. `setup.sh` does not start Dokploy's Traefik, because the provider tests do not route through it. The install check above started it inside the fixture with the installer's command:
+
+```sh
+docker compose -f tests/fixtures/dokploy/docker-compose.yml exec -T docker \
+  docker run -d --name dokploy-traefik --restart always --network dokploy-network \
+    -v /etc/dokploy/traefik/traefik.yml:/etc/traefik/traefik.yml \
+    -v /etc/dokploy/traefik/dynamic:/etc/dokploy/traefik/dynamic \
+    -v /var/run/docker.sock:/var/run/docker.sock:ro \
+    -p 80:80/tcp -p 443:443/tcp traefik:v3.6.25
+```
+
+Its ports are published on the Docker-in-Docker container's own address (`docker inspect sd-dokploy-docker-1` shows it), not on the host's loopback, so a browser reaches a deployed domain with a host-resolver rule such as Chromium's `--host-resolver-rules="MAP dashboard.fixture.test <that address>"`. `docker compose ... down -v` removes everything, including the inner volumes.
 
 ```sh
 docker compose -f tests/fixtures/dokploy/docker-compose.yml up -d --wait

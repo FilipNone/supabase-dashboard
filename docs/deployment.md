@@ -1,6 +1,6 @@
 # Deploying supabase-dashboard with Docker
 
-This guide runs a released build on one Linux server from the prebuilt container image `ghcr.io/filipnone/supabase-dashboard`. Nothing is compiled on the server. To build from source, see [docs/development.md](https://github.com/FilipNone/supabase-dashboard/blob/main/docs/development.md).
+This guide runs a released build on one Linux server from the prebuilt container image `ghcr.io/filipnone/supabase-dashboard`. Nothing is compiled on the server. To run the dashboard as a Dokploy service instead, see "Installing the dashboard on Dokploy" in [docs/dokploy.md](https://github.com/FilipNone/supabase-dashboard/blob/main/docs/dokploy.md#installing-the-dashboard-on-dokploy). To build from source, see [docs/development.md](https://github.com/FilipNone/supabase-dashboard/blob/main/docs/development.md).
 
 Development releases (`0.N.0-dev.N`) are previews. The dashboard can manage operator accounts, organizations, members, invitations, and a registry of self-hosted stacks. It can store a stack's API keys and Studio login, check whether its Auth, REST, and Studio routes answer, and open the stack's own Studio for members whose role allows it (see "Studio access" below). With a Dokploy instance connected, it can also create new stacks, adopt existing ones, stop, start, redeploy, reconfigure, and remove them (see `docs/dokploy.md`). Expect breaking changes between dev releases.
 

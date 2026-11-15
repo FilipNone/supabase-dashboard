@@ -1,0 +1,81 @@
+# Runs supabase-dashboard as a Dokploy compose service, with its own
+# PostgreSQL metadata database. Steps are in docs/dokploy.md, "Installing
+# the dashboard on Dokploy".
+#
+# Paste this file as the service's compose file (Provider: Raw), then set
+# these variables on the service's Environment tab:
+#
+#   SUPABASE_DASHBOARD_VERSION       release tag, for example 0.3.0-dev.2
+#   POSTGRES_PASSWORD                letters and digits only (`openssl rand -hex 32`)
+#   SUPABASE_DASHBOARD_PUBLIC_URL    https://<the domain you add in Dokploy>
+#   SUPABASE_DASHBOARD_STUDIO_DOMAIN optional, see "Studio hosts on Dokploy"
+#
+# and add a file mount with File Path `secret.key` holding the credential
+# encryption key (`openssl rand -base64 32`).
+#
+# Dokploy writes the variables to a .env file next to this one; only the
+# ones named below reach the containers. The database data lives in the
+# named volume `db-data`, which Dokploy prefixes with the service's
+# appName. Removing the service in Dokploy with "delete volumes" deletes it.
+services:
+  # Not called `db`: the dashboard also joins dokploy-network, where another
+  # service's `db` could answer to the same name.
+  supabase-dashboard-db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: dashboard
+      POSTGRES_DB: dashboard
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dashboard -d dashboard"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    # On the default network only: nothing outside this service can reach
+    # the database.
+
+  dashboard:
+    image: ghcr.io/filipnone/supabase-dashboard:${SUPABASE_DASHBOARD_VERSION:?set SUPABASE_DASHBOARD_VERSION}
+    restart: unless-stopped
+    depends_on:
+      supabase-dashboard-db:
+        condition: service_healthy
+    environment:
+      SUPABASE_DASHBOARD_DATABASE_URL: postgres://dashboard:${POSTGRES_PASSWORD}@supabase-dashboard-db:5432/dashboard
+      SUPABASE_DASHBOARD_SECRET_KEY_FILE: /run/secrets/secret_key
+      SUPABASE_DASHBOARD_PUBLIC_URL: ${SUPABASE_DASHBOARD_PUBLIC_URL:?set SUPABASE_DASHBOARD_PUBLIC_URL}
+      # Empty values count as unset.
+      SUPABASE_DASHBOARD_STUDIO_DOMAIN: ${SUPABASE_DASHBOARD_STUDIO_DOMAIN:-}
+      SUPABASE_DASHBOARD_ENV: ${SUPABASE_DASHBOARD_ENV:-production}
+      RUST_LOG: ${RUST_LOG:-info,tower_http=info,sqlx=warn}
+    secrets:
+      # Encrypts the stored keys of managed stacks and of Dokploy. Keep a
+      # copy away from the database backups.
+      - secret_key
+    networks:
+      - default
+      # Traefik reaches the dashboard here, and the dashboard reaches
+      # Dokploy's API at http://dokploy:3000.
+      - dokploy-network
+    # No published port: Dokploy's Traefik routes the domain to port 3000.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+secrets:
+  secret_key:
+    file: ../files/secret.key
+
+volumes:
+  db-data:
+
+networks:
+  dokploy-network:
+    external: true
