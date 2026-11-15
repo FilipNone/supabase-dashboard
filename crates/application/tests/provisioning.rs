@@ -50,7 +50,8 @@ use supabase_dashboard_domain::{
         ProvisionStep, ProvisionTargets, StackAction, StackDeploymentView, TargetChoice,
     },
     stack_settings::{
-        ChangedSecret, EnvChanges, EnvTracking, STACK_SETTINGS, SettingState, StackSettingsView,
+        ChangedSecret, EnvChanges, EnvTracking, SettingError, SettingState, StackSettingsView,
+        stack_settings,
     },
 };
 use supabase_dashboard_persistence::{Database, accounts::AccountRecord};
@@ -1730,7 +1731,7 @@ async fn owners_change_settings_and_edits_in_dokploy_stop_the_change() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(view.settings.len(), STACK_SETTINGS.len());
+    assert_eq!(view.settings.len(), stack_settings().count());
     assert!(!view.busy);
     // The provisioning job recorded what it wrote.
     assert_eq!(view.tracking, EnvTracking::Compared(EnvChanges::default()));
@@ -2421,6 +2422,318 @@ async fn owners_replace_and_remove_the_mail_server_password() {
     );
 
     for needle in [PASSWORD, SECOND, IN_DOKPLOY] {
+        assert_eq!(rows_holding(&f.db, needle).await, 0, "{needle}");
+    }
+    f.db.close().await;
+    scratch.drop().await;
+}
+
+#[tokio::test]
+async fn owners_set_up_sign_in_providers_with_a_write_only_secret() {
+    let Some(scratch) = ScratchDb::create("stack_auth_providers").await else {
+        return;
+    };
+    let f = setup(&scratch).await;
+    let (_, project) = provisioned(&f).await;
+    const SECRET: &str = "github-client-secret-0123456789abcdef";
+    const SECOND: &str = "github-client-secret-second";
+    let replace = |value: &str| SecretEdit::Replace(SecretString::from(value.to_owned()));
+    let settings = || async {
+        f.service
+            .stack_settings(&f.owner, project)
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    let secret_of = |view: &StackSettingsView, name: &str| {
+        let secret = view.secrets.iter().find(|s| s.name == name).unwrap();
+        (secret.set, secret.state.clone())
+    };
+    let value_of = |view: &StackSettingsView, name: &str| {
+        let setting = view.settings.iter().find(|s| s.name == name).unwrap();
+        (setting.value.clone(), setting.state.clone())
+    };
+
+    // A new stack has both providers off, without an ID or a secret, and
+    // the page shows the callback URL under the stack's public URL.
+    let view = settings().await;
+    for (key, label) in [("GITHUB", "GitHub"), ("GOOGLE", "Google")] {
+        assert_eq!(
+            value_of(&view, &format!("{key}_ENABLED")),
+            (Some("false".to_owned()), SettingState::Editable)
+        );
+        assert_eq!(
+            value_of(&view, &format!("{key}_CLIENT_ID")),
+            (Some(String::new()), SettingState::Editable)
+        );
+        assert_eq!(
+            secret_of(&view, &format!("{key}_SECRET")),
+            (false, SettingState::Editable)
+        );
+        let provider = view.providers.iter().find(|p| p.key == key).unwrap();
+        assert_eq!(provider.label, label);
+        assert_eq!(
+            provider.callback_url.as_deref(),
+            Some("https://shop.example.test/auth/v1/callback")
+        );
+    }
+
+    // Developers and viewers neither review nor queue a provider, and the
+    // refusal to queue is audited.
+    let enable = [
+        ("GITHUB_ENABLED", "true"),
+        ("GITHUB_CLIENT_ID", "Iv1.0123abcd"),
+    ];
+    for (name, role) in [("Dev", OrgRole::Developer), ("Vic", OrgRole::Viewer)] {
+        let member = account(&f.db, name, false).await;
+        add_member(&f.db, f.organization, &member, role).await;
+        assert!(matches!(
+            f.service.stack_settings(&member, project).await,
+            Err(ProvisionError::Forbidden)
+        ));
+        assert!(matches!(
+            f.service
+                .preview_settings(
+                    &member,
+                    project,
+                    &enable,
+                    &[("GITHUB_SECRET", replace(SECRET))]
+                )
+                .await,
+            Err(ProvisionError::Forbidden)
+        ));
+        assert!(matches!(
+            f.service
+                .queue_settings(
+                    &member,
+                    project,
+                    &enable,
+                    &[("GITHUB_SECRET", replace(SECRET))],
+                    "any",
+                    ctx(),
+                )
+                .await,
+            Err(ProvisionError::Forbidden)
+        ));
+    }
+    assert_eq!(
+        count(
+            &f.db,
+            "SELECT count(*) FROM audit_events WHERE outcome = 'denied' AND action = 'stack.configure'",
+        )
+        .await,
+        2
+    );
+
+    // Turning a provider on needs both an ID and a secret.
+    let incomplete = Err::<(), _>(SettingError::ProviderIncomplete { label: "GitHub" });
+    for (submitted, secrets) in [
+        (&enable[..], Vec::new()),
+        (&enable[..1], vec![("GITHUB_SECRET", replace(SECRET))]),
+        (
+            &[("GITHUB_ENABLED", "true"), ("GITHUB_CLIENT_ID", " ")][..],
+            vec![("GITHUB_SECRET", replace(SECRET))],
+        ),
+    ] {
+        let Err(ProvisionError::Setting(err)) = f
+            .service
+            .preview_settings(&f.owner, project, submitted, &secrets)
+            .await
+        else {
+            panic!("an incomplete provider should be refused: {submitted:?}");
+        };
+        assert_eq!(Err::<(), _>(err), incomplete);
+    }
+    // An ID or a secret that cannot be written unquoted is refused without
+    // repeating it.
+    let Err(ProvisionError::Setting(err)) = f
+        .service
+        .preview_settings(
+            &f.owner,
+            project,
+            &[],
+            &[("GITHUB_SECRET", replace("se cret$x"))],
+        )
+        .await
+    else {
+        panic!("an invalid secret should be refused");
+    };
+    assert!(!err.to_string().contains("se cret"), "{err}");
+    assert!(matches!(
+        f.service
+            .preview_settings(&f.owner, project, &[("GITHUB_CLIENT_ID", "a#b")], &[])
+            .await,
+        Err(ProvisionError::Setting(SettingError::ClientId { .. }))
+    ));
+
+    // The review names the variables, the secret hidden, and Auth.
+    let secrets = [("GITHUB_SECRET", replace(SECRET))];
+    let preview = f
+        .service
+        .preview_settings(&f.owner, project, &enable, &secrets)
+        .await
+        .unwrap();
+    assert_eq!(
+        preview.changed,
+        ["GITHUB_ENABLED", "GITHUB_CLIENT_ID", "GITHUB_SECRET"]
+    );
+    assert_eq!(
+        preview.secrets,
+        [ChangedSecret {
+            name: "GITHUB_SECRET".to_owned(),
+            removed: false,
+        }]
+    );
+    assert_eq!(preview.restarts, ["auth"]);
+    assert!(!format!("{preview:?}").contains(SECRET));
+
+    // Queued with the secret sealed apart from the job's data and audit
+    // row, written to Dokploy, and recorded as the dashboard's own write.
+    let job = f
+        .service
+        .queue_settings(&f.owner, project, &enable, &secrets, &preview.base, ctx())
+        .await
+        .unwrap();
+    assert!(f.db.job_secrets(job).await.unwrap().is_some());
+    let sealed_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM job_secrets WHERE position($1::bytea IN ciphertext) > 0",
+    )
+    .bind(SECRET.as_bytes())
+    .fetch_one(f.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(sealed_rows, 0);
+    let data = f.db.get_job(job).await.unwrap().unwrap().data;
+    assert!(data.contains("GITHUB_SECRET"), "{data}");
+    assert!(data.contains("Iv1.0123abcd"), "{data}");
+    assert_eq!(rows_holding(&f.db, SECRET).await, 0);
+    run_all(&f).await;
+    let stored = f.db.get_job(job).await.unwrap().unwrap();
+    assert_eq!(stored.state, "succeeded", "{:?}", stored.message);
+    assert_eq!(variable(&f, "GITHUB_ENABLED"), "true");
+    assert_eq!(variable(&f, "GITHUB_CLIENT_ID"), "Iv1.0123abcd");
+    assert_eq!(variable(&f, "GITHUB_SECRET"), SECRET);
+    assert!(f.db.job_secrets(job).await.unwrap().is_none());
+    assert_eq!(rows_holding(&f.db, SECRET).await, 0);
+    let view = settings().await;
+    assert_eq!(view.tracking, EnvTracking::Compared(EnvChanges::default()));
+    assert_eq!(
+        secret_of(&view, "GITHUB_SECRET"),
+        (true, SettingState::Editable)
+    );
+    assert_eq!(value_of(&view, "GITHUB_ENABLED").0.as_deref(), Some("true"));
+    assert!(!format!("{view:?}").contains(SECRET));
+
+    // With the provider on, its secret cannot be removed or its ID
+    // cleared, but the secret can be replaced, and other changes do not
+    // need the secret again.
+    for (submitted, secrets) in [
+        (&[][..], vec![("GITHUB_SECRET", SecretEdit::Remove)]),
+        (&[("GITHUB_CLIENT_ID", "")][..], Vec::new()),
+    ] {
+        assert!(matches!(
+            f.service
+                .preview_settings(&f.owner, project, submitted, &secrets)
+                .await,
+            Err(ProvisionError::Setting(SettingError::ProviderIncomplete {
+                label: "GitHub"
+            }))
+        ));
+    }
+    let rotated = f
+        .service
+        .preview_settings(
+            &f.owner,
+            project,
+            &[],
+            &[("GITHUB_SECRET", replace(SECOND))],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rotated.changed, ["GITHUB_SECRET"]);
+    let other = f
+        .service
+        .preview_settings(&f.owner, project, &[("GITHUB_CLIENT_ID", "Iv1.other")], &[])
+        .await
+        .unwrap();
+    assert_eq!(other.changed, ["GITHUB_CLIENT_ID"]);
+    // Turning it off and removing the secret together is allowed.
+    let off = [("GITHUB_ENABLED", "false")];
+    let removal = [("GITHUB_SECRET", SecretEdit::Remove)];
+    let preview = f
+        .service
+        .preview_settings(&f.owner, project, &off, &removal)
+        .await
+        .unwrap();
+    assert_eq!(
+        preview.secrets,
+        [ChangedSecret {
+            name: "GITHUB_SECRET".to_owned(),
+            removed: true,
+        }]
+    );
+    let job = f
+        .service
+        .queue_settings(&f.owner, project, &off, &removal, &preview.base, ctx())
+        .await
+        .unwrap();
+    run_all(&f).await;
+    let stored = f.db.get_job(job).await.unwrap().unwrap();
+    assert_eq!(stored.state, "succeeded", "{:?}", stored.message);
+    assert_eq!(variable(&f, "GITHUB_ENABLED"), "false");
+    assert_eq!(variable(&f, "GITHUB_SECRET"), "");
+    assert_eq!(
+        secret_of(&settings().await, "GITHUB_SECRET"),
+        (false, SettingState::Editable)
+    );
+
+    // A stack whose compose file predates the providers has them locked.
+    if let Some((file, _)) = f.compose.state.lock().unwrap().configured.as_mut() {
+        *file = file
+            .lines()
+            .filter(|line| !line.contains("GOTRUE_EXTERNAL_G"))
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    let view = settings().await;
+    for key in ["GITHUB", "GOOGLE"] {
+        assert_eq!(
+            value_of(&view, &format!("{key}_ENABLED")),
+            (None, SettingState::NotInComposeFile)
+        );
+        assert_eq!(
+            value_of(&view, &format!("{key}_CLIENT_ID")).1,
+            SettingState::NotInComposeFile
+        );
+        assert_eq!(
+            secret_of(&view, &format!("{key}_SECRET")).1,
+            SettingState::NotInComposeFile
+        );
+    }
+    assert!(matches!(
+        f.service
+            .preview_settings(
+                &f.owner,
+                project,
+                &[("GOOGLE_CLIENT_ID", "1-x.apps.googleusercontent.com")],
+                &[],
+            )
+            .await,
+        Err(ProvisionError::SettingUnavailable(_))
+    ));
+    assert!(matches!(
+        f.service
+            .preview_settings(
+                &f.owner,
+                project,
+                &[],
+                &[("GOOGLE_SECRET", replace(SECOND))]
+            )
+            .await,
+        Err(ProvisionError::SettingUnavailable(_))
+    ));
+
+    for needle in [SECRET, SECOND] {
         assert_eq!(rows_holding(&f.db, needle).await, 0, "{needle}");
     }
     f.db.close().await;

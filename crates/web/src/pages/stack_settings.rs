@@ -15,18 +15,22 @@
 //! page shows only whether the variable is set. The review names it; the
 //! value goes from the field to the server with the review and again with
 //! the apply, and never comes back.
+//!
+//! The sign-in providers' settings follow the others, one group per
+//! provider with the callback URL to register with it.
 
 use leptos::{form::ActionForm, prelude::*};
 
 use supabase_dashboard_domain::stack_settings::{
-    EnvChanges, EnvTracking, MAX_SECRET_LEN, SecretSettingView, SettingKind, SettingState,
-    StackConfigPreview, StackSettingView, StackSettingsView,
+    AuthProviderView, EnvChanges, EnvTracking, MAX_CLIENT_ID_LEN, MAX_SECRET_LEN,
+    SecretSettingView, SettingKind, SettingState, StackConfigPreview, StackSettingView,
+    StackSettingsView, auth_provider,
 };
 
 use crate::{
     error::AppError,
     server_fns::{
-        AcceptStackVariables, PreviewStackSettings, QueueStackSettings, SecretInput,
+        AcceptStackVariables, PreviewStackSettings, QueueStackSettings, REMOVE_SUFFIX,
         SettingsFields, get_stack_settings,
     },
 };
@@ -193,19 +197,52 @@ fn section(
     };
     let tracking = tracking_view(view.tracking, project, accept, Signal::derive(busy));
     // The secret settings' password fields, read when a review is applied.
-    let secret_inputs = SecretInputs::default();
-    let anchored = view.settings.iter().any(|s| s.name == SECRETS_AFTER);
-    let mut secrets = Some(view.secrets);
-    let mut secret_fields = move || {
-        secrets.take().map(|secrets| {
-            secrets
-                .into_iter()
-                .map(|secret| secret_field_view(secret, secret_inputs))
-                .collect_view()
-        })
+    let secret_inputs: SecretInputs = view
+        .secrets
+        .iter()
+        .map(|secret| (secret.name.clone(), NodeRef::new()))
+        .collect();
+    let input_of = {
+        let secret_inputs = secret_inputs.clone();
+        move |name: &str| {
+            secret_inputs
+                .iter()
+                .find(|(input, _)| input == name)
+                .map(|(_, node)| *node)
+                .unwrap_or_default()
+        }
+    };
+    // The providers' settings go in their own groups.
+    let of_provider = |name: &str| {
+        view.providers
+            .iter()
+            .filter_map(|provider| auth_provider(&provider.key))
+            .any(|p| [p.enabled.name, p.client_id.name, p.secret.name].contains(&name))
+    };
+    let (mut provider_settings, settings): (Vec<_>, Vec<_>) = view
+        .settings
+        .into_iter()
+        .partition(|s| of_provider(&s.name));
+    let (mut provider_secrets, secrets): (Vec<_>, Vec<_>) =
+        view.secrets.into_iter().partition(|s| of_provider(&s.name));
+    let anchored = settings.iter().any(|s| s.name == SECRETS_AFTER);
+    let mut secrets = Some(secrets);
+    let mut secret_fields = {
+        let input_of = input_of.clone();
+        move || {
+            secrets.take().map(|secrets| {
+                secrets
+                    .into_iter()
+                    .map(|secret| {
+                        let node = input_of(&secret.name);
+                        secret_field_view(secret, node)
+                    })
+                    .collect_view()
+            })
+        }
     };
     let mut fields = Vec::new();
-    for setting in view.settings {
+    for setting in settings {
         // The mail server's settings start their own group.
         let heading = (setting.name == "SMTP_HOST").then(|| {
             view! {
@@ -223,6 +260,41 @@ fn section(
     if !anchored {
         fields.push(secret_fields().into_any());
     }
+    let mut providers = Vec::new();
+    for provider in view.providers {
+        let Some(variables) = auth_provider(&provider.key) else {
+            continue;
+        };
+        let mut take = |name: &str| {
+            provider_settings
+                .iter()
+                .position(|s| s.name == name)
+                .map(|at| provider_settings.remove(at))
+        };
+        let enabled = take(variables.enabled.name);
+        let client_id = take(variables.client_id.name);
+        let secret = provider_secrets
+            .iter()
+            .position(|s| s.name == variables.secret.name)
+            .map(|at| provider_secrets.remove(at));
+        let secret = secret.map(|secret| {
+            let node = input_of(&secret.name);
+            secret_field_view(secret, node)
+        });
+        providers.push(provider_view(provider, enabled, client_id, secret).into_any());
+    }
+    if !providers.is_empty() {
+        fields.push(
+            view! {
+                <h3 class="subsection-title settings-group">"Sign-in providers"</h3>
+                <p class="field-hint">
+                    "Users of the stack's apps can sign in with these accounts as well as an email address. Register an OAuth app with each provider first."
+                </p>
+                {providers}
+            }
+            .into_any(),
+        );
+    }
     let fields = fields.collect_view();
     let summary = move || {
         if !reviewing.get() {
@@ -233,7 +305,7 @@ fn section(
             project,
             fields,
             preview,
-            secret_inputs,
+            secret_inputs.clone(),
             apply,
             Withdraw { reviewing, queued },
         ))
@@ -377,7 +449,7 @@ fn changes_view(changes: EnvChanges, accept: impl IntoView) -> impl IntoView {
 
 fn field_view(setting: StackSettingView) -> impl IntoView {
     let id = format!("setting-{}", setting.name.to_lowercase().replace('_', "-"));
-    let name = setting.name.to_lowercase();
+    let name = SettingsFields::field_name(&setting.name);
     let help_id = format!("{id}-help");
     let note = match setting.state {
         SettingState::Editable => None,
@@ -439,6 +511,12 @@ fn field_view(setting: StackSettingView) -> impl IntoView {
                 aria-describedby=help_id.clone() disabled=locked/>
         }
         .into_any(),
+        SettingKind::ClientId => view! {
+            <input class="input" id=id.clone() name=name type="text" value=value
+                autocomplete="off" spellcheck="false" maxlength=MAX_CLIENT_ID_LEN.to_string()
+                aria-describedby=help_id.clone() disabled=locked/>
+        }
+        .into_any(),
     };
     view! {
         <div class="field">
@@ -454,12 +532,43 @@ fn field_view(setting: StackSettingView) -> impl IntoView {
     }
 }
 
-/// The password fields of the secret settings. There is one, for
-/// `SMTP_PASS`.
-#[derive(Clone, Copy, Default)]
-struct SecretInputs {
-    smtp_pass: NodeRef<leptos::html::Input>,
+/// A sign-in provider's group: what to register with it, its callback URL,
+/// and its fields.
+fn provider_view(
+    provider: AuthProviderView,
+    enabled: Option<StackSettingView>,
+    client_id: Option<StackSettingView>,
+    secret: Option<impl IntoView>,
+) -> impl IntoView {
+    let callback = match provider.callback_url {
+        Some(url) => view! {
+            <p class="field-hint">
+                "Callback URL: " <code class="url-text">{url}</code>
+            </p>
+        }
+        .into_any(),
+        None => view! {
+            <p class="field-hint">
+                "The callback URL is the stack's public URL followed by " <code class="url-text">"/auth/v1/callback"</code>
+                ". The dashboard cannot read the public URL from this stack's variables."
+            </p>
+        }
+        .into_any(),
+    };
+    view! {
+        <fieldset class="settings-provider">
+            <legend class="subsection-title">{provider.label}</legend>
+            <p class="field-hint">{provider.help}</p>
+            {callback}
+            {enabled.map(field_view)}
+            {client_id.map(field_view)}
+            {secret}
+        </fieldset>
+    }
 }
+
+/// The password fields of the secret settings, by variable name.
+type SecretInputs = Vec<(String, NodeRef<leptos::html::Input>)>;
 
 /// The review's state, for the apply form.
 #[derive(Clone, Copy)]
@@ -470,9 +579,12 @@ struct Withdraw {
 
 /// A secret setting's field: a password input that is never filled in,
 /// whether the variable is set, and a box to remove it when it is.
-fn secret_field_view(setting: SecretSettingView, inputs: SecretInputs) -> impl IntoView {
+fn secret_field_view(
+    setting: SecretSettingView,
+    node_ref: NodeRef<leptos::html::Input>,
+) -> impl IntoView {
     let id = format!("setting-{}", setting.name.to_lowercase().replace('_', "-"));
-    let name = setting.name.to_lowercase();
+    let name = SettingsFields::field_name(&setting.name);
     let help_id = format!("{id}-help");
     let note = match setting.state {
         SettingState::Editable => None,
@@ -491,16 +603,12 @@ fn secret_field_view(setting: SecretSettingView, inputs: SecretInputs) -> impl I
     } else {
         "Not set."
     };
-    let node_ref = if setting.name == "SMTP_PASS" {
-        inputs.smtp_pass
-    } else {
-        NodeRef::new()
-    };
+    let remove_label = setting.remove_label;
     let remove = (setting.set && !locked).then(|| {
         view! {
             <label class="checkbox-field">
-                <input type="checkbox" name=format!("{name}_remove") value="true"/>
-                <span>"Remove the password"</span>
+                <input type="checkbox" name=format!("{name}{REMOVE_SUFFIX}") value="true"/>
+                <span>{remove_label}</span>
             </label>
         }
     });
@@ -533,10 +641,8 @@ fn review_view(
 ) -> impl IntoView {
     let disabled = move || (queued.get() || apply.pending().get()).then_some("true");
     let base = preview.base;
-    let pass = preview.secrets.iter().find(|s| s.name == "SMTP_PASS");
-    let pass_replaced = pass.is_some_and(|s| !s.removed);
-    let pass_removed = pass.is_some_and(|s| s.removed);
-    // The new password is read from its field, not kept in the review.
+    let changed_secrets = preview.secrets.clone();
+    // New secret values are read from their fields, not kept in the review.
     let on_submit = {
         let base = base.clone();
         move |ev: leptos::ev::SubmitEvent| {
@@ -544,10 +650,19 @@ fn review_view(
             if queued.get_untracked() || apply.pending().get_untracked() {
                 return;
             }
-            let smtp_pass = if pass_replaced {
+            let mut fields = fields.clone();
+            for secret in &changed_secrets {
+                if secret.removed {
+                    fields.insert(
+                        &format!("{}{REMOVE_SUFFIX}", secret.name),
+                        "true".to_owned(),
+                    );
+                    continue;
+                }
                 let typed = inputs
-                    .smtp_pass
-                    .get_untracked()
+                    .iter()
+                    .find(|(name, _)| *name == secret.name)
+                    .and_then(|(_, node)| node.get_untracked())
                     .map(|input| input.value())
                     .unwrap_or_default();
                 if typed.is_empty() {
@@ -555,16 +670,12 @@ fn review_view(
                     reviewing.set(false);
                     return;
                 }
-                Some(SecretInput::new(typed))
-            } else {
-                None
-            };
+                fields.insert(&secret.name, typed);
+            }
             apply.dispatch(QueueStackSettings {
                 id: project,
-                fields: fields.clone(),
                 base: base.clone(),
-                smtp_pass,
-                smtp_pass_remove: pass_removed.then(|| "true".to_owned()),
+                fields,
             });
         }
     };
@@ -625,9 +736,7 @@ fn review_view(
 #[cfg(test)]
 #[cfg(feature = "ssr")]
 mod tests {
-    use supabase_dashboard_domain::stack_settings::{
-        STACK_SETTINGS, secret_setting, stack_setting,
-    };
+    use supabase_dashboard_domain::stack_settings::{secret_setting, stack_setting};
 
     use super::*;
 
@@ -661,21 +770,22 @@ mod tests {
         assert!(from.contains(r#"aria-describedby="setting-smtp-admin-email-help""#));
     }
 
+    fn secret_view(name: &str, set: bool, state: SettingState) -> SecretSettingView {
+        let setting = secret_setting(name).unwrap();
+        SecretSettingView {
+            name: setting.name.to_owned(),
+            label: setting.label.to_owned(),
+            help: setting.help.to_owned(),
+            remove_label: setting.remove_label.to_owned(),
+            set,
+            state,
+        }
+    }
+
     fn rendered_secret(set: bool, state: SettingState) -> String {
         let owner = Owner::new();
         owner.set();
-        let setting = secret_setting("SMTP_PASS").unwrap();
-        secret_field_view(
-            SecretSettingView {
-                name: setting.name.to_owned(),
-                label: setting.label.to_owned(),
-                help: setting.help.to_owned(),
-                set,
-                state,
-            },
-            SecretInputs::default(),
-        )
-        .to_html()
+        secret_field_view(secret_view("SMTP_PASS", set, state), NodeRef::new()).to_html()
     }
 
     #[test]
@@ -707,11 +817,79 @@ mod tests {
         assert!(!locked.contains("smtp_pass_remove"), "{locked}");
     }
 
+    fn setting_view(name: &str, value: &str) -> StackSettingView {
+        let setting = stack_setting(name).unwrap();
+        StackSettingView {
+            name: setting.name.to_owned(),
+            label: setting.label.to_owned(),
+            help: setting.help.to_owned(),
+            kind: setting.kind,
+            value: Some(value.to_owned()),
+            state: SettingState::Editable,
+        }
+    }
+
     #[test]
-    fn every_setting_has_a_form_field() {
-        let fields = SettingsFields::default();
-        let names: Vec<&str> = fields.entries().iter().map(|(name, _)| *name).collect();
-        let settings: Vec<&str> = STACK_SETTINGS.iter().map(|s| s.name).collect();
-        assert_eq!(names, settings);
+    fn a_provider_shows_its_callback_url_and_never_its_secret() {
+        let owner = Owner::new();
+        owner.set();
+        let provider = |callback_url: Option<&str>| AuthProviderView {
+            key: "GITHUB".to_owned(),
+            label: "GitHub".to_owned(),
+            help: "Register an OAuth app.".to_owned(),
+            callback_url: callback_url.map(str::to_owned),
+        };
+        let html = provider_view(
+            provider(Some("https://api.example.test/auth/v1/callback")),
+            Some(setting_view("GITHUB_ENABLED", "true")),
+            Some(setting_view("GITHUB_CLIENT_ID", "Iv1.0123abcd")),
+            Some(secret_field_view(
+                secret_view("GITHUB_SECRET", true, SettingState::Editable),
+                NodeRef::new(),
+            )),
+        )
+        .to_html();
+        assert!(html.contains("<legend"), "{html}");
+        assert!(html.contains("GitHub"), "{html}");
+        assert!(
+            html.contains("https://api.example.test/auth/v1/callback"),
+            "{html}"
+        );
+        assert!(html.contains(r#"name="github_enabled""#), "{html}");
+        assert!(html.contains(r#"for="setting-github-enabled""#), "{html}");
+        assert!(html.contains(r#"name="github_client_id""#), "{html}");
+        assert!(html.contains(r#"value="Iv1.0123abcd""#), "{html}");
+        assert!(html.contains(r#"maxlength="256""#), "{html}");
+        assert!(html.contains(r#"for="setting-github-secret""#), "{html}");
+        assert!(
+            html.contains(r#"name="github_secret" type="password""#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"name="github_secret_remove" value="true""#),
+            "{html}"
+        );
+        assert!(html.contains("Remove the client secret"), "{html}");
+        assert!(html.contains("Set in Dokploy."), "{html}");
+
+        let unknown = provider_view(provider(None), None, None, None::<()>).to_html();
+        assert!(unknown.contains("/auth/v1/callback"), "{unknown}");
+        assert!(unknown.contains("cannot read the public URL"), "{unknown}");
+    }
+
+    #[test]
+    fn every_setting_has_its_own_form_field() {
+        use supabase_dashboard_domain::stack_settings::{secret_settings, stack_settings};
+        let mut names: Vec<String> = stack_settings()
+            .map(|s| SettingsFields::field_name(s.name))
+            .chain(secret_settings().flat_map(|s| {
+                let field = SettingsFields::field_name(s.name);
+                [format!("{field}{REMOVE_SUFFIX}"), field]
+            }))
+            .collect();
+        let count = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), count);
     }
 }

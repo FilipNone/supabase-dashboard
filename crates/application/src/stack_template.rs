@@ -205,9 +205,9 @@ mod tests {
 
     #[test]
     fn every_setting_is_a_defaulted_variable_of_the_services_it_names() {
-        use supabase_dashboard_domain::stack_settings::{SECRET_SETTINGS, STACK_SETTINGS};
+        use supabase_dashboard_domain::stack_settings::{secret_settings, stack_settings};
         let defaulted = defaulted_variables();
-        for setting in STACK_SETTINGS {
+        for setting in stack_settings() {
             assert!(setting.read_by(COMPOSE_FILE), "{}", setting.name);
             let uses: Vec<_> = defaulted
                 .iter()
@@ -230,7 +230,7 @@ mod tests {
                 None => assert!(uses.is_empty(), "{}", setting.name),
             }
         }
-        for secret in SECRET_SETTINGS {
+        for secret in secret_settings() {
             assert!(secret.read_by(COMPOSE_FILE), "{}", secret.name);
             let uses: Vec<_> = defaulted
                 .iter()
@@ -244,13 +244,41 @@ mod tests {
             assert_eq!(services, secret.services, "{}", secret.name);
         }
         for (name, _, _) in defaulted {
-            if SECRET_SETTINGS.iter().any(|s| s.name == name) {
+            if secret_settings().any(|s| s.name == name) {
                 continue;
             }
             assert!(
-                STACK_SETTINGS.iter().any(|s| s.name == name),
+                stack_settings().any(|s| s.name == name),
                 "{name} is not a setting"
             );
+        }
+    }
+
+    #[test]
+    fn every_provider_is_passed_to_auth_with_the_gateway_callback() {
+        use supabase_dashboard_domain::stack_settings::{AUTH_CALLBACK_PATH, AUTH_PROVIDERS};
+        let lines: Vec<&str> = COMPOSE_FILE.lines().map(str::trim).collect();
+        for provider in AUTH_PROVIDERS {
+            let key = provider.key;
+            for line in [
+                format!(
+                    "GOTRUE_EXTERNAL_{key}_ENABLED: ${{{}:-false}}",
+                    provider.enabled.name
+                ),
+                format!(
+                    "GOTRUE_EXTERNAL_{key}_CLIENT_ID: ${{{}:-}}",
+                    provider.client_id.name
+                ),
+                format!(
+                    "GOTRUE_EXTERNAL_{key}_SECRET: ${{{}:-}}",
+                    provider.secret.name
+                ),
+                format!(
+                    "GOTRUE_EXTERNAL_{key}_REDIRECT_URI: ${{SUPABASE_PUBLIC_URL}}{AUTH_CALLBACK_PATH}"
+                ),
+            ] {
+                assert!(lines.contains(&line.as_str()), "{line}");
+            }
         }
     }
 

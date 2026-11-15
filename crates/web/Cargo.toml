@@ -30,6 +30,10 @@ supabase-dashboard-application = { workspace = true, optional = true }
 secrecy = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 
+[dev-dependencies]
+# The encoding Leptos uses for forms and URL-encoded server functions.
+serde_qs.workspace = true
+
 [features]
 default = []
 hydrate = ["leptos/hydrate", "dep:console_error_panic_hook", "dep:wasm-bindgen", "dep:web-sys"]

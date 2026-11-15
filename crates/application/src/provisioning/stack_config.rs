@@ -15,9 +15,10 @@ use supabase_dashboard_domain::{
     dokploy_placement::DokployId,
     provisioning::StackAction,
     stack_settings::{
-        ChangedSecret, ENV_SEEN_MAX_LEN, EnvFile, EnvValue, SECRET_SETTINGS, STACK_SETTINGS,
+        AUTH_PROVIDERS, AuthProviderView, ChangedSecret, ENV_SEEN_MAX_LEN, EnvFile, EnvValue,
         SecretSetting, SecretSettingView, SettingState, StackConfigPreview, StackSetting,
-        StackSettingView, StackSettingsView, secret_setting, stack_setting,
+        StackSettingView, StackSettingsView, auth_callback_url, secret_setting, secret_settings,
+        stack_setting, stack_settings,
     },
 };
 use supabase_dashboard_persistence::audit::AuditOutcome;
@@ -72,8 +73,7 @@ struct CurrentSecret {
 
 fn read_secrets(config: &ComposeConfig) -> Vec<CurrentSecret> {
     let env = EnvFile::parse(config.env.expose_secret());
-    SECRET_SETTINGS
-        .iter()
+    secret_settings()
         .map(|setting| {
             let (state, raw, set) = match env.get(setting.name) {
                 EnvValue::Unreadable => (SettingState::Unreadable, None, true),
@@ -181,8 +181,7 @@ struct Current {
 
 fn read_settings(config: &ComposeConfig) -> Vec<Current> {
     let env = EnvFile::parse(config.env.expose_secret());
-    STACK_SETTINGS
-        .iter()
+    stack_settings()
         .map(|setting| {
             let (state, raw) = match env.get(setting.name) {
                 EnvValue::Unreadable => (SettingState::Unreadable, None),
@@ -267,6 +266,58 @@ fn plan(
         ));
     }
     Ok(changes)
+}
+
+/// Refuses a change that would leave a sign-in provider on without a
+/// client ID or a client secret. Only providers the change touches are
+/// checked, so a provider set up in Dokploy does not block unrelated
+/// changes.
+fn check_providers(
+    current: &[Current],
+    secrets: &[CurrentSecret],
+    changes: &[(&'static StackSetting, SettingChange)],
+    secret_changes: &[(&'static SecretSetting, SecretChange)],
+) -> Result<(), ProvisionError> {
+    let changed = |name: &str| {
+        changes
+            .iter()
+            .find(|(setting, _)| setting.name == name)
+            .map(|(_, change)| change.value.as_str())
+    };
+    // The value in effect after the change; `None` when it is not known.
+    let after = |name: &str| {
+        changed(name).map(str::to_owned).or_else(|| {
+            current
+                .iter()
+                .find(|now| now.setting.name == name)
+                .and_then(|now| now.effective.clone())
+        })
+    };
+    for provider in &AUTH_PROVIDERS {
+        let secret_change = secret_changes
+            .iter()
+            .find(|(setting, _)| setting.name == provider.secret.name);
+        if changed(provider.enabled.name).is_none()
+            && changed(provider.client_id.name).is_none()
+            && secret_change.is_none()
+        {
+            continue;
+        }
+        let secret_set = match secret_change {
+            Some((_, change)) => !change.value.expose_secret().is_empty(),
+            None => secrets
+                .iter()
+                .find(|now| now.setting.name == provider.secret.name)
+                .is_some_and(|now| now.set),
+        };
+        let enabled = after(provider.enabled.name).is_some_and(|value| value == "true");
+        provider.check(
+            enabled,
+            after(provider.client_id.name).as_deref(),
+            secret_set,
+        )?;
+    }
+    Ok(())
 }
 
 /// A digest of every setting's state and raw value, so a review can be
@@ -370,6 +421,10 @@ impl ProvisioningService {
         let env = EnvFile::parse(config.env.expose_secret());
         let tracking =
             env_record::tracking(&self.db, self.cipher.as_ref(), project_id, &env).await?;
+        let callback_url = match env.get("SUPABASE_PUBLIC_URL") {
+            EnvValue::Set(url) => auth_callback_url(url),
+            EnvValue::Missing | EnvValue::Unreadable => None,
+        };
         Ok(Some(StackSettingsView {
             settings: read_settings(&config)
                 .into_iter()
@@ -388,8 +443,18 @@ impl ProvisioningService {
                     name: now.setting.name.to_owned(),
                     label: now.setting.label.to_owned(),
                     help: now.setting.help.to_owned(),
+                    remove_label: now.setting.remove_label.to_owned(),
                     set: now.set,
                     state: now.state,
+                })
+                .collect(),
+            providers: AUTH_PROVIDERS
+                .iter()
+                .map(|provider| AuthProviderView {
+                    key: provider.key.to_owned(),
+                    label: provider.label.to_owned(),
+                    help: provider.help.to_owned(),
+                    callback_url: callback_url.clone(),
                 })
                 .collect(),
             busy,
@@ -416,6 +481,7 @@ impl ProvisioningService {
         if changes.is_empty() && secret_changes.is_empty() {
             return Err(ProvisionError::NoChanges);
         }
+        check_providers(&now, &now_secrets, &changes, &secret_changes)?;
         Ok(preview_of(&now, &now_secrets, &changes, &secret_changes))
     }
 
@@ -466,6 +532,7 @@ impl ProvisioningService {
         if changes.is_empty() && secret_changes.is_empty() {
             return Err(ProvisionError::NoChanges);
         }
+        check_providers(&now, &now_secrets, &changes, &secret_changes)?;
         let settings = changes.into_iter().map(|(_, change)| change).collect();
         let secret_changes = secret_changes
             .into_iter()

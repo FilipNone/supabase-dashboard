@@ -30,6 +30,8 @@ pub enum SettingKind {
     EmailAddress,
     /// A login name of plain characters, or empty for none.
     Username,
+    /// An OAuth client ID of plain characters, or empty for none.
+    ClientId,
 }
 
 /// A variable of the pinned stack the dashboard may change.
@@ -156,18 +158,152 @@ pub struct SecretSetting {
     pub name: &'static str,
     pub label: &'static str,
     pub help: &'static str,
+    /// The label of the box that removes the value.
+    pub remove_label: &'static str,
     /// The compose services that read it; Docker Compose recreates them
     /// when it changes. The compose file's default is always empty.
     pub services: &'static [&'static str],
 }
 
-/// Every secret setting, in display order.
+/// The secret settings other than the sign-in providers' secrets, in
+/// display order. [`secret_settings`] lists them all.
 pub const SECRET_SETTINGS: [SecretSetting; 1] = [SecretSetting {
     name: "SMTP_PASS",
     label: "Mail server password",
     help: "Leave empty to keep the current password. The dashboard writes it to Dokploy and never shows it again. Passwords with spaces, quotes, $, #, backslashes, or backticks must be set in Dokploy.",
+    remove_label: "Remove the password",
     services: &["auth"],
 }];
+
+/// An external OAuth sign-in provider of Auth. The pinned compose file
+/// passes `<KEY>_ENABLED`, `<KEY>_CLIENT_ID`, and `<KEY>_SECRET` to GoTrue
+/// as `GOTRUE_EXTERNAL_<KEY>_ENABLED`, `_CLIENT_ID`, and `_SECRET`, and
+/// sets `_REDIRECT_URI` to the stack's public URL and
+/// [`AUTH_CALLBACK_PATH`]. Only providers that need nothing else are
+/// listed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthProvider {
+    /// The variables' prefix, such as `GITHUB`.
+    pub key: &'static str,
+    /// The provider's name, such as `GitHub`.
+    pub label: &'static str,
+    /// Where the operator registers the OAuth app.
+    pub help: &'static str,
+    pub enabled: StackSetting,
+    pub client_id: StackSetting,
+    pub secret: SecretSetting,
+}
+
+/// Where Auth receives the providers' answers, under the stack's public
+/// URL. The gateway serves Auth under `/auth/v1`.
+pub const AUTH_CALLBACK_PATH: &str = "/auth/v1/callback";
+
+/// Longest OAuth client ID.
+pub const MAX_CLIENT_ID_LEN: usize = 256;
+
+macro_rules! auth_provider {
+    ($key:literal, $label:literal, $help:literal) => {
+        AuthProvider {
+            key: $key,
+            label: $label,
+            help: $help,
+            enabled: StackSetting {
+                name: concat!($key, "_ENABLED"),
+                label: concat!($label, " sign-in"),
+                help: concat!(
+                    "Users can sign in with their ",
+                    $label,
+                    " account. Turning it on needs the client ID and the client secret."
+                ),
+                kind: SettingKind::Bool,
+                default: Some("false"),
+                services: &["auth"],
+            },
+            client_id: StackSetting {
+                name: concat!($key, "_CLIENT_ID"),
+                label: concat!($label, " client ID"),
+                help: concat!("The client ID of the stack's OAuth app on ", $label, "."),
+                kind: SettingKind::ClientId,
+                default: Some(""),
+                services: &["auth"],
+            },
+            secret: SecretSetting {
+                name: concat!($key, "_SECRET"),
+                label: concat!($label, " client secret"),
+                help: "Leave empty to keep the current secret. The dashboard writes it to Dokploy and never shows it again. Secrets with spaces, quotes, $, #, backslashes, or backticks must be set in Dokploy.",
+                remove_label: "Remove the client secret",
+                services: &["auth"],
+            },
+        }
+    };
+}
+
+/// The sign-in providers the dashboard sets up, in display order. Adding
+/// one that needs only a client ID and a secret is one line here and four
+/// lines in the pinned compose file.
+pub const AUTH_PROVIDERS: [AuthProvider; 2] = [
+    auth_provider!(
+        "GITHUB",
+        "GitHub",
+        "Register an OAuth app on GitHub under Settings, Developer settings, OAuth Apps, with the callback URL below."
+    ),
+    auth_provider!(
+        "GOOGLE",
+        "Google",
+        "Create an OAuth client ID of type Web application in the Google Cloud console under APIs & Services, Credentials, with the callback URL below as an authorized redirect URI."
+    ),
+];
+
+/// The provider whose variables start with `key`.
+pub fn auth_provider(key: &str) -> Option<&'static AuthProvider> {
+    AUTH_PROVIDERS.iter().find(|provider| provider.key == key)
+}
+
+/// Every plain setting, in display order: [`STACK_SETTINGS`], then each
+/// provider's toggle and client ID.
+pub fn stack_settings() -> impl Iterator<Item = &'static StackSetting> {
+    STACK_SETTINGS.iter().chain(
+        AUTH_PROVIDERS
+            .iter()
+            .flat_map(|provider| [&provider.enabled, &provider.client_id]),
+    )
+}
+
+/// Every secret setting, in display order: [`SECRET_SETTINGS`], then each
+/// provider's client secret.
+pub fn secret_settings() -> impl Iterator<Item = &'static SecretSetting> {
+    SECRET_SETTINGS
+        .iter()
+        .chain(AUTH_PROVIDERS.iter().map(|provider| &provider.secret))
+}
+
+/// The URL to register with the providers for a stack served at
+/// `public_url`, or `None` when that is not a plain `http://` or
+/// `https://` URL.
+pub fn auth_callback_url(public_url: &str) -> Option<String> {
+    let public_url = public_url.trim_end_matches('/');
+    is_plain_url(public_url).then(|| format!("{public_url}{AUTH_CALLBACK_PATH}"))
+}
+
+impl AuthProvider {
+    /// Refuses a provider that would be on without a client ID or a client
+    /// secret. `client_id` is the ID in effect after the change; `None`
+    /// when the dashboard cannot read it, which counts as set, as does a
+    /// secret it cannot read.
+    pub fn check(
+        &self,
+        enabled: bool,
+        client_id: Option<&str>,
+        secret_set: bool,
+    ) -> Result<(), SettingError> {
+        let id_set = client_id.is_none_or(|id| !id.trim().is_empty());
+        if enabled && !(id_set && secret_set) {
+            Err(SettingError::ProviderIncomplete { label: self.label })
+        } else {
+            Ok(())
+        }
+    }
+}
 
 /// Longest secret setting value.
 pub const MAX_SECRET_LEN: usize = 512;
@@ -181,12 +317,12 @@ pub const MAX_USERNAME_LEN: usize = 256;
 
 /// The setting named `name`.
 pub fn stack_setting(name: &str) -> Option<&'static StackSetting> {
-    STACK_SETTINGS.iter().find(|setting| setting.name == name)
+    stack_settings().find(|setting| setting.name == name)
 }
 
 /// The secret setting named `name`.
 pub fn secret_setting(name: &str) -> Option<&'static SecretSetting> {
-    SECRET_SETTINGS.iter().find(|setting| setting.name == name)
+    secret_settings().find(|setting| setting.name == name)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -225,11 +361,19 @@ pub enum SettingError {
         "{label}: enter at most {MAX_USERNAME_LEN} characters without spaces, quotes, $, #, or backslashes, or leave it empty"
     )]
     Username { label: &'static str },
+    #[error(
+        "{label}: enter at most {MAX_CLIENT_ID_LEN} characters without spaces, quotes, $, #, or backslashes, or leave it empty"
+    )]
+    ClientId { label: &'static str },
     /// The value is never part of the message.
     #[error(
-        "{label}: enter 1 to {MAX_SECRET_LEN} characters without spaces, quotes, $, #, backslashes, or backticks; set a password with those in Dokploy"
+        "{label}: enter 1 to {MAX_SECRET_LEN} characters without spaces, quotes, $, #, backslashes, or backticks; set a value with those in Dokploy"
     )]
     Secret { label: &'static str },
+    #[error(
+        "{label} sign-in: enter a client ID and a client secret before turning it on, or leave it off"
+    )]
+    ProviderIncomplete { label: &'static str },
 }
 
 impl StackSetting {
@@ -313,6 +457,13 @@ impl StackSetting {
                     Ok(raw.to_owned())
                 } else {
                     Err(SettingError::Username { label })
+                }
+            }
+            SettingKind::ClientId => {
+                if raw.len() <= MAX_CLIENT_ID_LEN && raw.bytes().all(is_plain_char) {
+                    Ok(raw.to_owned())
+                } else {
+                    Err(SettingError::ClientId { label })
                 }
             }
         }
@@ -574,10 +725,24 @@ pub struct SecretSettingView {
     pub name: String,
     pub label: String,
     pub help: String,
+    pub remove_label: String,
     /// The variable has a value other than empty. A value the dashboard
     /// cannot read ([`SettingState::Unreadable`]) counts as set.
     pub set: bool,
     pub state: SettingState,
+}
+
+/// A sign-in provider as an owner or admin sees it. Its settings are in
+/// [`StackSettingsView::settings`] and [`StackSettingsView::secrets`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthProviderView {
+    /// [`AuthProvider::key`].
+    pub key: String,
+    pub label: String,
+    pub help: String,
+    /// The callback URL to register with the provider, `None` when the
+    /// stack's public URL cannot be read.
+    pub callback_url: Option<String>,
 }
 
 /// A provisioned stack's settings, read from Dokploy.
@@ -586,6 +751,8 @@ pub struct StackSettingsView {
     pub settings: Vec<StackSettingView>,
     /// The secret settings, after the others.
     pub secrets: Vec<SecretSettingView>,
+    /// The sign-in providers, whose settings are among the others.
+    pub providers: Vec<AuthProviderView>,
     /// An action on the stack is unfinished, so changes are refused.
     pub busy: bool,
     /// Variables edited in Dokploy since the dashboard wrote them.
@@ -832,13 +999,119 @@ mod tests {
 
     #[test]
     fn secret_settings_are_not_plain_settings() {
-        for secret in SECRET_SETTINGS {
+        for secret in secret_settings() {
             assert!(stack_setting(secret.name).is_none(), "{}", secret.name);
             assert!(!secret.services.is_empty(), "{}", secret.name);
         }
         let pass = secret_setting("SMTP_PASS").unwrap();
         assert!(pass.read_by("x: ${SMTP_PASS:-}"));
         assert!(!pass.read_by("x: ${SMTP_PASSWORD:-}"));
+    }
+
+    #[test]
+    fn providers_have_their_variables_and_labels() {
+        let github = auth_provider("GITHUB").unwrap();
+        assert_eq!(github.enabled.name, "GITHUB_ENABLED");
+        assert_eq!(github.client_id.name, "GITHUB_CLIENT_ID");
+        assert_eq!(github.secret.name, "GITHUB_SECRET");
+        assert_eq!(github.client_id.label, "GitHub client ID");
+        assert_eq!(
+            stack_setting("GOOGLE_ENABLED"),
+            Some(&AUTH_PROVIDERS[1].enabled)
+        );
+        assert_eq!(
+            stack_setting("GOOGLE_CLIENT_ID"),
+            Some(&AUTH_PROVIDERS[1].client_id)
+        );
+        assert_eq!(
+            secret_setting("GOOGLE_SECRET"),
+            Some(&AUTH_PROVIDERS[1].secret)
+        );
+        assert!(stack_setting("GOOGLE_SECRET").is_none());
+        assert!(auth_provider("github").is_none());
+        // Names are unique across every setting.
+        let mut names: Vec<&str> = stack_settings()
+            .map(|s| s.name)
+            .chain(secret_settings().map(|s| s.name))
+            .collect();
+        let count = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), count);
+        assert_eq!(
+            count,
+            STACK_SETTINGS.len() + SECRET_SETTINGS.len() + 3 * AUTH_PROVIDERS.len()
+        );
+    }
+
+    #[test]
+    fn client_ids_are_plain_and_bounded() {
+        let id = stack_setting("GOOGLE_CLIENT_ID").unwrap();
+        assert_eq!(id.normalize("").unwrap(), "");
+        assert_eq!(
+            id.normalize(" 1234-abc.apps.googleusercontent.com ")
+                .unwrap(),
+            "1234-abc.apps.googleusercontent.com"
+        );
+        assert_eq!(id.normalize("Iv1.0123abcd").unwrap(), "Iv1.0123abcd");
+        for bad in ["a b", "a$b", "a#b", "a'b", "a\\b", "caf\u{e9}"] {
+            assert_eq!(
+                id.normalize(bad),
+                Err(SettingError::ClientId { label: id.label }),
+                "{bad:?}"
+            );
+        }
+        assert!(id.normalize(&"i".repeat(MAX_CLIENT_ID_LEN)).is_ok());
+        assert!(id.normalize(&"i".repeat(MAX_CLIENT_ID_LEN + 1)).is_err());
+        let secret = secret_setting("GITHUB_SECRET").unwrap();
+        assert_eq!(
+            secret.check("0123456789abcdef0123456789abcdef01234567"),
+            Ok(())
+        );
+        let err = secret.check("has space").unwrap_err();
+        assert!(!err.to_string().contains("has space"));
+        assert!(err.to_string().starts_with("GitHub client secret: "));
+    }
+
+    #[test]
+    fn a_provider_is_not_turned_on_without_its_id_and_secret() {
+        let github = auth_provider("GITHUB").unwrap();
+        assert_eq!(github.check(true, Some("id"), true), Ok(()));
+        assert_eq!(github.check(false, Some(""), false), Ok(()));
+        assert_eq!(github.check(false, Some("id"), false), Ok(()));
+        let incomplete = Err(SettingError::ProviderIncomplete { label: "GitHub" });
+        assert_eq!(github.check(true, Some(""), true), incomplete);
+        assert_eq!(github.check(true, Some("  "), true), incomplete);
+        assert_eq!(github.check(true, Some("id"), false), incomplete);
+        assert_eq!(github.check(true, Some(""), false), incomplete);
+        // An ID the dashboard cannot read counts as set.
+        assert_eq!(github.check(true, None, true), Ok(()));
+        assert!(
+            SettingError::ProviderIncomplete { label: "GitHub" }
+                .to_string()
+                .starts_with("GitHub sign-in: enter a client ID and a client secret")
+        );
+    }
+
+    #[test]
+    fn the_callback_url_is_under_the_public_url() {
+        assert_eq!(
+            auth_callback_url("https://api.example.com").as_deref(),
+            Some("https://api.example.com/auth/v1/callback")
+        );
+        assert_eq!(
+            auth_callback_url("http://10.0.0.5:8000/").as_deref(),
+            Some("http://10.0.0.5:8000/auth/v1/callback")
+        );
+        for bad in [
+            "",
+            "api.example.com",
+            "https://",
+            "https://a b",
+            "javascript:x",
+        ] {
+            assert_eq!(auth_callback_url(bad), None, "{bad:?}");
+        }
     }
 
     #[test]

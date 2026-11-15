@@ -1331,6 +1331,43 @@ mod tests {
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "not both",
             ),
+            // A sign-in provider's client secret is handled the same way.
+            (
+                preview,
+                format!("github_enabled=true&github_client_id=Iv1.x&github_secret={PASS}"),
+                &bob,
+                StatusCode::FORBIDDEN,
+                "",
+            ),
+            (
+                queue,
+                format!("base=0&github_enabled=true&github_client_id=Iv1.x&github_secret={PASS}"),
+                &alice,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "not connected",
+            ),
+            (
+                preview,
+                format!("github_secret={PASS}%20x"),
+                &alice,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "GitHub client secret: enter 1 to 512 characters",
+            ),
+            (
+                queue,
+                format!("base=0&google_secret={PASS}&google_secret_remove=true"),
+                &alice,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Google client secret: enter a new value or remove it, not both",
+            ),
+            // Only the stack's settings are taken.
+            (
+                preview,
+                format!("jwt_secret={PASS}"),
+                &alice,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "not a stack setting",
+            ),
         ] {
             let (parts, body) = settings(path, format!("id={provisioned}&{form}"), cookie).await;
             assert_eq!(parts.status, status, "{path} {body}");

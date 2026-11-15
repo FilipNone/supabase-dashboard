@@ -599,101 +599,132 @@ pub async fn get_stack_settings(id: Uuid) -> Result<Option<StackSettingsView>, A
         .await?)
 }
 
-/// The settings a form submitted, one optional field per setting, named
-/// after its variable in lowercase. A field the form left out (a disabled
-/// input) is not changed.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SettingsFields {
-    pub site_url: Option<String>,
-    pub additional_redirect_urls: Option<String>,
-    pub disable_signup: Option<String>,
-    pub enable_email_autoconfirm: Option<String>,
-    pub enable_anonymous_users: Option<String>,
-    pub jwt_expiry: Option<String>,
-    pub pgrst_db_schemas: Option<String>,
-    pub smtp_host: Option<String>,
-    pub smtp_port: Option<String>,
-    pub smtp_user: Option<String>,
-    pub smtp_admin_email: Option<String>,
+/// The settings a form submitted, keyed by field name: each plain
+/// setting's variable name in lowercase, each secret setting's in
+/// lowercase (its new value; empty keeps it), and `<secret>_remove` when its
+/// remove box is checked. A field the form left out (a disabled input) is
+/// not changed. The server refuses a name that is none of these.
+///
+/// Secret values are only ever sent to the server: what comes back from a
+/// review holds the plain settings alone. `Debug` prints names, never
+/// values.
+#[derive(Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct SettingsFields(std::collections::BTreeMap<String, String>);
+
+impl<'de> Deserialize<'de> for SettingsFields {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut fields = std::collections::BTreeMap::<String, String>::deserialize(deserializer)?;
+        // An `ActionForm` adds its submit button to the form data even
+        // when the button has no name, which reaches here as `=`. A name
+        // without a letter or digit is never a field.
+        fields.retain(|name, _| name.bytes().any(|b| b.is_ascii_alphanumeric()));
+        Ok(Self(fields))
+    }
 }
 
+impl fmt::Debug for SettingsFields {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_set().entries(self.0.keys()).finish()
+    }
+}
+
+/// The suffix of a secret setting's remove box.
+pub const REMOVE_SUFFIX: &str = "_remove";
+
 impl SettingsFields {
-    /// Each setting's variable name and the submitted value, if any, in
-    /// display order.
-    pub fn entries(&self) -> [(&'static str, Option<&str>); 11] {
-        [
-            ("SITE_URL", self.site_url.as_deref()),
-            (
-                "ADDITIONAL_REDIRECT_URLS",
-                self.additional_redirect_urls.as_deref(),
-            ),
-            ("DISABLE_SIGNUP", self.disable_signup.as_deref()),
-            (
-                "ENABLE_EMAIL_AUTOCONFIRM",
-                self.enable_email_autoconfirm.as_deref(),
-            ),
-            (
-                "ENABLE_ANONYMOUS_USERS",
-                self.enable_anonymous_users.as_deref(),
-            ),
-            ("JWT_EXPIRY", self.jwt_expiry.as_deref()),
-            ("PGRST_DB_SCHEMAS", self.pgrst_db_schemas.as_deref()),
-            ("SMTP_HOST", self.smtp_host.as_deref()),
-            ("SMTP_PORT", self.smtp_port.as_deref()),
-            ("SMTP_USER", self.smtp_user.as_deref()),
-            ("SMTP_ADMIN_EMAIL", self.smtp_admin_email.as_deref()),
-        ]
+    /// The form field of the variable `name`.
+    pub fn field_name(name: &str) -> String {
+        name.to_lowercase()
     }
 
+    /// Sets the field of the variable `name`.
+    pub fn insert(&mut self, name: &str, value: String) {
+        self.0.insert(Self::field_name(name), value);
+    }
+
+    /// The submitted fields' names, sorted.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.0.keys().map(String::as_str)
+    }
+
+    /// Splits the fields into the plain settings, by variable name, and the
+    /// secret settings' edits. Refuses an unknown field, and a secret that
+    /// is both given and removed, without repeating any value.
+    #[cfg(feature = "ssr")]
+    fn split(
+        self,
+    ) -> Result<
+        (
+            Self,
+            Vec<supabase_dashboard_application::provisioning::SubmittedSecret<'static>>,
+        ),
+        AppError,
+    > {
+        use supabase_dashboard_application::provisioning::SecretEdit;
+        use supabase_dashboard_domain::stack_settings::{secret_settings, stack_settings};
+        let mut fields = self.0;
+        for name in fields.keys() {
+            let known = stack_settings().any(|s| Self::field_name(s.name) == *name)
+                || secret_settings().any(|s| {
+                    let field = Self::field_name(s.name);
+                    *name == field || *name == format!("{field}{REMOVE_SUFFIX}")
+                });
+            if !known {
+                return Err(AppError::Rejected(
+                    "The form has a field that is not a stack setting. Reload the page.".to_owned(),
+                ));
+            }
+        }
+        let mut secrets = Vec::new();
+        for setting in secret_settings() {
+            let field = Self::field_name(setting.name);
+            let value = fields.remove(&field).filter(|value| !value.is_empty());
+            let remove = fields
+                .remove(&format!("{field}{REMOVE_SUFFIX}"))
+                .is_some_and(|checked| checked == "true");
+            match (value, remove) {
+                (Some(_), true) => {
+                    return Err(AppError::Rejected(format!(
+                        "{}: enter a new value or remove it, not both.",
+                        setting.label
+                    )));
+                }
+                (Some(value), false) => secrets.push((
+                    setting.name,
+                    SecretEdit::Replace(secrecy::SecretString::from(value)),
+                )),
+                (None, true) => secrets.push((setting.name, SecretEdit::Remove)),
+                (None, false) => {}
+            }
+        }
+        Ok((Self(fields), secrets))
+    }
+
+    /// The plain settings, by variable name, in display order.
     #[cfg(feature = "ssr")]
     fn submitted(&self) -> Vec<(&'static str, &str)> {
-        self.entries()
-            .into_iter()
-            .filter_map(|(name, value)| value.map(|value| (name, value)))
+        use supabase_dashboard_domain::stack_settings::stack_settings;
+        stack_settings()
+            .filter_map(|setting| {
+                self.0
+                    .get(&Self::field_name(setting.name))
+                    .map(|value| (setting.name, value.as_str()))
+            })
             .collect()
     }
 }
 
-/// The secret settings a form submitted: `SMTP_PASS` from the
-/// `smtp_pass` field, replaced when it is not empty, and removed when the
-/// `smtp_pass_remove` box is checked.
-#[cfg(feature = "ssr")]
-fn submitted_secrets(
-    smtp_pass: Option<SecretInput>,
-    smtp_pass_remove: Option<String>,
-) -> Result<Vec<supabase_dashboard_application::provisioning::SubmittedSecret<'static>>, AppError> {
-    use supabase_dashboard_application::provisioning::SecretEdit;
-    let value = smtp_pass
-        .map(|input| input.0)
-        .filter(|value| !value.is_empty());
-    let remove = smtp_pass_remove.is_some_and(|checked| checked == "true");
-    Ok(match (value, remove) {
-        (Some(_), true) => {
-            return Err(AppError::Rejected(
-                "Mail server password: enter a new password or remove it, not both.".to_owned(),
-            ));
-        }
-        (Some(value), false) => vec![(
-            "SMTP_PASS",
-            SecretEdit::Replace(secrecy::SecretString::from(value)),
-        )],
-        (None, true) => vec![("SMTP_PASS", SecretEdit::Remove)],
-        (None, false) => Vec::new(),
-    })
-}
-
 /// What applying the submitted settings would change. Nothing is
-/// written. The submitted fields come back for the review to apply,
-/// except `smtp_pass`, which is never sent back. Owners and admins.
+/// written. The plain settings come back for the review to apply; the
+/// secret settings' values never do. Owners and admins.
 #[server]
 pub async fn preview_stack_settings(
     id: Uuid,
     #[server(flatten)] fields: SettingsFields,
-    #[server(default)] smtp_pass: Option<SecretInput>,
-    #[server(default)] smtp_pass_remove: Option<String>,
 ) -> Result<(SettingsFields, StackConfigPreview), AppError> {
     let session = org_context::session()?;
-    let secrets = submitted_secrets(smtp_pass, smtp_pass_remove)?;
+    let (fields, secrets) = fields.split()?;
     let preview = org_context::provisioning()?
         .preview_settings(&session, id, &fields.submitted(), &secrets)
         .await?;
@@ -702,20 +733,18 @@ pub async fn preview_stack_settings(
 
 /// Queues writing the submitted settings and redeploying, and returns
 /// the job's ID. `base` is the preview's digest of the settings it saw;
-/// the server refuses when any of them changed since. A new `smtp_pass`
-/// is kept sealed with the job until it is written.
+/// the server refuses when any of them changed since. New secret values
+/// are kept sealed with the job until they are written.
 /// Owners and admins.
 #[server]
 pub async fn queue_stack_settings(
     id: Uuid,
-    #[server(flatten)] fields: SettingsFields,
     base: String,
-    #[server(default)] smtp_pass: Option<SecretInput>,
-    #[server(default)] smtp_pass_remove: Option<String>,
+    #[server(flatten)] fields: SettingsFields,
 ) -> Result<Uuid, AppError> {
     let session = org_context::session()?;
     let audit = org_context::AuditContext::current();
-    let secrets = submitted_secrets(smtp_pass, smtp_pass_remove)?;
+    let (fields, secrets) = fields.split()?;
     Ok(org_context::provisioning()?
         .queue_settings(
             &session,
@@ -1282,4 +1311,119 @@ pub async fn create_dokploy_environment(project: String, name: String) -> Result
         .create_environment(&session, &project, &name, audit.get())
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+#[cfg(feature = "ssr")]
+mod tests {
+    use secrecy::ExposeSecret;
+    use supabase_dashboard_application::provisioning::SecretEdit;
+
+    use super::*;
+
+    fn fields(pairs: &[(&str, &str)]) -> SettingsFields {
+        SettingsFields(
+            pairs
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn secrets_are_split_off_and_never_sent_back() {
+        const SECRET: &str = "split-test-client-secret";
+        let submitted = fields(&[
+            ("github_enabled", "true"),
+            ("github_client_id", "Iv1.abc"),
+            ("github_secret", SECRET),
+            ("google_secret", ""),
+            ("smtp_pass_remove", "true"),
+            ("site_url", "https://app.example.test"),
+        ]);
+        assert!(!format!("{submitted:?}").contains(SECRET));
+        let (plain, secrets) = submitted.split().unwrap();
+        assert_eq!(
+            plain,
+            fields(&[
+                ("github_enabled", "true"),
+                ("github_client_id", "Iv1.abc"),
+                ("site_url", "https://app.example.test"),
+            ])
+        );
+        assert_eq!(
+            plain.submitted(),
+            [
+                ("SITE_URL", "https://app.example.test"),
+                ("GITHUB_ENABLED", "true"),
+                ("GITHUB_CLIENT_ID", "Iv1.abc"),
+            ]
+        );
+        assert_eq!(secrets.len(), 2);
+        assert!(matches!(secrets[0], ("SMTP_PASS", SecretEdit::Remove)));
+        let ("GITHUB_SECRET", SecretEdit::Replace(value)) = &secrets[1] else {
+            panic!("the GitHub secret should be replaced");
+        };
+        assert_eq!(value.expose_secret(), SECRET);
+        assert!(plain.0.values().all(|value| value != SECRET));
+    }
+
+    /// The way a review reaches the server from the browser: `ActionForm`
+    /// reads the form data, unnamed submit button included, with
+    /// serde_qs, and the action sends it encoded again.
+    #[test]
+    fn a_review_from_the_form_keeps_only_its_fields() {
+        const SECRET: &str = "form-test-client-secret";
+        let id = Uuid::nil();
+        let form = format!(
+            "id={id}&site_url=https%3A%2F%2Fapp.example.test&github_enabled=true\
+             &github_client_id=Iv1.abc&github_secret={SECRET}&google_secret=&="
+        );
+        let read = serde_qs::Config::new(5, false)
+            .deserialize_str::<PreviewStackSettings>(&form)
+            .unwrap();
+        let sent = serde_qs::to_string(&read).unwrap();
+        let received = serde_qs::Config::new(5, false)
+            .deserialize_str::<PreviewStackSettings>(&sent)
+            .unwrap();
+        assert_eq!(received.id, id);
+        assert_eq!(
+            received.fields.names().collect::<Vec<_>>(),
+            [
+                "github_client_id",
+                "github_enabled",
+                "github_secret",
+                "google_secret",
+                "site_url"
+            ]
+        );
+        let (plain, secrets) = received.fields.split().unwrap();
+        assert_eq!(plain.submitted().len(), 3);
+        assert_eq!(secrets.len(), 1);
+    }
+
+    #[test]
+    fn unknown_fields_and_a_secret_both_given_and_removed_are_refused() {
+        for pairs in [
+            &[("jwt_secret", "x")][..],
+            &[("SITE_URL", "https://a.example.test")][..],
+            &[("site_url_remove", "true")][..],
+        ] {
+            let Err(AppError::Rejected(message)) = fields(pairs).split() else {
+                panic!("{pairs:?} should be refused");
+            };
+            assert!(message.contains("not a stack setting"), "{message}");
+        }
+        let Err(AppError::Rejected(message)) = fields(&[
+            ("google_secret", "split-test-other"),
+            ("google_secret_remove", "true"),
+        ])
+        .split() else {
+            panic!("a secret given and removed should be refused");
+        };
+        assert_eq!(
+            message,
+            "Google client secret: enter a new value or remove it, not both."
+        );
+    }
 }
