@@ -11,6 +11,7 @@ use crate::pages::{
     account::{AccountAuditPage, AccountLayout, AccountProfilePage, AccountSecurityPage},
     admin::AdminPage,
     adopt::AdoptStackPage,
+    api_tokens::AccountTokensPage,
     invite::InvitePage,
     not_found::NotFound,
     organization::{
@@ -121,6 +122,7 @@ pub fn App() -> impl IntoView {
                     <ParentRoute path=path!("account") view=AccountLayout>
                         <Route path=path!("me") view=AccountProfilePage/>
                         <Route path=path!("security") view=AccountSecurityPage/>
+                        <Route path=path!("tokens") view=AccountTokensPage/>
                         <Route path=path!("audit") view=AccountAuditPage/>
                     </ParentRoute>
                     <ParentRoute path=path!("org/:org_id/projects/:project_id") view=ProjectLayout>

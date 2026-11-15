@@ -247,7 +247,7 @@ impl Database {
     }
 
     /// Sets a new password hash without checking the old one, revokes every
-    /// session of the account, and records `audit`, in one transaction.
+    /// session and API token of the account, and records `audit`, in one transaction.
     /// For out-of-band recovery by someone with server access. Returns the
     /// number of sessions revoked, or `None` when the account does not
     /// exist.
@@ -278,6 +278,15 @@ impl Database {
         .await
         .map_err(PersistenceError::Query)?
         .rows_affected();
+        // A password reset is the recovery path for a lost or compromised
+        // account, so its API tokens stop working too.
+        sqlx::query(
+            "UPDATE api_tokens SET revoked_at = now() WHERE account_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(PersistenceError::Query)?;
         insert_audit_event(&mut *tx, audit).await?;
         tx.commit().await.map_err(PersistenceError::Query)?;
         Ok(Some(revoked))

@@ -6,6 +6,7 @@
 pub mod account;
 pub mod admin;
 pub mod adoption;
+pub mod api_token;
 pub mod audit;
 pub mod authority;
 pub mod authz;

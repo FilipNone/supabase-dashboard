@@ -72,6 +72,7 @@ impl AppError {
 #[cfg(feature = "ssr")]
 mod server {
     use supabase_dashboard_application::{
+        api_tokens::ApiTokenError,
         auth::{AccountUpdateError, AdminError, AuthError, InvitationSignUpError},
         connections::ConnectionError,
         dokploy::DokployServiceError,
@@ -87,6 +88,22 @@ mod server {
         fn from(err: AuthError) -> Self {
             tracing::error!(error = %err, "account operation failed");
             Self::Unavailable
+        }
+    }
+
+    impl From<ApiTokenError> for AppError {
+        fn from(err: ApiTokenError) -> Self {
+            match err {
+                ApiTokenError::Input(_) | ApiTokenError::LimitReached => {
+                    Self::Rejected(err.to_string())
+                }
+                ApiTokenError::NotFound => Self::NotFound,
+                ApiTokenError::AccountUnavailable => Self::Unauthenticated,
+                ApiTokenError::Persistence(_) | ApiTokenError::Randomness(_) => {
+                    tracing::error!(error = %err, "API token operation failed");
+                    Self::Unavailable
+                }
+            }
         }
     }
 

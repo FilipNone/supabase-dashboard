@@ -99,6 +99,9 @@ enum Access {
     Optional,
     /// JSON API and server functions: 401 without a session.
     Api,
+    /// The token API under `/api/v1/`: authenticated by its bearer token
+    /// only. The session cookie is not even read.
+    Token,
     /// Everything else, including unknown paths: redirect to sign-in.
     Page,
 }
@@ -114,6 +117,7 @@ fn classify(path: &str) -> Access {
         SIGN_IN_PATH => Access::SignInPage,
         INVITE_PATH | INVITE_PREVIEW_PATH | INVITE_SIGN_UP_PATH => Access::Optional,
         _ if path.starts_with("/pkg/") => Access::Public,
+        _ if path.starts_with(crate::api::API_V1_PREFIX) => Access::Token,
         _ if path.starts_with("/api/") || path.starts_with("/auth/") => Access::Api,
         _ => Access::Page,
     }
@@ -124,6 +128,9 @@ fn classify(path: &str) -> Access {
 /// added to request extensions for server functions and SSR.
 pub async fn guard(State(state): State<AppState>, mut request: Request, next: Next) -> Response {
     let access = classify(request.uri().path());
+    if access == Access::Token {
+        return next.run(request).await;
+    }
     let session = match state.cookie.read(request.headers()) {
         None => None,
         Some(value) => match state.auth.authenticate(value).await {
@@ -131,7 +138,7 @@ pub async fn guard(State(state): State<AppState>, mut request: Request, next: Ne
             Err(err) => {
                 tracing::error!(error = %err, "session lookup failed");
                 return match access {
-                    Access::Public | Access::SignInPage | Access::Optional => {
+                    Access::Public | Access::SignInPage | Access::Optional | Access::Token => {
                         next.run(request).await
                     }
                     Access::Api => ApiError::Unavailable.into_response(),
@@ -158,7 +165,7 @@ pub async fn guard(State(state): State<AppState>, mut request: Request, next: Ne
                 .map_or(request.uri().path(), |p| p.as_str());
             Redirect::to(&sign_in_url(Some(target), None)).into_response()
         }
-        (Access::Public | Access::SignInPage, None) => next.run(request).await,
+        (Access::Public | Access::SignInPage | Access::Token, None) => next.run(request).await,
         (Access::Optional, None) => no_store(next.run(request).await),
         (_, Some(session)) => {
             request.extensions_mut().insert(session.summary());
@@ -346,6 +353,8 @@ mod tests {
         assert_eq!(classify("/pkg/supabase-dashboard.wasm"), Access::Public);
         assert_eq!(classify(SIGN_IN_PATH), Access::SignInPage);
         assert_eq!(classify("/api/get_installation_health"), Access::Api);
+        assert_eq!(classify("/api/v1/organizations"), Access::Token);
+        assert_eq!(classify("/api/v1"), Access::Api);
         assert_eq!(classify("/auth/other"), Access::Api);
         assert_eq!(classify("/dashboard/organizations"), Access::Page);
         assert_eq!(classify("/dashboard/sign-in/extra"), Access::Page);

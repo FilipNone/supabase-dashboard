@@ -97,6 +97,8 @@ pub fn action_label(action: &str) -> &str {
         "admin.account_enable" => "Enabled an account",
         "admin.account_list" => "Listed accounts",
         "admin.resource_list" => "Listed organizations and projects",
+        "api_token.create" => "Created an API token",
+        "api_token.revoke" => "Revoked an API token",
         "audit.read" => "Read the audit log",
         "credentials.reseal" => "Moved stored credentials to a new key",
         "dokploy.connect" => "Connected Dokploy",

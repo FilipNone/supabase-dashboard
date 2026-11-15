@@ -1,6 +1,7 @@
 //! supabase-dashboard HTTP server.
 
 mod access_export;
+mod api;
 mod app;
 mod cli;
 mod config;
@@ -26,6 +27,7 @@ use supabase_dashboard_adapters::{
     tls::{ExtraRoots, ExtraRootsError, MAX_EXTRA_CA_FILE_BYTES},
 };
 use supabase_dashboard_application::{
+    api_tokens::{ApiTokenService, TokenApi},
     auth::{AuthConfig, AuthError, AuthService, BootstrapError, PasswordResetError},
     connections::{ConnectionService, ScheduledChecks},
     dokploy::{DokployConnector, DokployCredentials, DokployService},
@@ -529,13 +531,21 @@ async fn run() -> Result<(), StartupError> {
         .public_url
         .as_ref()
         .is_some_and(|u| u.scheme() == "https");
+    let organizations = Arc::new(OrganizationService::new(db.clone()));
+    let projects = Arc::new(ProjectService::new(db.clone()));
     let state = AppState {
         leptos_options,
         db: db.clone(),
         readiness_timeout: config.readiness_timeout,
         auth,
-        organizations: Arc::new(OrganizationService::new(db.clone())),
-        projects: Arc::new(ProjectService::new(db.clone())),
+        api_tokens: Arc::new(ApiTokenService::new(db.clone())),
+        token_api: Arc::new(TokenApi::new(
+            organizations.clone(),
+            projects.clone(),
+            connections.clone(),
+        )),
+        organizations,
+        projects,
         connections,
         studio_access,
         dokploy,

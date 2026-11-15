@@ -11,6 +11,7 @@ use supabase_dashboard_domain::{
     account::{AccountSummary, AdminAccountSummary, SessionSummary},
     admin::RegisteredResources,
     adoption::{AdoptableServices, AdoptionPreview},
+    api_token::{ApiTokenSummary, IssuedApiToken},
     audit::AuditLogPage,
     authority::ProjectTrust,
     authz::OrgRole,
@@ -90,6 +91,7 @@ mod org_context {
 
     use leptos::prelude::use_context;
     use supabase_dashboard_application::{
+        api_tokens::ApiTokenService,
         auth::{AuthService, CurrentSession, RequestContext},
         connections::ConnectionService,
         dokploy::DokployService,
@@ -115,6 +117,13 @@ mod org_context {
     pub fn auth() -> Result<Arc<AuthService>, AppError> {
         use_context::<Arc<AuthService>>().ok_or_else(|| {
             tracing::error!("auth service is not configured");
+            AppError::Unavailable
+        })
+    }
+
+    pub fn api_tokens() -> Result<Arc<ApiTokenService>, AppError> {
+        use_context::<Arc<ApiTokenService>>().ok_or_else(|| {
+            tracing::error!("API token service is not configured");
             AppError::Unavailable
         })
     }
@@ -913,6 +922,56 @@ pub async fn revoke_other_sessions() -> Result<u64, AppError> {
     let audit = org_context::AuditContext::current();
     Ok(org_context::auth()?
         .revoke_other_sessions(&session, audit.get())
+        .await?)
+}
+
+/// The operator's own API tokens, newest first. Never the tokens themselves.
+#[server]
+pub async fn list_api_tokens() -> Result<Vec<ApiTokenSummary>, AppError> {
+    let session = org_context::session()?;
+    Ok(org_context::api_tokens()?.list(&session).await?)
+}
+
+/// Creates an API token for the operator's own account. The answer holds
+/// the only copy of the token.
+#[server]
+pub async fn create_api_token(
+    name: String,
+    lifetime: String,
+    #[server(default)] organizations_read: bool,
+    #[server(default)] projects_read: bool,
+) -> Result<IssuedApiToken, AppError> {
+    use supabase_dashboard_domain::api_token::ApiTokenScope;
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    let scopes: Vec<String> = [
+        (organizations_read, ApiTokenScope::OrganizationsRead),
+        (projects_read, ApiTokenScope::ProjectsRead),
+    ]
+    .into_iter()
+    .filter(|(ticked, _)| *ticked)
+    .map(|(_, scope)| scope.as_str().to_owned())
+    .collect();
+    Ok(org_context::api_tokens()?
+        .create(
+            &session,
+            supabase_dashboard_application::api_tokens::NewToken {
+                name: &name,
+                lifetime: &lifetime,
+                scopes: &scopes,
+            },
+            audit.get(),
+        )
+        .await?)
+}
+
+/// Revokes one of the operator's own API tokens.
+#[server]
+pub async fn revoke_api_token(token_id: Uuid) -> Result<(), AppError> {
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    Ok(org_context::api_tokens()?
+        .revoke(&session, token_id, audit.get())
         .await?)
 }
 

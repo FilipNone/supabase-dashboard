@@ -1,4 +1,5 @@
-//! The signed-in operator's own account: profile and security.
+//! The signed-in operator's own account: profile, security, API tokens, and
+//! audit log.
 //!
 //! These pages only ever act on the operator's own account; the server
 //! takes the account from the session, never from the request.
@@ -32,6 +33,7 @@ pub fn AccountLayout() -> impl IntoView {
         <nav class="tabs" aria-label="Account">
             <A href="/dashboard/account/me" attr:class="tab">"Profile"</A>
             <A href="/dashboard/account/security" attr:class="tab">"Security"</A>
+            <A href="/dashboard/account/tokens" attr:class="tab">"API tokens"</A>
             <A href="/dashboard/account/audit" attr:class="tab">"Audit log"</A>
         </nav>
         <Outlet/>

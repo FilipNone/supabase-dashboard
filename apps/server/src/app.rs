@@ -25,7 +25,7 @@ use tower_http::{
     trace::TraceLayer,
 };
 
-use crate::{access_export, error, health, session, state::AppState, studio};
+use crate::{access_export, api, error, health, session, state::AppState, studio};
 
 pub struct HttpLimits {
     pub max_body_bytes: usize,
@@ -48,6 +48,7 @@ pub fn router(state: AppState, limits: &HttpLimits) -> Router {
     let dokploy = state.dokploy.clone();
     let provisioning = state.provisioning.clone();
     let auth = state.auth.clone();
+    let api_tokens = state.api_tokens.clone();
     let leptos_options = state.leptos_options.clone();
     let x_request_id = HeaderName::from_static("x-request-id");
     // Studio hosts get their own routes, body limit, and timeout.
@@ -77,6 +78,7 @@ pub fn router(state: AppState, limits: &HttpLimits) -> Router {
             "/dashboard/project/{project_id}/studio-access.csv",
             get(access_export::studio_access_csv_download),
         )
+        .merge(api::router())
         .route("/api/{*rest}", any(error::api_not_found))
         .leptos_routes_with_context(
             &state,
@@ -90,6 +92,7 @@ pub fn router(state: AppState, limits: &HttpLimits) -> Router {
                 provide_context(dokploy.clone());
                 provide_context(provisioning.clone());
                 provide_context(auth.clone());
+                provide_context(api_tokens.clone());
             },
             move || shell(leptos_options.clone()),
         )
@@ -178,6 +181,7 @@ mod tests {
     use secrecy::SecretString;
     use supabase_dashboard_adapters::net::TargetPolicy;
     use supabase_dashboard_application::{
+        api_tokens::{ApiTokenService, TokenApi},
         auth::{AuthConfig, AuthService},
         connections::ConnectionService,
         organizations::OrganizationService,
@@ -191,16 +195,17 @@ mod tests {
         server_fns::{
             AcceptStackVariables, AdminListAccounts, AdminSetAccountDisabled, AdoptDokployService,
             ChangePassword, CheckProjectHealth, ClearDokployPlacement, ConfirmDokployPlacement,
-            ConnectDokploy, CreateInvitation, CreateOrganization, DisconnectDokploy,
-            GetAdoptableServices, GetAdoptionPreview, GetCurrentAccount, GetDokployConnection,
-            GetDokployPlacement, GetInstallationHealth, GetOrganization, GetOrganizationAuditLog,
-            GetProject, GetProjectAuthorities, GetProjectCredentials, GetProjectDeployment,
-            GetProjectHealth, GetProvisionJob, GetProvisionTargets, GetStackSettings,
-            GetStudioAccessLog, ListOrganizations, ListProjects, ListProvisionJobs, ListSessions,
-            PreviewInvitation, PreviewStackSettings, QueueStackAction, QueueStackRemoval,
-            QueueStackSettings, RegisterProject, RemoveProjectAuthorities, RemoveProjectCredential,
-            RenameOrganization, ReplaceDokployKey, ReplaceProjectAuthorities,
-            ReplaceProjectCredential, ReplaceStudioLogin, RevokeSession, SignUpWithInvitation,
+            ConnectDokploy, CreateApiToken, CreateInvitation, CreateOrganization,
+            DisconnectDokploy, GetAdoptableServices, GetAdoptionPreview, GetCurrentAccount,
+            GetDokployConnection, GetDokployPlacement, GetInstallationHealth, GetOrganization,
+            GetOrganizationAuditLog, GetProject, GetProjectAuthorities, GetProjectCredentials,
+            GetProjectDeployment, GetProjectHealth, GetProvisionJob, GetProvisionTargets,
+            GetStackSettings, GetStudioAccessLog, ListApiTokens, ListOrganizations, ListProjects,
+            ListProvisionJobs, ListSessions, PreviewInvitation, PreviewStackSettings,
+            QueueStackAction, QueueStackRemoval, QueueStackSettings, RegisterProject,
+            RemoveProjectAuthorities, RemoveProjectCredential, RenameOrganization,
+            ReplaceDokployKey, ReplaceProjectAuthorities, ReplaceProjectCredential,
+            ReplaceStudioLogin, RevokeApiToken, RevokeSession, SignUpWithInvitation,
             StartProvisioning, UnregisterProject, UpdateProfile,
         },
     };
@@ -267,25 +272,33 @@ mod tests {
             .unwrap();
         let studio_access = Arc::new(StudioAccessService::new(db.clone(), access_log_days));
         let dokploy = dokploy_service(&db, cipher.clone(), dokploy_policy);
+        let organizations = Arc::new(OrganizationService::new(db.clone()));
+        let projects = Arc::new(ProjectService::new(db.clone()));
+        let connections = Arc::new(ConnectionService::new(
+            db.clone(),
+            cipher.clone(),
+            supabase_dashboard_adapters::gateway::GatewayProbe::shared(Default::default()).unwrap(),
+        ));
         let state = AppState {
             leptos_options: LeptosOptions::builder()
                 .output_name("supabase-dashboard")
                 .site_root("target/site")
                 .build(),
-            organizations: Arc::new(OrganizationService::new(db.clone())),
-            projects: Arc::new(ProjectService::new(db.clone())),
+            api_tokens: Arc::new(ApiTokenService::new(db.clone())),
+            token_api: Arc::new(TokenApi::new(
+                organizations.clone(),
+                projects.clone(),
+                connections.clone(),
+            )),
+            organizations,
+            projects,
             provisioning: Arc::new(ProvisioningService::new(
                 db.clone(),
-                cipher.clone(),
+                cipher,
                 Arc::clone(&dokploy),
             )),
             dokploy,
-            connections: Arc::new(ConnectionService::new(
-                db.clone(),
-                cipher,
-                supabase_dashboard_adapters::gateway::GatewayProbe::shared(Default::default())
-                    .unwrap(),
-            )),
+            connections,
             db,
             readiness_timeout: Duration::from_secs(1),
             auth: Arc::new(auth),
@@ -455,7 +468,7 @@ mod tests {
     #[tokio::test]
     async fn api_paths_need_a_session() {
         let router = offline_router().await;
-        let (parts, body) = send(&router, get("/api/v1/does-not-exist")).await;
+        let (parts, body) = send(&router, get("/api/does-not-exist")).await;
         assert_eq!(parts.status, StatusCode::UNAUTHORIZED);
         assert_eq!(parts.headers[header::CONTENT_TYPE], "application/json");
         assert_eq!(
@@ -464,6 +477,10 @@ mod tests {
         );
         let (parts, _) = send(&router, form_post(GetInstallationHealth::PATH, "", None)).await;
         assert_eq!(parts.status, StatusCode::UNAUTHORIZED);
+        // The token API is outside the session guard: an unknown path there
+        // is a plain not-found, never a sign-in prompt.
+        let (parts, _) = send(&router, get("/api/v1/does-not-exist")).await;
+        assert_eq!(parts.status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -1839,6 +1856,17 @@ mod tests {
             db: db.clone(),
             readiness_timeout: Duration::from_secs(1),
             auth: Arc::new(auth),
+            api_tokens: Arc::new(ApiTokenService::new(db.clone())),
+            token_api: Arc::new(TokenApi::new(
+                Arc::new(OrganizationService::new(db.clone())),
+                Arc::new(ProjectService::new(db.clone())),
+                Arc::new(ConnectionService::new(
+                    db.clone(),
+                    None,
+                    supabase_dashboard_adapters::gateway::GatewayProbe::shared(Default::default())
+                        .unwrap(),
+                )),
+            )),
             cookie: CookieSettings::new(false, 3600),
             expected_origin: None,
             studio: Some(Arc::new(gateway)),
@@ -3180,6 +3208,221 @@ mod tests {
                 ("dokploy.placement_confirm", "failure"),
                 ("dokploy.disconnect", "success"),
             ]
+        );
+
+        db.close().await;
+        scratch.drop().await;
+    }
+
+    fn bearer_get(path: &str, authorization: &str) -> Request<Body> {
+        Request::get(path)
+            .header(header::HOST, HOST)
+            .header(header::AUTHORIZATION, authorization)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_token_api_answers_only_bearer_tokens() {
+        let Some(scratch) = ScratchDb::create("http_api_tokens").await else {
+            return;
+        };
+        let db = Database::connect(&scratch.settings).await.unwrap();
+        db.migrate().await.unwrap();
+        let router = router_for(db.clone()).await;
+        AuthService::new(db.clone(), AuthConfig::default())
+            .await
+            .unwrap()
+            .bootstrap_owner(
+                "alice@example.test",
+                "Alice",
+                &SecretString::from("correct horse battery staple"),
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO accounts (id, email, display_name, password_hash) \
+             SELECT gen_random_uuid(), 'bob@example.test', 'Bob', password_hash FROM accounts",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let alice = sign_in_cookie(&router, "alice%40example.test").await;
+        let bob = sign_in_cookie(&router, "bob%40example.test").await;
+        let call = |path: &'static str, body: String, cookie: &str| {
+            send(&router, form_post(path, &body, Some(cookie)))
+        };
+        let json = |body: &str| serde_json::from_str::<serde_json::Value>(body).unwrap();
+
+        let (_, body) = call(CreateOrganization::PATH, "name=Acme".into(), &alice).await;
+        let acme = json(&body)["id"].as_str().unwrap().to_owned();
+        let (_, body) = call(
+            RegisterProject::PATH,
+            format!("organization_id={acme}&name=Shop&api_url=https%3A%2F%2Fshop.example.test"),
+            &alice,
+        )
+        .await;
+        let shop = json(&body)["id"].as_str().unwrap().to_owned();
+        call(CreateOrganization::PATH, "name=Globex".into(), &bob).await;
+
+        let create = |cookie: &str, scopes: &str| {
+            call(
+                CreateApiToken::PATH,
+                format!("name=Script&lifetime=30{scopes}"),
+                cookie,
+            )
+        };
+        let (parts, body) = create(&alice, "&organizations_read=true&projects_read=true").await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        let issued = json(&body);
+        let full = issued["secret"].as_str().unwrap().to_owned();
+        let full_id = issued["token"]["id"].as_str().unwrap().to_owned();
+        assert!(full.starts_with("sbd_"), "{full}");
+        let (_, body) = create(&alice, "&organizations_read=true").await;
+        let orgs_only = json(&body)["secret"].as_str().unwrap().to_owned();
+        let (_, body) = create(&bob, "&organizations_read=true&projects_read=true").await;
+        let bob_token = json(&body)["secret"].as_str().unwrap().to_owned();
+        let (parts, body) = create(&alice, "").await;
+        assert_eq!(parts.status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+        // No token, a session cookie, another scheme, and a made-up token
+        // get the same 401 with a Bearer challenge.
+        let made_up = format!("Bearer sbd_{}", "ab".repeat(32));
+        let mut refusals = Vec::new();
+        for request in [
+            get("/api/v1/organizations"),
+            get_with_cookie("/api/v1/organizations", &alice),
+            bearer_get("/api/v1/organizations", "Basic YWxpY2U6cHc="),
+            bearer_get("/api/v1/organizations", &made_up),
+            bearer_get("/api/v1/organizations", &format!("Bearer {}", &full[4..])),
+        ] {
+            let (parts, body) = send(&router, request).await;
+            assert_eq!(parts.status, StatusCode::UNAUTHORIZED, "{body}");
+            assert!(
+                parts.headers[header::WWW_AUTHENTICATE]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("Bearer"),
+            );
+            refusals.push(body);
+        }
+        assert!(refusals.windows(2).all(|pair| pair[0] == pair[1]));
+        assert!(refusals[0].contains("invalid_token"), "{}", refusals[0]);
+
+        // Alice's token reads her organizations and projects.
+        let bearer = format!("Bearer {full}");
+        let (parts, body) = send(&router, bearer_get("/api/v1/organizations", &bearer)).await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        assert_eq!(parts.headers[header::CACHE_CONTROL], "no-store");
+        let orgs = json(&body);
+        assert_eq!(orgs["organizations"].as_array().unwrap().len(), 1);
+        assert_eq!(orgs["organizations"][0]["name"], "Acme");
+        assert_eq!(orgs["organizations"][0]["role"], "owner");
+        let projects_path = format!("/api/v1/organizations/{acme}/projects");
+        let (parts, body) = send(&router, bearer_get(&projects_path, &bearer)).await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        let projects = json(&body);
+        assert_eq!(projects["projects"][0]["name"], "Shop");
+        assert_eq!(
+            projects["projects"][0]["api_url"],
+            "https://shop.example.test"
+        );
+        assert!(projects["projects"][0]["last_check"].is_null());
+        let project_path = format!("/api/v1/projects/{shop}");
+        let (parts, body) = send(&router, bearer_get(&project_path, &bearer)).await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        assert_eq!(json(&body)["project"]["organization_id"], acme.as_str());
+        assert!(!body.contains("key"), "{body}");
+
+        // A token without the scope gets 403 naming it.
+        let (parts, body) = send(
+            &router,
+            bearer_get(&projects_path, &format!("Bearer {orgs_only}")),
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body.contains("insufficient_scope"), "{body}");
+        assert!(
+            parts.headers[header::WWW_AUTHENTICATE]
+                .to_str()
+                .unwrap()
+                .contains("scope=\"projects:read\"")
+        );
+
+        // Bob's token gets the same 404 for Alice's organization and
+        // project as for ones that do not exist.
+        let bob_bearer = format!("Bearer {bob_token}");
+        let made_up_id = uuid::Uuid::now_v7();
+        let mut missing = Vec::new();
+        for path in [
+            projects_path.clone(),
+            project_path.clone(),
+            format!("/api/v1/organizations/{made_up_id}/projects"),
+            format!("/api/v1/projects/{made_up_id}"),
+            "/api/v1/projects/not-a-uuid".to_owned(),
+        ] {
+            let (parts, body) = send(&router, bearer_get(&path, &bob_bearer)).await;
+            assert_eq!(parts.status, StatusCode::NOT_FOUND, "{path}: {body}");
+            assert!(!body.contains("Shop") && !body.contains("Acme"), "{body}");
+            missing.push(body);
+        }
+        assert!(missing.windows(2).all(|pair| pair[0] == pair[1]));
+
+        // Only GET: a same-origin POST with a token changes nothing.
+        let post = Request::post("/api/v1/organizations")
+            .header(header::HOST, HOST)
+            .header(header::ORIGIN, ORIGIN)
+            .header(header::AUTHORIZATION, &bearer)
+            .body(Body::empty())
+            .unwrap();
+        let (parts, _) = send(&router, post).await;
+        assert_eq!(parts.status, StatusCode::METHOD_NOT_ALLOWED);
+
+        // The list and the page never show the token again.
+        let (parts, body) = call(ListApiTokens::PATH, String::new(), &alice).await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        assert!(
+            body.contains(&full[..12]) && !body.contains(&full[12..]),
+            "{body}"
+        );
+        let (parts, body) = send(
+            &router,
+            get_with_cookie("/dashboard/account/tokens", &alice),
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::OK);
+        assert!(body.contains("Create an API token"), "{body}");
+        assert!(
+            body.contains("Script") && !body.contains(&full[12..]),
+            "{body}"
+        );
+        let (parts, _) = send(&router, get("/dashboard/account/tokens")).await;
+        assert_eq!(parts.status, StatusCode::SEE_OTHER);
+
+        // Bob cannot revoke Alice's token; Alice can, and it stops working.
+        let (parts, _) = call(RevokeApiToken::PATH, format!("token_id={full_id}"), &bob).await;
+        assert_eq!(parts.status, StatusCode::NOT_FOUND);
+        let (parts, _) = send(&router, bearer_get("/api/v1/organizations", &bearer)).await;
+        assert_eq!(parts.status, StatusCode::OK);
+        let (parts, _) = call(RevokeApiToken::PATH, format!("token_id={full_id}"), &alice).await;
+        assert_eq!(parts.status, StatusCode::OK);
+        let (parts, body) = send(&router, bearer_get("/api/v1/organizations", &bearer)).await;
+        assert_eq!(parts.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body, refusals[0]);
+
+        // The audit log has both changes, never the token.
+        let events: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT action, target_id FROM audit_events WHERE action LIKE 'api_token.%' \
+             ORDER BY occurred_at",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(events.len(), 4);
+        assert!(
+            events
+                .iter()
+                .all(|(_, target)| !target.as_deref().unwrap_or_default().contains("sbd_"))
         );
 
         db.close().await;

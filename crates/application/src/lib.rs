@@ -4,6 +4,7 @@
 //!
 //! Server-only: this crate must never be a dependency of the browser build.
 
+pub mod api_tokens;
 pub mod auth;
 pub mod connections;
 pub mod dokploy;

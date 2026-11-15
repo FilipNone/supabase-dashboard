@@ -5,6 +5,7 @@
 
 pub mod accounts;
 pub mod admin;
+pub mod api_tokens;
 pub mod audit;
 pub mod connections;
 pub mod dokploy;

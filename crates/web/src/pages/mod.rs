@@ -4,6 +4,7 @@ mod admin_dokploy;
 mod admin_dokploy_placement;
 mod admin_dokploy_targets;
 pub mod adopt;
+pub mod api_tokens;
 pub mod audit;
 mod health_chart;
 mod integrations;

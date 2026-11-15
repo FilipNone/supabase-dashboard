@@ -3,9 +3,14 @@ use std::{sync::Arc, time::Duration};
 use axum::extract::FromRef;
 use leptos::config::LeptosOptions;
 use supabase_dashboard_application::{
-    auth::AuthService, connections::ConnectionService, dokploy::DokployService,
-    organizations::OrganizationService, projects::ProjectService,
-    provisioning::ProvisioningService, studio_access::StudioAccessService,
+    api_tokens::{ApiTokenService, TokenApi},
+    auth::AuthService,
+    connections::ConnectionService,
+    dokploy::DokployService,
+    organizations::OrganizationService,
+    projects::ProjectService,
+    provisioning::ProvisioningService,
+    studio_access::StudioAccessService,
 };
 use supabase_dashboard_persistence::Database;
 
@@ -17,6 +22,10 @@ pub struct AppState {
     pub db: Database,
     pub readiness_timeout: Duration,
     pub auth: Arc<AuthService>,
+    /// Creates, lists, and revokes API tokens, and resolves bearer tokens.
+    pub api_tokens: Arc<ApiTokenService>,
+    /// The reads the token API offers.
+    pub token_api: Arc<TokenApi>,
     pub organizations: Arc<OrganizationService>,
     pub projects: Arc<ProjectService>,
     pub connections: Arc<ConnectionService>,
