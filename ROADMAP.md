@@ -211,6 +211,7 @@ Release checks include a fresh installation, Studio access tests for each role, 
 
 ## Revision history
 
+- 2026-11-15: released `v0.3.0-dev.2` with the organization and account audit logs and the Integrations tab.
 - 2026-11-15: M6 audit views: organization and account audit logs. M6 integrations: the organization's Integrations tab shows Dokploy and the organization's targets.
 - 2026-11-15: released `v0.3.0-dev.1`, the first release that provisions stacks through Dokploy: placement detection, allowed targets, the provisioning job, stop, start, redeploy, remove and destroy, stack settings with tracking of variables edited in Dokploy, adoption of existing services, and the failed jobs table for installation admins.
 - 2026-11-13: M4 adoption started: owners and admins can adopt a Supabase compose service from an allowed Dokploy environment as a project, copying its keys only when asked.
