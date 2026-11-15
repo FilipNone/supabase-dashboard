@@ -636,6 +636,7 @@ async fn only_installation_admins_manage_accounts() {
         target_id: None,
         outcome: AuditOutcome::Success,
         request_id: None,
+        organization_id: None,
     };
     assert_eq!(
         db.set_account_disabled(owner.account.id, true, &event)

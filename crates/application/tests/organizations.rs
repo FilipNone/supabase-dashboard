@@ -377,6 +377,7 @@ async fn membership_count_is_capped() {
         target_id: None,
         outcome: AuditOutcome::Success,
         request_id: None,
+        organization_id: None,
     };
     let name = supabase_dashboard_domain::organization::OrganizationName::parse("Acme").unwrap();
     let mut outcomes = Vec::new();

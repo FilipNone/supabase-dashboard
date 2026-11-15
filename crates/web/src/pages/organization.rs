@@ -98,6 +98,10 @@ pub fn OrganizationLayout() -> impl IntoView {
                                     <A href=base.clone() exact=true attr:class="tab">"Projects"</A>
                                     <A href=format!("{base}/general") attr:class="tab">"General"</A>
                                     <A href=format!("{base}/team") attr:class="tab">"Team"</A>
+                                    <A href=format!("{base}/integrations") attr:class="tab">"Integrations"</A>
+                                    {org.role.allows(Permission::AuditRead).then(|| view! {
+                                        <A href=format!("{base}/audit") attr:class="tab">"Audit log"</A>
+                                    })}
                                 </nav>
                                 <Outlet/>
                             }
@@ -117,6 +121,42 @@ pub fn OrganizationLayout() -> impl IntoView {
             }}
         </Transition>
     }
+}
+
+/// The providers the organization's projects use.
+#[component]
+pub fn OrganizationIntegrationsPage() -> impl IntoView {
+    let Some(ctx) = use_context::<OrgContext>() else {
+        return ().into_any();
+    };
+    view! {
+        <Title text="Integrations"/>
+        {move || loaded_org(ctx).map(|org| view! {
+            <crate::pages::integrations::DokployIntegration
+                organization_id=org.id
+                can_create=crate::pages::integrations::can_see_targets(org.role)
+            />
+        })}
+    }
+    .into_any()
+}
+
+/// The organization's audit log, for owners and admins. The tab is shown
+/// only to them; the server refuses everyone else.
+#[component]
+pub fn OrganizationAuditPage() -> impl IntoView {
+    let Some(ctx) = use_context::<OrgContext>() else {
+        return ().into_any();
+    };
+    view! {
+        <Title text="Audit log"/>
+        {move || ctx.id.get().map(|id| view! {
+            <crate::pages::audit::AuditLogPanel
+                subject=crate::pages::audit::AuditLogSubject::Organization(id)
+            />
+        })}
+    }
+    .into_any()
 }
 
 fn loaded_org(ctx: OrgContext) -> Option<OrganizationSummary> {

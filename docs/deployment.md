@@ -147,6 +147,8 @@ The project page warns every member until a Studio login is saved.
 
 `reset-password` signs the account out everywhere. Keep backups outside the server and treat them as secrets: they contain session hashes, password hashes, audit records, and the encrypted API keys of registered stacks. Keep `secret.key` in a different place from the dumps.
 
+The audit log records sign-ins, membership and role changes, project and stack changes, and refused attempts, without passwords, keys, or project data. Owners and admins read their organization's events on its Audit log tab, and every operator reads their own under Account, Audit log. Events are kept until the metadata database is cleaned by hand; there is no retention limit yet.
+
 ### Replacing the encryption key
 
 The dashboard can read stored keys under an old encryption key while it moves them to a new one, so the stacks stay reachable during the change. Run these steps in the directory that holds `compose.yaml`:

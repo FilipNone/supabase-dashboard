@@ -10,12 +10,13 @@ use supabase_dashboard_domain::{
         check_new_password,
     },
     admin::{ADMIN_RESOURCE_LIST_LIMIT, RegisteredResources},
+    audit::{AUDIT_PAGE, AuditLogPage},
     invitation::InvitationPreview,
 };
 use supabase_dashboard_persistence::{
     Database, PersistenceError,
     accounts::{AccountRecord, NewAccount, SetDisabledOutcome},
-    audit::{AuditEvent, AuditOutcome},
+    audit::{AuditEvent, AuditOutcome, AuditScope},
     invitations::AcceptNewAccountOutcome,
     sessions::NewSession,
 };
@@ -283,6 +284,7 @@ impl AuthService {
                     target_id: Some(id.to_string()),
                     outcome: AuditOutcome::Success,
                     request_id: None,
+                    organization_id: None,
                 },
             )
             .await
@@ -425,6 +427,32 @@ impl AuthService {
         Ok(())
     }
 
+    /// One page of the account's own audit log, newest first: what the
+    /// account did, and what was done to it, such as failed sign-ins or an
+    /// administrator disabling it. Only ever the signed-in account's.
+    pub async fn account_audit_log(
+        &self,
+        current: &CurrentSession,
+        before: Option<Uuid>,
+    ) -> Result<AuditLogPage, AuthError> {
+        let (entries, older) = crate::organizations::audit_page(
+            self.db
+                .list_audit_events(
+                    AuditScope::Account(current.account.id),
+                    None,
+                    before,
+                    AUDIT_PAGE.saturating_add(1),
+                )
+                .await?,
+        );
+        Ok(AuditLogPage {
+            entries,
+            older,
+            members: Vec::new(),
+            more_members: false,
+        })
+    }
+
     /// The operator's live sessions, newest first, with the one making
     /// this request marked.
     pub async fn list_sessions(
@@ -478,6 +506,7 @@ impl AuthService {
             target_id: Some(account.id.to_string()),
             outcome: AuditOutcome::Success,
             request_id: None,
+            organization_id: None,
         };
         match self
             .db
@@ -581,6 +610,7 @@ impl AuthService {
             target_id: Some(account_id.to_string()),
             outcome: AuditOutcome::Success,
             request_id: ctx.request_id,
+            organization_id: None,
         };
         match self
             .db
@@ -637,6 +667,7 @@ impl AuthService {
             target_id: Some(current.account.id.to_string()),
             outcome: AuditOutcome::Success,
             request_id: ctx.request_id,
+            organization_id: None,
         };
         if !self
             .db
@@ -695,6 +726,7 @@ impl AuthService {
             target_id: Some(current.account.id.to_string()),
             outcome: AuditOutcome::Success,
             request_id: ctx.request_id,
+            organization_id: None,
         };
         self.db
             .change_password(
@@ -822,6 +854,7 @@ impl AuthService {
                 target_id: Some(account_id.to_string()),
                 outcome: AuditOutcome::Success,
                 request_id: ctx.request_id,
+                organization_id: None,
             },
             AuditEvent {
                 actor_account_id: Some(account_id),
@@ -830,6 +863,7 @@ impl AuthService {
                 target_id: Some(invitation.id.to_string()),
                 outcome: AuditOutcome::Success,
                 request_id: ctx.request_id,
+                organization_id: None,
             },
         ];
         let outcome = self
@@ -891,6 +925,7 @@ impl AuthService {
             target_id: target.map(|(_, id)| id.to_string()),
             outcome,
             request_id: ctx.request_id,
+            organization_id: None,
         };
         if let Err(err) = self.db.record_audit_event(&event).await {
             tracing::error!(error = %err, action, "could not record audit event");

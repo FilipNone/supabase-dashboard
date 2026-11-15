@@ -1,6 +1,6 @@
 # Supabase Dashboard roadmap
 
-Updated: 2026-11-13
+Updated: 2026-11-15
 
 ## Goal and status
 
@@ -145,9 +145,9 @@ Acceptance: each page has tested authorized success, permission-denied, service-
 - [ ] Add dashboard email delivery for invitations and chosen account-recovery flows, initially SMTP and/or Resend through a replaceable adapter. Keep this distinct from a managed project's SMTP configuration.
 - [ ] Add organization SSO enforcement only after testing owner recovery, existing sessions, and lockout prevention.
 - [ ] Add GitHub project integration with least-privilege repository access, verified webhook signatures, and explicit deployment/migration permissions. Linking this source repository does not implement this product feature.
-- [ ] Show the Dokploy connection and each organization's allowed Dokploy targets on `/org/:org_id/integrations` next to the other providers. The Dokploy provider itself is M4 work.
+- [ ] Show the Dokploy connection and each organization's allowed Dokploy targets on `/org/:org_id/integrations` next to the other providers. The Dokploy provider itself is M4 work. (Started 2026-11-15: the organization's Integrations tab at `/dashboard/org/:org_id/integrations` has a Dokploy card. Owners and admins see whether Dokploy is connected and the environments new stacks can go to, with links to create or adopt a stack; other roles get a sentence saying who can see them, and the server refuses them. It reuses the create-stack form's server function, so the states match that form. Covered by an HTTP test of the not-connected state, and browser-checked at 1280 and 390 wide in both themes in that state only; the list of targets has not been seen in a browser against the Dokploy fixture.)
 - [ ] Add a DNS-provider adapter for previewed record changes, ownership checks, propagation status, and safe rollback. Select the first provider before implementation.
-- [ ] Add scoped/revocable dashboard API tokens, integration settings, and account/organization audit views.
+- [ ] Add scoped/revocable dashboard API tokens, integration settings, and account/organization audit views. (Started 2026-11-15: audit events now record the organization they belong to, named by the writer when the target is deleted in the same transaction and otherwise taken from the target; a migration fills it in for earlier events, except those about projects unregistered since. Owners and admins read their organization's events on the organization's Audit log tab at `/dashboard/org/:org_id/audit`, newest first, 50 per page, for everyone or one member; developers and viewers do not see the tab and the server refuses them, audited as `audit.read`. Every operator reads their own events and the events about their account, such as failed sign-ins with their email, under Account, Audit log. Covered by application tests for roles, isolation between organizations, a cursor from another organization, paging through events with equal times, the account scope, and the target lookup, and by an HTTP test. Browser-checked in Chromium at 1280 wide in the dark theme and 390 wide in the light theme: no page overflow, the table scrolls inside its region on a phone, and focus moves through the tabs, the filter, and the table. Missing: API tokens and integration settings.)
 
 Acceptance: each integration has documented credentials, scopes, version support, error handling, and disposable test coverage. Tokens stay server-side; webhook replay or a repository link alone cannot authorize arbitrary deployment commands.
 
@@ -211,6 +211,7 @@ Release checks include a fresh installation, Studio access tests for each role, 
 
 ## Revision history
 
+- 2026-11-15: M6 audit views: organization and account audit logs. M6 integrations: the organization's Integrations tab shows Dokploy and the organization's targets.
 - 2026-11-15: released `v0.3.0-dev.1`, the first release that provisions stacks through Dokploy: placement detection, allowed targets, the provisioning job, stop, start, redeploy, remove and destroy, stack settings with tracking of variables edited in Dokploy, adoption of existing services, and the failed jobs table for installation admins.
 - 2026-11-13: M4 adoption started: owners and admins can adopt a Supabase compose service from an allowed Dokploy environment as a project, copying its keys only when asked.
 - 2026-11-13: Stack settings warn that every exposed schema must exist: a redeploy with a missing schema leaves PostgREST unhealthy and fails, which a browser check hit by editing the variable in Dokploy.

@@ -108,6 +108,7 @@ impl StudioAccessService {
                 target_id: Some(project_id.to_string()),
                 outcome: AuditOutcome::Denied,
                 request_id: ctx.request_id,
+                organization_id: None,
             };
             if let Err(err) = self.db.record_audit_event(&denied).await {
                 tracing::error!(error = %err, "could not record audit event");
@@ -177,6 +178,7 @@ impl StudioAccessService {
             target_id: Some(project_id.to_string()),
             outcome,
             request_id: ctx.request_id,
+            organization_id: None,
         };
         if !access.role.allows(Permission::AuditRead) {
             if let Err(err) = self

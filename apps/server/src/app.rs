@@ -193,15 +193,15 @@ mod tests {
             ChangePassword, CheckProjectHealth, ClearDokployPlacement, ConfirmDokployPlacement,
             ConnectDokploy, CreateInvitation, CreateOrganization, DisconnectDokploy,
             GetAdoptableServices, GetAdoptionPreview, GetCurrentAccount, GetDokployConnection,
-            GetDokployPlacement, GetInstallationHealth, GetOrganization, GetProject,
-            GetProjectAuthorities, GetProjectCredentials, GetProjectDeployment, GetProjectHealth,
-            GetProvisionJob, GetProvisionTargets, GetStackSettings, GetStudioAccessLog,
-            ListOrganizations, ListProjects, ListProvisionJobs, ListSessions, PreviewInvitation,
-            PreviewStackSettings, QueueStackAction, QueueStackRemoval, QueueStackSettings,
-            RegisterProject, RemoveProjectAuthorities, RemoveProjectCredential, RenameOrganization,
-            ReplaceDokployKey, ReplaceProjectAuthorities, ReplaceProjectCredential,
-            ReplaceStudioLogin, RevokeSession, SignUpWithInvitation, StartProvisioning,
-            UnregisterProject, UpdateProfile,
+            GetDokployPlacement, GetInstallationHealth, GetOrganization, GetOrganizationAuditLog,
+            GetProject, GetProjectAuthorities, GetProjectCredentials, GetProjectDeployment,
+            GetProjectHealth, GetProvisionJob, GetProvisionTargets, GetStackSettings,
+            GetStudioAccessLog, ListOrganizations, ListProjects, ListProvisionJobs, ListSessions,
+            PreviewInvitation, PreviewStackSettings, QueueStackAction, QueueStackRemoval,
+            QueueStackSettings, RegisterProject, RemoveProjectAuthorities, RemoveProjectCredential,
+            RenameOrganization, ReplaceDokployKey, ReplaceProjectAuthorities,
+            ReplaceProjectCredential, ReplaceStudioLogin, RevokeSession, SignUpWithInvitation,
+            StartProvisioning, UnregisterProject, UpdateProfile,
         },
     };
     use tower::ServiceExt;
@@ -675,6 +675,38 @@ mod tests {
         assert!(!body.contains("Acme"), "{body}");
         let (_, body) = send(&router, get_with_cookie(&page, &alice)).await;
         assert!(body.contains("Acme Secret"), "{body}");
+
+        // The audit log: Alice reads her organization's events; Bob's
+        // request gets the same answer as for a made-up organization.
+        let (parts, body) = call(
+            GetOrganizationAuditLog::PATH,
+            format!("organization_id={acme_id}"),
+            &alice,
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        assert!(body.contains("organization.create"), "{body}");
+        for id in [&acme_id, &made_up] {
+            let (parts, body) = call(
+                GetOrganizationAuditLog::PATH,
+                format!("organization_id={id}"),
+                &bob,
+            )
+            .await;
+            assert_eq!(parts.status, StatusCode::NOT_FOUND, "{body}");
+        }
+        let audit_page = format!("/dashboard/org/{acme_id}/audit");
+        let (parts, body) = send(&router, get_with_cookie(&audit_page, &alice)).await;
+        assert_eq!(parts.status, StatusCode::OK);
+        assert!(body.contains("Created the organization"), "{body}");
+        let (_, body) = send(&router, get_with_cookie("/dashboard/account/audit", &bob)).await;
+        assert!(body.contains("Created the organization"), "{body}");
+
+        // The Integrations tab says Dokploy is not connected yet.
+        let page = format!("/dashboard/org/{acme_id}/integrations");
+        let (parts, body) = send(&router, get_with_cookie(&page, &alice)).await;
+        assert_eq!(parts.status, StatusCode::OK);
+        assert!(body.contains("Dokploy is not connected"), "{body}");
 
         // A cross-site form cannot rename it, even with Alice's cookie.
         let forged = Request::post(RenameOrganization::PATH)

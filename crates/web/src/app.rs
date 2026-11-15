@@ -8,13 +8,14 @@ use supabase_dashboard_domain::theme::ThemePreference;
 
 use crate::components::layout::DashboardLayout;
 use crate::pages::{
-    account::{AccountLayout, AccountProfilePage, AccountSecurityPage},
+    account::{AccountAuditPage, AccountLayout, AccountProfilePage, AccountSecurityPage},
     admin::AdminPage,
     adopt::AdoptStackPage,
     invite::InvitePage,
     not_found::NotFound,
     organization::{
-        OrganizationGeneralPage, OrganizationLayout, OrganizationProjectsPage, OrganizationTeamPage,
+        OrganizationAuditPage, OrganizationGeneralPage, OrganizationIntegrationsPage,
+        OrganizationLayout, OrganizationProjectsPage, OrganizationTeamPage,
     },
     organizations::OrganizationsPage,
     project::{
@@ -120,6 +121,7 @@ pub fn App() -> impl IntoView {
                     <ParentRoute path=path!("account") view=AccountLayout>
                         <Route path=path!("me") view=AccountProfilePage/>
                         <Route path=path!("security") view=AccountSecurityPage/>
+                        <Route path=path!("audit") view=AccountAuditPage/>
                     </ParentRoute>
                     <ParentRoute path=path!("org/:org_id/projects/:project_id") view=ProjectLayout>
                         <Route path=path!("") view=ProjectOverviewPage/>
@@ -130,6 +132,8 @@ pub fn App() -> impl IntoView {
                         <Route path=path!("") view=OrganizationProjectsPage/>
                         <Route path=path!("general") view=OrganizationGeneralPage/>
                         <Route path=path!("team") view=OrganizationTeamPage/>
+                        <Route path=path!("integrations") view=OrganizationIntegrationsPage/>
+                        <Route path=path!("audit") view=OrganizationAuditPage/>
                         <Route path=path!("provisioning/:job_id") view=ProvisionJobPage/>
                     </ParentRoute>
                     <Route path=path!("new/:org_id") view=NewProjectPage/>

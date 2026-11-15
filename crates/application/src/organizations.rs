@@ -8,6 +8,7 @@
 
 use supabase_dashboard_domain::{
     account::{AccountInputError, Email},
+    audit::{AUDIT_MEMBER_CHOICES, AUDIT_PAGE, AuditEntry, AuditLogPage},
     authz::{MembershipChange, MembershipError, OrgRole, Permission, check_membership_change},
     invitation::{
         INVITATION_LIFETIME, InvitationCode, InvitationSummary, IssuedInvitation,
@@ -20,7 +21,7 @@ use supabase_dashboard_domain::{
 };
 use supabase_dashboard_persistence::{
     Database, PersistenceError,
-    audit::{AuditEvent, AuditOutcome},
+    audit::{AuditEvent, AuditOutcome, AuditScope},
     invitations::{AcceptOutcome, InvitationChangeOutcome, NewInvitation},
     organizations::{CreateOrganizationOutcome, Membership, MembershipChangeOutcome},
 };
@@ -556,6 +557,58 @@ impl OrganizationService {
         OrganizationError::InvitationInvalid
     }
 
+    /// One page of the organization's audit log, newest first, for its
+    /// owners and admins: the newest events, or those older than the event
+    /// `before`. With `member`, only that account's events. A member
+    /// without access is refused and audited as `audit.read`.
+    pub async fn audit_log(
+        &self,
+        current: &CurrentSession,
+        organization_id: Uuid,
+        member: Option<Uuid>,
+        before: Option<Uuid>,
+        ctx: RequestContext<'_>,
+    ) -> Result<AuditLogPage, OrganizationError> {
+        let membership = self
+            .db
+            .find_membership(organization_id, current.account.id)
+            .await?
+            .ok_or(OrganizationError::NotFound)?;
+        if !membership.role.allows(Permission::AuditRead) {
+            self.record(
+                current,
+                "audit.read",
+                ("organization", organization_id.to_string()),
+                AuditOutcome::Denied,
+                ctx,
+            )
+            .await;
+            return Err(OrganizationError::Forbidden);
+        }
+        let (entries, older) = audit_page(
+            self.db
+                .list_audit_events(
+                    AuditScope::Organization(organization_id),
+                    member,
+                    before,
+                    AUDIT_PAGE.saturating_add(1),
+                )
+                .await?,
+        );
+        let mut members = self
+            .db
+            .list_audit_actors(organization_id, AUDIT_MEMBER_CHOICES.saturating_add(1))
+            .await?;
+        let more_members = members.len() > usize::from(AUDIT_MEMBER_CHOICES);
+        members.truncate(usize::from(AUDIT_MEMBER_CHOICES));
+        Ok(AuditLogPage {
+            entries,
+            older,
+            members,
+            more_members,
+        })
+    }
+
     /// Records a refusal. Best effort: a failed write is logged.
     async fn record(
         &self,
@@ -569,6 +622,18 @@ impl OrganizationService {
         if let Err(err) = self.db.record_audit_event(&event).await {
             tracing::error!(error = %err, action, "could not record audit event");
         }
+    }
+}
+
+/// Splits a list fetched with one entry more than a page into the page and
+/// the cursor for the next one.
+pub(crate) fn audit_page(mut entries: Vec<AuditEntry>) -> (Vec<AuditEntry>, Option<Uuid>) {
+    if entries.len() > usize::from(AUDIT_PAGE) {
+        entries.truncate(usize::from(AUDIT_PAGE));
+        let older = entries.last().map(|entry| entry.id);
+        (entries, older)
+    } else {
+        (entries, None)
     }
 }
 
@@ -594,5 +659,6 @@ pub(crate) fn event<'a>(
         target_id: Some(target_id),
         outcome,
         request_id: ctx.request_id,
+        organization_id: None,
     }
 }

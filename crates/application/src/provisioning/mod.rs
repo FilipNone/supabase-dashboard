@@ -1172,6 +1172,7 @@ impl Step<'_> {
                     target_id: Some(project_id.to_string()),
                     outcome: AuditOutcome::Success,
                     request_id: None,
+                    organization_id: None,
                 }],
             )
             .await

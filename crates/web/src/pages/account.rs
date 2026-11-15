@@ -32,8 +32,18 @@ pub fn AccountLayout() -> impl IntoView {
         <nav class="tabs" aria-label="Account">
             <A href="/dashboard/account/me" attr:class="tab">"Profile"</A>
             <A href="/dashboard/account/security" attr:class="tab">"Security"</A>
+            <A href="/dashboard/account/audit" attr:class="tab">"Audit log"</A>
         </nav>
         <Outlet/>
+    }
+}
+
+/// The account's own audit log.
+#[component]
+pub fn AccountAuditPage() -> impl IntoView {
+    view! {
+        <Title text="Audit log"/>
+        <crate::pages::audit::AuditLogPanel subject=crate::pages::audit::AuditLogSubject::Account/>
     }
 }
 

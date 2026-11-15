@@ -795,6 +795,7 @@ async fn rotating_the_key_reseals_unfinished_jobs_secrets() {
             target_id: Some(job.to_string()),
             outcome: AuditOutcome::Success,
             request_id: None,
+            organization_id: None,
         },
     )
     .await

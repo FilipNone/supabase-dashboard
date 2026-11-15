@@ -435,6 +435,7 @@ fn organization_event<'a>(
         target_id: Some(organization_id.to_string()),
         outcome,
         request_id: ctx.request_id,
+        organization_id: None,
     }
 }
 
@@ -459,5 +460,6 @@ fn project_event<'a>(
         target_id,
         outcome,
         request_id: ctx.request_id,
+        organization_id: None,
     }
 }

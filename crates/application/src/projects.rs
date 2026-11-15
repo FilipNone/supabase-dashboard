@@ -13,7 +13,7 @@ use supabase_dashboard_domain::{
 };
 use supabase_dashboard_persistence::{
     Database, PersistenceError,
-    audit::AuditOutcome,
+    audit::{AuditEvent, AuditOutcome},
     projects::{CreateProjectOutcome, NewProject, ProjectAccess, ProjectRecord},
 };
 use time::OffsetDateTime;
@@ -261,7 +261,12 @@ impl ProjectService {
             .db
             .delete_project(
                 project_id,
-                &event(current, action, target, AuditOutcome::Success, ctx),
+                // The project row is gone when the event is written, so its
+                // organization cannot be looked up from the target.
+                &AuditEvent {
+                    organization_id: Some(access.project.organization_id),
+                    ..event(current, action, target, AuditOutcome::Success, ctx)
+                },
             )
             .await?;
         if deleted {

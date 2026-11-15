@@ -273,6 +273,7 @@ pub async fn reseal_credentials(
         target_id: Some(cipher.key_id().to_owned()),
         outcome: AuditOutcome::Success,
         request_id: None,
+        organization_id: None,
     })
     .await?;
     Ok(summary)

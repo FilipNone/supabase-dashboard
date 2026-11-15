@@ -139,7 +139,7 @@ pub fn NewStackPage() -> impl IntoView {
 }
 
 /// Why no stack can be created now, and who can change that.
-fn no_targets(targets: &ProvisionTargets) -> impl IntoView + use<> {
+pub(crate) fn no_targets(targets: &ProvisionTargets) -> impl IntoView + use<> {
     let (title, detail) = match targets {
         ProvisionTargets::NotConnected => (
             "Dokploy is not connected",

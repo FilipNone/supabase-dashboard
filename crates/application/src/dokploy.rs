@@ -914,6 +914,7 @@ fn deployment_event(
         target_id: Some(truncate(&url.host(), AUDIT_TARGET_MAX_CHARS).to_owned()),
         outcome,
         request_id: None,
+        organization_id: None,
     }
 }
 
@@ -935,6 +936,7 @@ fn service_event<'a>(
             .map(|service| format!("{}:{}", service.kind.as_str(), service.id.as_str())),
         outcome,
         request_id: ctx.request_id,
+        organization_id: None,
     }
 }
 
@@ -954,6 +956,7 @@ fn event<'a>(
         target_id: url.map(|url| truncate(&url.host(), AUDIT_TARGET_MAX_CHARS).to_owned()),
         outcome,
         request_id: ctx.request_id,
+        organization_id: None,
     }
 }
 

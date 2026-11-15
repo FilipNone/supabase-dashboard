@@ -11,6 +11,7 @@ use supabase_dashboard_domain::{
     account::{AccountSummary, AdminAccountSummary, SessionSummary},
     admin::RegisteredResources,
     adoption::{AdoptableServices, AdoptionPreview},
+    audit::AuditLogPage,
     authority::ProjectTrust,
     authz::OrgRole,
     connection::{
@@ -191,6 +192,21 @@ mod org_context {
             }
         }
     }
+}
+
+/// An organization's audit log, for owners and admins: the newest page, or
+/// the page older than event `before`; only `member`'s events when given.
+#[server]
+pub async fn get_organization_audit_log(
+    organization_id: Uuid,
+    member: Option<Uuid>,
+    before: Option<Uuid>,
+) -> Result<AuditLogPage, AppError> {
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    Ok(org_context::organizations()?
+        .audit_log(&session, organization_id, member, before, audit.get())
+        .await?)
 }
 
 /// Organizations the signed-in operator belongs to.
@@ -849,6 +865,16 @@ pub async fn change_password(
             &secrecy::SecretString::from(new_password.0),
             audit.get(),
         )
+        .await?)
+}
+
+/// The signed-in operator's own audit log: the newest page, or the page
+/// older than event `before`.
+#[server]
+pub async fn get_account_audit_log(before: Option<Uuid>) -> Result<AuditLogPage, AppError> {
+    let session = org_context::session()?;
+    Ok(org_context::auth()?
+        .account_audit_log(&session, before)
         .await?)
 }
 

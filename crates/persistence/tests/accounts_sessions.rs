@@ -29,6 +29,7 @@ fn bootstrap_event() -> AuditEvent<'static> {
         target_id: None,
         outcome: AuditOutcome::Success,
         request_id: None,
+        organization_id: None,
     }
 }
 
@@ -264,6 +265,7 @@ async fn audit_rejects_malformed_actions() {
     let long_request_id = "r".repeat(500);
     let ok = AuditEvent {
         request_id: Some(&long_request_id),
+        organization_id: None,
         ..bootstrap_event()
     };
     db.record_audit_event(&ok).await.unwrap();
