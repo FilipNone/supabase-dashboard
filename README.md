@@ -16,6 +16,10 @@ Development releases ship a prebuilt container image for linux/amd64 and linux/a
 
 See [docs/development.md](docs/development.md).
 
+## API
+
+Scripts can read organizations, projects, and their last health check with a scoped, read-only API token. See [docs/api.md](docs/api.md).
+
 ## License
 
 Licensed under either of
