@@ -331,11 +331,21 @@ mod tests {
         router_for(Database::connect_lazy(&settings).unwrap()).await
     }
 
+    /// Fails a request that takes this long instead of letting the test
+    /// hang, and names the path so a hang in CI points at its request.
+    const REQUEST_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
     async fn send(router: &Router, request: Request<Body>) -> (http::response::Parts, String) {
-        let response = router.clone().oneshot(request).await.unwrap();
-        let (parts, body) = response.into_parts();
-        let bytes = body.collect().await.unwrap().to_bytes();
-        (parts, String::from_utf8_lossy(&bytes).into_owned())
+        let target = format!("{} {}", request.method(), request.uri());
+        let exchange = async {
+            let response = router.clone().oneshot(request).await.unwrap();
+            let (parts, body) = response.into_parts();
+            let bytes = body.collect().await.unwrap().to_bytes();
+            (parts, String::from_utf8_lossy(&bytes).into_owned())
+        };
+        tokio::time::timeout(REQUEST_LIMIT, exchange)
+            .await
+            .unwrap_or_else(|_| panic!("{target} took longer than {REQUEST_LIMIT:?}"))
     }
 
     fn get(path: &str) -> Request<Body> {
