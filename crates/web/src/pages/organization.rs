@@ -13,7 +13,7 @@ use leptos_router::{
 use supabase_dashboard_domain::{
     authz::{OrgRole, Permission},
     connection::{HealthDigest, KeyExpiry},
-    invitation::{InvitationSummary, IssuedInvitation},
+    invitation::{InvitationDelivery, InvitationSummary, IssuedInvitation},
     organization::{MemberSummary, ORGANIZATION_NAME_MAX_CHARS, OrganizationSummary},
     project::ProjectSummary,
 };
@@ -691,14 +691,44 @@ fn InviteMember(org: OrganizationSummary) -> impl IntoView {
 #[component]
 fn IssuedLink(issued: IssuedInvitation) -> impl IntoView {
     let link = invitation_link(issued.code.expose());
+    let email = issued.invitation.email.as_str().to_owned();
+    // Whether the email went out, as the mail server answered. A failure is
+    // announced as an alert; the link below still works.
+    let delivery = match issued.delivery {
+        InvitationDelivery::Sent => view! {
+            <p class="form-ok" role="status">
+                {format!("Invitation created and emailed to {email}.")}
+            </p>
+        }
+        .into_any(),
+        InvitationDelivery::Failed => view! {
+            <p class="form-error" role="alert">
+                {format!(
+                    "The invitation was created, but the email to {email} could not be sent. \
+                     Send the link below yourself, or withdraw the invitation and try again later."
+                )}
+            </p>
+        }
+        .into_any(),
+        InvitationDelivery::NotConfigured => {
+            view! { <p class="form-ok" role="status">"Invitation created."</p> }.into_any()
+        }
+    };
+    let send = match issued.delivery {
+        InvitationDelivery::Sent => "You can also copy the link and send it yourself.",
+        InvitationDelivery::Failed => "Send this link to the invited address yourself.",
+        InvitationDelivery::NotConfigured => {
+            "Email is not set up on this dashboard, so send this link to the invited address \
+             yourself."
+        }
+    };
     let note = format!(
-        "Send this link to {} yourself; the dashboard does not send email yet. \
-         It is shown only once, works for that address only, and expires on {} (UTC).",
-        issued.invitation.email.as_str(),
+        "{send} It is shown only once, works for {email} only, and expires on {} (UTC).",
         issued.invitation.expires_at.date(),
     );
     view! {
-        <div class="issued-link" role="status">
+        <div class="issued-link">
+            {delivery}
             <label class="field">
                 <span class="field-label">"Invitation link"</span>
                 <input class="input mono" readonly value=link aria-describedby="issued-link-note"/>

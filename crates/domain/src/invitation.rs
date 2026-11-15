@@ -87,6 +87,21 @@ impl fmt::Debug for InvitationCode {
 pub struct IssuedInvitation {
     pub invitation: InvitationSummary,
     pub code: InvitationCode,
+    /// Whether the link was emailed to the invited address.
+    pub delivery: InvitationDelivery,
+}
+
+/// Whether the dashboard emailed a new invitation's link. The link is shown
+/// to the inviter in every case, so a failed email can be sent by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InvitationDelivery {
+    /// The server has no outgoing mail configured.
+    NotConfigured,
+    /// The mail server accepted the message.
+    Sent,
+    /// The mail server could not be reached, refused the message, or did
+    /// not answer in time.
+    Failed,
 }
 
 #[cfg(test)]

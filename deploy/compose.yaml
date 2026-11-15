@@ -43,6 +43,10 @@ services:
       # Encrypts the API keys of managed stacks. Back it up separately from
       # the database: without it, stored keys cannot be read.
       - secret_key
+      # With invitation email: also set SUPABASE_DASHBOARD_SMTP_PASSWORD_FILE
+      # to /run/secrets/smtp_password in .env and uncomment smtp_password here
+      # and under `secrets:` below.
+      # - smtp_password
     ports:
       # Loopback only by default; put an HTTPS reverse proxy in front.
       - "${SUPABASE_DASHBOARD_BIND:-127.0.0.1}:${SUPABASE_DASHBOARD_PORT:-3000}:3000"
@@ -76,6 +80,8 @@ services:
 secrets:
   secret_key:
     file: ./secret.key
+  # smtp_password:
+  #   file: ./smtp-password
 
 volumes:
   db-data:

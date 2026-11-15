@@ -11,8 +11,8 @@ use supabase_dashboard_domain::{
     audit::{AUDIT_MEMBER_CHOICES, AUDIT_PAGE, AuditEntry, AuditLogPage},
     authz::{MembershipChange, MembershipError, OrgRole, Permission, check_membership_change},
     invitation::{
-        INVITATION_LIFETIME, InvitationCode, InvitationSummary, IssuedInvitation,
-        MAX_OPEN_INVITATIONS_PER_ORGANIZATION, check_invitation,
+        INVITATION_LIFETIME, InvitationCode, InvitationDelivery, InvitationSummary,
+        IssuedInvitation, MAX_OPEN_INVITATIONS_PER_ORGANIZATION, check_invitation,
     },
     organization::{
         MAX_MEMBERS_PER_ORGANIZATION, MAX_ORGANIZATIONS_PER_ACCOUNT, MemberSummary,
@@ -30,6 +30,7 @@ use uuid::Uuid;
 
 use crate::{
     auth::{CurrentSession, RequestContext},
+    mail::{InvitationMail, InvitationMessage},
     token::{InvitationToken, RandomnessError},
 };
 
@@ -77,11 +78,20 @@ pub enum OrganizationError {
 
 pub struct OrganizationService {
     db: Database,
+    /// Emails new invitations when set.
+    mail: Option<InvitationMail>,
 }
 
 impl OrganizationService {
     pub const fn new(db: Database) -> Self {
-        Self { db }
+        Self { db, mail: None }
+    }
+
+    /// Emails each new invitation's link to the invited address.
+    #[must_use]
+    pub fn with_invitation_mail(mut self, mail: InvitationMail) -> Self {
+        self.mail = Some(mail);
+        self
     }
 
     /// Organizations the operator belongs to, by name.
@@ -362,20 +372,99 @@ impl OrganizationService {
             )
             .await?;
         match outcome {
-            InvitationChangeOutcome::Applied => Ok(IssuedInvitation {
-                invitation: InvitationSummary {
-                    id,
-                    email,
-                    role,
-                    invited_by: Some(current.account.display_name.clone()),
-                    expires_at,
-                },
-                code: InvitationCode::new(token.expose_code().to_owned()),
-            }),
+            InvitationChangeOutcome::Applied => {
+                let code = InvitationCode::new(token.expose_code().to_owned());
+                let delivery = self
+                    .email_invitation(
+                        current,
+                        organization_id,
+                        id,
+                        &email,
+                        role,
+                        &code,
+                        expires_at,
+                        ctx,
+                    )
+                    .await;
+                Ok(IssuedInvitation {
+                    invitation: InvitationSummary {
+                        id,
+                        email,
+                        role,
+                        invited_by: Some(current.account.display_name.clone()),
+                        expires_at,
+                    },
+                    code,
+                    delivery,
+                })
+            }
             InvitationChangeOutcome::ActorNotMember
             | InvitationChangeOutcome::InvitationNotFound => Err(OrganizationError::NotFound),
             InvitationChangeOutcome::Refused(refusal) => {
                 Err(self.refused(current, action, target, ctx, refusal).await)
+            }
+        }
+    }
+
+    /// Emails a committed invitation, when mail is configured, and audits
+    /// the outcome as `organization.invitation_email` against the
+    /// invitation. A failure is reported, never retried here: the inviter
+    /// still has the link and can send it by hand or invite again.
+    #[allow(clippy::too_many_arguments)]
+    async fn email_invitation(
+        &self,
+        current: &CurrentSession,
+        organization_id: Uuid,
+        invitation_id: Uuid,
+        to: &Email,
+        role: OrgRole,
+        code: &InvitationCode,
+        expires_at: OffsetDateTime,
+        ctx: RequestContext<'_>,
+    ) -> InvitationDelivery {
+        let Some(mail) = &self.mail else {
+            return InvitationDelivery::NotConfigured;
+        };
+        let action = "organization.invitation_email";
+        let target = ("organization_invitation", invitation_id.to_string());
+        let organization = match self
+            .db
+            .find_membership(organization_id, current.account.id)
+            .await
+        {
+            Ok(Some(membership)) => membership.organization.name,
+            Ok(None) => {
+                // Removed between committing the invitation and now.
+                self.record(current, action, target, AuditOutcome::Failure, ctx)
+                    .await;
+                return InvitationDelivery::Failed;
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "could not read the organization for an invitation email");
+                self.record(current, action, target, AuditOutcome::Failure, ctx)
+                    .await;
+                return InvitationDelivery::Failed;
+            }
+        };
+        let message = mail.message(&InvitationMessage {
+            to,
+            organization: &organization,
+            inviter: &current.account.display_name,
+            role,
+            code,
+            expires_at,
+        });
+        match mail.mailer.send(&message).await {
+            Ok(()) => {
+                self.record(current, action, target, AuditOutcome::Success, ctx)
+                    .await;
+                InvitationDelivery::Sent
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, %invitation_id, "invitation email not sent");
+                self.record(current, action, target, AuditOutcome::Failure, ctx)
+                    .await;
+                InvitationDelivery::Failed
             }
         }
     }

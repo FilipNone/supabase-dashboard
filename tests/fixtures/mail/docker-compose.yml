@@ -1,0 +1,32 @@
+# Disposable mail servers for the SMTP adapter tests. Run setup.sh, which
+# creates the test certificate authority and then starts these.
+#
+#   plain: SMTP without TLS on 127.0.0.1:54350, API on 127.0.0.1:54351
+#   tls:   STARTTLS required, login required, on 127.0.0.1:54352,
+#          API on 127.0.0.1:54353
+#
+# Nothing here is a real credential: the certificates are made fresh by
+# setup.sh and the login is fixture-only.
+name: sd-mail-fixture
+
+services:
+  plain:
+    image: axllent/mailpit:v1.33.1
+    command: ["--smtp-disable-rdns"]
+    ports:
+      - "127.0.0.1:54350:1025"
+      - "127.0.0.1:54351:8025"
+
+  tls:
+    image: axllent/mailpit:v1.33.1
+    command:
+      - --smtp-disable-rdns
+      - --smtp-tls-cert=/certs/server.crt
+      - --smtp-tls-key=/certs/server.key
+      - --smtp-require-starttls
+      - --smtp-auth-file=/certs/smtp-auth
+    volumes:
+      - ./certs:/certs:ro
+    ports:
+      - "127.0.0.1:54352:1025"
+      - "127.0.0.1:54353:8025"

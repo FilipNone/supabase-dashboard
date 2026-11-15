@@ -51,10 +51,18 @@ services:
       SUPABASE_DASHBOARD_STUDIO_DOMAIN: ${SUPABASE_DASHBOARD_STUDIO_DOMAIN:-}
       SUPABASE_DASHBOARD_ENV: ${SUPABASE_DASHBOARD_ENV:-production}
       RUST_LOG: ${RUST_LOG:-info,tower_http=info,sqlx=warn}
+      # Invitation email (docs/dokploy.md, "Invitation email"). Uncomment,
+      # set the variables on the Environment tab, and add a file mount
+      # `smtp-password` with the password.
+      # SUPABASE_DASHBOARD_SMTP_URL: ${SUPABASE_DASHBOARD_SMTP_URL:-}
+      # SUPABASE_DASHBOARD_MAIL_FROM: ${SUPABASE_DASHBOARD_MAIL_FROM:-}
+      # SUPABASE_DASHBOARD_SMTP_USERNAME: ${SUPABASE_DASHBOARD_SMTP_USERNAME:-}
+      # SUPABASE_DASHBOARD_SMTP_PASSWORD_FILE: /run/secrets/smtp_password
     secrets:
       # Encrypts the stored keys of managed stacks and of Dokploy. Keep a
       # copy away from the database backups.
       - secret_key
+      # - smtp_password
     networks:
       - default
       # Traefik reaches the dashboard here, and the dashboard reaches
@@ -72,6 +80,8 @@ services:
 secrets:
   secret_key:
     file: ../files/secret.key
+  # smtp_password:
+  #   file: ../files/smtp-password
 
 volumes:
   db-data:

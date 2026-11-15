@@ -96,6 +96,11 @@ impl ExtraRoots {
         self.0.is_empty()
     }
 
+    /// The certificates, DER encoded.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &CertificateDer<'static>> {
+        self.0.iter()
+    }
+
     /// These roots followed by `other`'s.
     fn with(&self, other: &ExtraRoots) -> ExtraRoots {
         Self(self.0.iter().chain(other.0.iter()).cloned().collect())

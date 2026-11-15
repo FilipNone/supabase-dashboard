@@ -4,6 +4,9 @@
 use std::{fmt, time::Duration};
 
 use secrecy::SecretString;
+use supabase_dashboard_adapters::mail::{
+    DEFAULT_SMTP_TIMEOUT, SmtpEndpoint, SmtpSecurity, check_from_address,
+};
 use supabase_dashboard_domain::{
     dokploy::DokployUrl, studio_access::STUDIO_ACCESS_MAX_RETENTION_DAYS,
 };
@@ -71,6 +74,20 @@ pub struct Config {
     /// A Dokploy connection the deployment supplies. The server stores it
     /// at startup, and administrators cannot replace or remove it.
     pub dokploy: Option<DeploymentDokploy>,
+    /// Outgoing email for invitations. `None` (the default) sends nothing.
+    pub mail: Option<MailConfig>,
+}
+
+/// `SUPABASE_DASHBOARD_SMTP_URL` and the settings that go with it.
+#[derive(Debug, Clone)]
+pub struct MailConfig {
+    pub endpoint: SmtpEndpoint,
+    /// Username and where the password comes from, when the server needs
+    /// them.
+    pub credentials: Option<(String, SecretKeySource)>,
+    /// The From address, as `address` or `Name <address>`.
+    pub from: String,
+    pub timeout: Duration,
 }
 
 /// `SUPABASE_DASHBOARD_DOKPLOY_URL` and the file holding the API key.
@@ -264,6 +281,8 @@ impl Config {
             }),
         };
 
+        let mail = mail_config(&get, environment, public_url.as_ref())?;
+
         Ok(Self {
             environment,
             public_url,
@@ -286,8 +305,106 @@ impl Config {
             health_check_interval,
             studio_access_log_days,
             dokploy,
+            mail,
         })
     }
+}
+
+/// Mail is off unless `SMTP_URL` is set, and every other mail setting
+/// needs it. TLS is required outside development, and a password is never
+/// sent without it. The password comes from a file or the environment,
+/// never from the URL, and no error repeats it.
+fn mail_config(
+    get: &impl Fn(&str) -> Option<String>,
+    environment: Environment,
+    public_url: Option<&url::Url>,
+) -> Result<Option<MailConfig>, ConfigError> {
+    const DEPENDENT: [&str; 6] = [
+        "MAIL_FROM",
+        "SMTP_USERNAME",
+        "SMTP_PASSWORD",
+        "SMTP_PASSWORD_FILE",
+        "SMTP_PLAINTEXT",
+        "SMTP_TIMEOUT_SECS",
+    ];
+    let Some(raw_url) = get("SMTP_URL") else {
+        if let Some(name) = DEPENDENT.into_iter().find(|name| get(name).is_some()) {
+            return Err(invalid(name, "needs SUPABASE_DASHBOARD_SMTP_URL"));
+        }
+        return Ok(None);
+    };
+    let allow_plaintext = match get("SMTP_PLAINTEXT").as_deref() {
+        None | Some("false") => false,
+        Some("true") if environment == Environment::Development => true,
+        Some("true") => {
+            return Err(invalid(
+                "SMTP_PLAINTEXT",
+                "plain SMTP is allowed only with SUPABASE_DASHBOARD_ENV=development",
+            ));
+        }
+        Some(_) => return Err(invalid("SMTP_PLAINTEXT", "expected `true` or `false`")),
+    };
+    let endpoint =
+        SmtpEndpoint::parse(&raw_url, allow_plaintext).map_err(|e| invalid("SMTP_URL", e))?;
+    if public_url.is_none() {
+        return Err(invalid(
+            "SMTP_URL",
+            "emailed links need SUPABASE_DASHBOARD_PUBLIC_URL",
+        ));
+    }
+    let from = get("MAIL_FROM").ok_or_else(|| missing("MAIL_FROM"))?;
+    if from.chars().any(char::is_control) {
+        return Err(invalid("MAIL_FROM", "must be a single line"));
+    }
+    check_from_address(&from).map_err(|e| invalid("MAIL_FROM", e))?;
+    let password = match (get("SMTP_PASSWORD_FILE"), get("SMTP_PASSWORD")) {
+        (Some(_), Some(_)) => {
+            return Err(invalid(
+                "SMTP_PASSWORD",
+                "set either SUPABASE_DASHBOARD_SMTP_PASSWORD or \
+                 SUPABASE_DASHBOARD_SMTP_PASSWORD_FILE, not both",
+            ));
+        }
+        (Some(path), None) => Some(SecretKeySource::File(path.into())),
+        // Do not echo the value in any error.
+        (None, Some(password)) => Some(SecretKeySource::Inline(SecretString::from(password))),
+        (None, None) => None,
+    };
+    let credentials = match (get("SMTP_USERNAME"), password) {
+        (Some(username), Some(password)) => Some((username, password)),
+        (None, None) => None,
+        (Some(_), None) => {
+            return Err(invalid(
+                "SMTP_USERNAME",
+                "needs SUPABASE_DASHBOARD_SMTP_PASSWORD_FILE or SUPABASE_DASHBOARD_SMTP_PASSWORD",
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(invalid(
+                "SMTP_PASSWORD",
+                "needs SUPABASE_DASHBOARD_SMTP_USERNAME",
+            ));
+        }
+    };
+    if credentials.is_some() && endpoint.security == SmtpSecurity::Plaintext {
+        return Err(invalid(
+            "SMTP_PLAINTEXT",
+            "a password is never sent over plain SMTP; remove the credentials or use TLS",
+        ));
+    }
+    let timeout = secs(bounded(
+        get,
+        "SMTP_TIMEOUT_SECS",
+        DEFAULT_SMTP_TIMEOUT.as_secs(),
+        1,
+        120,
+    )?);
+    Ok(Some(MailConfig {
+        endpoint,
+        credentials,
+        from,
+        timeout,
+    }))
 }
 
 fn parse_public_url(raw: &str, environment: Environment) -> Result<url::Url, ConfigError> {
@@ -620,6 +737,104 @@ mod tests {
             file,
             ("DOKPLOY_URL", "ftp://dokploy.example.test")
         ]));
+    }
+
+    #[test]
+    fn mail_is_off_by_default_and_needs_an_smtp_url() {
+        let dev = ("ENV", "development");
+        assert!(load(&[DB, dev]).unwrap().mail.is_none());
+        let err = load(&[DB, dev, ("MAIL_FROM", "dash@example.test")]).unwrap_err();
+        assert!(err.to_string().contains("SMTP_URL"), "{err}");
+        let err = load(&[DB, dev, ("SMTP_PASSWORD", "hunter2")]).unwrap_err();
+        assert!(!err.to_string().contains("hunter2"), "{err}");
+    }
+
+    #[test]
+    fn mail_needs_a_from_address_and_a_public_url() {
+        let public = ("PUBLIC_URL", "https://dash.example.test");
+        let smtp = ("SMTP_URL", "smtps://mail.example.test");
+        let err = load(&[DB, public, smtp]).unwrap_err();
+        assert!(err.to_string().contains("MAIL_FROM"), "{err}");
+        let err = load(&[DB, ("ENV", "development"), smtp, ("MAIL_FROM", "a@b.test")]).unwrap_err();
+        assert!(err.to_string().contains("PUBLIC_URL"), "{err}");
+        let err = load(&[DB, public, smtp, ("MAIL_FROM", "nobody")]).unwrap_err();
+        assert!(err.to_string().contains("MAIL_FROM"), "{err}");
+        let mail = load(&[
+            DB,
+            public,
+            smtp,
+            ("MAIL_FROM", "Dashboard <dash@example.test>"),
+        ])
+        .unwrap()
+        .mail
+        .unwrap();
+        assert_eq!(mail.endpoint.port, 465);
+        assert!(mail.credentials.is_none());
+        assert_eq!(mail.timeout, DEFAULT_SMTP_TIMEOUT);
+    }
+
+    #[test]
+    fn plain_smtp_only_in_development_and_never_with_a_password() {
+        let from = ("MAIL_FROM", "dash@example.test");
+        let smtp = ("SMTP_URL", "smtp://localhost:1025");
+        let plain = ("SMTP_PLAINTEXT", "true");
+        let public = ("PUBLIC_URL", "https://dash.example.test");
+        let err = load(&[DB, public, smtp, from, plain]).unwrap_err();
+        assert!(err.to_string().contains("development"), "{err}");
+        let starttls = load(&[DB, public, smtp, from]).unwrap().mail.unwrap();
+        assert_eq!(starttls.endpoint.security, SmtpSecurity::StartTls);
+        let dev = [
+            DB,
+            ("ENV", "development"),
+            ("PUBLIC_URL", "http://localhost:3000"),
+            smtp,
+            from,
+            plain,
+        ];
+        let mail = load(&dev).unwrap().mail.unwrap();
+        assert_eq!(mail.endpoint.security, SmtpSecurity::Plaintext);
+        let mut with_password = dev.to_vec();
+        with_password.extend([("SMTP_USERNAME", "dash"), ("SMTP_PASSWORD", "hunter2")]);
+        let err = load(&with_password).unwrap_err();
+        assert!(!err.to_string().contains("hunter2"), "{err}");
+    }
+
+    #[test]
+    fn smtp_credentials_come_in_pairs_from_one_source() {
+        let with = |url: &'static str, extra: &[(&'static str, &'static str)]| {
+            let mut pairs = vec![
+                DB,
+                ("PUBLIC_URL", "https://dash.example.test"),
+                ("SMTP_URL", url),
+                ("MAIL_FROM", "dash@example.test"),
+            ];
+            pairs.extend_from_slice(extra);
+            load(&pairs)
+        };
+        let url = "smtp://mail.example.test";
+        with(url, &[("SMTP_USERNAME", "dash")]).unwrap_err();
+        with(url, &[("SMTP_PASSWORD_FILE", "/run/secrets/smtp")]).unwrap_err();
+        let err = with(
+            url,
+            &[
+                ("SMTP_USERNAME", "dash"),
+                ("SMTP_PASSWORD_FILE", "/run/secrets/smtp"),
+                ("SMTP_PASSWORD", "hunter2"),
+            ],
+        )
+        .unwrap_err();
+        assert!(!err.to_string().contains("hunter2"), "{err}");
+        let mail = with(
+            url,
+            &[("SMTP_USERNAME", "dash"), ("SMTP_PASSWORD", "hunter2")],
+        )
+        .unwrap()
+        .mail
+        .unwrap();
+        assert!(!format!("{mail:?}").contains("hunter2"));
+        let err = with("smtp://dash:hunter2@mail.example.test", &[]).unwrap_err();
+        assert!(!err.to_string().contains("hunter2"), "{err}");
+        with(url, &[("SMTP_TIMEOUT_SECS", "0")]).unwrap_err();
     }
 
     #[test]

@@ -86,6 +86,13 @@ All settings are environment variables. Invalid values stop the server at startu
 | `SUPABASE_DASHBOARD_EXTRA_CA_FILE` | unset | Path to a PEM file of certificate authorities to trust for service checks and Studio traffic, on top of the bundled Mozilla roots, for every project. Authorities for one project are stored on that project's settings page. Up to 1 MiB; it may hold only `CERTIFICATE` blocks. The server refuses to start if the file is missing, empty, or holds anything else, and logs how many it loaded |
 | `SUPABASE_DASHBOARD_DOKPLOY_URL` | unset | Dokploy's address, as an administrator would enter it on the administrator page. Needs `SUPABASE_DASHBOARD_DOKPLOY_API_KEY_FILE` and an encryption key. See "Supplied by the deployment" in [docs/dokploy.md](dokploy.md) |
 | `SUPABASE_DASHBOARD_DOKPLOY_API_KEY_FILE` | unset | Path to a file holding the Dokploy API key alone (surrounding whitespace is ignored, at most 4 KiB). Read once at startup; the server refuses to start if it is missing or the key is malformed. Needs `SUPABASE_DASHBOARD_DOKPLOY_URL` |
+| `SUPABASE_DASHBOARD_SMTP_URL` | unset | Mail server for the dashboard's own email (invitation links), as `smtps://host[:port]` (TLS from the start, port 465 by default) or `smtp://host[:port]` (STARTTLS required, port 587 by default). No credentials, path, or query. Needs `SUPABASE_DASHBOARD_PUBLIC_URL` and `SUPABASE_DASHBOARD_MAIL_FROM`. Unset sends no email; see "Invitation email" below |
+| `SUPABASE_DASHBOARD_MAIL_FROM` | unset | From address, as `dashboard@example.com` or `Dashboard <dashboard@example.com>`. Needs `SUPABASE_DASHBOARD_SMTP_URL` |
+| `SUPABASE_DASHBOARD_SMTP_USERNAME` | unset | Login for the mail server. Set together with one of the two password settings |
+| `SUPABASE_DASHBOARD_SMTP_PASSWORD_FILE` | unset | Path to a file holding the SMTP password (a final newline is ignored, at most 4 KiB). Read once at startup |
+| `SUPABASE_DASHBOARD_SMTP_PASSWORD` | unset | The same password given directly. Set only one of the two; prefer the file |
+| `SUPABASE_DASHBOARD_SMTP_TIMEOUT_SECS` | 15 | 1 to 120; longest time one email may take, connecting included |
+| `SUPABASE_DASHBOARD_SMTP_PLAINTEXT` | `false` | `true` makes `smtp://` connect without TLS, for a local test server such as Mailpit. Allowed only with `SUPABASE_DASHBOARD_ENV=development` and without a login |
 | `RUST_LOG` | `info,tower_http=info,sqlx=warn` | Standard `tracing` filter |
 | `LEPTOS_SITE_ADDR` | `127.0.0.1:3000` | Listen address |
 
@@ -106,6 +113,24 @@ When a pasted anon or service role key is a JWT, the server reads its `role` and
 
 The project overview's "Check now" button asks the stack's API gateway for `/auth/v1/health`, `/storage/v1/version`, and `/realtime/v1/api/ping` (with the anon key), `/rest/v1/` (with the service role key), and `/` (Studio's route, once without a login and once with the stored one). Only those paths under the registered API URL are requested. Saving a Studio login requests `/` the same way before storing it. The client refuses loopback (unless allowed above), link-local, multicast, and cloud metadata addresses, checks every address a host name resolves to, does not follow redirects, ignores proxy environment variables, and gives up after 5 seconds to connect or 10 seconds in total. HTTPS uses the Mozilla root store bundled with the binary, plus the certificate authorities in `SUPABASE_DASHBOARD_EXTRA_CA_FILE` for stacks behind a private one. Those extra authorities apply to every project; there is no per-project setting. A certificate that no trusted authority signed shows as a TLS error, not as an unreachable service. A project can be checked once every 10 seconds. Besides the button, the server checks projects itself: once a minute it takes up to 20 projects that were never checked or whose last check is older than `SUPABASE_DASHBOARD_HEALTH_CHECK_INTERVAL_MINS`, oldest first, and checks up to 4 at a time with the same requests. Every saved result is also added to the project's history, which the overview summarizes under "Recent checks": a count of checks that found a failing service, a grid with one row per UTC day and one cell per hour (no check, no failures, or at least one failing check, with the counts on hover), a "Checks per day" table with the same counts, and the newest 20 checks. Saving a result deletes that project's entries older than 7 days and any beyond its newest 1000; entries older than 7 days are hidden right away, even before the next save deletes them. Unregistering a project deletes its history. Each pass first claims its projects for 10 minutes in the `project_check_claims` table, so several server processes sharing one database split the scheduled checks instead of repeating them; a process that stops mid-pass leaves its claims to lapse, and another process picks those projects up afterwards. "Check now" does not take a claim.
 
+
+### Invitation email
+
+With `SUPABASE_DASHBOARD_SMTP_URL` set, creating an invitation also emails its link to the invited address once the invitation is saved. The message is plain text: who invited them, the organization, the role, the link, and when it expires. The link is `<public URL origin>/dashboard/invite#<code>`, with the code in the fragment so opening it does not send the code to the server. The page still shows the link once and says whether the email went out; when the mail server is unreachable, refuses the message, or does not answer within `SUPABASE_DASHBOARD_SMTP_TIMEOUT_SECS`, the invitation stays open and the inviter can send the link by hand. A failed send is not retried. Each attempt is audited as `organization.invitation_email` against the invitation, with success or failure and nothing from the message.
+
+The connection is always encrypted outside development: `smtp://` requires STARTTLS, and a server that does not offer it gets neither the login nor the message. Certificates are checked against the Mozilla roots bundled with the binary plus `SUPABASE_DASHBOARD_EXTRA_CA_FILE`. The password stays in the server process and is never logged. This mail is the dashboard's own, separate from the SMTP settings of a managed project's Auth service. Self-service password reset by email is not implemented; `reset-password` on the server is still the recovery path.
+
+To try it locally, run Mailpit and point the dashboard at it:
+
+```sh
+docker run -d --name sd-mailpit -p 127.0.0.1:1025:1025 -p 127.0.0.1:8025:8025 axllent/mailpit:v1.33.1
+# in .env (development only)
+SUPABASE_DASHBOARD_SMTP_URL=smtp://127.0.0.1:1025
+SUPABASE_DASHBOARD_SMTP_PLAINTEXT=true
+SUPABASE_DASHBOARD_MAIL_FROM=Dashboard <dashboard@example.test>
+```
+
+Messages show up at <http://127.0.0.1:8025>. The adapter tests run against `tests/fixtures/mail` (Mailpit without TLS, and Mailpit with STARTTLS and a login): run `tests/fixtures/mail/setup.sh`, then `SUPABASE_DASHBOARD_TEST_MAIL_FIXTURE=1 cargo test -p supabase-dashboard-adapters --test mail_fixture`.
 
 ### Studio access log
 

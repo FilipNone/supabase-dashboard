@@ -36,3 +36,6 @@ Thumbs.db
 
 # Key the Dokploy fixture creates for the tests
 /tests/fixtures/dokploy/api-key
+
+# Certificates and login the mail fixture creates for the tests
+/tests/fixtures/mail/certs/

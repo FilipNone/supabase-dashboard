@@ -231,6 +231,10 @@ and under the top-level `secrets`:
 
 Then redeploy. A connection an administrator already made at the same URL is taken over.
 
+### Invitation email
+
+To have the dashboard email invitation links (see "Invitation email" in the Docker guide), uncomment the `SUPABASE_DASHBOARD_SMTP_*` and `SUPABASE_DASHBOARD_MAIL_FROM` lines and `smtp_password` in `deploy/dokploy-compose.yaml`, set `SUPABASE_DASHBOARD_SMTP_URL`, `SUPABASE_DASHBOARD_MAIL_FROM`, and `SUPABASE_DASHBOARD_SMTP_USERNAME` on the Environment tab, and add a File mount with File Path `smtp-password` holding the mail password alone. Then redeploy. This was not tried on Dokploy; the same settings were tested with the Docker image's server against Mailpit.
+
 ### Where the secrets live
 
 Dokploy keeps the service's variables and the contents of its file mounts in its own database, and writes them to the Dokploy server in plain text: the variables to the service's `.env`, the mounts to `/etc/dokploy/compose/<appName>/files/` (on v0.31.1 as root-owned files readable by every user on that server). So Dokploy holds the metadata database's password, the credential encryption key, and the Dokploy key if the deployment supplies it. Anyone who can open the dashboard's service in Dokploy, or call `mounts.listByServiceId` or `compose.one` for it with a key, can read them, and with the encryption key and a database backup can decrypt every stored stack key. That includes the dashboard's own Dokploy key, which needs access to the dashboard's service to find its placement. Limit who has access to this service in Dokploy, and keep it in a project that other Dokploy members cannot open.

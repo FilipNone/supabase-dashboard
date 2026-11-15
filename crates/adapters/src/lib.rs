@@ -7,6 +7,7 @@
 
 pub mod dokploy;
 pub mod gateway;
+pub mod mail;
 pub mod net;
 pub mod studio_proxy;
 pub mod tls;

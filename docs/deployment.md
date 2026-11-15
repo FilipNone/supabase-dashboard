@@ -99,6 +99,21 @@ If a stack's gateway uses a certificate from a private certificate authority, mo
 
 That file is trusted for every project. To trust an authority for one project only, an owner or admin pastes its certificate into the Certificate authorities section of that project's settings page instead. The dashboard stores it with the project (public certificates only, at most 8 and 64 KiB), lists each certificate's subject, expiry, and SHA-256 fingerprint, and uses it for that project's health checks, the Studio login check, and Studio traffic. Saving and removing it are audited. A change applies to the next request without a restart.
 
+### Invitation email
+
+By default the dashboard sends no email: an owner or admin who invites someone copies the invitation link and sends it themselves. To have the dashboard email the link as well, give it a mail server in `.env`:
+
+```sh
+SUPABASE_DASHBOARD_SMTP_URL=smtps://smtp.example.com      # or smtp://smtp.example.com:587 for STARTTLS
+SUPABASE_DASHBOARD_MAIL_FROM=Dashboard <dashboard@example.com>
+SUPABASE_DASHBOARD_SMTP_USERNAME=dashboard@example.com
+SUPABASE_DASHBOARD_SMTP_PASSWORD_FILE=/run/secrets/smtp_password
+```
+
+The URL holds no credentials. Keep the password in a file mounted as a Compose secret, as for the encryption key: add `smtp_password` under `secrets:` in `compose.yaml` (`file: ./smtp-password`) and list it under the dashboard's `secrets`. `SUPABASE_DASHBOARD_SMTP_PASSWORD` also works, but then the password appears in `docker inspect`. The connection always uses TLS: `smtp://` requires the server to offer STARTTLS, and the certificate must chain to a public authority or to `SUPABASE_DASHBOARD_EXTRA_CA_FILE`. `SUPABASE_DASHBOARD_PUBLIC_URL` must be set, because the emailed link starts with it.
+
+After an invitation is created, the page says whether the email went out. If the mail server could not be reached or refused the message, the invitation still works and the link is still shown once to send by hand; the dashboard does not retry. Each send is recorded in the audit log as `organization.invitation_email`, without the message or the link. The settings and their limits are in [Configuration](https://github.com/FilipNone/supabase-dashboard/blob/main/docs/development.md#configuration). Password reset by email is not implemented yet; a forgotten password is reset with `supabase-dashboard-server reset-password` on the server.
+
 ## Studio access
 
 Members open a project's Studio through the dashboard, which serves each project's Studio on its own host under `SUPABASE_DASHBOARD_STUDIO_DOMAIN` (see `docs/adr/0002-studio-access.md`). To turn it on:

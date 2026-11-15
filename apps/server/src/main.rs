@@ -22,6 +22,7 @@ use secrecy::ExposeSecret;
 use supabase_dashboard_adapters::{
     dokploy::{DokployClient, DokploySettings},
     gateway::{GatewayError, GatewayProbe, GatewaySettings},
+    mail::{SmtpMailer, SmtpSecurity, SmtpSettings, SmtpSetupError},
     net::TargetPolicy,
     studio_proxy::{StudioProxy, StudioProxySettings},
     tls::{ExtraRoots, ExtraRootsError, MAX_EXTRA_CA_FILE_BYTES},
@@ -33,6 +34,7 @@ use supabase_dashboard_application::{
     dokploy::{DokployConnector, DokployCredentials, DokployService},
     jobs::{JobHandler, JobRunner, RunnerSettings},
     key_rotation::{RotationError, key_usage, reseal_credentials},
+    mail::InvitationMail,
     organizations::OrganizationService,
     projects::ProjectService,
     provisioning::{ComposeApi, ProvisionStackHandler, ProvisioningService, StackActionHandler},
@@ -98,6 +100,18 @@ enum StartupError {
     },
     #[error("no credential encryption key is configured; set SUPABASE_DASHBOARD_SECRET_KEY_FILE")]
     NoSecretKey,
+    #[error("could not read SUPABASE_DASHBOARD_SMTP_PASSWORD_FILE {path}: {source}")]
+    SmtpPasswordFile {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
+    #[error("SUPABASE_DASHBOARD_SMTP_PASSWORD_FILE {path} is invalid: {reason}")]
+    SmtpPassword {
+        path: std::path::PathBuf,
+        reason: &'static str,
+    },
+    #[error("could not set up outgoing mail: {0}")]
+    Mail(#[from] SmtpSetupError),
     #[error("could not reseal stored credentials: {0}")]
     Rotation(#[from] RotationError),
     #[error("could not set up project connections: {0}")]
@@ -153,6 +167,76 @@ fn deployment_dokploy(config: &Config) -> Result<Option<DokployCredentials>, Sta
     Ok(Some(DokployCredentials {
         url: supplied.url.clone(),
         key: secrecy::SecretString::from(key.to_owned()),
+    }))
+}
+
+/// Largest SMTP password file read, so a wrong path fails fast.
+const MAX_SMTP_PASSWORD_FILE_BYTES: u64 = 4096;
+
+/// Sets up invitation email, if the deployment configured a mail server.
+/// The password file is read once, its size checked first, and a final
+/// newline ignored; nothing from it appears in an error.
+fn invitation_mail(
+    config: &Config,
+    extra_roots: &ExtraRoots,
+) -> Result<Option<InvitationMail>, StartupError> {
+    let (Some(mail), Some(public_url)) = (&config.mail, &config.public_url) else {
+        tracing::info!("outgoing mail is off; invitation links are shown, not emailed");
+        return Ok(None);
+    };
+    let credentials = match &mail.credentials {
+        None => None,
+        Some((username, SecretKeySource::Inline(password))) => {
+            Some((username.clone(), password.clone()))
+        }
+        Some((username, SecretKeySource::File(path))) => {
+            let read_err = |source| StartupError::SmtpPasswordFile {
+                path: path.clone(),
+                source,
+            };
+            let invalid = |reason| StartupError::SmtpPassword {
+                path: path.clone(),
+                reason,
+            };
+            let len = std::fs::metadata(path).map_err(read_err)?.len();
+            if len > MAX_SMTP_PASSWORD_FILE_BYTES {
+                return Err(invalid("the file is larger than 4 KiB"));
+            }
+            let raw = secrecy::SecretString::from(std::fs::read_to_string(path).map_err(read_err)?);
+            let password = raw.expose_secret().trim_end_matches(['\r', '\n']);
+            if password.is_empty() {
+                return Err(invalid("the file is empty"));
+            }
+            Some((
+                username.clone(),
+                secrecy::SecretString::from(password.to_owned()),
+            ))
+        }
+    };
+    let mailer = SmtpMailer::new(SmtpSettings {
+        endpoint: mail.endpoint.clone(),
+        credentials,
+        from: mail.from.clone(),
+        timeout: mail.timeout,
+        hello_name: public_url.host_str().map(str::to_owned),
+        extra_roots: extra_roots.clone(),
+    })?;
+    if mail.endpoint.security == SmtpSecurity::Plaintext {
+        tracing::warn!("outgoing mail is sent without encryption (development only)");
+    }
+    tracing::info!(
+        host = %mail.endpoint.host,
+        port = mail.endpoint.port,
+        security = ?mail.endpoint.security,
+        "invitation links are emailed"
+    );
+    Ok(Some(InvitationMail {
+        mailer: Arc::new(mailer),
+        invite_page_url: format!(
+            "{}{}",
+            public_url.origin().ascii_serialization(),
+            supabase_dashboard_web::app::INVITE_PATH
+        ),
     }))
 }
 
@@ -433,7 +517,7 @@ async fn run() -> Result<(), StartupError> {
             let proxy = StudioProxy::new(StudioProxySettings {
                 policy,
                 read_timeout: config.studio_request_timeout,
-                extra_roots,
+                extra_roots: extra_roots.clone(),
                 ..StudioProxySettings::default()
             })?;
             tracing::info!(
@@ -531,7 +615,11 @@ async fn run() -> Result<(), StartupError> {
         .public_url
         .as_ref()
         .is_some_and(|u| u.scheme() == "https");
-    let organizations = Arc::new(OrganizationService::new(db.clone()));
+    let organizations = OrganizationService::new(db.clone());
+    let organizations = Arc::new(match invitation_mail(&config, &extra_roots)? {
+        Some(mail) => organizations.with_invitation_mail(mail),
+        None => organizations,
+    });
     let projects = Arc::new(ProjectService::new(db.clone()));
     let state = AppState {
         leptos_options,

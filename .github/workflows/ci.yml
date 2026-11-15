@@ -150,6 +150,26 @@ jobs:
         if: always()
         run: docker compose -p sd-fixture down -v
 
+  mail:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start disposable mail servers
+        run: tests/fixtures/mail/setup.sh
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: SMTP mailer tests against the fixture
+        env:
+          SUPABASE_DASHBOARD_TEST_MAIL_FIXTURE: "1"
+        run: cargo test -p supabase-dashboard-adapters --locked --test mail_fixture
+      - name: Show logs on failure
+        if: failure()
+        run: docker compose -f tests/fixtures/mail/docker-compose.yml logs --no-color --tail 50
+      - name: Tear down
+        if: always()
+        run: docker compose -f tests/fixtures/mail/docker-compose.yml down -v
+
   dokploy:
     runs-on: ubuntu-latest
     timeout-minutes: 30

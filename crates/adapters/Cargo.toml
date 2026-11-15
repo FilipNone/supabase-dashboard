@@ -14,6 +14,10 @@ supabase-dashboard-domain.workspace = true
 bytes = "1"
 futures-core = "0.3"
 http.workspace = true
+# The dashboard's own email (invitations). No default features: rustls with
+# the ring provider and the bundled Mozilla roots, like the HTTP client, and
+# no connection pool or native TLS.
+lettre = { version = "0.11.23", default-features = false, features = ["smtp-transport", "builder", "tokio1-rustls-tls"] }
 # No default features: TLS comes from the preconfigured rustls config below,
 # with the ring provider, instead of reqwest's aws-lc-rs default.
 # `stream` lets Studio request bodies flow through without buffering.
@@ -43,7 +47,7 @@ hmac = "0.13"
 futures-util = { version = "0.3", default-features = false }
 http-body-util = "0.1"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 
 [lints]
