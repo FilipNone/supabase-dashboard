@@ -336,6 +336,65 @@ impl OrganizationService {
         ctx: RequestContext<'_>,
     ) -> Result<IssuedInvitation, OrganizationError> {
         let email = Email::parse(email)?;
+        self.issue(
+            current,
+            organization_id,
+            email,
+            role,
+            None,
+            "organization.invitation_create",
+            ctx,
+        )
+        .await
+    }
+
+    /// Sends an open invitation again: a new code replaces the old one,
+    /// whose link stops working, and the new link is emailed when mail is
+    /// configured. The address and role stay the same, and the same rules
+    /// apply as for creating it. Audited as `organization.invitation_resend`
+    /// against the new invitation.
+    pub async fn resend_invitation(
+        &self,
+        current: &CurrentSession,
+        organization_id: Uuid,
+        invitation_id: Uuid,
+        ctx: RequestContext<'_>,
+    ) -> Result<IssuedInvitation, OrganizationError> {
+        // Anyone who can see the invitation list may look the invitation
+        // up; whether they may replace it is decided, and a refusal
+        // audited, when the new one is written.
+        self.authorize(current, organization_id, Permission::MembersRead)
+            .await?;
+        let open = self
+            .db
+            .find_open_invitation(organization_id, invitation_id)
+            .await?
+            .ok_or(OrganizationError::InvitationNotFound)?;
+        self.issue(
+            current,
+            organization_id,
+            open.email,
+            open.role,
+            Some(invitation_id),
+            "organization.invitation_resend",
+            ctx,
+        )
+        .await
+    }
+
+    /// Creates an invitation with a new code, replacing any open one to the
+    /// same address, and emails it when mail is configured.
+    #[allow(clippy::too_many_arguments)]
+    async fn issue(
+        &self,
+        current: &CurrentSession,
+        organization_id: Uuid,
+        email: Email,
+        role: OrgRole,
+        replaces: Option<Uuid>,
+        action: &'static str,
+        ctx: RequestContext<'_>,
+    ) -> Result<IssuedInvitation, OrganizationError> {
         let token = InvitationToken::generate()?;
         let id = Uuid::now_v7();
         // Whole seconds, so the returned value matches what the database
@@ -344,7 +403,6 @@ impl OrganizationService {
             .checked_add(INVITATION_LIFETIME)
             .and_then(|at| at.replace_nanosecond(0).ok())
             .ok_or(OrganizationError::InvitationInvalid)?;
-        let action = "organization.invitation_create";
         let target = ("organization_invitation", id.to_string());
         let outcome = self
             .db
@@ -357,6 +415,7 @@ impl OrganizationService {
                     token_hash: token.hash(),
                     invited_by: current.account.id,
                     expires_at,
+                    replaces,
                 },
                 |snapshot| {
                     check_invitation(snapshot.actor_role, role)?;
@@ -398,8 +457,10 @@ impl OrganizationService {
                     delivery,
                 })
             }
-            InvitationChangeOutcome::ActorNotMember
-            | InvitationChangeOutcome::InvitationNotFound => Err(OrganizationError::NotFound),
+            InvitationChangeOutcome::ActorNotMember => Err(OrganizationError::NotFound),
+            InvitationChangeOutcome::InvitationNotFound => {
+                Err(OrganizationError::InvitationNotFound)
+            }
             InvitationChangeOutcome::Refused(refusal) => {
                 Err(self.refused(current, action, target, ctx, refusal).await)
             }

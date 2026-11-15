@@ -765,6 +765,20 @@ pub async fn create_invitation(
         .await?)
 }
 
+/// Sends an open invitation again with a new code; the old link stops
+/// working. The response carries the new code, once.
+#[server]
+pub async fn resend_invitation(
+    organization_id: Uuid,
+    invitation_id: Uuid,
+) -> Result<IssuedInvitation, AppError> {
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    Ok(org_context::organizations()?
+        .resend_invitation(&session, organization_id, invitation_id, audit.get())
+        .await?)
+}
+
 #[server]
 pub async fn revoke_invitation(organization_id: Uuid, invitation_id: Uuid) -> Result<(), AppError> {
     let session = org_context::session()?;

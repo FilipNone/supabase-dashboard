@@ -583,3 +583,120 @@ async fn invitation_changes_follow_the_role_matrix() {
     s.db.close().await;
     scratch.drop().await;
 }
+
+#[tokio::test]
+async fn resending_replaces_the_link_and_follows_the_role_rules() {
+    let Some(scratch) = ScratchDb::create("app_invite_resend").await else {
+        return;
+    };
+    let s = setup(&scratch).await;
+    let owner = account(&s.db, "Olivia").await;
+    let admin = account(&s.db, "Adam").await;
+    let viewer = account(&s.db, "Vera").await;
+    let outsider = account(&s.db, "Oscar").await;
+    let carol = account(&s.db, "Carol").await;
+    let org = s.orgs.create(&owner, "Acme", ctx()).await.unwrap().id;
+    add_member(&s.db, org, &admin, OrgRole::Admin).await;
+    add_member(&s.db, org, &viewer, OrgRole::Viewer).await;
+    s.orgs.create(&outsider, "Globex", ctx()).await.unwrap();
+
+    let first = s
+        .orgs
+        .invite(&owner, org, "carol@example.test", OrgRole::Developer, ctx())
+        .await
+        .unwrap();
+    let again = s
+        .orgs
+        .resend_invitation(&admin, org, first.invitation.id, ctx())
+        .await
+        .unwrap();
+    assert_ne!(again.invitation.id, first.invitation.id);
+    assert_ne!(again.code.expose(), first.code.expose());
+    assert_eq!(again.invitation.email, first.invitation.email);
+    assert_eq!(again.invitation.role, OrgRole::Developer);
+    assert_eq!(
+        audit_count(&s.db, "organization.invitation_resend", "success").await,
+        1
+    );
+    let open = s.orgs.invitations(&owner, org).await.unwrap();
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].id, again.invitation.id);
+
+    // The replaced invitation cannot be sent again or accepted.
+    assert!(matches!(
+        s.orgs
+            .resend_invitation(&owner, org, first.invitation.id, ctx())
+            .await,
+        Err(OrganizationError::InvitationNotFound)
+    ));
+    assert!(matches!(
+        s.orgs
+            .accept_invitation(&carol, first.code.expose(), ctx())
+            .await,
+        Err(OrganizationError::InvitationInvalid)
+    ));
+
+    // Viewers are refused and audited; outsiders cannot tell it exists.
+    assert!(matches!(
+        s.orgs
+            .resend_invitation(&viewer, org, again.invitation.id, ctx())
+            .await,
+        Err(OrganizationError::Forbidden)
+    ));
+    assert_eq!(
+        denied_by(&s.db, "organization.invitation_resend", &viewer).await,
+        1
+    );
+    for id in [again.invitation.id, Uuid::now_v7()] {
+        assert!(matches!(
+            s.orgs.resend_invitation(&outsider, org, id, ctx()).await,
+            Err(OrganizationError::NotFound)
+        ));
+    }
+
+    // Only an owner sends an owner invitation again.
+    let boss = s
+        .orgs
+        .invite(&owner, org, "boss@example.test", OrgRole::Owner, ctx())
+        .await
+        .unwrap();
+    assert!(matches!(
+        s.orgs
+            .resend_invitation(&admin, org, boss.invitation.id, ctx())
+            .await,
+        Err(OrganizationError::Membership(
+            MembershipError::OwnerRoleRequiresOwner
+        ))
+    ));
+    assert!(
+        s.orgs
+            .invitations(&owner, org)
+            .await
+            .unwrap()
+            .contains(&boss.invitation)
+    );
+
+    // A withdrawn invitation cannot be sent again.
+    s.orgs
+        .revoke_invitation(&owner, org, boss.invitation.id, ctx())
+        .await
+        .unwrap();
+    assert!(matches!(
+        s.orgs
+            .resend_invitation(&owner, org, boss.invitation.id, ctx())
+            .await,
+        Err(OrganizationError::InvitationNotFound)
+    ));
+
+    // The new link works.
+    s.orgs
+        .accept_invitation(&carol, again.code.expose(), ctx())
+        .await
+        .unwrap();
+    assert_eq!(
+        role_of(&s.db, org, carol.account.id).await.as_deref(),
+        Some("developer")
+    );
+    s.db.close().await;
+    scratch.drop().await;
+}

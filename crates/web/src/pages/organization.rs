@@ -34,8 +34,9 @@ use crate::{
         provision::{RecentStacks, new_stack_path},
     },
     server_fns::{
-        ChangeMemberRole, CreateInvitation, RemoveMember, RenameOrganization, RevokeInvitation,
-        get_organization, list_invitations, list_members, list_project_health, list_projects,
+        ChangeMemberRole, CreateInvitation, RemoveMember, RenameOrganization, ResendInvitation,
+        RevokeInvitation, get_organization, list_invitations, list_members, list_project_health,
+        list_projects,
     },
 };
 
@@ -657,7 +658,7 @@ fn InviteMember(org: OrganizationSummary) -> impl IntoView {
         .collect_view();
     let result = move || {
         create.value().get().map(|result| match result {
-            Ok(issued) => view! { <IssuedLink issued/> }.into_any(),
+            Ok(issued) => view! { <IssuedLink issued resent=false/> }.into_any(),
             Err(err) => {
                 view! { <p class="form-error" role="alert">{err.to_string()}</p> }.into_any()
             }
@@ -687,31 +688,42 @@ fn InviteMember(org: OrganizationSummary) -> impl IntoView {
 }
 
 /// The link for a new invitation. Shown once: the server keeps only a hash
-/// of the code and cannot show it again.
+/// of the code and cannot show it again. `resent` is set when an open
+/// invitation was sent again with a new code.
 #[component]
-fn IssuedLink(issued: IssuedInvitation) -> impl IntoView {
+fn IssuedLink(issued: IssuedInvitation, resent: bool) -> impl IntoView {
     let link = invitation_link(issued.code.expose());
     let email = issued.invitation.email.as_str().to_owned();
+    let done = if resent {
+        "A new invitation link was created"
+    } else {
+        "Invitation created"
+    };
+    let note_id = if resent {
+        "resent-link-note"
+    } else {
+        "issued-link-note"
+    };
     // Whether the email went out, as the mail server answered. A failure is
     // announced as an alert; the link below still works.
     let delivery = match issued.delivery {
         InvitationDelivery::Sent => view! {
             <p class="form-ok" role="status">
-                {format!("Invitation created and emailed to {email}.")}
+                {format!("{done} and emailed to {email}.")}
             </p>
         }
         .into_any(),
         InvitationDelivery::Failed => view! {
             <p class="form-error" role="alert">
                 {format!(
-                    "The invitation was created, but the email to {email} could not be sent. \
+                    "{done}, but the email to {email} could not be sent. \
                      Send the link below yourself, or withdraw the invitation and try again later."
                 )}
             </p>
         }
         .into_any(),
         InvitationDelivery::NotConfigured => {
-            view! { <p class="form-ok" role="status">"Invitation created."</p> }.into_any()
+            view! { <p class="form-ok" role="status">{format!("{done}.")}</p> }.into_any()
         }
     };
     let send = match issued.delivery {
@@ -722,8 +734,13 @@ fn IssuedLink(issued: IssuedInvitation) -> impl IntoView {
              yourself."
         }
     };
+    let replaced = if resent {
+        " The previous link no longer works."
+    } else {
+        ""
+    };
     let note = format!(
-        "{send} It is shown only once, works for {email} only, and expires on {} (UTC).",
+        "{send} It is shown only once, works for {email} only, and expires on {} (UTC).{replaced}",
         issued.invitation.expires_at.date(),
     );
     view! {
@@ -731,9 +748,9 @@ fn IssuedLink(issued: IssuedInvitation) -> impl IntoView {
             {delivery}
             <label class="field">
                 <span class="field-label">"Invitation link"</span>
-                <input class="input mono" readonly value=link aria-describedby="issued-link-note"/>
+                <input class="input mono" readonly value=link aria-describedby=note_id/>
             </label>
-            <p class="field-hint" id="issued-link-note">{note}</p>
+            <p class="field-hint" id=note_id>{note}</p>
         </div>
     }
 }
@@ -743,6 +760,7 @@ fn IssuedLink(issued: IssuedInvitation) -> impl IntoView {
 #[derive(Clone, Copy)]
 struct InvitationActions {
     create: ServerAction<CreateInvitation>,
+    resend: ServerAction<ResendInvitation>,
     revoke: ServerAction<RevokeInvitation>,
 }
 
@@ -750,6 +768,7 @@ struct InvitationActions {
 fn Invitations(ctx: OrgContext) -> impl IntoView {
     let actions = InvitationActions {
         create: ServerAction::<CreateInvitation>::new(),
+        resend: ServerAction::<ResendInvitation>::new(),
         revoke: ServerAction::<RevokeInvitation>::new(),
     };
     provide_context(actions);
@@ -758,10 +777,11 @@ fn Invitations(ctx: OrgContext) -> impl IntoView {
             (
                 ctx.id.get(),
                 actions.create.version().get(),
+                actions.resend.version().get(),
                 actions.revoke.version().get(),
             )
         },
-        |(id, _, _)| async move {
+        |(id, _, _, _)| async move {
             match id {
                 Some(id) => list_invitations(id).await,
                 None => Err(AppError::NotFound),
@@ -776,6 +796,14 @@ fn Invitations(ctx: OrgContext) -> impl IntoView {
             .and_then(Result::err)
             .map(|err| view! { <p class="form-error" role="alert">{err.to_string()}</p> })
     };
+    let resent = move || {
+        actions.resend.value().get().map(|result| match result {
+            Ok(issued) => view! { <IssuedLink issued resent=true/> }.into_any(),
+            Err(err) => {
+                view! { <p class="form-error" role="alert">{err.to_string()}</p> }.into_any()
+            }
+        })
+    };
     view! {
         <Transition fallback=|| ()>
             {move || {
@@ -788,7 +816,8 @@ fn Invitations(ctx: OrgContext) -> impl IntoView {
                             <section class="panel" aria-labelledby="invitations-title">
                                 <h2 class="section-title" id="invitations-title">"Open invitations"</h2>
                                 {revoke_error}
-                                <InvitationTable list actor org_id revoke=actions.revoke/>
+                                {resent}
+                                <InvitationTable list actor org_id actions/>
                             </section>
                         }
                         .into_any()
@@ -813,23 +842,40 @@ fn InvitationTable(
     list: Vec<InvitationSummary>,
     actor: OrgRole,
     org_id: String,
-    revoke: ServerAction<RevokeInvitation>,
+    actions: InvitationActions,
 ) -> impl IntoView {
     let can_manage = actor.allows(Permission::MembersManage);
     let rows = list
         .into_iter()
         .map(|invitation| {
             let email = invitation.email.as_str().to_owned();
-            let withdrawable =
+            let manageable =
                 can_manage && (actor == OrgRole::Owner || invitation.role != OrgRole::Owner);
-            let controls = withdrawable.then(|| {
+            let controls = manageable.then(|| {
                 let org_id = org_id.clone();
                 let invitation_id = invitation.id.to_string();
                 let confirm = format!("Withdraw invitation for {email}");
+                let resend = format!("Send a new link to {email}");
+                let resend_org_id = org_id.clone();
+                let resend_invitation_id = invitation_id.clone();
                 view! {
                     <div class="row-actions">
+                        <ConfirmDialog trigger="Resend" title=format!("{}?", resend)>
+                            <ActionForm action=actions.resend attr:class="dialog-form">
+                                <input type="hidden" name="organization_id" value=resend_org_id/>
+                                <input type="hidden" name="invitation_id" value=resend_invitation_id/>
+                                <p>
+                                    "A new link replaces the current one, which stops working. \
+                                     The role stays the same and the new link expires a week from now."
+                                </p>
+                                <div class="dialog-actions">
+                                    <DialogCancel/>
+                                    <button type="submit" class="button button-primary">{resend}</button>
+                                </div>
+                            </ActionForm>
+                        </ConfirmDialog>
                         <ConfirmDialog trigger="Withdraw" title=format!("{}?", confirm)>
-                            <ActionForm action=revoke attr:class="dialog-form">
+                            <ActionForm action=actions.revoke attr:class="dialog-form">
                                 <input type="hidden" name="organization_id" value=org_id/>
                                 <input type="hidden" name="invitation_id" value=invitation_id/>
                                 <p>"The link stops working immediately."</p>
@@ -841,6 +887,7 @@ fn InvitationTable(
                         </ConfirmDialog>
                     </div>
                 }
+                .into_any()
             });
             view! {
                 <tr>

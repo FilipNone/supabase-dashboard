@@ -36,6 +36,11 @@ pub struct NewInvitation<'a> {
     pub token_hash: &'a [u8; 32],
     pub invited_by: Uuid,
     pub expires_at: OffsetDateTime,
+    /// Set when sending an open invitation again: the invitation must still
+    /// be open, in this organization, for the same address and role, or
+    /// nothing is written and the outcome is
+    /// [`InvitationChangeOutcome::InvitationNotFound`].
+    pub replaces: Option<Uuid>,
 }
 
 /// State read under the organization lock, handed to the decision callback
@@ -223,6 +228,25 @@ impl Database {
         .await
         .map_err(query_err)?;
 
+        if let Some(replaced) = new.replaces {
+            let still_open: bool = sqlx::query_scalar(concat!(
+                "SELECT EXISTS (SELECT 1 FROM organization_invitations \
+                 WHERE id = $1 AND organization_id = $2 AND email = $3 AND role = $4 AND ",
+                open!(),
+                ")"
+            ))
+            .bind(replaced)
+            .bind(new.organization_id)
+            .bind(new.email.as_str())
+            .bind(new.role.as_str())
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(query_err)?;
+            if !still_open {
+                return Ok(InvitationChangeOutcome::InvitationNotFound);
+            }
+        }
+
         let snapshot = InvitationSnapshot {
             actor_role: parse_role(&actor_role)?,
             already_member,
@@ -270,6 +294,16 @@ impl Database {
         organization_id: Uuid,
         limit: usize,
     ) -> Result<Vec<InvitationRecord>, PersistenceError> {
+        self.list_open_invitations_where(organization_id, None, limit)
+            .await
+    }
+
+    async fn list_open_invitations_where(
+        &self,
+        organization_id: Uuid,
+        invitation_id: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<InvitationRecord>, PersistenceError> {
         #[derive(sqlx::FromRow)]
         struct Row {
             id: Uuid,
@@ -283,11 +317,13 @@ impl Database {
              FROM organization_invitations i LEFT JOIN accounts a ON a.id = i.invited_by \
              WHERE i.organization_id = $1 AND i.accepted_at IS NULL \
                AND i.revoked_at IS NULL AND i.expires_at > now() \
+               AND ($3::uuid IS NULL OR i.id = $3) \
              ORDER BY i.created_at DESC, i.id \
              LIMIT $2",
         )
         .bind(organization_id)
         .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .bind(invitation_id)
         .fetch_all(&self.pool)
         .await
         .map_err(query_err)?;
@@ -310,6 +346,18 @@ impl Database {
                 })
             })
             .collect()
+    }
+
+    /// One open, unexpired invitation of an organization by its ID.
+    pub async fn find_open_invitation(
+        &self,
+        organization_id: Uuid,
+        invitation_id: Uuid,
+    ) -> Result<Option<InvitationRecord>, PersistenceError> {
+        Ok(self
+            .list_open_invitations_where(organization_id, Some(invitation_id), 1)
+            .await?
+            .pop())
     }
 
     /// Withdraws an open invitation if `decide` allows it. `decide` gets the

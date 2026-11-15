@@ -282,3 +282,39 @@ async fn refused_invitations_send_nothing() {
     ));
     assert!(mailer.sent.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn a_resent_invitation_emails_the_new_link() {
+    let Some(scratch) = ScratchDb::create("app_invite_mail_resent").await else {
+        return;
+    };
+    let db = database(&scratch).await;
+    let mailer = Arc::new(FakeMailer::default());
+    let orgs = with_mail(&db, &mailer);
+    let owner = account(&db, "Olivia").await;
+    let org = orgs.create(&owner, "Acme", ctx()).await.unwrap().id;
+    let first = orgs
+        .invite(&owner, org, "new@example.test", OrgRole::Viewer, ctx())
+        .await
+        .unwrap();
+    let again = orgs
+        .resend_invitation(&owner, org, first.invitation.id, ctx())
+        .await
+        .unwrap();
+    assert_eq!(again.delivery, InvitationDelivery::Sent);
+
+    let sent = mailer.sent.lock().unwrap().clone();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[1].to.as_str(), "new@example.test");
+    assert!(
+        sent[1]
+            .body
+            .contains(&format!("{PAGE}#{}", again.code.expose()))
+    );
+    assert!(!sent[1].body.contains(first.code.expose()));
+    assert_eq!(
+        email_events(&db, again.invitation.id, org, "success").await,
+        1
+    );
+    assert_eq!(audit_rows_containing(&db, again.code.expose()).await, 0);
+}
