@@ -1261,6 +1261,21 @@ pub async fn admin_set_account_disabled(
         .await?)
 }
 
+/// Unlinks another operator's single sign-on identity and ends the
+/// dashboard sessions that came from it. Installation administrators only;
+/// operators unlink their own identity under Account settings.
+#[server]
+pub async fn admin_unlink_oidc_identity(
+    account_id: Uuid,
+    identity_id: Uuid,
+) -> Result<u64, AppError> {
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    Ok(org_context::auth()?
+        .admin_unlink_oidc_identity(&session, account_id, identity_id, audit.get())
+        .await?)
+}
+
 /// The installation's Dokploy connection, without its key. Installation
 /// administrators only.
 #[server]

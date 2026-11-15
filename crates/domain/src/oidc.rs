@@ -56,6 +56,17 @@ pub struct LinkedIdentity {
     pub current_provider: bool,
 }
 
+/// An identity linked to an account, as an installation administrator sees
+/// it in the account list. The ID is for unlinking; it is not a credential.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminLinkedIdentity {
+    pub id: uuid::Uuid,
+    pub issuer: String,
+    /// What the provider called the identity when it was linked. For
+    /// display only.
+    pub label: Option<String>,
+}
+
 /// The account security page's single sign-on panel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OidcOverview {

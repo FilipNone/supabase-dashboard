@@ -167,6 +167,8 @@ pub struct AdminAccountSummary {
     pub organization_count: i64,
     /// The administrator viewing the list.
     pub is_you: bool,
+    /// Identities at OpenID Connect providers linked to the account.
+    pub oidc_identities: Vec<crate::oidc::AdminLinkedIdentity>,
 }
 
 /// One of the operator's own signed-in sessions, as listed on the account

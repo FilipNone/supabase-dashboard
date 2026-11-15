@@ -1,5 +1,6 @@
 //! Installation administration: every dashboard account, with the means to
-//! disable and re-enable them, a read-only list of every organization and
+//! disable and re-enable them and to unlink their single sign-on
+//! identities, a read-only list of every organization and
 //! registered project, and the installation's Dokploy connection.
 //!
 //! The server refuses these calls for anyone who is not an installation
@@ -15,6 +16,7 @@ use supabase_dashboard_domain::{
     },
     connection::KeyExpiry,
     job::JobKind,
+    oidc::AdminLinkedIdentity,
 };
 
 use crate::{
@@ -22,19 +24,36 @@ use crate::{
     components::page::{PageHeader, StatePanel, StateTone},
     error::AppError,
     pages::{account::utc_minutes, admin_dokploy::DokployPanel, organization::health_badges},
-    server_fns::{AdminSetAccountDisabled, admin_list_accounts, admin_list_resources},
+    server_fns::{
+        AdminSetAccountDisabled, AdminUnlinkOidcIdentity, admin_list_accounts, admin_list_resources,
+    },
 };
 
 #[component]
 pub fn AdminPage() -> impl IntoView {
     let toggle = ServerAction::<AdminSetAccountDisabled>::new();
-    let accounts = Resource::new(move || toggle.version().get(), |_| admin_list_accounts());
+    let unlink = ServerAction::<AdminUnlinkOidcIdentity>::new();
+    let accounts = Resource::new(
+        move || (toggle.version().get(), unlink.version().get()),
+        |_| admin_list_accounts(),
+    );
     let toggle_error = move || {
         toggle
             .value()
             .get()
             .and_then(Result::err)
             .map(|err| view! { <p class="form-error" role="alert">{err.to_string()}</p> })
+    };
+    let unlink_outcome = move || {
+        unlink.value().get().map(|result| match result {
+            Ok(ended) => view! {
+                <p class="form-ok" role="status">{unlinked_message(ended)}</p>
+            }
+            .into_any(),
+            Err(err) => {
+                view! { <p class="form-error" role="alert">{err.to_string()}</p> }.into_any()
+            }
+        })
     };
     view! {
         <Title text="Administration"/>
@@ -48,10 +67,11 @@ pub fn AdminPage() -> impl IntoView {
                 "A disabled account cannot sign in and is signed out everywhere. It keeps its organization memberships, so enabling it again restores its access."
             </p>
             {toggle_error}
+            {unlink_outcome}
             <Transition fallback=|| view! { <p class="loading" role="status">"Loading accounts…"</p> }>
                 {move || {
                     accounts.get().map(|result| match result {
-                        Ok(list) => view! { <AccountTable list toggle/> }.into_any(),
+                        Ok(list) => view! { <AccountTable list toggle unlink/> }.into_any(),
                         Err(AppError::Forbidden) => view! {
                             <StatePanel
                                 tone=StateTone::Error
@@ -351,6 +371,7 @@ fn ProjectTable(list: Vec<AdminProjectSummary>, truncated: bool) -> impl IntoVie
 fn AccountTable(
     list: Vec<AdminAccountSummary>,
     toggle: ServerAction<AdminSetAccountDisabled>,
+    unlink: ServerAction<AdminUnlinkOidcIdentity>,
 ) -> impl IntoView {
     let rows = list
         .into_iter()
@@ -388,6 +409,7 @@ fn AccountTable(
                 .into_any()
             };
             let status = if account.disabled { "Disabled" } else { "Active" };
+            let identities = linked_identities(&account, &name, unlink);
             view! {
                 <tr>
                     <td>
@@ -398,6 +420,7 @@ fn AccountTable(
                     <td>{account.email.to_string()}</td>
                     <td>{status}</td>
                     <td>{account.organization_count.to_string()}</td>
+                    <td>{identities}</td>
                     <td class="nowrap">{account.created_at.date().to_string()}</td>
                     <td>{action}</td>
                 </tr>
@@ -414,6 +437,7 @@ fn AccountTable(
                         <th scope="col">"Email"</th>
                         <th scope="col">"Status"</th>
                         <th scope="col">"Organizations"</th>
+                        <th scope="col">"Single sign-on"</th>
                         <th scope="col">"Created (UTC)"</th>
                         <th scope="col"><span class="visually-hidden">"Actions"</span></th>
                     </tr>
@@ -421,6 +445,76 @@ fn AccountTable(
                 <tbody>{rows}</tbody>
             </table>
         </div>
+    }
+}
+
+/// The identities linked to one account, each with an Unlink button
+/// unless it is the administrator's own account (that is under Account
+/// settings, Security).
+fn linked_identities(
+    account: &AdminAccountSummary,
+    name: &str,
+    unlink: ServerAction<AdminUnlinkOidcIdentity>,
+) -> AnyView {
+    if account.oidc_identities.is_empty() {
+        return view! { <span class="field-hint">"None"</span> }.into_any();
+    }
+    let account_id = account.id.to_string();
+    account
+        .oidc_identities
+        .iter()
+        .map(|identity| {
+            let label = identity_label(identity);
+            let action = (!account.is_you).then(|| {
+                let confirm = format!("Unlink from {name}");
+                let title = format!("Unlink {label} from {name}?");
+                let detail = format!(
+                    "{name} can no longer sign in with this identity, and their dashboard sessions started with it end now, with any Studio access opened from them. Other sessions and their password are not affected."
+                );
+                let account_id = account_id.clone();
+                let identity_id = identity.id.to_string();
+                view! {
+                    <ConfirmDialog trigger="Unlink" title>
+                        <ActionForm action=unlink attr:class="dialog-form">
+                            <input type="hidden" name="account_id" value=account_id/>
+                            <input type="hidden" name="identity_id" value=identity_id/>
+                            <p>{detail}</p>
+                            <div class="dialog-actions">
+                                <DialogCancel/>
+                                <button type="submit" class="button button-danger">{confirm}</button>
+                            </div>
+                        </ActionForm>
+                    </ConfirmDialog>
+                }
+            });
+            view! {
+                <div class="identity-item">
+                    <span title=identity.issuer.clone()>{label.clone()}</span>
+                    {action}
+                </div>
+            }
+        })
+        .collect_view()
+        .into_any()
+}
+
+/// What the account list calls a linked identity: the provider's name for
+/// it, else the issuer without its scheme.
+fn identity_label(identity: &AdminLinkedIdentity) -> String {
+    identity.label.clone().unwrap_or_else(|| {
+        let issuer = identity.issuer.as_str();
+        issuer
+            .split_once("://")
+            .map_or(issuer, |(_, rest)| rest)
+            .to_owned()
+    })
+}
+
+fn unlinked_message(ended: u64) -> String {
+    match ended {
+        0 => "Identity unlinked. No session had been started with it.".to_owned(),
+        1 => "Identity unlinked. 1 session started with it has ended.".to_owned(),
+        n => format!("Identity unlinked. {n} sessions started with it have ended."),
     }
 }
 

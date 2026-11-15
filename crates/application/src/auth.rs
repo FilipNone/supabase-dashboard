@@ -12,6 +12,7 @@ use supabase_dashboard_domain::{
     admin::{ADMIN_RESOURCE_LIST_LIMIT, RegisteredResources},
     audit::{AUDIT_PAGE, AuditLogPage},
     invitation::InvitationPreview,
+    oidc::AdminLinkedIdentity,
 };
 use supabase_dashboard_persistence::{
     Database, PersistenceError,
@@ -145,6 +146,9 @@ pub enum AdminError {
     CannotDisableSelf,
     #[error("at least one installation administrator must stay enabled")]
     LastAdmin,
+    /// Administrators unlink their own identities under Account settings.
+    #[error("unlink your own identity under Account settings > Security")]
+    OwnIdentity,
     #[error(transparent)]
     Internal(#[from] AuthError),
 }
@@ -589,9 +593,23 @@ impl AuthService {
         self.require_admin(current, "admin.account_list", None, ctx)
             .await?;
         let accounts = self.db.list_accounts().await?;
+        let ids: Vec<Uuid> = accounts.iter().map(|listing| listing.account.id).collect();
+        let mut identities: std::collections::HashMap<Uuid, Vec<AdminLinkedIdentity>> =
+            std::collections::HashMap::new();
+        for (account_id, record) in self.db.list_oidc_identities_of(&ids).await? {
+            identities
+                .entry(account_id)
+                .or_default()
+                .push(AdminLinkedIdentity {
+                    id: record.id,
+                    issuer: record.issuer,
+                    label: record.label,
+                });
+        }
         Ok(accounts
             .into_iter()
             .map(|listing| AdminAccountSummary {
+                oidc_identities: identities.remove(&listing.account.id).unwrap_or_default(),
                 is_you: listing.account.id == current.account.id,
                 id: listing.account.id,
                 email: listing.account.email,
@@ -672,6 +690,61 @@ impl AuthService {
             }
             SetDisabledOutcome::LastAdmin => {
                 refuse(AuditOutcome::Denied, AdminError::LastAdmin).await
+            }
+        }
+    }
+
+    /// Unlinks another operator's identity at an OpenID Connect provider,
+    /// for installation administrators, and signs out the sessions that
+    /// account started with it. The account keeps its password and its
+    /// other sessions. Administrators unlink their own identities under
+    /// Account settings. Returns how many sessions were signed out.
+    pub async fn admin_unlink_oidc_identity(
+        &self,
+        current: &CurrentSession,
+        account_id: Uuid,
+        identity_id: Uuid,
+        ctx: RequestContext<'_>,
+    ) -> Result<u64, AdminError> {
+        const ACTION: &str = "admin.account_oidc_unlink";
+        self.require_admin(current, ACTION, Some(account_id), ctx)
+            .await?;
+        if account_id == current.account.id {
+            self.audit(
+                Some(current.account.id),
+                ACTION,
+                Some(("account", account_id)),
+                AuditOutcome::Denied,
+                ctx,
+            )
+            .await;
+            return Err(AdminError::OwnIdentity);
+        }
+        let event = AuditEvent {
+            actor_account_id: Some(current.account.id),
+            action: ACTION,
+            target_type: Some("account"),
+            target_id: Some(account_id.to_string()),
+            outcome: AuditOutcome::Success,
+            request_id: ctx.request_id,
+            organization_id: None,
+        };
+        match self
+            .db
+            .unlink_oidc_identity_and_sessions(account_id, identity_id, &event)
+            .await?
+        {
+            Some(revoked) => Ok(revoked),
+            None => {
+                self.audit(
+                    Some(current.account.id),
+                    ACTION,
+                    Some(("account", account_id)),
+                    AuditOutcome::Failure,
+                    ctx,
+                )
+                .await;
+                Err(AdminError::NotFound)
             }
         }
     }

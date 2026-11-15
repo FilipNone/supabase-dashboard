@@ -883,3 +883,111 @@ async fn back_channel_logout_from_a_mock_provider() {
     h.db.close().await;
     h.scratch.drop().await;
 }
+
+#[tokio::test]
+async fn administrators_unlink_other_operators_identities() {
+    use leptos::server_fn::ServerFn;
+    use supabase_dashboard_web::server_fns::AdminUnlinkOidcIdentity;
+
+    let Some(h) = harness("http_oidc_admin_unlink").await else {
+        return;
+    };
+    sqlx::query(
+        "INSERT INTO accounts (id, email, display_name, password_hash) \
+         SELECT gen_random_uuid(), 'bob@example.test', 'Bob', password_hash FROM accounts LIMIT 1",
+    )
+    .execute(h.db.pool())
+    .await
+    .unwrap();
+    let owner = h.password_session("owner%40example.test").await;
+    let bob = h.password_session("bob%40example.test").await;
+    for (session, subject, code) in [
+        (&owner, "alice", "code-link-a"),
+        (&bob, "bob", "code-link-b"),
+    ] {
+        let linking = h.start("/auth/oidc/link", "", Some(session)).await;
+        h.grant(&linking, code, subject, |_| {});
+        let (parts, _) = send(&h.router, linking.callback(code, Some(session))).await;
+        assert_eq!(
+            location(&parts),
+            format!("{ACCOUNT_SECURITY_PATH}?oidc=linked")
+        );
+    }
+    let bob_sso = h.oidc_session("code-bob", "bob", "sid-bob").await;
+    let pool = h.db.pool().clone();
+    let ids = |email: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (Uuid, Uuid)>(
+                "SELECT a.id, i.id FROM accounts a JOIN oidc_identities i ON i.account_id = a.id \
+             WHERE a.email = $1",
+            )
+            .bind(email)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let (owner_id, owner_identity) = ids("owner@example.test").await;
+    let (bob_id, bob_identity) = ids("bob@example.test").await;
+    let unlink = |account: Uuid, identity: Uuid, session: &str| {
+        send(
+            &h.router,
+            form_post(
+                AdminUnlinkOidcIdentity::PATH,
+                &format!("account_id={account}&identity_id={identity}"),
+                Some(session),
+            ),
+        )
+    };
+
+    // Bob is not an administrator: refused on the server.
+    let (parts, body) = unlink(owner_id, owner_identity, &bob).await;
+    assert!(!parts.status.is_success());
+    assert!(body.contains("Forbidden"), "{body}");
+    // The owner's own identity is unlinked under Account settings instead,
+    // and an identity is only found under its own account.
+    let (_, body) = unlink(owner_id, owner_identity, &owner).await;
+    assert!(body.contains("Account settings"), "{body}");
+    let (parts, _) = unlink(bob_id, owner_identity, &owner).await;
+    assert!(!parts.status.is_success());
+    let linked: i64 = sqlx::query_scalar("SELECT count(*) FROM oidc_identities")
+        .fetch_one(h.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(linked, 2);
+    assert!(h.signed_in(&bob_sso).await);
+
+    // The account list names the identity and the account in the dialog.
+    let (parts, body) = send(&h.router, get_with_cookie("/dashboard/admin", &owner)).await;
+    assert_eq!(parts.status, StatusCode::OK);
+    assert!(
+        body.contains("Unlink bob@idp.example.test from Bob?"),
+        "{body}"
+    );
+    assert!(
+        !body.contains(&format!("value=\"{owner_identity}\"")),
+        "{body}"
+    );
+
+    // The owner unlinks Bob's: his single sign-on session ends, his
+    // password session stays, and the identity no longer signs in.
+    let (parts, body) = unlink(bob_id, bob_identity, &owner).await;
+    assert_eq!(parts.status, StatusCode::OK, "{body}");
+    assert_eq!(body, "1");
+    assert!(!h.signed_in(&bob_sso).await);
+    assert!(h.signed_in(&bob).await);
+    let started = h.start_sign_in().await;
+    h.grant(&started, "code-after", "bob", |_| {});
+    let (parts, _) = send(&h.router, started.callback("code-after", None)).await;
+    assert_eq!(location(&parts), sign_in_error("oidc_unlinked"));
+    let (parts, _) = unlink(bob_id, bob_identity, &owner).await;
+    assert!(!parts.status.is_success());
+
+    assert_eq!(h.audited("admin.account_oidc_unlink", "success").await, 1);
+    assert_eq!(h.audited("admin.account_oidc_unlink", "denied").await, 2);
+    assert_eq!(h.audited("admin.account_oidc_unlink", "failure").await, 2);
+
+    h.db.close().await;
+    h.scratch.drop().await;
+}

@@ -179,6 +179,76 @@ impl Database {
         .map_err(PersistenceError::Query)
     }
 
+    /// The identities of each of `account_ids`, oldest first, at most
+    /// [`OIDC_IDENTITY_LIST_LIMIT`] per account, for the administrator's
+    /// account list.
+    pub async fn list_oidc_identities_of(
+        &self,
+        account_ids: &[Uuid],
+    ) -> Result<Vec<(Uuid, OidcIdentityRecord)>, PersistenceError> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            account_id: Uuid,
+            #[sqlx(flatten)]
+            record: OidcIdentityRecord,
+        }
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT account_id, id, issuer, label, created_at, last_used_at FROM ( \
+                 SELECT *, row_number() OVER (PARTITION BY account_id ORDER BY created_at, id) AS n \
+                 FROM oidc_identities WHERE account_id = ANY($1) \
+             ) ranked WHERE n <= $2 ORDER BY account_id, created_at, id",
+        )
+        .bind(account_ids)
+        .bind(OIDC_IDENTITY_LIST_LIMIT)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(PersistenceError::Query)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.account_id, row.record))
+            .collect())
+    }
+
+    /// Removes one of the account's identities, revokes the account's
+    /// sessions that were signed in with it, and records `audit`, in one
+    /// transaction. Returns how many sessions were revoked, or `None` when
+    /// the account has no identity with that ID.
+    pub async fn unlink_oidc_identity_and_sessions(
+        &self,
+        account_id: Uuid,
+        identity_id: Uuid,
+        audit: &AuditEvent<'_>,
+    ) -> Result<Option<u64>, PersistenceError> {
+        let mut tx = self.pool.begin().await.map_err(PersistenceError::Query)?;
+        let removed: Option<(String, String)> = sqlx::query_as(
+            "DELETE FROM oidc_identities WHERE id = $1 AND account_id = $2 \
+             RETURNING issuer, subject",
+        )
+        .bind(identity_id)
+        .bind(account_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(PersistenceError::Query)?;
+        let Some((issuer, subject)) = removed else {
+            return Ok(None);
+        };
+        let revoked = sqlx::query(
+            "UPDATE sessions SET revoked_at = now() \
+             WHERE account_id = $1 AND oidc_issuer = $2 AND oidc_subject = $3 \
+               AND revoked_at IS NULL",
+        )
+        .bind(account_id)
+        .bind(&issuer)
+        .bind(&subject)
+        .execute(&mut *tx)
+        .await
+        .map_err(PersistenceError::Query)?
+        .rows_affected();
+        insert_audit_event(&mut *tx, audit).await?;
+        tx.commit().await.map_err(PersistenceError::Query)?;
+        Ok(Some(revoked))
+    }
+
     /// Removes one of the account's identities and records `audit` with it.
     /// Returns `false` when the account has no identity with that ID.
     pub async fn unlink_oidc_identity(

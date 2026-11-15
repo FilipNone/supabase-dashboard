@@ -116,7 +116,7 @@ mod server {
             match err {
                 AdminError::Forbidden => Self::Forbidden,
                 AdminError::NotFound => Self::NotFound,
-                AdminError::CannotDisableSelf | AdminError::LastAdmin => {
+                AdminError::CannotDisableSelf | AdminError::LastAdmin | AdminError::OwnIdentity => {
                     Self::Rejected(err.to_string())
                 }
                 AdminError::Internal(err) => err.into(),

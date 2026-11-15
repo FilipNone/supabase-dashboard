@@ -692,3 +692,94 @@ async fn backchannel_logout_revokes_only_the_sessions_it_names() {
     db.close().await;
     scratch.drop().await;
 }
+
+#[tokio::test]
+async fn admins_unlink_other_operators_identities() {
+    let Some(scratch) = ScratchDb::create("app_oidc_admin_unlink").await else {
+        return;
+    };
+    let (db, auth) = service(&scratch, ISSUER).await;
+    let owner = session_for(&auth, "owner@example.test").await;
+    let bob_id = add_account(&db, "bob@example.test").await;
+    let bob = session_for(&auth, "bob@example.test").await;
+    link(&auth, &bob, "bob-sub").await.unwrap();
+    link(&auth, &owner, "alice").await.unwrap();
+    let bob_sso = oidc_session(&auth, "sub:bob-sub@sid-b").await;
+
+    // The account list shows each account's identities.
+    let accounts = auth.admin_list_accounts(&owner, ctx()).await.unwrap();
+    let listed = accounts.iter().find(|a| a.id == bob_id).unwrap();
+    assert_eq!(listed.oidc_identities.len(), 1);
+    assert_eq!(listed.oidc_identities[0].issuer, ISSUER);
+    assert_eq!(
+        listed.oidc_identities[0].label.as_deref(),
+        Some("bob-sub@idp.example.test")
+    );
+    let identity = listed.oidc_identities[0].id;
+    let owner_identity = accounts
+        .iter()
+        .find(|a| a.id == owner.account.id)
+        .unwrap()
+        .oidc_identities[0]
+        .id;
+
+    // Not for operators who are not installation administrators.
+    assert!(matches!(
+        auth.admin_unlink_oidc_identity(&bob, owner.account.id, owner_identity, ctx())
+            .await,
+        Err(supabase_dashboard_application::auth::AdminError::Forbidden)
+    ));
+    assert_eq!(audited(&db, "admin.account_oidc_unlink", "denied").await, 1);
+    // Not for the administrator's own identity, which is unlinked under
+    // Account settings.
+    assert!(matches!(
+        auth.admin_unlink_oidc_identity(&owner, owner.account.id, owner_identity, ctx())
+            .await,
+        Err(supabase_dashboard_application::auth::AdminError::OwnIdentity)
+    ));
+    // The identity must belong to the account named.
+    assert!(matches!(
+        auth.admin_unlink_oidc_identity(&owner, bob_id, owner_identity, ctx())
+            .await,
+        Err(supabase_dashboard_application::auth::AdminError::NotFound)
+    ));
+    assert!(matches!(
+        auth.admin_unlink_oidc_identity(&owner, bob_id, Uuid::now_v7(), ctx())
+            .await,
+        Err(supabase_dashboard_application::auth::AdminError::NotFound)
+    ));
+    assert_eq!(
+        auth.oidc_overview(&owner).await.unwrap().identities.len(),
+        1
+    );
+
+    // Unlinked: the sessions it started end, the password session stays,
+    // and it no longer signs in.
+    assert_eq!(
+        auth.admin_unlink_oidc_identity(&owner, bob_id, identity, ctx())
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(!alive(&auth, &bob_sso).await);
+    assert!(
+        auth.oidc_overview(&bob)
+            .await
+            .unwrap()
+            .identities
+            .is_empty()
+    );
+    assert!(matches!(
+        sign_in(&auth, "bob-sub").await,
+        Err(OidcError::NotLinked)
+    ));
+    let live = auth.list_sessions(&bob).await.unwrap();
+    assert!(live.iter().any(|session| session.id == bob.session_id));
+    assert_eq!(live.len(), 1);
+    assert_eq!(
+        audited(&db, "admin.account_oidc_unlink", "success").await,
+        1
+    );
+    db.close().await;
+    scratch.drop().await;
+}
