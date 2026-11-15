@@ -127,7 +127,7 @@ After an invitation is created, the page says whether the email went out. If the
 
 Operators can also sign in through an OpenID Connect provider, such as Authentik. It is off by default, and passwords keep working with it on. A provider identity signs in only to the dashboard account it was linked to: the dashboard never finds, links, or creates accounts by email, and the provider cannot sign anyone up.
 
-1. In Authentik, create an OAuth2/OpenID provider (Applications > Providers): client type Confidential, authorization flow of your choice, and one strict redirect URI, `https://<dashboard host>/auth/oidc/callback` (the dashboard's `SUPABASE_DASHBOARD_PUBLIC_URL` followed by `/auth/oidc/callback`). Keep the default scope mappings for `openid`, `email`, and `profile`, and the signing key (an RS256 or ES256 certificate; the dashboard refuses HMAC-signed ID tokens). Then create an application that uses the provider and note its slug.
+1. In Authentik, create an OAuth2/OpenID provider (Applications > Providers): client type Confidential, authorization flow of your choice, grant types including Authorization Code, and one strict redirect URI, `https://<dashboard host>/auth/oidc/callback` (the dashboard's `SUPABASE_DASHBOARD_PUBLIC_URL` followed by `/auth/oidc/callback`). Keep the default scope mappings for `openid`, `email`, and `profile`, and the signing key (an RS256 or ES256 certificate; the dashboard refuses HMAC-signed ID tokens). Then create an application that uses the provider and note its slug.
 2. Put the client secret in a file next to `compose.yaml`, add it as a Compose secret like the encryption key (`oidc_client_secret` under `secrets:` with `file: ./oidc-client-secret`, and listed under the dashboard's `secrets`), and set in `.env`:
 
    ```sh
@@ -144,6 +144,8 @@ Operators can also sign in through an OpenID Connect provider, such as Authentik
 The dashboard talks to the provider only at the issuer's origin: discovery, the key set, and the token endpoint must be there, redirects are not followed, no proxy is used, and answers are size- and time-limited. Cloud metadata addresses are always refused. A provider on the same host is allowed, because the issuer is configured by the deployment. If the provider's certificate is from a private authority, add it to `SUPABASE_DASHBOARD_EXTRA_CA_FILE`. Sign-ins, refusals, links, and unlinks are in the audit log, without codes, tokens, or ID token contents. A disabled account cannot sign in this way either.
 
 The sign-in uses the authorization code flow with PKCE, `state`, and `nonce`, and checks the ID token's issuer, audience, signature, and expiry. A started sign-in waits at most 10 minutes, only in the browser that started it, and in the dashboard's memory: restarting the dashboard cancels sign-ins in progress. Signing out of Authentik does not yet sign out of the dashboard, and Authentik groups are not mapped to roles.
+
+The flow was checked on 2026-11-15 in Chromium against Authentik 2026.8.5 from `tests/fixtures/authentik/` (see its `setup.sh`): link from Account settings > Security, sign out, sign in through Authentik and land on the `next` page, unlink, and be refused after unlinking.
 
 ## Studio access
 

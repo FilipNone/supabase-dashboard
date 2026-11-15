@@ -1,0 +1,56 @@
+# Disposable Authentik for trying dashboard sign-in through OpenID Connect.
+# Run setup.sh, which starts these and applies blueprints/dashboard.yaml.
+#
+#   Authentik: http://localhost:54390 (admin interface at /if/admin/)
+#   issuer:    http://localhost:54390/application/o/supabase-dashboard/
+#
+# Everything is kept in tmpfs, so `docker compose down` leaves no volume.
+# Nothing here is a real credential: the passwords, secret key, and client
+# secret in fixture.env are fixture-only. The worker gets no Docker socket.
+name: sd-authentik-fixture
+
+x-authentik: &authentik
+  image: ghcr.io/goauthentik/server:2026.8.5
+  env_file: fixture.env
+  environment:
+    AUTHENTIK_POSTGRESQL__HOST: postgresql
+    AUTHENTIK_POSTGRESQL__NAME: authentik
+    AUTHENTIK_POSTGRESQL__USER: authentik
+    AUTHENTIK_POSTGRESQL__PASSWORD: fixture-only-db-password
+  depends_on:
+    postgresql:
+      condition: service_healthy
+  shm_size: 512mb
+  tmpfs:
+    - /data
+  volumes:
+    - ./blueprints:/blueprints/custom:ro
+
+services:
+  postgresql:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: authentik
+      POSTGRES_USER: authentik
+      POSTGRES_PASSWORD: fixture-only-db-password
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d authentik -U authentik"]
+      interval: 2s
+      retries: 30
+
+  server:
+    <<: *authentik
+    command: server
+    ports:
+      - "127.0.0.1:54390:9000"
+    healthcheck:
+      test: ["CMD", "ak", "healthcheck"]
+      interval: 5s
+      retries: 60
+      start_period: 20s
+
+  worker:
+    <<: *authentik
+    command: worker
