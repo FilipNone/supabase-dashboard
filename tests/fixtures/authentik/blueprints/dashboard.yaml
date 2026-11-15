@@ -20,6 +20,11 @@ entries:
       redirect_uris:
         - matching_mode: strict
           url: http://dash.localhost:3000/auth/oidc/callback
+      # Signing out of Authentik ends the dashboard sessions it started.
+      # The worker posts here; docker-compose.yml points dash.localhost at
+      # the Docker host.
+      logout_uri: http://dash.localhost:3000/auth/oidc/backchannel-logout
+      logout_method: backchannel
       signing_key: !Find [authentik_crypto.certificatekeypair, [name, authentik Self-signed Certificate]]
       sub_mode: hashed_user_id
       property_mappings:

@@ -1,6 +1,6 @@
 //! Single sign-on over HTTP against an in-process mock OpenID Connect
 //! provider: discovery, keys, and a token endpoint that signs real RS256 ID
-//! tokens. The dashboard side is the real router, the real adapter, and a
+//! tokens, plus back-channel logout tokens signed with the same key. The dashboard side is the real router, the real adapter, and a
 //! scratch metadata database. Skipped unless
 //! `SUPABASE_DASHBOARD_TEST_DATABASE_URL` is set.
 
@@ -18,12 +18,13 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use openidconnect::{
-    Audience, EmptyAdditionalClaims, EndUserEmail, IssuerUrl, Nonce, PkceCodeChallenge,
-    PkceCodeVerifier, PrivateSigningKey, StandardClaims, SubjectIdentifier,
+    AdditionalClaims, Audience, EndUserEmail, IdToken, IdTokenClaims, IssuerUrl, Nonce,
+    PkceCodeChallenge, PkceCodeVerifier, PrivateSigningKey, StandardClaims, SubjectIdentifier,
     core::{
-        CoreIdToken, CoreIdTokenClaims, CoreJsonWebKeySet, CoreJwsSigningAlgorithm,
-        CoreRsaPrivateSigningKey,
+        CoreGenderClaim, CoreJsonWebKeySet, CoreJweContentEncryptionAlgorithm,
+        CoreJwsSigningAlgorithm, CoreRsaPrivateSigningKey,
     },
 };
 use rsa::pkcs1::{EncodeRsaPrivateKey, LineEnding};
@@ -36,6 +37,7 @@ use supabase_dashboard_adapters::{
 use supabase_dashboard_application::auth::{AuthConfig, AuthService, oidc::OidcSignIn};
 use supabase_dashboard_persistence::Database;
 use supabase_dashboard_web::app::{ACCOUNT_SECURITY_PATH, SIGN_IN_PATH};
+use uuid::Uuid;
 
 use crate::{
     app::tests::{form_post, get_with_cookie, location, router_with_auth, send},
@@ -64,10 +66,27 @@ fn signing_key() -> CoreRsaPrivateSigningKey {
     .unwrap()
 }
 
+/// The provider's session ID, which back-channel logout tokens name.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct SessionClaims {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sid: Option<String>,
+}
+
+impl AdditionalClaims for SessionClaims {}
+
+type MockIdToken = IdToken<
+    SessionClaims,
+    CoreGenderClaim,
+    CoreJweContentEncryptionAlgorithm,
+    CoreJwsSigningAlgorithm,
+>;
+
 /// What the token endpoint puts in the ID token for one code.
 #[derive(Clone)]
 struct Grant {
     subject: String,
+    sid: Option<String>,
     nonce: String,
     audience: String,
     expired: bool,
@@ -138,7 +157,7 @@ async fn token(State(mock): State<Mock>, headers: HeaderMap, body: Bytes) -> Res
     } else {
         (now, now + chrono::Duration::minutes(5))
     };
-    let claims = CoreIdTokenClaims::new(
+    let claims = IdTokenClaims::<SessionClaims, CoreGenderClaim>::new(
         IssuerUrl::new(mock.issuer.clone()).unwrap(),
         vec![Audience::new(grant.audience)],
         expires,
@@ -146,10 +165,10 @@ async fn token(State(mock): State<Mock>, headers: HeaderMap, body: Bytes) -> Res
         StandardClaims::new(SubjectIdentifier::new(grant.subject.clone())).set_email(Some(
             EndUserEmail::new(format!("{}@idp.example.test", grant.subject)),
         )),
-        EmptyAdditionalClaims {},
+        SessionClaims { sid: grant.sid },
     )
     .set_nonce(Some(Nonce::new(grant.nonce)));
-    let id_token = CoreIdToken::new(
+    let id_token = MockIdToken::new(
         claims,
         &signing_key(),
         CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256,
@@ -300,6 +319,7 @@ impl Harness {
     fn grant(&self, started: &Started, code: &str, subject: &str, tweak: impl FnOnce(&mut Grant)) {
         let mut grant = Grant {
             subject: subject.to_owned(),
+            sid: None,
             nonce: query_param(&started.authorize_url, "nonce"),
             audience: CLIENT_ID.to_owned(),
             expired: false,
@@ -530,4 +550,336 @@ async fn sign_in_page_offers_single_sign_on_only_when_configured() {
     assert_eq!(location(&parts), sign_in_error("oidc"));
     db.close().await;
     scratch.drop().await;
+}
+
+const LOGOUT_PATH: &str = "/auth/oidc/backchannel-logout";
+const LOGOUT_EVENT: &str = "http://schemas.openid.net/event/backchannel-logout";
+
+fn b64_json(value: &serde_json::Value) -> String {
+    URL_SAFE_NO_PAD.encode(serde_json::to_vec(value).unwrap())
+}
+
+/// A logout token signed with the mock provider's key.
+fn logout_token(claims: &serde_json::Value) -> String {
+    let header = serde_json::json!({ "alg": "RS256", "kid": "mock-key", "typ": "logout+jwt" });
+    let input = format!("{}.{}", b64_json(&header), b64_json(claims));
+    let signature = signing_key()
+        .sign(
+            &CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256,
+            input.as_bytes(),
+        )
+        .unwrap();
+    format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature))
+}
+
+/// The provider's back-channel request: no cookie, and from another site.
+fn logout_request(body: String) -> Request<Body> {
+    Request::post(LOGOUT_PATH)
+        .header(header::HOST, crate::app::tests::HOST)
+        .header(header::ORIGIN, "http://idp.example.test")
+        .header("sec-fetch-site", "cross-site")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+fn logout_form(token: &str) -> String {
+    url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("logout_token", token)
+        .finish()
+}
+
+impl Harness {
+    fn logout_claims(&self, jti: &str) -> serde_json::Value {
+        serde_json::json!({
+            "iss": self.mock.issuer,
+            "aud": CLIENT_ID,
+            "iat": chrono::Utc::now().timestamp(),
+            "jti": jti,
+            "events": { LOGOUT_EVENT: {} },
+        })
+    }
+
+    /// Signs in as `subject` with the provider session `sid`.
+    async fn oidc_session(&self, code: &str, subject: &str, sid: &str) -> String {
+        let started = self.start_sign_in().await;
+        self.grant(&started, code, subject, |grant| {
+            grant.sid = Some(sid.to_owned());
+        });
+        let (parts, _) = send(&self.router, started.callback(code, None)).await;
+        assert_eq!(location(&parts), NEXT, "{code}");
+        cookie(&parts, "sd-session").unwrap()
+    }
+
+    async fn logout(&self, token: &str) -> (http::response::Parts, String) {
+        send(&self.router, logout_request(logout_form(token))).await
+    }
+
+    async fn signed_in(&self, session: &str) -> bool {
+        let (parts, _) = send(&self.router, get_with_cookie(NEXT, session)).await;
+        parts.status == StatusCode::OK
+    }
+
+    /// A Studio session on a project of the owner's, started from the
+    /// dashboard session that has provider session `sid`.
+    async fn studio_session(&self, sid: &str) -> (Uuid, [u8; 32]) {
+        let org = Uuid::now_v7();
+        let project = Uuid::now_v7();
+        let token_hash = [7u8; 32];
+        let pool = self.db.pool();
+        sqlx::query("INSERT INTO organizations (id, name) VALUES ($1, 'Org')")
+            .bind(org)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO organization_members (organization_id, account_id, role) \
+             SELECT $1, id, 'owner' FROM accounts WHERE email = 'owner@example.test'",
+        )
+        .bind(org)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO projects (id, organization_id, name, api_url) \
+             VALUES ($1, $2, 'Project', 'http://stack.example.test')",
+        )
+        .bind(project)
+        .bind(org)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO project_credentials (project_id, kind, key_id, nonce, ciphertext) \
+             VALUES ($1, 'studio_login', 'k1', $2, $3)",
+        )
+        .bind(project)
+        .bind([0u8; 12].as_slice())
+        .bind([0u8; 32].as_slice())
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO studio_sessions (token_hash, session_id, project_id, expires_at) \
+             SELECT $1, id, $2, now() + interval '1 hour' FROM sessions WHERE oidc_sid = $3",
+        )
+        .bind(token_hash.as_slice())
+        .bind(project)
+        .bind(sid)
+        .execute(pool)
+        .await
+        .unwrap();
+        (project, token_hash)
+    }
+
+    async fn studio_open(&self, (project, token_hash): (Uuid, [u8; 32])) -> bool {
+        self.db
+            .find_studio_grant(&token_hash, project, StdDuration::from_secs(3600))
+            .await
+            .unwrap()
+            .is_some()
+    }
+}
+
+#[tokio::test]
+async fn back_channel_logout_from_a_mock_provider() {
+    let Some(h) = harness("http_oidc_logout").await else {
+        return;
+    };
+    // The owner links `alice` and signs in through it twice (two provider
+    // sessions), and once with a password.
+    let password = h.password_session("owner%40example.test").await;
+    let linking = h.start("/auth/oidc/link", "", Some(&password)).await;
+    h.grant(&linking, "code-link", "alice", |_| {});
+    let (parts, _) = send(&h.router, linking.callback("code-link", Some(&password))).await;
+    assert_eq!(
+        location(&parts),
+        format!("{ACCOUNT_SECURITY_PATH}?oidc=linked")
+    );
+    let first = h.oidc_session("code-1", "alice", "sid-1").await;
+    let second = h.oidc_session("code-2", "alice", "sid-2").await;
+    let studio = h.studio_session("sid-1").await;
+    assert!(h.studio_open(studio).await);
+
+    // Tokens the dashboard refuses, each with a generic answer and
+    // nothing revoked.
+    let claims = |jti: &str, edit: &dyn Fn(&mut serde_json::Value)| {
+        let mut claims = h.logout_claims(jti);
+        claims["sid"] = serde_json::json!("sid-1");
+        edit(&mut claims);
+        claims
+    };
+    // The first logouts arrive together, as Authentik sends one per token
+    // of a session: both wait for one key fetch and succeed.
+    let together = [
+        logout_token(&claims("first-1", &|c| c["sid"] = "sid-x".into())),
+        logout_token(&claims("first-2", &|c| c["sid"] = "sid-x".into())),
+    ];
+    let (one, two) = tokio::join!(h.logout(&together[0]), h.logout(&together[1]));
+    assert_eq!(
+        (one.0.status, two.0.status),
+        (StatusCode::OK, StatusCode::OK)
+    );
+    let tampered = {
+        // Another token's claims under this token's signature.
+        let signed = logout_token(&claims("bad-signature", &|_| {}));
+        let other = b64_json(&claims("bad-signature", &|c| c["sid"] = "sid-2".into()));
+        let mut parts = signed.split('.');
+        let header = parts.next().unwrap();
+        let _ = parts.next();
+        format!("{header}.{other}.{}", parts.next().unwrap())
+    };
+    for (name, token) in [
+        (
+            "audience",
+            logout_token(&claims("aud", &|c| c["aud"] = "another-client".into())),
+        ),
+        (
+            "issuer",
+            logout_token(&claims("iss", &|c| {
+                c["iss"] = "http://idp.example.test".into();
+            })),
+        ),
+        (
+            "nonce",
+            logout_token(&claims("nonce", &|c| c["nonce"] = "n-1".into())),
+        ),
+        (
+            "events",
+            logout_token(&claims("events", &|c| {
+                c.as_object_mut().unwrap().remove("events");
+            })),
+        ),
+        (
+            "issued long ago",
+            logout_token(&claims("iat", &|c| {
+                c["iat"] = (chrono::Utc::now().timestamp() - 3600).into();
+            })),
+        ),
+        (
+            "neither sub nor sid",
+            logout_token(&claims("nothing", &|c| {
+                c.as_object_mut().unwrap().remove("sid");
+            })),
+        ),
+        ("signature", tampered),
+        ("garbage", "not-a-jwt".to_owned()),
+    ] {
+        let (parts, body) = h.logout(&token).await;
+        assert_eq!(parts.status, StatusCode::BAD_REQUEST, "{name}");
+        assert_eq!(parts.headers[header::CACHE_CONTROL], "no-store", "{name}");
+        assert_eq!(body, r#"{"error":"invalid_request"}"#, "{name}");
+    }
+    assert!(h.signed_in(&first).await);
+    assert!(h.studio_open(studio).await);
+
+    // Malformed requests: not a form, no token, two tokens, too large.
+    let valid = logout_token(&claims("valid-1", &|_| {}));
+    let mut not_a_form = logout_request(logout_form(&valid));
+    not_a_form
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+    for request in [
+        not_a_form,
+        logout_request(String::new()),
+        logout_request(format!("{0}&{0}", logout_form(&valid))),
+    ] {
+        let (parts, _) = send(&h.router, request).await;
+        assert_eq!(parts.status, StatusCode::BAD_REQUEST);
+    }
+    // Too large, whether announced or not: a valid token padded past the
+    // limit is refused unread.
+    let padded = format!(
+        "{}&pad={}",
+        logout_form(&logout_token(&claims("padded", &|_| {}))),
+        "a".repeat(17 * 1024)
+    );
+    let mut announced = logout_request(padded.clone());
+    announced
+        .headers_mut()
+        .insert(header::CONTENT_LENGTH, padded.len().into());
+    let (parts, _) = send(&h.router, announced).await;
+    assert_eq!(parts.status, StatusCode::PAYLOAD_TOO_LARGE);
+    let (parts, _) = send(&h.router, logout_request(padded)).await;
+    assert!(parts.status.is_client_error(), "{}", parts.status);
+    assert!(h.signed_in(&first).await);
+
+    // A provider session the dashboard never saw: accepted, nothing ends.
+    let (parts, body) = h
+        .logout(&logout_token(&claims("unknown", &|c| {
+            c["sid"] = "sid-unknown".into();
+        })))
+        .await;
+    assert_eq!(parts.status, StatusCode::OK);
+    assert_eq!(body, "");
+    assert!(h.signed_in(&first).await && h.signed_in(&second).await);
+
+    // By sid: only that dashboard session ends, with its Studio session.
+    // The cross-site Origin is no obstacle on this one path.
+    let (parts, body) = h.logout(&valid).await;
+    assert_eq!(parts.status, StatusCode::OK);
+    assert_eq!(parts.headers[header::CACHE_CONTROL], "no-store");
+    assert_eq!(body, "");
+    assert!(!h.signed_in(&first).await);
+    assert!(!h.studio_open(studio).await);
+    assert!(h.signed_in(&second).await);
+    assert!(h.signed_in(&password).await);
+    assert_eq!(
+        h.audited("session.oidc_backchannel_logout", "success")
+            .await,
+        1
+    );
+
+    // The same token again is a replay.
+    let (parts, _) = h.logout(&valid).await;
+    assert_eq!(parts.status, StatusCode::BAD_REQUEST);
+
+    // A subject of another identity ends nothing.
+    let mut other = h.logout_claims("other-subject");
+    other["sub"] = "mallory".into();
+    let (parts, _) = h.logout(&logout_token(&other)).await;
+    assert_eq!(parts.status, StatusCode::OK);
+    assert!(h.signed_in(&second).await);
+
+    // By sub alone: every session from that identity ends, and the
+    // password session stays.
+    let third = h.oidc_session("code-3", "alice", "sid-3").await;
+    let mut by_subject = h.logout_claims("by-subject");
+    by_subject["sub"] = "alice".into();
+    let (parts, _) = h.logout(&logout_token(&by_subject)).await;
+    assert_eq!(parts.status, StatusCode::OK);
+    assert!(!h.signed_in(&second).await);
+    assert!(!h.signed_in(&third).await);
+    assert!(h.signed_in(&password).await);
+    assert_eq!(
+        h.audited("session.oidc_backchannel_logout", "success")
+            .await,
+        3
+    );
+
+    // The same route is only for POST; elsewhere a cross-site POST is
+    // still refused.
+    let (parts, _) = send(&h.router, crate::app::tests::get(LOGOUT_PATH)).await;
+    assert_eq!(parts.status, StatusCode::METHOD_NOT_ALLOWED);
+    let mut cross_site = logout_request(String::new());
+    *cross_site.uri_mut() = "/auth/oidc/sign-in".parse().unwrap();
+    let (parts, _) = send(&h.router, cross_site).await;
+    assert_eq!(parts.status, StatusCode::FORBIDDEN);
+
+    // Nothing from the tokens reaches the audit log.
+    let audit_text: Vec<String> = sqlx::query_scalar(
+        "SELECT concat_ws(' ', action, target_type, target_id, outcome, request_id) \
+         FROM audit_events",
+    )
+    .fetch_all(h.db.pool())
+    .await
+    .unwrap();
+    for row in &audit_text {
+        for secret in ["eyJ", "sid-", "valid-1", "by-subject", "alice"] {
+            assert!(!row.contains(secret), "{row}");
+        }
+    }
+
+    h.db.close().await;
+    h.scratch.drop().await;
 }

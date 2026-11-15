@@ -75,6 +75,12 @@ pub fn router(state: AppState, limits: &HttpLimits) -> Router {
         .route(oidc::SIGN_IN_PATH, post(oidc::sign_in))
         .route(oidc::LINK_PATH, post(oidc::link))
         .route(oidc::CALLBACK_PATH, get(oidc::callback))
+        .route(
+            oidc::BACKCHANNEL_LOGOUT_PATH,
+            post(oidc::backchannel_logout).layer(RequestBodyLimitLayer::new(
+                oidc::MAX_BACKCHANNEL_LOGOUT_BODY,
+            )),
+        )
         .route("/dashboard/project/{project_id}", get(studio::launch))
         .route(studio::TLS_ASK_PATH, get(studio::tls_ask))
         .route(

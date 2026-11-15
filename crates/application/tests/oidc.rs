@@ -15,8 +15,9 @@ use secrecy::SecretString;
 use supabase_dashboard_application::auth::{
     AuthConfig, AuthService, CurrentSession, RequestContext,
     oidc::{
-        AuthorizeFuture, ExchangeFuture, OidcAuthorization, OidcCallback, OidcError, OidcFinished,
-        OidcIdentityClaims, OidcPending, OidcProvider, OidcProviderError, OidcRedirect, OidcSignIn,
+        AuthorizeFuture, ExchangeFuture, LogoutTokenFuture, OidcAuthorization, OidcCallback,
+        OidcError, OidcFinished, OidcIdentityClaims, OidcLogoutClaims, OidcLogoutError,
+        OidcPending, OidcProvider, OidcProviderError, OidcRedirect, OidcSignIn,
     },
 };
 use supabase_dashboard_persistence::Database;
@@ -59,9 +60,15 @@ impl OidcProvider for FakeProvider {
     fn exchange<'a>(&'a self, code: &'a str, _pending: &'a OidcPending) -> ExchangeFuture<'a> {
         Box::pin(async move {
             if let Some(subject) = code.strip_prefix("sub:") {
+                // `sub:<subject>@<sid>` names a provider session too.
+                let (subject, sid) = match subject.split_once('@') {
+                    Some((subject, sid)) => (subject, Some(sid.to_owned())),
+                    None => (subject, None),
+                };
                 Ok(OidcIdentityClaims {
                     subject: subject.to_owned(),
                     label: Some(format!("{subject}@idp.example.test")),
+                    session_id: sid,
                 })
             } else if code == "rejected" {
                 Err(OidcProviderError::Rejected("audience".to_owned()))
@@ -70,6 +77,33 @@ impl OidcProvider for FakeProvider {
                     "connection refused".to_owned(),
                 ))
             }
+        })
+    }
+
+    /// `sub=<s>;sid=<s>;jti=<s>` with any part left out; `rejected` fails
+    /// verification; `down` means the provider is unreachable.
+    fn verify_logout_token<'a>(&'a self, token: &'a str) -> LogoutTokenFuture<'a> {
+        Box::pin(async move {
+            match token {
+                "rejected" => return Err(OidcProviderError::Rejected("signature".to_owned())),
+                "down" => {
+                    return Err(OidcProviderError::Unavailable(
+                        "connection refused".to_owned(),
+                    ));
+                }
+                _ => {}
+            }
+            let part = |name: &str| {
+                token
+                    .split(';')
+                    .find_map(|part| part.strip_prefix(&format!("{name}=")))
+                    .map(str::to_owned)
+            };
+            Ok(OidcLogoutClaims {
+                subject: part("sub"),
+                session_id: part("sid"),
+                token_id: part("jti").unwrap_or_default(),
+            })
         })
     }
 }
@@ -536,6 +570,124 @@ async fn identities_of_another_provider_are_listed_but_do_not_sign_in() {
     assert!(matches!(
         none.begin_oidc_link(&owner).await,
         Err(OidcError::NotConfigured)
+    ));
+    db.close().await;
+    scratch.drop().await;
+}
+
+/// The cookie value of a single sign-on as `code` (`sub:<subject>@<sid>`).
+async fn oidc_session(auth: &AuthService, code: &str) -> String {
+    let redirect = auth.begin_oidc_sign_in(None).await.unwrap();
+    let signed_in = match finish(auth, &redirect, Some(code), None).await.unwrap() {
+        OidcFinished::SignedIn { signed_in, .. } => Some(signed_in),
+        OidcFinished::Linked => None,
+    };
+    signed_in.unwrap().token.expose_cookie_value().to_owned()
+}
+
+async fn alive(auth: &AuthService, cookie: &str) -> bool {
+    auth.authenticate(cookie).await.unwrap().is_some()
+}
+
+#[tokio::test]
+async fn backchannel_logout_revokes_only_the_sessions_it_names() {
+    let Some(scratch) = ScratchDb::create("app_oidc_logout").await else {
+        return;
+    };
+    let (db, auth) = service(&scratch, ISSUER).await;
+    let owner = session_for(&auth, "owner@example.test").await;
+    link(&auth, &owner, "alice").await.unwrap();
+    let password = auth
+        .sign_in("owner@example.test", &SecretString::from(PASSWORD), ctx())
+        .await
+        .unwrap()
+        .token
+        .expose_cookie_value()
+        .to_owned();
+    let first = oidc_session(&auth, "sub:alice@sid-1").await;
+    let second = oidc_session(&auth, "sub:alice@sid-2").await;
+    let no_sid = oidc_session(&auth, "sub:alice").await;
+
+    // By sid: only that provider session ends.
+    assert_eq!(
+        auth.oidc_backchannel_logout("sid=sid-1;jti=j1", ctx())
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(!alive(&auth, &first).await);
+    assert!(alive(&auth, &second).await);
+    assert!(alive(&auth, &no_sid).await);
+
+    // The same token again is a replay.
+    assert!(matches!(
+        auth.oidc_backchannel_logout("sid=sid-1;jti=j1", ctx())
+            .await,
+        Err(OidcLogoutError::Replayed)
+    ));
+    // An unknown sid, or a sid with another subject, ends nothing.
+    for token in ["sid=unknown;jti=j2", "sub=bob;sid=sid-2;jti=j3"] {
+        assert_eq!(auth.oidc_backchannel_logout(token, ctx()).await.unwrap(), 0);
+    }
+    assert!(alive(&auth, &second).await);
+
+    // Refused tokens.
+    for token in ["sid=sid-2", "jti=j4", "rejected", ""] {
+        assert!(
+            matches!(
+                auth.oidc_backchannel_logout(token, ctx()).await,
+                Err(OidcLogoutError::Invalid(_))
+            ),
+            "{token}"
+        );
+    }
+    assert!(matches!(
+        auth.oidc_backchannel_logout("down", ctx()).await,
+        Err(OidcLogoutError::Unavailable(_))
+    ));
+
+    // By sub: every single sign-on session of the identity, and never the
+    // password session of the same account.
+    assert_eq!(
+        auth.oidc_backchannel_logout("sub=alice;jti=j5", ctx())
+            .await
+            .unwrap(),
+        2
+    );
+    assert!(!alive(&auth, &second).await);
+    assert!(!alive(&auth, &no_sid).await);
+    assert!(alive(&auth, &password).await);
+    assert_eq!(
+        audited(&db, "session.oidc_backchannel_logout", "success").await,
+        3
+    );
+
+    // Another provider's logout never touches these sessions.
+    let fresh = oidc_session(&auth, "sub:alice@sid-9").await;
+    let other = AuthService::new(db.clone(), AuthConfig::default())
+        .await
+        .unwrap()
+        .with_oidc(OidcSignIn::new(
+            provider("https://other-idp.example.test/"),
+            "Other IdP",
+        ));
+    assert_eq!(
+        other
+            .oidc_backchannel_logout("sub=alice;sid=sid-9;jti=j6", ctx())
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(alive(&auth, &fresh).await);
+
+    // Without a provider there is nothing to log out of.
+    let none = AuthService::new(db.clone(), AuthConfig::default())
+        .await
+        .unwrap();
+    assert!(matches!(
+        none.oidc_backchannel_logout("sub=alice;jti=j7", ctx())
+            .await,
+        Err(OidcLogoutError::NotConfigured)
     ));
     db.close().await;
     scratch.drop().await;

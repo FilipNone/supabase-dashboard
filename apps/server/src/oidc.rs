@@ -1,6 +1,7 @@
 //! Single sign-on through the deployment's OpenID Connect provider: the
-//! form handlers that start a sign-in or a link, and the callback the
-//! provider sends the browser back to.
+//! form handlers that start a sign-in or a link, the callback the provider
+//! sends the browser back to, and the back-channel logout endpoint the
+//! provider posts to.
 //!
 //! The browser only ever sees a fixed error code. What went wrong is in
 //! the server log and the audit log, without codes, tokens, or claims.
@@ -8,12 +9,12 @@
 use axum::{
     body::Bytes,
     extract::{Request, State},
-    http::{HeaderMap, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Redirect, Response},
 };
 use supabase_dashboard_application::auth::{
     CurrentSession,
-    oidc::{OidcCallback, OidcError, OidcFinished},
+    oidc::{OidcCallback, OidcError, OidcFinished, OidcLogoutError},
 };
 use supabase_dashboard_web::app::{
     ACCOUNT_SECURITY_PATH, OIDC_LINK_PATH, OIDC_SIGN_IN_PATH, sign_in_return_path,
@@ -33,6 +34,12 @@ pub const SIGN_IN_PATH: &str = OIDC_SIGN_IN_PATH;
 pub const LINK_PATH: &str = OIDC_LINK_PATH;
 /// `GET`: where the provider sends the browser back.
 pub const CALLBACK_PATH: &str = crate::config::OIDC_CALLBACK_PATH;
+/// `POST`: where the provider posts back-channel logout tokens, server to
+/// server. No session, and exempt from the Origin check.
+pub const BACKCHANNEL_LOGOUT_PATH: &str = crate::config::OIDC_BACKCHANNEL_LOGOUT_PATH;
+
+/// Largest back-channel logout request body read.
+pub const MAX_BACKCHANNEL_LOGOUT_BODY: usize = 16 * 1024;
 
 /// Longest callback parameter read. Real codes and states are far shorter.
 const MAX_PARAM_LEN: usize = 2048;
@@ -157,4 +164,78 @@ fn failure(err: &OidcError, signed_in: bool) -> Response {
         (true, _) => security_page("failed"),
         (false, code) => Redirect::to(&sign_in_url(None, Some(code))).into_response(),
     }
+}
+
+/// `POST /auth/oidc/backchannel-logout` (OpenID Connect Back-Channel Logout
+/// 1.0, section 2.5): a form with one `logout_token`. Answers 200 when the
+/// token is valid, whether or not it named a live session; 400 with a
+/// generic body when the request or token is not valid; 503 when the
+/// provider's keys or the metadata database are unavailable or too many
+/// logouts are in progress. Never cached.
+pub async fn backchannel_logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let is_form = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| {
+            value
+                .trim()
+                .eq_ignore_ascii_case("application/x-www-form-urlencoded")
+        });
+    let mut tokens = url::form_urlencoded::parse(&body)
+        .filter(|(key, _)| key == "logout_token")
+        .map(|(_, value)| value);
+    let token = match (is_form, tokens.next(), tokens.next()) {
+        (true, Some(token), None) => token,
+        _ => {
+            tracing::warn!(
+                "back-channel logout request without exactly one logout_token form field"
+            );
+            return logout_answer(StatusCode::BAD_REQUEST);
+        }
+    };
+    let status = match state
+        .auth
+        .oidc_backchannel_logout(&token, request_context(&headers))
+        .await
+    {
+        Ok(_) => StatusCode::OK,
+        Err(OidcLogoutError::NotConfigured) => StatusCode::NOT_FOUND,
+        Err(err @ (OidcLogoutError::Invalid(_) | OidcLogoutError::Replayed)) => {
+            tracing::warn!(error = %err, "back-channel logout refused");
+            StatusCode::BAD_REQUEST
+        }
+        Err(err @ OidcLogoutError::Busy) => {
+            tracing::warn!(error = %err, "back-channel logout refused");
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        Err(err @ (OidcLogoutError::Unavailable(_) | OidcLogoutError::Internal(_))) => {
+            tracing::error!(error = %err, "back-channel logout failed");
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+    };
+    logout_answer(status)
+}
+
+/// The answer to a back-channel logout: empty on success, a fixed error
+/// code otherwise, and never stored.
+fn logout_answer(status: StatusCode) -> Response {
+    let mut response = if status == StatusCode::OK {
+        status.into_response()
+    } else {
+        let error = if status == StatusCode::BAD_REQUEST {
+            "invalid_request"
+        } else {
+            "temporarily_unavailable"
+        };
+        (status, axum::Json(serde_json::json!({ "error": error }))).into_response()
+    };
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }

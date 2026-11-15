@@ -252,6 +252,7 @@ fn single_sign_on(
     tracing::info!(
         issuer = %oidc.issuer,
         redirect_url = %oidc.redirect_url,
+        backchannel_logout_url = %oidc.backchannel_logout_url,
         "single sign-on is enabled"
     );
     Ok(Some(OidcSignIn::new(provider, oidc.display_name.clone())))

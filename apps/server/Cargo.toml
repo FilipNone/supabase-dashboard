@@ -38,7 +38,8 @@ uuid.workspace = true
 
 [dev-dependencies]
 # The mock OpenID Connect provider in the single sign-on tests signs real
-# RS256 ID tokens with a key generated for each run.
+# RS256 ID and logout tokens with a key generated for each run.
+base64 = "0.22"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 openidconnect.workspace = true
 rsa = { version = "0.9.10", features = ["getrandom"] }

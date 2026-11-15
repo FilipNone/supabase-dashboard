@@ -114,6 +114,10 @@ enum Access {
     /// The token API under `/api/v1/`: authenticated by its bearer token
     /// only. The session cookie is not even read.
     Token,
+    /// The provider's back-channel logout: server to server, authenticated
+    /// by the signed logout token in the body. The session cookie is not
+    /// read.
+    Provider,
     /// Everything else, including unknown paths: redirect to sign-in.
     Page,
 }
@@ -130,6 +134,7 @@ fn classify(path: &str) -> Access {
         // The callback signs in or links (with the session attached), and
         // starting a link sends a browser without a session to sign in.
         crate::oidc::CALLBACK_PATH | crate::oidc::LINK_PATH => Access::Optional,
+        crate::oidc::BACKCHANNEL_LOGOUT_PATH => Access::Provider,
         SIGN_IN_OPTIONS_PATH => Access::Optional,
         SIGN_IN_PATH => Access::SignInPage,
         INVITE_PATH | INVITE_PREVIEW_PATH | INVITE_SIGN_UP_PATH => Access::Optional,
@@ -149,7 +154,7 @@ fn classify(path: &str) -> Access {
 /// added to request extensions for server functions and SSR.
 pub async fn guard(State(state): State<AppState>, mut request: Request, next: Next) -> Response {
     let access = classify(request.uri().path());
-    if access == Access::Token {
+    if matches!(access, Access::Token | Access::Provider) {
         return next.run(request).await;
     }
     let session = match state.cookie.read(request.headers()) {
@@ -159,9 +164,11 @@ pub async fn guard(State(state): State<AppState>, mut request: Request, next: Ne
             Err(err) => {
                 tracing::error!(error = %err, "session lookup failed");
                 return match access {
-                    Access::Public | Access::SignInPage | Access::Optional | Access::Token => {
-                        next.run(request).await
-                    }
+                    Access::Public
+                    | Access::SignInPage
+                    | Access::Optional
+                    | Access::Token
+                    | Access::Provider => next.run(request).await,
                     Access::Api => ApiError::Unavailable.into_response(),
                     Access::Page => (
                         StatusCode::SERVICE_UNAVAILABLE,
@@ -186,7 +193,9 @@ pub async fn guard(State(state): State<AppState>, mut request: Request, next: Ne
                 .map_or(request.uri().path(), |p| p.as_str());
             Redirect::to(&sign_in_url(Some(target), None)).into_response()
         }
-        (Access::Public | Access::SignInPage | Access::Token, None) => next.run(request).await,
+        (Access::Public | Access::SignInPage | Access::Token | Access::Provider, None) => {
+            next.run(request).await
+        }
         (Access::Optional, None) => no_store(next.run(request).await),
         (_, Some(session)) => {
             request.extensions_mut().insert(session.summary());
@@ -212,17 +221,29 @@ fn no_store(mut response: Response) -> Response {
 /// with neither is refused as well: cookie-authenticated mutations only come
 /// from this dashboard's own pages. Together with `SameSite=Lax` this is the
 /// CSRF defense; there is no token to leak.
+///
+/// The one exception is `POST` to the back-channel logout path: the
+/// provider calls it server to server, without a browser, and the session
+/// guard does not read the cookie there.
 pub async fn verify_origin(
     State(state): State<AppState>,
     request: Request,
     next: Next,
 ) -> Response {
-    if is_safe_method(request.method()) || origin_allowed(&state, request.headers()) {
+    if is_safe_method(request.method())
+        || is_provider_call(request.method(), request.uri().path())
+        || origin_allowed(&state, request.headers())
+    {
         next.run(request).await
     } else {
         tracing::warn!(path = %request.uri().path(), "cross-origin state change refused");
         ApiError::CrossOriginRequest.into_response()
     }
+}
+
+/// Exactly `POST` to the back-channel logout path; no other method or path.
+fn is_provider_call(method: &Method, path: &str) -> bool {
+    *method == Method::POST && path == crate::oidc::BACKCHANNEL_LOGOUT_PATH
 }
 
 pub(crate) fn is_safe_method(method: &Method) -> bool {
@@ -408,8 +429,35 @@ mod tests {
         assert_eq!(classify("/auth/oidc/callback"), Access::Optional);
         assert_eq!(classify("/auth/oidc/link"), Access::Optional);
         assert_eq!(classify("/auth/oidc/other"), Access::Api);
+        assert_eq!(classify("/auth/oidc/backchannel-logout"), Access::Provider);
+        assert_eq!(classify("/auth/oidc/backchannel-logout/x"), Access::Api);
         assert_eq!(classify("/auth/sign-in-options"), Access::Optional);
         assert_eq!(classify("/anything-else"), Access::Page);
+    }
+
+    #[test]
+    fn only_a_post_to_the_logout_path_skips_the_origin_check() {
+        assert!(is_provider_call(
+            &Method::POST,
+            "/auth/oidc/backchannel-logout"
+        ));
+        assert!(!is_provider_call(
+            &Method::PUT,
+            "/auth/oidc/backchannel-logout"
+        ));
+        assert!(!is_provider_call(
+            &Method::DELETE,
+            "/auth/oidc/backchannel-logout"
+        ));
+        for path in [
+            "/auth/oidc/backchannel-logout/",
+            "/auth/oidc/backchannel-logout/x",
+            "/auth/oidc/callback",
+            "/auth/sign-out",
+            "/AUTH/OIDC/BACKCHANNEL-LOGOUT",
+        ] {
+            assert!(!is_provider_call(&Method::POST, path), "{path}");
+        }
     }
 
     #[test]

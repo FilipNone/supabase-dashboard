@@ -18,7 +18,7 @@ use supabase_dashboard_persistence::{
     accounts::{AccountRecord, NewAccount, SetDisabledOutcome},
     audit::{AuditEvent, AuditOutcome, AuditScope},
     invitations::AcceptNewAccountOutcome,
-    sessions::NewSession,
+    sessions::{NewSession, SessionOidcOrigin},
 };
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -386,7 +386,7 @@ impl AuthService {
         }
 
         self.throttle.record_success(key);
-        let (token, expires_at, session_id) = self.start_session(account.id, ctx).await?;
+        let (token, expires_at, session_id) = self.start_session(account.id, None, ctx).await?;
         self.audit(
             Some(account.id),
             "session.sign_in",
@@ -402,11 +402,13 @@ impl AuthService {
         })
     }
 
-    /// Creates a session for an account that just proved who it is.
-    /// Returns the token for the cookie, its expiry, and the session ID.
+    /// Creates a session for an account that just proved who it is, noting
+    /// the provider identity when it signed in through one. Returns the
+    /// token for the cookie, its expiry, and the session ID.
     async fn start_session(
         &self,
         account_id: Uuid,
+        oidc: Option<SessionOidcOrigin<'_>>,
         ctx: RequestContext<'_>,
     ) -> Result<(SessionToken, OffsetDateTime, Uuid), AuthError> {
         let token = SessionToken::generate()?;
@@ -423,6 +425,7 @@ impl AuthService {
                 token_hash: token.hash(),
                 expires_at,
                 user_agent: ctx.user_agent.map(|ua| truncate(ua, 256)),
+                oidc,
             })
             .await?;
         Ok((token, expires_at, session_id))

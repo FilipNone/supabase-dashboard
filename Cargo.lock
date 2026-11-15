@@ -4022,6 +4022,7 @@ name = "supabase-dashboard-server"
 version = "0.3.0-dev.6"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "chrono",
  "http",
  "http-body-util",

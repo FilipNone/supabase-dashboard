@@ -24,6 +24,17 @@
 //!
 //! Every account has a password, so unlinking an identity never leaves an
 //! account without a way to sign in.
+//!
+//! Back-channel logout (OpenID Connect Back-Channel Logout 1.0): a session
+//! started through the provider remembers the identity and the provider's
+//! `sid`. When the provider posts a logout token, the adapter verifies it
+//! (signature, issuer, audience, issue time, event, no nonce) and this
+//! module refuses a token ID (`jti`) it has seen within
+//! [`LOGOUT_TOKEN_MAX_AGE`] plus [`LOGOUT_TOKEN_CLOCK_SKEW`], then revokes
+//! the matching sessions, which ends their Studio sessions too. Seen token
+//! IDs are kept in memory only: after a restart, a token captured before it
+//! could be replayed within that window, which at worst signs out sessions
+//! the provider already ended.
 
 use std::{
     collections::HashMap,
@@ -40,6 +51,7 @@ use supabase_dashboard_domain::oidc::{
 use supabase_dashboard_persistence::{
     audit::{AuditEvent, AuditOutcome},
     oidc_identities::{LinkOidcOutcome, NewOidcIdentity},
+    sessions::{OidcLogoutTarget, SessionOidcOrigin},
 };
 use uuid::Uuid;
 
@@ -47,6 +59,7 @@ use super::{AuthError, AuthService, CurrentSession, RequestContext, SignedIn};
 use crate::token::RandomToken;
 
 const SIGN_IN_ACTION: &str = "session.sign_in_oidc";
+const LOGOUT_ACTION: &str = "session.oidc_backchannel_logout";
 const LINK_ACTION: &str = "account.oidc_link";
 const UNLINK_ACTION: &str = "account.oidc_unlink";
 
@@ -62,6 +75,27 @@ const MAX_STATE_LEN: usize = 256;
 
 /// Longest `next` page kept with a flow.
 const MAX_NEXT_LEN: usize = 2048;
+
+/// How old a logout token's `iat` may be.
+pub const LOGOUT_TOKEN_MAX_AGE: Duration = Duration::from_secs(300);
+
+/// How far a logout token's `iat` may be in the future, and how far past
+/// its `exp` it is still accepted, for clocks that disagree.
+pub const LOGOUT_TOKEN_CLOCK_SKEW: Duration = Duration::from_secs(60);
+
+/// Longest logout token read. Real ones are around a kilobyte.
+pub const MAX_LOGOUT_TOKEN_LEN: usize = 8 * 1024;
+
+/// Longest `jti` kept.
+pub const MAX_LOGOUT_TOKEN_ID_LEN: usize = 256;
+
+/// Most logout token IDs remembered at once. Only verified tokens are
+/// remembered; past this, logouts are refused until old IDs expire.
+const MAX_SEEN_LOGOUT_TOKENS: usize = 10_000;
+
+/// Most logout requests verified at the same time. Anyone can post one, so
+/// further requests are refused rather than queued.
+const MAX_CONCURRENT_LOGOUTS: usize = 8;
 
 /// What the adapter needs back at the callback to verify the answer. Both
 /// are secrets until the flow ends.
@@ -86,6 +120,21 @@ pub struct OidcIdentityClaims {
     /// The email or preferred username, kept only to show the operator
     /// which identity they linked.
     pub label: Option<String>,
+    /// The provider's session ID (`sid`), when the ID token names one. A
+    /// back-channel logout for that provider session ends the dashboard
+    /// session it started.
+    pub session_id: Option<String>,
+}
+
+/// What a verified logout token asks to end. At least one of `subject` and
+/// `session_id` is set.
+#[derive(Debug, Clone)]
+pub struct OidcLogoutClaims {
+    pub subject: Option<String>,
+    /// The provider's session ID (`sid`).
+    pub session_id: Option<String>,
+    /// The token's ID (`jti`), for refusing replays.
+    pub token_id: String,
 }
 
 /// Why the adapter could not produce a verified identity. The message is
@@ -102,6 +151,8 @@ pub type AuthorizeFuture<'a> =
     Pin<Box<dyn Future<Output = Result<OidcAuthorization, OidcProviderError>> + Send + 'a>>;
 pub type ExchangeFuture<'a> =
     Pin<Box<dyn Future<Output = Result<OidcIdentityClaims, OidcProviderError>> + Send + 'a>>;
+pub type LogoutTokenFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<OidcLogoutClaims, OidcProviderError>> + Send + 'a>>;
 
 /// The provider adapter.
 pub trait OidcProvider: Send + Sync {
@@ -111,6 +162,12 @@ pub trait OidcProvider: Send + Sync {
     fn authorize(&self) -> AuthorizeFuture<'_>;
     /// Exchanges `code` and verifies the ID token against `pending`.
     fn exchange<'a>(&'a self, code: &'a str, pending: &'a OidcPending) -> ExchangeFuture<'a>;
+    /// Verifies a back-channel logout token: signature with the provider's
+    /// keys, issuer, audience, `iat` within [`LOGOUT_TOKEN_MAX_AGE`] and
+    /// [`LOGOUT_TOKEN_CLOCK_SKEW`], `exp` if present, the back-channel
+    /// logout event, `sub` or `sid`, a `jti`, and no `nonce`. Replays are
+    /// the caller's to refuse.
+    fn verify_logout_token<'a>(&'a self, token: &'a str) -> LogoutTokenFuture<'a>;
 }
 
 /// The provider and its button name.
@@ -118,6 +175,10 @@ pub struct OidcSignIn {
     provider: Arc<dyn OidcProvider>,
     display_name: String,
     flows: Mutex<HashMap<String, PendingFlow>>,
+    /// Logout token IDs seen, until they could no longer pass the `iat`
+    /// check.
+    seen_logout_tokens: Mutex<HashMap<String, Instant>>,
+    logouts: tokio::sync::Semaphore,
 }
 
 impl OidcSignIn {
@@ -126,7 +187,33 @@ impl OidcSignIn {
             provider,
             display_name: display_name.into(),
             flows: Mutex::new(HashMap::new()),
+            seen_logout_tokens: Mutex::new(HashMap::new()),
+            logouts: tokio::sync::Semaphore::new(MAX_CONCURRENT_LOGOUTS),
         }
+    }
+
+    /// Remembers a verified logout token's ID. `Err` when it was seen
+    /// before (a replay) or when too many are remembered.
+    fn remember_logout_token(&self, token_id: &str) -> Result<(), OidcLogoutError> {
+        let mut seen = self
+            .seen_logout_tokens
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let now = Instant::now();
+        seen.retain(|_, until| *until > now);
+        if seen.contains_key(token_id) {
+            return Err(OidcLogoutError::Replayed);
+        }
+        if seen.len() >= MAX_SEEN_LOGOUT_TOKENS {
+            return Err(OidcLogoutError::Busy);
+        }
+        let until = now
+            .checked_add(
+                LOGOUT_TOKEN_MAX_AGE.saturating_add(LOGOUT_TOKEN_CLOCK_SKEW.saturating_mul(2)),
+            )
+            .ok_or(OidcLogoutError::Busy)?;
+        seen.insert(token_id.to_owned(), until);
+        Ok(())
     }
 
     fn insert(&self, state: String, flow: PendingFlow) -> Result<(), OidcError> {
@@ -244,6 +331,32 @@ pub enum OidcError {
     SessionChanged,
     #[error(transparent)]
     Internal(#[from] AuthError),
+}
+
+/// Why a back-channel logout request was refused. The provider gets a
+/// generic answer; the reason goes to the log.
+#[derive(Debug, thiserror::Error)]
+pub enum OidcLogoutError {
+    #[error("single sign-on is not configured")]
+    NotConfigured,
+    /// Too many logouts at once, or too many token IDs remembered.
+    #[error("too many logout requests")]
+    Busy,
+    #[error("the logout token is malformed or failed verification: {0}")]
+    Invalid(String),
+    #[error("the logout token was used before")]
+    Replayed,
+    /// The provider's keys could not be fetched.
+    #[error("the provider could not be reached: {0}")]
+    Unavailable(String),
+    #[error(transparent)]
+    Internal(#[from] AuthError),
+}
+
+impl From<supabase_dashboard_persistence::PersistenceError> for OidcLogoutError {
+    fn from(err: supabase_dashboard_persistence::PersistenceError) -> Self {
+        Self::Internal(err.into())
+    }
 }
 
 impl From<supabase_dashboard_persistence::PersistenceError> for OidcError {
@@ -426,7 +539,16 @@ impl AuthService {
             .await;
             return Err(OidcError::NotLinked);
         }
-        let (token, expires_at, session_id) = self.start_session(account.id, ctx).await?;
+        let origin = SessionOidcOrigin {
+            issuer,
+            subject: &claims.subject,
+            sid: claims
+                .session_id
+                .as_deref()
+                .filter(|sid| valid_subject(sid)),
+        };
+        let (token, expires_at, session_id) =
+            self.start_session(account.id, Some(origin), ctx).await?;
         if let Err(err) = self.db.touch_oidc_identity(found.identity_id).await {
             tracing::warn!(error = %err, "could not note the identity's last use");
         }
@@ -491,6 +613,68 @@ impl AuthService {
         )
         .await;
         Err(refused)
+    }
+
+    /// Handles a back-channel logout from the provider: verifies
+    /// `logout_token`, refuses a replayed one, and revokes the dashboard
+    /// sessions it names. With a `sid`, those are the sessions started from
+    /// that provider session (and, if `sub` is given too, that identity);
+    /// with only `sub`, every session signed in with that identity. Password
+    /// sessions are never touched. Each revocation is audited. Returns how
+    /// many sessions were revoked; naming none is not an error.
+    pub async fn oidc_backchannel_logout(
+        &self,
+        logout_token: &str,
+        ctx: RequestContext<'_>,
+    ) -> Result<usize, OidcLogoutError> {
+        let oidc = self.oidc.as_ref().ok_or(OidcLogoutError::NotConfigured)?;
+        if logout_token.is_empty() || logout_token.len() > MAX_LOGOUT_TOKEN_LEN {
+            return Err(OidcLogoutError::Invalid("missing or too long".to_owned()));
+        }
+        let _permit = oidc
+            .logouts
+            .try_acquire()
+            .map_err(|_| OidcLogoutError::Busy)?;
+        let claims = oidc
+            .provider
+            .verify_logout_token(logout_token)
+            .await
+            .map_err(|err| match err {
+                OidcProviderError::Rejected(reason) => OidcLogoutError::Invalid(reason),
+                OidcProviderError::Unavailable(reason) => OidcLogoutError::Unavailable(reason),
+            })?;
+        let subject = claims.subject.as_deref();
+        let sid = claims.session_id.as_deref();
+        let in_range = |value: Option<&str>| value.is_none_or(valid_subject);
+        if (subject.is_none() && sid.is_none())
+            || !in_range(subject)
+            || !in_range(sid)
+            || claims.token_id.is_empty()
+            || claims.token_id.len() > MAX_LOGOUT_TOKEN_ID_LEN
+        {
+            return Err(OidcLogoutError::Invalid(
+                "sub, sid, or jti missing or out of range".to_owned(),
+            ));
+        }
+        oidc.remember_logout_token(&claims.token_id)?;
+        let revoked = self
+            .db
+            .revoke_oidc_sessions(
+                OidcLogoutTarget {
+                    issuer: oidc.provider.issuer(),
+                    subject,
+                    sid,
+                },
+                LOGOUT_ACTION,
+                ctx.request_id,
+            )
+            .await?;
+        tracing::info!(
+            revoked = revoked.len(),
+            by_sid = sid.is_some(),
+            "back-channel logout from the provider"
+        );
+        Ok(revoked.len())
     }
 
     /// The signed-in operator's linked identities and the provider's name.

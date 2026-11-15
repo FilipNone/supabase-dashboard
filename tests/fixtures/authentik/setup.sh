@@ -11,6 +11,12 @@
 #   SUPABASE_DASHBOARD_OIDC_NAME=Authentik
 # and sign in at Authentik as `operator` / `fixture-only-operator-password`.
 #
+# Signing out of Authentik sends a back-channel logout to
+# http://dash.localhost:3000/auth/oidc/backchannel-logout, which the
+# containers resolve to the Docker host. It arrives only if the dashboard
+# listens where containers reach it, for example
+# LEPTOS_SITE_ADDR=172.17.0.1:3000 (the docker0 address), not 127.0.0.1.
+#
 # Remove it with: docker compose -f tests/fixtures/authentik/docker-compose.yml down
 set -eu
 

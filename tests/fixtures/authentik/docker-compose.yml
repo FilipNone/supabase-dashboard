@@ -25,6 +25,9 @@ x-authentik: &authentik
     - /data
   volumes:
     - ./blueprints:/blueprints/custom:ro
+  # Back-channel logout requests go to the dashboard on the Docker host.
+  extra_hosts:
+    - "dash.localhost:host-gateway"
 
 services:
   postgresql:

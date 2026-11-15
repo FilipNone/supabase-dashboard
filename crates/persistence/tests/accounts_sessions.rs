@@ -136,6 +136,7 @@ async fn session_lifecycle_and_revocation() {
             token_hash: token,
             expires_at,
             user_agent: Some("test-agent"),
+            oidc: None,
         })
         .await
         .unwrap();
@@ -210,6 +211,7 @@ async fn idle_and_disabled_sessions_are_rejected() {
         token_hash: &token,
         expires_at: OffsetDateTime::now_utc() + time::Duration::days(1),
         user_agent: None,
+        oidc: None,
     })
     .await
     .unwrap();

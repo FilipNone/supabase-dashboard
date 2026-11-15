@@ -5,7 +5,11 @@ use std::time::Duration;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::{Database, PersistenceError, accounts::AccountRecord, accounts::AccountRow};
+use crate::{
+    Database, PersistenceError,
+    accounts::{AccountRecord, AccountRow},
+    audit::{AuditEvent, AuditOutcome, insert_audit_event},
+};
 
 /// Upper bound on sessions returned for one account.
 pub const SESSION_LIST_LIMIT: i64 = 100;
@@ -16,6 +20,36 @@ pub struct NewSession<'a> {
     pub token_hash: &'a [u8; 32],
     pub expires_at: OffsetDateTime,
     pub user_agent: Option<&'a str>,
+    /// Set when the session was started by signing in through the
+    /// deployment's OpenID Connect provider.
+    pub oidc: Option<SessionOidcOrigin<'a>>,
+}
+
+/// The provider identity a session was signed in with, and the provider's
+/// session ID (`sid`) when its ID token named one. A back-channel logout
+/// from the provider names these.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionOidcOrigin<'a> {
+    pub issuer: &'a str,
+    pub subject: &'a str,
+    pub sid: Option<&'a str>,
+}
+
+/// Which sessions a provider's back-channel logout ends. `sid` alone, or
+/// with `subject`, ends the sessions of that provider session; `subject`
+/// alone ends every session signed in with that identity.
+#[derive(Debug, Clone, Copy)]
+pub struct OidcLogoutTarget<'a> {
+    pub issuer: &'a str,
+    pub subject: Option<&'a str>,
+    pub sid: Option<&'a str>,
+}
+
+/// A session revoked by a back-channel logout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
+pub struct RevokedSession {
+    pub session_id: Uuid,
+    pub account_id: Uuid,
 }
 
 /// A valid session and the account it belongs to.
@@ -37,14 +71,18 @@ pub struct SessionInfo {
 impl Database {
     pub async fn create_session(&self, new: &NewSession<'_>) -> Result<(), PersistenceError> {
         sqlx::query(
-            "INSERT INTO sessions (id, account_id, token_hash, expires_at, user_agent) \
-             VALUES ($1, $2, $3, $4, $5)",
+            "INSERT INTO sessions (id, account_id, token_hash, expires_at, user_agent, \
+                                   oidc_issuer, oidc_subject, oidc_sid) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(new.id)
         .bind(new.account_id)
         .bind(new.token_hash.as_slice())
         .bind(new.expires_at)
         .bind(new.user_agent)
+        .bind(new.oidc.map(|origin| origin.issuer))
+        .bind(new.oidc.map(|origin| origin.subject))
+        .bind(new.oidc.and_then(|origin| origin.sid))
         .execute(&self.pool)
         .await
         .map_err(PersistenceError::Query)?;
@@ -107,6 +145,52 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map_err(PersistenceError::Query)
+    }
+
+    /// Revokes the live sessions a provider's back-channel logout names and
+    /// records one `action` audit event for each, in one transaction. Only
+    /// sessions signed in through that provider match; password sessions
+    /// never do. Returns the sessions revoked.
+    pub async fn revoke_oidc_sessions(
+        &self,
+        target: OidcLogoutTarget<'_>,
+        action: &'static str,
+        request_id: Option<&str>,
+    ) -> Result<Vec<RevokedSession>, PersistenceError> {
+        if target.subject.is_none() && target.sid.is_none() {
+            return Ok(Vec::new());
+        }
+        let mut tx = self.pool.begin().await.map_err(PersistenceError::Query)?;
+        let revoked: Vec<RevokedSession> = sqlx::query_as(
+            "UPDATE sessions SET revoked_at = now() \
+             WHERE oidc_issuer = $1 AND revoked_at IS NULL \
+               AND ($2::text IS NULL OR oidc_subject = $2) \
+               AND ($3::text IS NULL OR oidc_sid = $3) \
+             RETURNING id AS session_id, account_id",
+        )
+        .bind(target.issuer)
+        .bind(target.subject)
+        .bind(target.sid)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(PersistenceError::Query)?;
+        for session in &revoked {
+            insert_audit_event(
+                &mut *tx,
+                &AuditEvent {
+                    actor_account_id: Some(session.account_id),
+                    action,
+                    target_type: Some("session"),
+                    target_id: Some(session.session_id.to_string()),
+                    outcome: AuditOutcome::Success,
+                    request_id,
+                    organization_id: None,
+                },
+            )
+            .await?;
+        }
+        tx.commit().await.map_err(PersistenceError::Query)?;
+        Ok(revoked)
     }
 
     /// Revokes one session, but only if it belongs to `account_id`.

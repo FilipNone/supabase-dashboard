@@ -95,10 +95,16 @@ pub struct OidcConfig {
     pub display_name: String,
     /// The callback URL to register at the provider.
     pub redirect_url: String,
+    /// The back-channel logout URL to register at the provider.
+    pub backchannel_logout_url: String,
 }
 
 /// Where the provider sends the browser back to, under the public URL.
 pub const OIDC_CALLBACK_PATH: &str = "/auth/oidc/callback";
+
+/// Where the provider posts back-channel logout tokens, under the public
+/// URL.
+pub const OIDC_BACKCHANNEL_LOGOUT_PATH: &str = "/auth/oidc/backchannel-logout";
 
 /// Outgoing email: where it goes and who it is from.
 #[derive(Debug, Clone)]
@@ -404,16 +410,16 @@ fn oidc_config(
             .to_owned(),
         None => "OpenID Connect".to_owned(),
     };
-    let redirect_url = format!(
-        "{}{OIDC_CALLBACK_PATH}",
-        public_url.origin().ascii_serialization()
-    );
+    let origin = public_url.origin().ascii_serialization();
+    let redirect_url = format!("{origin}{OIDC_CALLBACK_PATH}");
+    let backchannel_logout_url = format!("{origin}{OIDC_BACKCHANNEL_LOGOUT_PATH}");
     Ok(Some(OidcConfig {
         issuer,
         client_id,
         client_secret,
         display_name,
         redirect_url,
+        backchannel_logout_url,
     }))
 }
 
@@ -798,6 +804,10 @@ mod tests {
         assert_eq!(
             oidc.redirect_url,
             "https://dash.example.test/auth/oidc/callback"
+        );
+        assert_eq!(
+            oidc.backchannel_logout_url,
+            "https://dash.example.test/auth/oidc/backchannel-logout"
         );
 
         // The name has a default.
