@@ -10,21 +10,29 @@
 //! Above the form, the section lists by name the variables edited in
 //! Dokploy since the dashboard wrote them, and lets the operator accept
 //! them so they stop being listed.
+//!
+//! A secret setting has a password field that is never filled in: the
+//! page shows only whether the variable is set. The review names it; the
+//! value goes from the field to the server with the review and again with
+//! the apply, and never comes back.
 
 use leptos::{form::ActionForm, prelude::*};
 
 use supabase_dashboard_domain::stack_settings::{
-    EnvChanges, EnvTracking, SettingKind, SettingState, StackConfigPreview, StackSettingView,
-    StackSettingsView,
+    EnvChanges, EnvTracking, MAX_SECRET_LEN, SecretSettingView, SettingKind, SettingState,
+    StackConfigPreview, StackSettingView, StackSettingsView,
 };
 
 use crate::{
     error::AppError,
     server_fns::{
-        AcceptStackVariables, PreviewStackSettings, QueueStackSettings, SettingsFields,
-        get_stack_settings,
+        AcceptStackVariables, PreviewStackSettings, QueueStackSettings, SecretInput,
+        SettingsFields, get_stack_settings,
     },
 };
+
+/// The plain setting the secret settings' fields follow.
+const SECRETS_AFTER: &str = "SMTP_USER";
 
 #[component]
 pub fn StackSettingsSection(
@@ -184,30 +192,51 @@ fn section(
             .map(|err| view! { <p class="form-error" role="alert">{err.to_string()}</p> })
     };
     let tracking = tracking_view(view.tracking, project, accept, Signal::derive(busy));
-    let fields = view
-        .settings
-        .into_iter()
-        .map(|setting| {
-            // The mail server's settings start their own group.
-            let heading = (setting.name == "SMTP_HOST").then(|| {
-                view! {
-                    <h3 class="subsection-title settings-group">"Auth mail server"</h3>
-                    <p class="field-hint">
-                        "Auth emails sign-up confirmations, magic links, invitations, and password recovery links through this server. Set the password as "
-                        <code class="url-text">"SMTP_PASS"</code>
-                        " in the service's environment in Dokploy; the dashboard does not read, store, or show it."
-                    </p>
-                }
-            });
-            view! { {heading} {field_view(setting)} }
+    // The secret settings' password fields, read when a review is applied.
+    let secret_inputs = SecretInputs::default();
+    let anchored = view.settings.iter().any(|s| s.name == SECRETS_AFTER);
+    let mut secrets = Some(view.secrets);
+    let mut secret_fields = move || {
+        secrets.take().map(|secrets| {
+            secrets
+                .into_iter()
+                .map(|secret| secret_field_view(secret, secret_inputs))
+                .collect_view()
         })
-        .collect_view();
+    };
+    let mut fields = Vec::new();
+    for setting in view.settings {
+        // The mail server's settings start their own group.
+        let heading = (setting.name == "SMTP_HOST").then(|| {
+            view! {
+                <h3 class="subsection-title settings-group">"Auth mail server"</h3>
+                <p class="field-hint">
+                    "Auth emails sign-up confirmations, magic links, invitations, and password recovery links through this server."
+                </p>
+            }
+        });
+        let after = (setting.name == SECRETS_AFTER)
+            .then(&mut secret_fields)
+            .flatten();
+        fields.push(view! { {heading} {field_view(setting)} {after} }.into_any());
+    }
+    if !anchored {
+        fields.push(secret_fields().into_any());
+    }
+    let fields = fields.collect_view();
     let summary = move || {
         if !reviewing.get() {
             return None;
         }
         let (fields, preview) = review.value().get()?.ok()?;
-        Some(review_view(project, fields, preview, apply, queued))
+        Some(review_view(
+            project,
+            fields,
+            preview,
+            secret_inputs,
+            apply,
+            Withdraw { reviewing, queued },
+        ))
     };
     view! {
         <section class="panel" aria-labelledby="stack-settings-title">
@@ -425,26 +454,120 @@ fn field_view(setting: StackSettingView) -> impl IntoView {
     }
 }
 
+/// The password fields of the secret settings. There is one, for
+/// `SMTP_PASS`.
+#[derive(Clone, Copy, Default)]
+struct SecretInputs {
+    smtp_pass: NodeRef<leptos::html::Input>,
+}
+
+/// The review's state, for the apply form.
+#[derive(Clone, Copy)]
+struct Withdraw {
+    reviewing: RwSignal<bool>,
+    queued: RwSignal<bool>,
+}
+
+/// A secret setting's field: a password input that is never filled in,
+/// whether the variable is set, and a box to remove it when it is.
+fn secret_field_view(setting: SecretSettingView, inputs: SecretInputs) -> impl IntoView {
+    let id = format!("setting-{}", setting.name.to_lowercase().replace('_', "-"));
+    let name = setting.name.to_lowercase();
+    let help_id = format!("{id}-help");
+    let note = match setting.state {
+        SettingState::Editable => None,
+        SettingState::NotInComposeFile => Some(format!(
+            "This stack's compose file does not read {}, so it cannot be changed here.",
+            setting.name
+        )),
+        SettingState::Unreadable => Some(format!(
+            "{} is set in Dokploy in a form the dashboard does not rewrite. Change it in Dokploy.",
+            setting.name
+        )),
+    };
+    let locked = note.is_some();
+    let status = if setting.set {
+        "Set in Dokploy."
+    } else {
+        "Not set."
+    };
+    let node_ref = if setting.name == "SMTP_PASS" {
+        inputs.smtp_pass
+    } else {
+        NodeRef::new()
+    };
+    let remove = (setting.set && !locked).then(|| {
+        view! {
+            <label class="checkbox-field">
+                <input type="checkbox" name=format!("{name}_remove") value="true"/>
+                <span>"Remove the password"</span>
+            </label>
+        }
+    });
+    view! {
+        <div class="field">
+            <label for=id.clone()>{setting.label}</label>
+            <input class="input" id=id name=name type="password" autocomplete="new-password"
+                spellcheck="false" maxlength=MAX_SECRET_LEN.to_string()
+                aria-describedby=help_id.clone() disabled=locked node_ref=node_ref/>
+            <p class="field-hint" id=help_id>
+                <strong class="setting-status">{status}</strong>
+                " "
+                {setting.help}
+                " "
+                <code class="url-text">{setting.name}</code>
+                {note.map(|note| view! { <span class="setting-note">" " {note}</span> })}
+            </p>
+            {remove}
+        </div>
+    }
+}
+
 fn review_view(
     project: uuid::Uuid,
     fields: SettingsFields,
     preview: StackConfigPreview,
+    inputs: SecretInputs,
     apply: ServerAction<QueueStackSettings>,
-    queued: RwSignal<bool>,
+    Withdraw { reviewing, queued }: Withdraw,
 ) -> impl IntoView {
     let disabled = move || (queued.get() || apply.pending().get()).then_some("true");
-    let hidden = fields
-        .entries()
-        .into_iter()
-        .filter_map(|(name, value)| {
-            value.map(|value| {
-                let name = name.to_lowercase();
-                let value = value.to_owned();
-                view! { <input type="hidden" name=name value=value/> }
-            })
-        })
-        .collect_view();
     let base = preview.base;
+    let pass = preview.secrets.iter().find(|s| s.name == "SMTP_PASS");
+    let pass_replaced = pass.is_some_and(|s| !s.removed);
+    let pass_removed = pass.is_some_and(|s| s.removed);
+    // The new password is read from its field, not kept in the review.
+    let on_submit = {
+        let base = base.clone();
+        move |ev: leptos::ev::SubmitEvent| {
+            ev.prevent_default();
+            if queued.get_untracked() || apply.pending().get_untracked() {
+                return;
+            }
+            let smtp_pass = if pass_replaced {
+                let typed = inputs
+                    .smtp_pass
+                    .get_untracked()
+                    .map(|input| input.value())
+                    .unwrap_or_default();
+                if typed.is_empty() {
+                    // The field was cleared since the review.
+                    reviewing.set(false);
+                    return;
+                }
+                Some(SecretInput::new(typed))
+            } else {
+                None
+            };
+            apply.dispatch(QueueStackSettings {
+                id: project,
+                fields: fields.clone(),
+                base: base.clone(),
+                smtp_pass,
+                smtp_pass_remove: pass_removed.then(|| "true".to_owned()),
+            });
+        }
+    };
     let schemas_changed = preview
         .changed
         .iter()
@@ -455,10 +578,20 @@ fn review_view(
     } else {
         format!("{count} settings change")
     };
+    let secrets = preview.secrets;
     let changed = preview
         .changed
         .into_iter()
-        .map(|name| view! { <li><code class="url-text">{name}</code></li> })
+        .map(|name| {
+            let note = secrets.iter().find(|s| s.name == name).map(|s| {
+                if s.removed {
+                    " (removed)"
+                } else {
+                    " (new value, hidden)"
+                }
+            });
+            view! { <li><code class="url-text">{name}</code>{note}</li> }
+        })
         .collect_view();
     // The dashboard cannot see the stack's database, so it cannot check
     // that the schemas exist; PostgREST refuses to start when one does
@@ -480,21 +613,21 @@ fn review_view(
                 ". They stop answering for a few seconds while they restart."
             </p>
             {schemas}
-            <ActionForm action=apply attr:class="inline-form">
-                <input type="hidden" name="id" value=project.to_string()/>
-                {hidden}
-                <input type="hidden" name="base" value=base/>
+            <form class="inline-form" on:submit=on_submit>
                 <button type="submit" class="button button-primary" aria-disabled=disabled>
                     "Apply and redeploy"
                 </button>
-            </ActionForm>
+            </form>
         </div>
     }
 }
 
-#[cfg(all(test, feature = "ssr"))]
+#[cfg(test)]
+#[cfg(feature = "ssr")]
 mod tests {
-    use supabase_dashboard_domain::stack_settings::{STACK_SETTINGS, stack_setting};
+    use supabase_dashboard_domain::stack_settings::{
+        STACK_SETTINGS, secret_setting, stack_setting,
+    };
 
     use super::*;
 
@@ -526,6 +659,52 @@ mod tests {
         let from = rendered("SMTP_ADMIN_EMAIL", "");
         assert!(from.contains(r#"type="email""#), "{from}");
         assert!(from.contains(r#"aria-describedby="setting-smtp-admin-email-help""#));
+    }
+
+    fn rendered_secret(set: bool, state: SettingState) -> String {
+        let owner = Owner::new();
+        owner.set();
+        let setting = secret_setting("SMTP_PASS").unwrap();
+        secret_field_view(
+            SecretSettingView {
+                name: setting.name.to_owned(),
+                label: setting.label.to_owned(),
+                help: setting.help.to_owned(),
+                set,
+                state,
+            },
+            SecretInputs::default(),
+        )
+        .to_html()
+    }
+
+    #[test]
+    fn the_password_field_is_never_filled_in_and_says_whether_one_is_set() {
+        let set = rendered_secret(true, SettingState::Editable);
+        assert!(set.contains(r#"for="setting-smtp-pass""#), "{set}");
+        assert!(set.contains(r#"name="smtp_pass""#), "{set}");
+        assert!(set.contains(r#"type="password""#), "{set}");
+        assert!(set.contains(r#"autocomplete="new-password""#), "{set}");
+        assert!(set.contains(r#"maxlength="512""#), "{set}");
+        assert!(set.contains(r#"aria-describedby="setting-smtp-pass-help""#));
+        // The only value attribute is the remove box's.
+        assert_eq!(set.matches("value=").count(), 1, "{set}");
+        assert!(
+            set.contains(r#"name="smtp_pass_remove" value="true""#),
+            "{set}"
+        );
+        assert!(set.contains("Set in Dokploy."), "{set}");
+        assert!(!set.contains("disabled"), "{set}");
+
+        let unset = rendered_secret(false, SettingState::Editable);
+        assert!(unset.contains("Not set."), "{unset}");
+        assert!(!unset.contains("value="), "{unset}");
+        assert!(!unset.contains("smtp_pass_remove"), "{unset}");
+
+        let locked = rendered_secret(true, SettingState::Unreadable);
+        assert!(locked.contains("disabled"), "{locked}");
+        assert!(locked.contains("does not rewrite"), "{locked}");
+        assert!(!locked.contains("smtp_pass_remove"), "{locked}");
     }
 
     #[test]

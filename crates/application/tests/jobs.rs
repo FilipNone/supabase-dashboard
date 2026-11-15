@@ -275,6 +275,7 @@ async fn a_job_whose_runner_stopped_is_resumed_by_another() {
             &supabase_dashboard_persistence::jobs::JobUpdate::Fail {
                 data: "{}",
                 message: "late",
+                drop_secrets: false,
             },
         )
         .await

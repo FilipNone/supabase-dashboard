@@ -87,9 +87,12 @@ pub enum JobUpdate<'a> {
         data: &'a str,
         message: Option<&'a str>,
     },
+    /// `drop_secrets` also deletes the job's secrets, for a job whose
+    /// secrets are of no use once it stopped.
     Fail {
         data: &'a str,
         message: &'a str,
+        drop_secrets: bool,
     },
 }
 
@@ -205,7 +208,8 @@ impl Database {
     }
 
     /// Applies `update` to job `id` if `owner` still holds its lease.
-    /// Finishing a job successfully also deletes its secrets.
+    /// Finishing a job successfully also deletes its secrets, and so does
+    /// failing one with `drop_secrets`.
     pub async fn update_job(
         &self,
         id: Uuid,
@@ -257,7 +261,7 @@ impl Database {
             .bind(owner)
             .bind(*data)
             .bind(*message),
-            JobUpdate::Fail { data, message } => sqlx::query(
+            JobUpdate::Fail { data, message, .. } => sqlx::query(
                 "UPDATE jobs SET state = 'failed', data = $3::jsonb, message = $4, \
                      lease_owner = NULL, lease_until = NULL, updated_at = now(), \
                      finished_at = now() \
@@ -274,7 +278,15 @@ impl Database {
             .map_err(query_err)?
             .rows_affected()
             == 1;
-        if held && matches!(update, JobUpdate::Succeed { .. }) {
+        let drop_secrets = matches!(
+            update,
+            JobUpdate::Succeed { .. }
+                | JobUpdate::Fail {
+                    drop_secrets: true,
+                    ..
+                }
+        );
+        if held && drop_secrets {
             sqlx::query("DELETE FROM job_secrets WHERE job_id = $1")
                 .bind(id)
                 .execute(&mut *tx)
@@ -342,6 +354,16 @@ impl Database {
         .map_err(query_err)?
         .rows_affected();
         Ok(updated == 1)
+    }
+
+    /// Deletes a job's secrets, for a step that no longer needs them.
+    pub async fn delete_job_secrets(&self, id: Uuid) -> Result<(), PersistenceError> {
+        sqlx::query("DELETE FROM job_secrets WHERE job_id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(query_err)?;
+        Ok(())
     }
 
     pub async fn job_secrets(

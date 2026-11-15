@@ -272,6 +272,13 @@ impl fmt::Debug for SecretInput {
     }
 }
 
+impl SecretInput {
+    /// A value read from a form field, to send to the server.
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+}
+
 /// Stores or replaces one of a project's API keys.
 #[server]
 pub async fn replace_project_credential(
@@ -647,34 +654,77 @@ impl SettingsFields {
     }
 }
 
+/// The secret settings a form submitted: `SMTP_PASS` from the
+/// `smtp_pass` field, replaced when it is not empty, and removed when the
+/// `smtp_pass_remove` box is checked.
+#[cfg(feature = "ssr")]
+fn submitted_secrets(
+    smtp_pass: Option<SecretInput>,
+    smtp_pass_remove: Option<String>,
+) -> Result<Vec<supabase_dashboard_application::provisioning::SubmittedSecret<'static>>, AppError> {
+    use supabase_dashboard_application::provisioning::SecretEdit;
+    let value = smtp_pass
+        .map(|input| input.0)
+        .filter(|value| !value.is_empty());
+    let remove = smtp_pass_remove.is_some_and(|checked| checked == "true");
+    Ok(match (value, remove) {
+        (Some(_), true) => {
+            return Err(AppError::Rejected(
+                "Mail server password: enter a new password or remove it, not both.".to_owned(),
+            ));
+        }
+        (Some(value), false) => vec![(
+            "SMTP_PASS",
+            SecretEdit::Replace(secrecy::SecretString::from(value)),
+        )],
+        (None, true) => vec![("SMTP_PASS", SecretEdit::Remove)],
+        (None, false) => Vec::new(),
+    })
+}
+
 /// What applying the submitted settings would change. Nothing is
-/// written. Owners and admins.
+/// written. The submitted fields come back for the review to apply,
+/// except `smtp_pass`, which is never sent back. Owners and admins.
 #[server]
 pub async fn preview_stack_settings(
     id: Uuid,
     #[server(flatten)] fields: SettingsFields,
+    #[server(default)] smtp_pass: Option<SecretInput>,
+    #[server(default)] smtp_pass_remove: Option<String>,
 ) -> Result<(SettingsFields, StackConfigPreview), AppError> {
     let session = org_context::session()?;
+    let secrets = submitted_secrets(smtp_pass, smtp_pass_remove)?;
     let preview = org_context::provisioning()?
-        .preview_settings(&session, id, &fields.submitted())
+        .preview_settings(&session, id, &fields.submitted(), &secrets)
         .await?;
     Ok((fields, preview))
 }
 
 /// Queues writing the submitted settings and redeploying, and returns
 /// the job's ID. `base` is the preview's digest of the settings it saw;
-/// the server refuses when any of them changed since.
+/// the server refuses when any of them changed since. A new `smtp_pass`
+/// is kept sealed with the job until it is written.
 /// Owners and admins.
 #[server]
 pub async fn queue_stack_settings(
     id: Uuid,
     #[server(flatten)] fields: SettingsFields,
     base: String,
+    #[server(default)] smtp_pass: Option<SecretInput>,
+    #[server(default)] smtp_pass_remove: Option<String>,
 ) -> Result<Uuid, AppError> {
     let session = org_context::session()?;
     let audit = org_context::AuditContext::current();
+    let secrets = submitted_secrets(smtp_pass, smtp_pass_remove)?;
     Ok(org_context::provisioning()?
-        .queue_settings(&session, id, &fields.submitted(), &base, audit.get())
+        .queue_settings(
+            &session,
+            id,
+            &fields.submitted(),
+            &secrets,
+            &base,
+            audit.get(),
+        )
         .await?)
 }
 

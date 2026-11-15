@@ -205,7 +205,7 @@ mod tests {
 
     #[test]
     fn every_setting_is_a_defaulted_variable_of_the_services_it_names() {
-        use supabase_dashboard_domain::stack_settings::{DOKPLOY_ONLY_VARIABLES, STACK_SETTINGS};
+        use supabase_dashboard_domain::stack_settings::{SECRET_SETTINGS, STACK_SETTINGS};
         let defaulted = defaulted_variables();
         for setting in STACK_SETTINGS {
             assert!(setting.read_by(COMPOSE_FILE), "{}", setting.name);
@@ -230,13 +230,21 @@ mod tests {
                 None => assert!(uses.is_empty(), "{}", setting.name),
             }
         }
-        for (name, default, _) in defaulted {
-            if DOKPLOY_ONLY_VARIABLES.contains(&name) {
-                assert_eq!(default, "", "{name} has a default");
-                assert!(
-                    STACK_SETTINGS.iter().all(|s| s.name != name),
-                    "{name} is a setting"
-                );
+        for secret in SECRET_SETTINGS {
+            assert!(secret.read_by(COMPOSE_FILE), "{}", secret.name);
+            let uses: Vec<_> = defaulted
+                .iter()
+                .filter(|(name, _, _)| *name == secret.name)
+                .collect();
+            assert!(!uses.is_empty(), "{} has no default", secret.name);
+            assert!(uses.iter().all(|(_, d, _)| d.is_empty()), "{}", secret.name);
+            let mut services: Vec<&str> = uses.iter().map(|(_, _, service)| *service).collect();
+            services.sort_unstable();
+            services.dedup();
+            assert_eq!(services, secret.services, "{}", secret.name);
+        }
+        for (name, _, _) in defaulted {
+            if SECRET_SETTINGS.iter().any(|s| s.name == name) {
                 continue;
             }
             assert!(

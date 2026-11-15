@@ -132,7 +132,7 @@ pub const STACK_SETTINGS: [StackSetting; 11] = [
     StackSetting {
         name: "SMTP_USER",
         label: "Mail server username",
-        help: "Leave empty when the server needs no login. The password is the SMTP_PASS variable, which you set in Dokploy; the dashboard does not read or show it.",
+        help: "Leave empty when the server needs no login. The password is the next field.",
         kind: SettingKind::Username,
         default: Some(""),
         services: &["auth"],
@@ -147,10 +147,30 @@ pub const STACK_SETTINGS: [StackSetting; 11] = [
     },
 ];
 
-/// Variables the pinned compose file reads that the dashboard never
-/// writes or shows, because they hold a secret. Operators set them in
-/// Dokploy.
-pub const DOKPLOY_ONLY_VARIABLES: [&str; 1] = ["SMTP_PASS"];
+/// A variable of the pinned stack that holds a secret. Owners and admins
+/// may replace or remove it, but the dashboard never shows it: the page
+/// learns only whether it is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SecretSetting {
+    /// The variable's name, also the form field's name.
+    pub name: &'static str,
+    pub label: &'static str,
+    pub help: &'static str,
+    /// The compose services that read it; Docker Compose recreates them
+    /// when it changes. The compose file's default is always empty.
+    pub services: &'static [&'static str],
+}
+
+/// Every secret setting, in display order.
+pub const SECRET_SETTINGS: [SecretSetting; 1] = [SecretSetting {
+    name: "SMTP_PASS",
+    label: "Mail server password",
+    help: "Leave empty to keep the current password. The dashboard writes it to Dokploy and never shows it again. Passwords with spaces, quotes, $, #, backslashes, or backticks must be set in Dokploy.",
+    services: &["auth"],
+}];
+
+/// Longest secret setting value.
+pub const MAX_SECRET_LEN: usize = 512;
 
 /// Longest host name, per DNS.
 pub const MAX_HOST_LEN: usize = 253;
@@ -162,6 +182,11 @@ pub const MAX_USERNAME_LEN: usize = 256;
 /// The setting named `name`.
 pub fn stack_setting(name: &str) -> Option<&'static StackSetting> {
     STACK_SETTINGS.iter().find(|setting| setting.name == name)
+}
+
+/// The secret setting named `name`.
+pub fn secret_setting(name: &str) -> Option<&'static SecretSetting> {
+    SECRET_SETTINGS.iter().find(|setting| setting.name == name)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -200,6 +225,11 @@ pub enum SettingError {
         "{label}: enter at most {MAX_USERNAME_LEN} characters without spaces, quotes, $, #, or backslashes, or leave it empty"
     )]
     Username { label: &'static str },
+    /// The value is never part of the message.
+    #[error(
+        "{label}: enter 1 to {MAX_SECRET_LEN} characters without spaces, quotes, $, #, backslashes, or backticks; set a password with those in Dokploy"
+    )]
+    Secret { label: &'static str },
 }
 
 impl StackSetting {
@@ -290,12 +320,35 @@ impl StackSetting {
 
     /// Whether `compose_file` reads this setting's variable.
     pub fn read_by(&self, compose_file: &str) -> bool {
-        compose_file.match_indices("${").any(|(at, _)| {
-            let rest = &compose_file[at + 2..];
-            rest.strip_prefix(self.name)
-                .is_some_and(|after| after.starts_with('}') || after.starts_with(":-"))
-        })
+        compose_reads(compose_file, self.name)
     }
+}
+
+impl SecretSetting {
+    /// Checks a new value without changing it: values are written as
+    /// typed, unquoted, so they hold only visible ASCII other than quotes,
+    /// `$`, `#`, `\`, and backtick. The error never holds the value.
+    pub fn check(&self, value: &str) -> Result<(), SettingError> {
+        if (1..=MAX_SECRET_LEN).contains(&value.len()) && value.bytes().all(is_plain_char) {
+            Ok(())
+        } else {
+            Err(SettingError::Secret { label: self.label })
+        }
+    }
+
+    /// Whether `compose_file` reads this setting's variable.
+    pub fn read_by(&self, compose_file: &str) -> bool {
+        compose_reads(compose_file, self.name)
+    }
+}
+
+/// Whether `compose_file` reads `name` as `${NAME}` or `${NAME:-...}`.
+fn compose_reads(compose_file: &str, name: &str) -> bool {
+    compose_file.match_indices("${").any(|(at, _)| {
+        let rest = &compose_file[at + 2..];
+        rest.strip_prefix(name)
+            .is_some_and(|after| after.starts_with('}') || after.starts_with(":-"))
+    })
 }
 
 /// Characters allowed in an unquoted value: visible ASCII other than
@@ -514,10 +567,25 @@ pub struct StackSettingView {
     pub state: SettingState,
 }
 
+/// One secret setting as an owner or admin sees it: whether it is set,
+/// never its value or length.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretSettingView {
+    pub name: String,
+    pub label: String,
+    pub help: String,
+    /// The variable has a value other than empty. A value the dashboard
+    /// cannot read ([`SettingState::Unreadable`]) counts as set.
+    pub set: bool,
+    pub state: SettingState,
+}
+
 /// A provisioned stack's settings, read from Dokploy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StackSettingsView {
     pub settings: Vec<StackSettingView>,
+    /// The secret settings, after the others.
+    pub secrets: Vec<SecretSettingView>,
     /// An action on the stack is unfinished, so changes are refused.
     pub busy: bool,
     /// Variables edited in Dokploy since the dashboard wrote them.
@@ -527,14 +595,26 @@ pub struct StackSettingsView {
 /// What applying the submitted settings would change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StackConfigPreview {
-    /// The changed variables' names, in display order. Values are not
-    /// repeated here.
+    /// The changed variables' names, in display order, secret settings
+    /// last. Values are not repeated here.
     pub changed: Vec<String>,
+    /// The changed secret settings, also in `changed`.
+    pub secrets: Vec<ChangedSecret>,
     /// The compose services Docker Compose recreates, sorted.
     pub restarts: Vec<String>,
     /// A digest of the settings' current values; applying is refused
-    /// when they changed since. Settings hold no secret.
+    /// when they changed since. For a secret setting it covers only
+    /// whether the variable is set, never its value, because the page
+    /// holds the digest.
     pub base: String,
+}
+
+/// A secret setting a change writes, by name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangedSecret {
+    pub name: String,
+    /// The change removes the value instead of replacing it.
+    pub removed: bool,
 }
 
 /// Variables changed in Dokploy since the dashboard last wrote the
@@ -714,6 +794,51 @@ mod tests {
             assert!(user.normalize(bad).is_err(), "{bad:?}");
         }
         assert!(user.normalize(&"u".repeat(MAX_USERNAME_LEN + 1)).is_err());
+    }
+
+    #[test]
+    fn secret_values_are_checked_and_never_echoed() {
+        let pass = secret_setting("SMTP_PASS").unwrap();
+        assert!(stack_setting("SMTP_PASS").is_none());
+        for good in ["x", "SG.abc-123_def+/=", "p@ss:w0rd!%&*()[]{}<>?~^|;,."] {
+            assert_eq!(pass.check(good), Ok(()), "{good:?}");
+        }
+        assert_eq!(pass.check(&"a".repeat(MAX_SECRET_LEN)), Ok(()));
+        let long = "a".repeat(MAX_SECRET_LEN + 1);
+        for bad in [
+            "",
+            " ",
+            "two words",
+            " leading",
+            "trailing ",
+            "pa$$word",
+            "pass#word",
+            "it's",
+            "say\"hi\"",
+            "back\\slash",
+            "back`tick",
+            "line\nbreak",
+            "tab\there",
+            "caf\u{e9}",
+            long.as_str(),
+        ] {
+            let err = pass.check(bad).unwrap_err();
+            assert_eq!(err, SettingError::Secret { label: pass.label });
+            if !bad.trim().is_empty() {
+                assert!(!err.to_string().contains(bad), "{bad:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn secret_settings_are_not_plain_settings() {
+        for secret in SECRET_SETTINGS {
+            assert!(stack_setting(secret.name).is_none(), "{}", secret.name);
+            assert!(!secret.services.is_empty(), "{}", secret.name);
+        }
+        let pass = secret_setting("SMTP_PASS").unwrap();
+        assert!(pass.read_by("x: ${SMTP_PASS:-}"));
+        assert!(!pass.read_by("x: ${SMTP_PASSWORD:-}"));
     }
 
     #[test]

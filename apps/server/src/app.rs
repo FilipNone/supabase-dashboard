@@ -1283,6 +1283,70 @@ mod tests {
         assert!(body.contains("not connected"), "{body}");
         assert_eq!(jobs().await, 0);
 
+        // A new mail server password is never sent back: not when the
+        // role is refused, the value is refused, or Dokploy is away.
+        const PASS: &str = "http-test-smtp-pass";
+        let preview = PreviewStackSettings::PATH;
+        let queue = QueueStackSettings::PATH;
+        for (path, form, cookie, status, says) in [
+            (
+                preview,
+                format!("smtp_pass={PASS}"),
+                &bob,
+                StatusCode::FORBIDDEN,
+                "",
+            ),
+            (
+                queue,
+                format!("base=0&smtp_pass={PASS}"),
+                &bob,
+                StatusCode::FORBIDDEN,
+                "",
+            ),
+            (
+                preview,
+                format!("smtp_pass={PASS}"),
+                &alice,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "not connected",
+            ),
+            (
+                queue,
+                format!("base=0&smtp_pass={PASS}"),
+                &alice,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "not connected",
+            ),
+            (
+                preview,
+                format!("smtp_pass={PASS}%24x"),
+                &alice,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Mail server password: enter 1 to 512 characters",
+            ),
+            (
+                queue,
+                format!("base=0&smtp_pass={PASS}&smtp_pass_remove=true"),
+                &alice,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "not both",
+            ),
+        ] {
+            let (parts, body) = settings(path, format!("id={provisioned}&{form}"), cookie).await;
+            assert_eq!(parts.status, status, "{path} {body}");
+            assert!(body.contains(says), "{path} {body}");
+            assert!(!body.contains(PASS), "{path} {body}");
+        }
+        assert_eq!(jobs().await, 0);
+        let kept: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_events a WHERE strpos(row_to_json(a)::text, $1) > 0",
+        )
+        .bind(PASS)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(kept, 0);
+
         // Removal needs its own endpoint, the role, and the exact name.
         let removal = |body: String, cookie: &str| {
             send(

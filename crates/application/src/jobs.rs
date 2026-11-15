@@ -96,6 +96,13 @@ pub trait JobHandler: Send + Sync {
     /// Runs `job.step`. See the module documentation: the step must be safe
     /// to run again after an interruption.
     fn run_step<'a>(&'a self, job: &'a ClaimedJob) -> StepFuture<'a>;
+
+    /// Whether a failed job keeps its secrets, as provisioning does
+    /// because the stack it began may already hold them. A job that
+    /// succeeds never keeps them.
+    fn keeps_secrets_after_failure(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -174,22 +181,24 @@ impl JobRunner {
                         &JobUpdate::Fail {
                             data: &data_text,
                             message: &message,
+                            drop_secrets: false,
                         },
                     )
                     .await;
             }
         };
+        let Some(handler) = self.handlers.iter().find(|h| h.kind() == job.kind).cloned() else {
+            let message = format!("This server cannot run {} jobs.", job.kind);
+            return self.fail(&job, message, true).await;
+        };
+        let keep_secrets = handler.keeps_secrets_after_failure();
         if job.interruptions > self.settings.max_interruptions {
             let message = format!(
                 "The job was interrupted {} times at step {}, so it stopped. Check what the step had done before starting again.",
                 job.interruptions, job.step
             );
-            return self.fail(&job, message).await;
+            return self.fail(&job, message, keep_secrets).await;
         }
-        let Some(handler) = self.handlers.iter().find(|h| h.kind() == job.kind).cloned() else {
-            let message = format!("This server cannot run {} jobs.", job.kind);
-            return self.fail(&job, message).await;
-        };
 
         for _ in 0..self.settings.max_steps_per_claim {
             let outcome = match tokio::time::timeout(
@@ -225,7 +234,7 @@ impl JobRunner {
                 StepOutcome::Next { step, data } => {
                     if !is_step_name(step) {
                         return self
-                            .fail(&job, format!("Unknown next step {step:?}."))
+                            .fail(&job, format!("Unknown next step {step:?}."), keep_secrets)
                             .await;
                     }
                     let text = data.to_string();
@@ -248,7 +257,7 @@ impl JobRunner {
                 } => {
                     if !is_step_name(step) {
                         return self
-                            .fail(&job, format!("Unknown next step {step:?}."))
+                            .fail(&job, format!("Unknown next step {step:?}."), keep_secrets)
                             .await;
                     }
                     let text = data.to_string();
@@ -282,7 +291,7 @@ impl JobRunner {
                 }
                 StepOutcome::Fail { data, message } => {
                     job.data = data;
-                    return self.fail(&job, message).await;
+                    return self.fail(&job, message, keep_secrets).await;
                 }
             }
         }
@@ -301,7 +310,12 @@ impl JobRunner {
         .await
     }
 
-    async fn fail(&self, job: &ClaimedJob, message: String) -> Result<RunResult, JobError> {
+    async fn fail(
+        &self,
+        job: &ClaimedJob,
+        message: String,
+        keep_secrets: bool,
+    ) -> Result<RunResult, JobError> {
         tracing::warn!(job_id = %job.id, kind = %job.kind, step = %job.step, "job failed");
         let data = job.data.to_string();
         let message = clip(&message);
@@ -310,6 +324,7 @@ impl JobRunner {
             &JobUpdate::Fail {
                 data: &data,
                 message: &message,
+                drop_secrets: !keep_secrets,
             },
         )
         .await
