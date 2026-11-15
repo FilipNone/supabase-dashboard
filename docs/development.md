@@ -87,12 +87,15 @@ All settings are environment variables. Invalid values stop the server at startu
 | `SUPABASE_DASHBOARD_DOKPLOY_URL` | unset | Dokploy's address, as an administrator would enter it on the administrator page. Needs `SUPABASE_DASHBOARD_DOKPLOY_API_KEY_FILE` and an encryption key. See "Supplied by the deployment" in [docs/dokploy.md](dokploy.md) |
 | `SUPABASE_DASHBOARD_DOKPLOY_API_KEY_FILE` | unset | Path to a file holding the Dokploy API key alone (surrounding whitespace is ignored, at most 4 KiB). Read once at startup; the server refuses to start if it is missing or the key is malformed. Needs `SUPABASE_DASHBOARD_DOKPLOY_URL` |
 | `SUPABASE_DASHBOARD_SMTP_URL` | unset | Mail server for the dashboard's own email (invitation and password reset links), as `smtps://host[:port]` (TLS from the start, port 465 by default) or `smtp://host[:port]` (STARTTLS required, port 587 by default). No credentials, path, or query. Needs `SUPABASE_DASHBOARD_PUBLIC_URL` and `SUPABASE_DASHBOARD_MAIL_FROM`. Unset sends no email; see "Invitation email" below |
-| `SUPABASE_DASHBOARD_MAIL_FROM` | unset | From address, as `dashboard@example.com` or `Dashboard <dashboard@example.com>`. Needs `SUPABASE_DASHBOARD_SMTP_URL` |
+| `SUPABASE_DASHBOARD_MAIL_FROM` | unset | From address, as `dashboard@example.com` or `Dashboard <dashboard@example.com>`. Needs `SUPABASE_DASHBOARD_SMTP_URL` or a Resend API key; with Resend, on a domain verified there |
 | `SUPABASE_DASHBOARD_SMTP_USERNAME` | unset | Login for the mail server. Set together with one of the two password settings |
 | `SUPABASE_DASHBOARD_SMTP_PASSWORD_FILE` | unset | Path to a file holding the SMTP password (a final newline is ignored, at most 4 KiB). Read once at startup |
 | `SUPABASE_DASHBOARD_SMTP_PASSWORD` | unset | The same password given directly. Set only one of the two; prefer the file |
 | `SUPABASE_DASHBOARD_SMTP_TIMEOUT_SECS` | 15 | 1 to 120; longest time one email may take, connecting included |
 | `SUPABASE_DASHBOARD_SMTP_PLAINTEXT` | `false` | `true` makes `smtp://` connect without TLS, for a local test server such as Mailpit. Allowed only with `SUPABASE_DASHBOARD_ENV=development` and without a login |
+| `SUPABASE_DASHBOARD_RESEND_API_KEY_FILE` | unset | Path to a file holding a [Resend](https://resend.com) API key (a final newline is ignored, at most 4 KiB). Sends the dashboard's own email through Resend's HTTP API instead of SMTP; set this or `SUPABASE_DASHBOARD_SMTP_URL`, not both. Read once at startup |
+| `SUPABASE_DASHBOARD_RESEND_API_KEY` | unset | The same key given directly. Set only one of the two; prefer the file |
+| `SUPABASE_DASHBOARD_RESEND_TIMEOUT_SECS` | 15 | 1 to 120; longest time one email may take through Resend, connecting included |
 | `RUST_LOG` | `info,tower_http=info,sqlx=warn` | Standard `tracing` filter |
 | `LEPTOS_SITE_ADDR` | `127.0.0.1:3000` | Listen address |
 
@@ -116,11 +119,13 @@ The project overview's "Check now" button asks the stack's API gateway for `/aut
 
 ### Invitation email
 
-With `SUPABASE_DASHBOARD_SMTP_URL` set, creating an invitation also emails its link to the invited address once the invitation is saved. The message is plain text: who invited them, the organization, the role, the link, and when it expires. The link is `<public URL origin>/dashboard/invite#<code>`, with the code in the fragment so opening it does not send the code to the server. The page still shows the link once and says whether the email went out; when the mail server is unreachable, refuses the message, or does not answer within `SUPABASE_DASHBOARD_SMTP_TIMEOUT_SECS`, the invitation stays open and the inviter can send the link by hand. A failed send is not retried. Each attempt is audited as `organization.invitation_email` against the invitation, with success or failure and nothing from the message.
+With mail set up (`SUPABASE_DASHBOARD_SMTP_URL` or a Resend API key), creating an invitation also emails its link to the invited address once the invitation is saved. The message is plain text: who invited them, the organization, the role, the link, and when it expires. The link is `<public URL origin>/dashboard/invite#<code>`, with the code in the fragment so opening it does not send the code to the server. The page still shows the link once and says whether the email went out; when the mail server is unreachable, refuses the message, or does not answer within `SUPABASE_DASHBOARD_SMTP_TIMEOUT_SECS`, the invitation stays open and the inviter can send the link by hand. A failed send is not retried. Each attempt is audited as `organization.invitation_email` against the invitation, with success or failure and nothing from the message.
 
 Owners and admins can send an open invitation again with Resend on the Team page (only an owner, for an invitation to the owner role). Because only a hash of each code is stored, the old code cannot be sent again: a new invitation with a new code and a new seven-day expiry replaces it in one transaction, for the same address and role, and the old link stops working. The new link is shown once and emailed when mail is configured. The resend is audited as `organization.invitation_resend` against the new invitation, and refused when the invitation was withdrawn, accepted, expired, or already replaced in the meantime. Without mail configured, Resend still makes a new link to copy.
 
 The connection is always encrypted outside development: `smtp://` requires STARTTLS, and a server that does not offer it gets neither the login nor the message. Certificates are checked against the Mozilla roots bundled with the binary plus `SUPABASE_DASHBOARD_EXTRA_CA_FILE`. The password stays in the server process and is never logged. This mail is the dashboard's own, separate from the SMTP settings of a managed project's Auth service. The same mail server sends password reset links; see "Password reset by email" below.
+
+With a Resend API key set instead, each message is one `POST https://api.resend.com/emails` with the key in the `Authorization` header and the plain-text body. The address cannot be changed, redirects are not followed, no proxy is used, and certificates are checked as for SMTP. A 401, 403, 429, redirect, or server error counts as Resend being unavailable, other refusals as the message being refused; errors name the HTTP status and Resend's error code (such as `validation_error`) but not Resend's message, which can repeat the recipient address. Nothing is retried, so no idempotency key is sent. `crates/adapters/tests/resend_mock.rs` checks this against an in-process imitation of the endpoint; the real service has not been tested.
 
 To try it locally, run Mailpit and point the dashboard at it:
 
@@ -136,7 +141,7 @@ Messages show up at <http://127.0.0.1:8025>. The adapter tests run against `test
 
 ### Password reset by email
 
-With `SUPABASE_DASHBOARD_SMTP_URL` set, the sign-in page's "Forgot your password?" link opens `/dashboard/forgot-password`, where an operator enters their email address. Without mail, that page says passwords are reset on the server with `reset-password` and shows no form.
+With mail set up (SMTP or Resend), the sign-in page's "Forgot your password?" link opens `/dashboard/forgot-password`, where an operator enters their email address. Without mail, that page says passwords are reset on the server with `reset-password` and shows no form.
 
 The page answers the same way whether or not an account uses the address. The lookup, the saved request, and the email happen in a background task after the answer, so its timing does not depend on the account either; at most 8 requests are handled at once, and more are refused with "try again in a minute". An enabled account gets an email with a link to `<public URL origin>/dashboard/reset-password#<code>`; the code is in the fragment, so opening the link does not send it to the server, and the page removes it from the address bar. Only a SHA-256 hash of the code is stored, in `password_reset_requests`.
 

@@ -24,6 +24,7 @@ use supabase_dashboard_adapters::{
     gateway::{GatewayError, GatewayProbe, GatewaySettings},
     mail::{SmtpMailer, SmtpSecurity, SmtpSettings, SmtpSetupError},
     net::TargetPolicy,
+    resend::{RESEND_API_URL, ResendMailer, ResendSettings, ResendSetupError},
     studio_proxy::{StudioProxy, StudioProxySettings},
     tls::{ExtraRoots, ExtraRootsError, MAX_EXTRA_CA_FILE_BYTES},
 };
@@ -48,7 +49,7 @@ use tokio::net::TcpListener;
 
 use crate::{
     app::HttpLimits,
-    config::{Config, ConfigError, SecretKeySource},
+    config::{Config, ConfigError, MailTransport, SecretKeySource},
     session::CookieSettings,
     state::AppState,
     studio::StudioGateway,
@@ -100,18 +101,22 @@ enum StartupError {
     },
     #[error("no credential encryption key is configured; set SUPABASE_DASHBOARD_SECRET_KEY_FILE")]
     NoSecretKey,
-    #[error("could not read SUPABASE_DASHBOARD_SMTP_PASSWORD_FILE {path}: {source}")]
-    SmtpPasswordFile {
+    #[error("could not read SUPABASE_DASHBOARD_{setting} {path}: {source}")]
+    MailSecretFile {
+        setting: &'static str,
         path: std::path::PathBuf,
         source: std::io::Error,
     },
-    #[error("SUPABASE_DASHBOARD_SMTP_PASSWORD_FILE {path} is invalid: {reason}")]
-    SmtpPassword {
+    #[error("SUPABASE_DASHBOARD_{setting} {path} is invalid: {reason}")]
+    MailSecret {
+        setting: &'static str,
         path: std::path::PathBuf,
         reason: &'static str,
     },
     #[error("could not set up outgoing mail: {0}")]
     Mail(#[from] SmtpSetupError),
+    #[error("could not set up outgoing mail: {0}")]
+    Resend(#[from] ResendSetupError),
     #[error("could not reseal stored credentials: {0}")]
     Rotation(#[from] RotationError),
     #[error("could not set up project connections: {0}")]
@@ -170,8 +175,9 @@ fn deployment_dokploy(config: &Config) -> Result<Option<DokployCredentials>, Sta
     }))
 }
 
-/// Largest SMTP password file read, so a wrong path fails fast.
-const MAX_SMTP_PASSWORD_FILE_BYTES: u64 = 4096;
+/// Largest SMTP password or Resend API key file read, so a wrong path
+/// fails fast.
+const MAX_MAIL_SECRET_FILE_BYTES: u64 = 4096;
 
 /// The dashboard's own outgoing mail: invitation and password reset links.
 struct OutgoingMail {
@@ -179,9 +185,41 @@ struct OutgoingMail {
     password_resets: PasswordResetMail,
 }
 
-/// Sets up outgoing email, if the deployment configured a mail server.
-/// The password file is read once, its size checked first, and a final
-/// newline ignored; nothing from it appears in an error.
+/// Reads an SMTP password or a Resend API key. A file is read once, its
+/// size checked first, and a final newline ignored; nothing from it
+/// appears in an error.
+fn mail_secret(
+    source: &SecretKeySource,
+    setting: &'static str,
+) -> Result<secrecy::SecretString, StartupError> {
+    let path = match source {
+        SecretKeySource::Inline(value) => return Ok(value.clone()),
+        SecretKeySource::File(path) => path,
+    };
+    let read_err = |source| StartupError::MailSecretFile {
+        setting,
+        path: path.clone(),
+        source,
+    };
+    let invalid = |reason| StartupError::MailSecret {
+        setting,
+        path: path.clone(),
+        reason,
+    };
+    let len = std::fs::metadata(path).map_err(read_err)?.len();
+    if len > MAX_MAIL_SECRET_FILE_BYTES {
+        return Err(invalid("the file is larger than 4 KiB"));
+    }
+    let raw = secrecy::SecretString::from(std::fs::read_to_string(path).map_err(read_err)?);
+    let value = raw.expose_secret().trim_end_matches(['\r', '\n']);
+    if value.is_empty() {
+        return Err(invalid("the file is empty"));
+    }
+    Ok(secrecy::SecretString::from(value.to_owned()))
+}
+
+/// Sets up outgoing email, if the deployment configured a mail server or
+/// Resend.
 fn outgoing_mail(
     config: &Config,
     extra_roots: &ExtraRoots,
@@ -193,53 +231,47 @@ fn outgoing_mail(
         );
         return Ok(None);
     };
-    let credentials = match &mail.credentials {
-        None => None,
-        Some((username, SecretKeySource::Inline(password))) => {
-            Some((username.clone(), password.clone()))
+    let mailer: Arc<dyn Mailer> = match &mail.transport {
+        MailTransport::Smtp(smtp) => {
+            let credentials = match &smtp.credentials {
+                None => None,
+                Some((username, password)) => Some((
+                    username.clone(),
+                    mail_secret(password, "SMTP_PASSWORD_FILE")?,
+                )),
+            };
+            let mailer = SmtpMailer::new(SmtpSettings {
+                endpoint: smtp.endpoint.clone(),
+                credentials,
+                from: mail.from.clone(),
+                timeout: smtp.timeout,
+                hello_name: public_url.host_str().map(str::to_owned),
+                extra_roots: extra_roots.clone(),
+            })?;
+            if smtp.endpoint.security == SmtpSecurity::Plaintext {
+                tracing::warn!("outgoing mail is sent without encryption (development only)");
+            }
+            tracing::info!(
+                host = %smtp.endpoint.host,
+                port = smtp.endpoint.port,
+                security = ?smtp.endpoint.security,
+                "invitation and password reset links are emailed over SMTP"
+            );
+            Arc::new(mailer)
         }
-        Some((username, SecretKeySource::File(path))) => {
-            let read_err = |source| StartupError::SmtpPasswordFile {
-                path: path.clone(),
-                source,
-            };
-            let invalid = |reason| StartupError::SmtpPassword {
-                path: path.clone(),
-                reason,
-            };
-            let len = std::fs::metadata(path).map_err(read_err)?.len();
-            if len > MAX_SMTP_PASSWORD_FILE_BYTES {
-                return Err(invalid("the file is larger than 4 KiB"));
-            }
-            let raw = secrecy::SecretString::from(std::fs::read_to_string(path).map_err(read_err)?);
-            let password = raw.expose_secret().trim_end_matches(['\r', '\n']);
-            if password.is_empty() {
-                return Err(invalid("the file is empty"));
-            }
-            Some((
-                username.clone(),
-                secrecy::SecretString::from(password.to_owned()),
-            ))
+        MailTransport::Resend(resend) => {
+            let api_url = url::Url::parse(RESEND_API_URL).map_err(|_| ResendSetupError::Url)?;
+            let mailer = ResendMailer::new(ResendSettings {
+                api_key: mail_secret(&resend.api_key, "RESEND_API_KEY_FILE")?,
+                from: mail.from.clone(),
+                timeout: resend.timeout,
+                extra_roots: extra_roots.clone(),
+                api_url,
+            })?;
+            tracing::info!("invitation and password reset links are emailed through Resend");
+            Arc::new(mailer)
         }
     };
-    let mailer = SmtpMailer::new(SmtpSettings {
-        endpoint: mail.endpoint.clone(),
-        credentials,
-        from: mail.from.clone(),
-        timeout: mail.timeout,
-        hello_name: public_url.host_str().map(str::to_owned),
-        extra_roots: extra_roots.clone(),
-    })?;
-    if mail.endpoint.security == SmtpSecurity::Plaintext {
-        tracing::warn!("outgoing mail is sent without encryption (development only)");
-    }
-    tracing::info!(
-        host = %mail.endpoint.host,
-        port = mail.endpoint.port,
-        security = ?mail.endpoint.security,
-        "invitation and password reset links are emailed"
-    );
-    let mailer: Arc<dyn Mailer> = Arc::new(mailer);
     let origin = public_url.origin().ascii_serialization();
     Ok(Some(OutgoingMail {
         invitations: InvitationMail {

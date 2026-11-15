@@ -4,8 +4,9 @@
 use std::{fmt, time::Duration};
 
 use secrecy::SecretString;
-use supabase_dashboard_adapters::mail::{
-    DEFAULT_SMTP_TIMEOUT, SmtpEndpoint, SmtpSecurity, check_from_address,
+use supabase_dashboard_adapters::{
+    mail::{DEFAULT_SMTP_TIMEOUT, SmtpEndpoint, SmtpSecurity, check_from_address},
+    resend::DEFAULT_RESEND_TIMEOUT,
 };
 use supabase_dashboard_domain::{
     dokploy::DokployUrl, studio_access::STUDIO_ACCESS_MAX_RETENTION_DAYS,
@@ -74,19 +75,42 @@ pub struct Config {
     /// A Dokploy connection the deployment supplies. The server stores it
     /// at startup, and administrators cannot replace or remove it.
     pub dokploy: Option<DeploymentDokploy>,
-    /// Outgoing email for invitations. `None` (the default) sends nothing.
+    /// Outgoing email for invitations and password resets. `None` (the
+    /// default) sends nothing.
     pub mail: Option<MailConfig>,
+}
+
+/// Outgoing email: where it goes and who it is from.
+#[derive(Debug, Clone)]
+pub struct MailConfig {
+    pub transport: MailTransport,
+    /// The From address, as `address` or `Name <address>`.
+    pub from: String,
+}
+
+/// How outgoing email is sent: `SUPABASE_DASHBOARD_SMTP_URL` or a Resend
+/// API key, never both.
+#[derive(Debug, Clone)]
+pub enum MailTransport {
+    Smtp(SmtpConfig),
+    Resend(ResendConfig),
 }
 
 /// `SUPABASE_DASHBOARD_SMTP_URL` and the settings that go with it.
 #[derive(Debug, Clone)]
-pub struct MailConfig {
+pub struct SmtpConfig {
     pub endpoint: SmtpEndpoint,
     /// Username and where the password comes from, when the server needs
     /// them.
     pub credentials: Option<(String, SecretKeySource)>,
-    /// The From address, as `address` or `Name <address>`.
-    pub from: String,
+    pub timeout: Duration,
+}
+
+/// `SUPABASE_DASHBOARD_RESEND_API_KEY_FILE` or `_RESEND_API_KEY`, and the
+/// settings that go with it.
+#[derive(Debug, Clone)]
+pub struct ResendConfig {
+    pub api_key: SecretKeySource,
     pub timeout: Duration,
 }
 
@@ -310,29 +334,107 @@ impl Config {
     }
 }
 
-/// Mail is off unless `SMTP_URL` is set, and every other mail setting
-/// needs it. TLS is required outside development, and a password is never
-/// sent without it. The password comes from a file or the environment,
-/// never from the URL, and no error repeats it.
+/// Mail is off unless `SMTP_URL` or a Resend API key is set, and every
+/// other mail setting needs one of them. Secrets come from a file or the
+/// environment, never from a URL, and no error repeats them.
 fn mail_config(
     get: &impl Fn(&str) -> Option<String>,
     environment: Environment,
     public_url: Option<&url::Url>,
 ) -> Result<Option<MailConfig>, ConfigError> {
-    const DEPENDENT: [&str; 6] = [
-        "MAIL_FROM",
+    const SMTP_DEPENDENT: [&str; 5] = [
         "SMTP_USERNAME",
         "SMTP_PASSWORD",
         "SMTP_PASSWORD_FILE",
         "SMTP_PLAINTEXT",
         "SMTP_TIMEOUT_SECS",
     ];
-    let Some(raw_url) = get("SMTP_URL") else {
-        if let Some(name) = DEPENDENT.into_iter().find(|name| get(name).is_some()) {
-            return Err(invalid(name, "needs SUPABASE_DASHBOARD_SMTP_URL"));
+    let smtp_url = get("SMTP_URL");
+    if smtp_url.is_none()
+        && let Some(name) = SMTP_DEPENDENT.into_iter().find(|name| get(name).is_some())
+    {
+        return Err(invalid(name, "needs SUPABASE_DASHBOARD_SMTP_URL"));
+    }
+    let resend_key = secret_source(get, "RESEND_API_KEY")?;
+    if resend_key.is_none() && get("RESEND_TIMEOUT_SECS").is_some() {
+        return Err(invalid(
+            "RESEND_TIMEOUT_SECS",
+            "needs SUPABASE_DASHBOARD_RESEND_API_KEY_FILE or SUPABASE_DASHBOARD_RESEND_API_KEY",
+        ));
+    }
+    let (transport, setting) = match (smtp_url, resend_key) {
+        (None, None) => {
+            if get("MAIL_FROM").is_some() {
+                return Err(invalid(
+                    "MAIL_FROM",
+                    "needs SUPABASE_DASHBOARD_SMTP_URL or SUPABASE_DASHBOARD_RESEND_API_KEY_FILE",
+                ));
+            }
+            return Ok(None);
         }
-        return Ok(None);
+        (Some(_), Some(_)) => {
+            return Err(invalid(
+                "RESEND_API_KEY_FILE",
+                "send mail either over SMTP (SUPABASE_DASHBOARD_SMTP_URL) or through Resend, \
+                 not both",
+            ));
+        }
+        (Some(raw_url), None) => (
+            MailTransport::Smtp(smtp_config(get, environment, &raw_url)?),
+            "SMTP_URL",
+        ),
+        (None, Some(api_key)) => (
+            MailTransport::Resend(ResendConfig {
+                api_key,
+                timeout: secs(bounded(
+                    get,
+                    "RESEND_TIMEOUT_SECS",
+                    DEFAULT_RESEND_TIMEOUT.as_secs(),
+                    1,
+                    120,
+                )?),
+            }),
+            "RESEND_API_KEY_FILE",
+        ),
     };
+    if public_url.is_none() {
+        return Err(invalid(
+            setting,
+            "emailed links need SUPABASE_DASHBOARD_PUBLIC_URL",
+        ));
+    }
+    let from = get("MAIL_FROM").ok_or_else(|| missing("MAIL_FROM"))?;
+    if from.chars().any(char::is_control) {
+        return Err(invalid("MAIL_FROM", "must be a single line"));
+    }
+    check_from_address(&from).map_err(|e| invalid("MAIL_FROM", e))?;
+    Ok(Some(MailConfig { transport, from }))
+}
+
+/// `{name}_FILE` or `{name}`, not both. The value is never echoed.
+fn secret_source(
+    get: &impl Fn(&str) -> Option<String>,
+    name: &str,
+) -> Result<Option<SecretKeySource>, ConfigError> {
+    let file_name = format!("{name}_FILE");
+    match (get(&file_name), get(name)) {
+        (Some(_), Some(_)) => Err(invalid(
+            name,
+            format!("set either {PREFIX}{name} or {PREFIX}{file_name}, not both"),
+        )),
+        (Some(path), None) => Ok(Some(SecretKeySource::File(path.into()))),
+        (None, Some(value)) => Ok(Some(SecretKeySource::Inline(SecretString::from(value)))),
+        (None, None) => Ok(None),
+    }
+}
+
+/// TLS is required outside development, and a password is never sent
+/// without it.
+fn smtp_config(
+    get: &impl Fn(&str) -> Option<String>,
+    environment: Environment,
+    raw_url: &str,
+) -> Result<SmtpConfig, ConfigError> {
     let allow_plaintext = match get("SMTP_PLAINTEXT").as_deref() {
         None | Some("false") => false,
         Some("true") if environment == Environment::Development => true,
@@ -345,31 +447,8 @@ fn mail_config(
         Some(_) => return Err(invalid("SMTP_PLAINTEXT", "expected `true` or `false`")),
     };
     let endpoint =
-        SmtpEndpoint::parse(&raw_url, allow_plaintext).map_err(|e| invalid("SMTP_URL", e))?;
-    if public_url.is_none() {
-        return Err(invalid(
-            "SMTP_URL",
-            "emailed links need SUPABASE_DASHBOARD_PUBLIC_URL",
-        ));
-    }
-    let from = get("MAIL_FROM").ok_or_else(|| missing("MAIL_FROM"))?;
-    if from.chars().any(char::is_control) {
-        return Err(invalid("MAIL_FROM", "must be a single line"));
-    }
-    check_from_address(&from).map_err(|e| invalid("MAIL_FROM", e))?;
-    let password = match (get("SMTP_PASSWORD_FILE"), get("SMTP_PASSWORD")) {
-        (Some(_), Some(_)) => {
-            return Err(invalid(
-                "SMTP_PASSWORD",
-                "set either SUPABASE_DASHBOARD_SMTP_PASSWORD or \
-                 SUPABASE_DASHBOARD_SMTP_PASSWORD_FILE, not both",
-            ));
-        }
-        (Some(path), None) => Some(SecretKeySource::File(path.into())),
-        // Do not echo the value in any error.
-        (None, Some(password)) => Some(SecretKeySource::Inline(SecretString::from(password))),
-        (None, None) => None,
-    };
+        SmtpEndpoint::parse(raw_url, allow_plaintext).map_err(|e| invalid("SMTP_URL", e))?;
+    let password = secret_source(get, "SMTP_PASSWORD")?;
     let credentials = match (get("SMTP_USERNAME"), password) {
         (Some(username), Some(password)) => Some((username, password)),
         (None, None) => None,
@@ -399,12 +478,11 @@ fn mail_config(
         1,
         120,
     )?);
-    Ok(Some(MailConfig {
+    Ok(SmtpConfig {
         endpoint,
         credentials,
-        from,
         timeout,
-    }))
+    })
 }
 
 fn parse_public_url(raw: &str, environment: Environment) -> Result<url::Url, ConfigError> {
@@ -739,6 +817,56 @@ mod tests {
         ]));
     }
 
+    fn smtp_of(mail: &MailConfig) -> &SmtpConfig {
+        match &mail.transport {
+            MailTransport::Smtp(smtp) => smtp,
+            MailTransport::Resend(_) => panic!("expected SMTP"),
+        }
+    }
+
+    #[test]
+    fn resend_needs_a_key_from_one_source_and_excludes_smtp() {
+        let public = ("PUBLIC_URL", "https://dash.example.test");
+        let from = ("MAIL_FROM", "dash@example.test");
+        let key = ("RESEND_API_KEY", "re_hunter2");
+        let mail = load(&[DB, public, from, key]).unwrap().mail.unwrap();
+        let MailTransport::Resend(resend) = &mail.transport else {
+            panic!("expected Resend");
+        };
+        assert_eq!(resend.timeout, DEFAULT_RESEND_TIMEOUT);
+        assert!(!format!("{mail:?}").contains("hunter2"));
+        let file = ("RESEND_API_KEY_FILE", "/run/secrets/resend");
+        let mail = load(&[DB, public, from, file, ("RESEND_TIMEOUT_SECS", "30")])
+            .unwrap()
+            .mail
+            .unwrap();
+        assert!(matches!(
+            mail.transport,
+            MailTransport::Resend(ResendConfig {
+                api_key: SecretKeySource::File(_),
+                timeout,
+            }) if timeout == Duration::from_secs(30)
+        ));
+
+        for pairs in [
+            vec![DB, public, from, key, file],
+            vec![
+                DB,
+                public,
+                from,
+                key,
+                ("SMTP_URL", "smtps://mail.example.test"),
+            ],
+            vec![DB, ("ENV", "development"), from, key],
+            vec![DB, public, key],
+            vec![DB, public, from, ("RESEND_TIMEOUT_SECS", "30")],
+            vec![DB, public, from, key, ("SMTP_USERNAME", "dash")],
+        ] {
+            let err = load(&pairs).unwrap_err();
+            assert!(!err.to_string().contains("hunter2"), "{err}");
+        }
+    }
+
     #[test]
     fn mail_is_off_by_default_and_needs_an_smtp_url() {
         let dev = ("ENV", "development");
@@ -768,9 +896,10 @@ mod tests {
         .unwrap()
         .mail
         .unwrap();
-        assert_eq!(mail.endpoint.port, 465);
-        assert!(mail.credentials.is_none());
-        assert_eq!(mail.timeout, DEFAULT_SMTP_TIMEOUT);
+        let smtp = smtp_of(&mail);
+        assert_eq!(smtp.endpoint.port, 465);
+        assert!(smtp.credentials.is_none());
+        assert_eq!(smtp.timeout, DEFAULT_SMTP_TIMEOUT);
     }
 
     #[test]
@@ -782,7 +911,7 @@ mod tests {
         let err = load(&[DB, public, smtp, from, plain]).unwrap_err();
         assert!(err.to_string().contains("development"), "{err}");
         let starttls = load(&[DB, public, smtp, from]).unwrap().mail.unwrap();
-        assert_eq!(starttls.endpoint.security, SmtpSecurity::StartTls);
+        assert_eq!(smtp_of(&starttls).endpoint.security, SmtpSecurity::StartTls);
         let dev = [
             DB,
             ("ENV", "development"),
@@ -792,7 +921,7 @@ mod tests {
             plain,
         ];
         let mail = load(&dev).unwrap().mail.unwrap();
-        assert_eq!(mail.endpoint.security, SmtpSecurity::Plaintext);
+        assert_eq!(smtp_of(&mail).endpoint.security, SmtpSecurity::Plaintext);
         let mut with_password = dev.to_vec();
         with_password.extend([("SMTP_USERNAME", "dash"), ("SMTP_PASSWORD", "hunter2")]);
         let err = load(&with_password).unwrap_err();

@@ -112,7 +112,16 @@ SUPABASE_DASHBOARD_SMTP_PASSWORD_FILE=/run/secrets/smtp_password
 
 The URL holds no credentials. Keep the password in a file mounted as a Compose secret, as for the encryption key: add `smtp_password` under `secrets:` in `compose.yaml` (`file: ./smtp-password`) and list it under the dashboard's `secrets`. `SUPABASE_DASHBOARD_SMTP_PASSWORD` also works, but then the password appears in `docker inspect`. The connection always uses TLS: `smtp://` requires the server to offer STARTTLS, and the certificate must chain to a public authority or to `SUPABASE_DASHBOARD_EXTRA_CA_FILE`. `SUPABASE_DASHBOARD_PUBLIC_URL` must be set, because the emailed link starts with it.
 
-After an invitation is created, the page says whether the email went out. If the mail server could not be reached or refused the message, the invitation still works and the link is still shown once to send by hand; the dashboard does not retry. To send it again later, use Resend next to the invitation under Open invitations: it makes a new link, emails it, and the old link stops working. Each send is recorded in the audit log as `organization.invitation_email`, without the message or the link. The settings and their limits are in [Configuration](https://github.com/FilipNone/supabase-dashboard/blob/main/docs/development.md#configuration). With mail set up, the sign-in page's "Forgot your password?" link also emails operators a one-hour link to choose a new password; without it, a forgotten password is reset with `supabase-dashboard-server reset-password` on the server.
+To send through [Resend](https://resend.com)'s HTTP API instead of SMTP, set an API key in place of the `SMTP_*` settings:
+
+```sh
+SUPABASE_DASHBOARD_RESEND_API_KEY_FILE=/run/secrets/resend_api_key
+SUPABASE_DASHBOARD_MAIL_FROM=Dashboard <dashboard@example.com>
+```
+
+The From address must be on a domain verified in Resend, and a key limited to sending is enough. Mount the key as a Compose secret like the SMTP password; `SUPABASE_DASHBOARD_RESEND_API_KEY` also works, with the same `docker inspect` caveat. The dashboard sends only to `https://api.resend.com`, directly (no proxy). Set SMTP or Resend, not both.
+
+After an invitation is created, the page says whether the email went out. If the mail server or Resend could not be reached or refused the message, the invitation still works and the link is still shown once to send by hand; the dashboard does not retry. To send it again later, use Resend next to the invitation under Open invitations: it makes a new link, emails it, and the old link stops working. Each send is recorded in the audit log as `organization.invitation_email`, without the message or the link. The settings and their limits are in [Configuration](https://github.com/FilipNone/supabase-dashboard/blob/main/docs/development.md#configuration). With mail set up, the sign-in page's "Forgot your password?" link also emails operators a one-hour link to choose a new password; without it, a forgotten password is reset with `supabase-dashboard-server reset-password` on the server.
 
 ## Studio access
 
