@@ -59,8 +59,8 @@ fn DokployTargets(organization_id: Uuid) -> impl IntoView {
                                 format!("New stacks can go to these {count} Dokploy environments:")
                             }}
                         </p>
-                        <ul class="target-list">{items}</ul>
-                        <div class="inline-form">
+                        <ul class="integration-targets">{items}</ul>
+                        <div class="link-actions">
                             <a class="button button-primary" href=format!("{base}/stack")>"Create a stack"</a>
                             <a class="button" href=format!("{base}/adopt")>"Adopt a stack from Dokploy"</a>
                         </div>

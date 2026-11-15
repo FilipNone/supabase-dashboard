@@ -487,7 +487,10 @@ td { vertical-align: middle; }
 .access-table { min-width: 44rem; }
 .access-table td.request { min-width: 18rem; }
 .audit-table { min-width: 44rem; }
-.target-list { margin: 0 0 var(--space-3); padding-left: var(--space-4); overflow-wrap: anywhere; }
+/* The Integrations tab's list of targets; `.target-list` is the admin table's. */
+.integration-targets { margin: 0; padding-left: var(--space-6); list-style: disc; display: grid; gap: var(--space-1); overflow-wrap: anywhere; }
+/* Links side by side, centred on one line when the first is a primary button. */
+.link-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2) var(--space-3); }
 .url-text { overflow-wrap: anywhere; font-family: var(--font-mono, ui-monospace, monospace); }
 .card-meta.url-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .checkbox-field { display: flex; align-items: flex-start; gap: var(--space-2); font-size: var(--text-sm); }
