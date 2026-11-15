@@ -211,6 +211,7 @@ Release checks include a fresh installation, Studio access tests for each role, 
 
 ## Revision history
 
+- 2026-11-16: released `v0.3.0-dev.7` with OIDC back-channel logout and installation admins unlinking an operator's OIDC identity.
 - 2026-11-15: M6 OIDC: installation admins can unlink another operator's identity from the account list, which also ends the sessions started with it. Updated the M6 OIDC item.
 - 2026-11-15: M6 OIDC back-channel logout: signing out of the provider revokes the dashboard sessions started through it, and with them Studio access. Verified against the mock provider and Authentik 2026.8.5. Updated the M6 OIDC item.
 - 2026-11-15: released `v0.3.0-dev.6` with single sign-on through an OpenID Connect provider (tested with Authentik), changing the sign-in email, and invitees returning to their invitation after signing in.
