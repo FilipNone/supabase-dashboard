@@ -27,6 +27,7 @@ use supabase_dashboard_domain::{
     dokploy_target::StackTargetsOverview,
     health::InstallationHealth,
     invitation::{InvitationCode, InvitationPreview, InvitationSummary, IssuedInvitation},
+    oidc::{OidcOverview, SignInOptions},
     organization::{MemberSummary, OrganizationSummary},
     project::ProjectSummary,
     provisioning::{ProvisionJobSummary, ProvisionTargets, StackAction, StackDeploymentView},
@@ -959,6 +960,38 @@ pub async fn sign_up_with_invitation(
     Ok(org_context::auth()?
         .accept_invitation_with_new_account(code.expose(), &display_name, &password, audit.get())
         .await?)
+}
+
+/// Public: what the sign-in page offers besides a password. Holds only
+/// the provider's display name; the provider's URLs stay on the server.
+#[server(prefix = "/auth", endpoint = "sign-in-options")]
+pub async fn get_sign_in_options() -> Result<SignInOptions, AppError> {
+    Ok(SignInOptions {
+        oidc_provider_name: org_context::auth()?.oidc_provider_name().map(str::to_owned),
+    })
+}
+
+/// The signed-in operator's single sign-on identities.
+#[server]
+pub async fn get_oidc_overview() -> Result<OidcOverview, AppError> {
+    let session = org_context::session()?;
+    Ok(org_context::auth()?.oidc_overview(&session).await?)
+}
+
+/// Unlinks one of the signed-in operator's single sign-on identities. The
+/// account keeps its password, so it can still sign in.
+#[server]
+pub async fn unlink_oidc_identity(identity_id: Uuid) -> Result<(), AppError> {
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    if org_context::auth()?
+        .unlink_oidc_identity(&session, identity_id, audit.get())
+        .await?
+    {
+        Ok(())
+    } else {
+        Err(AppError::NotFound)
+    }
 }
 
 /// Public: whether this dashboard can email password reset links.

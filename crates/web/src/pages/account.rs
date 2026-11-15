@@ -6,14 +6,21 @@
 
 use leptos::{form::ActionForm, prelude::*};
 use leptos_meta::Title;
-use leptos_router::components::{A, Outlet};
-use supabase_dashboard_domain::account::{
-    AccountSummary, DISPLAY_NAME_MAX_CHARS, EMAIL_CHANGE_LIMIT, EMAIL_MAX_LEN, EmailChangeSent,
-    PASSWORD_MIN_CHARS, SessionSummary,
+use leptos_router::{
+    components::{A, Outlet},
+    hooks::use_query_map,
+};
+use supabase_dashboard_domain::{
+    account::{
+        AccountSummary, DISPLAY_NAME_MAX_CHARS, EMAIL_CHANGE_LIMIT, EMAIL_MAX_LEN, EmailChangeSent,
+        PASSWORD_MIN_CHARS, SessionSummary,
+    },
+    oidc::{LinkedIdentity, OidcOverview},
 };
 use time::OffsetDateTime;
 
 use crate::{
+    app::OIDC_LINK_PATH,
     components::dialog::{ConfirmDialog, DialogCancel},
     components::{
         layout::Refresh,
@@ -21,8 +28,9 @@ use crate::{
     },
     error::AppError,
     server_fns::{
-        ChangePassword, RequestEmailChange, RevokeOtherSessions, RevokeSession, UpdateProfile,
-        email_change_available, get_current_account, list_sessions,
+        ChangePassword, RequestEmailChange, RevokeOtherSessions, RevokeSession, UnlinkOidcIdentity,
+        UpdateProfile, email_change_available, get_current_account, get_oidc_overview,
+        list_sessions,
     },
 };
 
@@ -250,6 +258,7 @@ pub fn AccountSecurityPage() -> impl IntoView {
     view! {
         <Title text="Security"/>
         <PasswordPanel change/>
+        <SingleSignOnPanel/>
         <section class="panel" aria-labelledby="sessions-title">
             <h2 class="section-title" id="sessions-title">"Sessions"</h2>
             <p class="field-hint">
@@ -284,6 +293,184 @@ pub fn AccountSecurityPage() -> impl IntoView {
                 }}
             </Transition>
         </section>
+    }
+}
+
+/// What a single sign-on link attempt ended with, from the `oidc` code the
+/// server redirects back with. Unknown codes show nothing.
+fn link_result_message(code: &str) -> Option<(bool, &'static str)> {
+    Some(match code {
+        "linked" => (true, "Identity linked. You can now sign in with it."),
+        "taken" => (
+            false,
+            "That identity is already linked to another dashboard account.",
+        ),
+        "has_identity" => (
+            false,
+            "Your account already has an identity at this provider. Unlink it first.",
+        ),
+        "session" => (false, "Your session changed while linking. Try again."),
+        "unavailable" => (
+            false,
+            "Single sign-on is unavailable right now. Try again shortly.",
+        ),
+        "failed" => (false, "Linking did not complete. Try again."),
+        _ => return None,
+    })
+}
+
+/// Identities at the deployment's OpenID Connect provider that sign in to
+/// this account. Linking goes through the provider, as a plain form POST;
+/// unlinking asks for confirmation.
+#[component]
+fn SingleSignOnPanel() -> impl IntoView {
+    let query = use_query_map();
+    let unlink = ServerAction::<UnlinkOidcIdentity>::new();
+    let overview = Resource::new(move || unlink.version().get(), |_| get_oidc_overview());
+    let link_result = move || {
+        query
+            .read()
+            .get("oidc")
+            .and_then(|code| link_result_message(&code))
+            .map(|(ok, text)| {
+                if ok {
+                    view! { <p class="form-ok" role="status">{text}</p> }.into_any()
+                } else {
+                    view! { <p class="form-error" role="alert">{text}</p> }.into_any()
+                }
+            })
+    };
+    let unlink_result = move || {
+        unlink.value().get().map(|result| match result {
+            Ok(()) => {
+                view! { <p class="form-ok" role="status">"Identity unlinked."</p> }.into_any()
+            }
+            Err(err) => {
+                view! { <p class="form-error" role="alert">{err.to_string()}</p> }.into_any()
+            }
+        })
+    };
+    view! {
+        <section class="panel" aria-labelledby="sso-title">
+            <h2 class="section-title" id="sso-title">"Single sign-on"</h2>
+            {link_result}
+            {unlink_result}
+            <Transition fallback=|| view! { <p class="loading" role="status">"Loading…"</p> }>
+                {move || {
+                    overview.get().map(|result| match result {
+                        Ok(overview) => view! { <SingleSignOnBody overview unlink/> }.into_any(),
+                        Err(err) => view! {
+                            <StatePanel
+                                tone=StateTone::Error
+                                title="Could not load single sign-on identities".to_string()
+                                detail=err.to_string()
+                            />
+                        }
+                        .into_any(),
+                    })
+                }}
+            </Transition>
+        </section>
+    }
+}
+
+#[component]
+fn SingleSignOnBody(
+    overview: OidcOverview,
+    unlink: ServerAction<UnlinkOidcIdentity>,
+) -> impl IntoView {
+    let OidcOverview {
+        provider_name,
+        identities,
+    } = overview;
+    let has_current = identities.iter().any(|identity| identity.current_provider);
+    let link = match (&provider_name, has_current) {
+        (Some(name), false) => {
+            let label = format!("Link {name}");
+            view! {
+                <p class="field-hint">
+                    {format!(
+                        "Link your {name} identity to sign in with it. You are sent to {name} and back."
+                    )}
+                </p>
+                <form method="post" action=OIDC_LINK_PATH>
+                    <button type="submit" class="button" name="provider" value="oidc">{label}</button>
+                </form>
+            }
+            .into_any()
+        }
+        (Some(_), true) => ().into_any(),
+        (None, _) => view! {
+            <p class="field-hint">
+                "Single sign-on is not configured on this installation. An administrator can set it up in the deployment's settings."
+            </p>
+        }
+        .into_any(),
+    };
+    let table = (!identities.is_empty()).then(|| view! { <IdentityTable identities unlink/> });
+    view! {
+        {link}
+        {table}
+    }
+}
+
+#[component]
+fn IdentityTable(
+    identities: Vec<LinkedIdentity>,
+    unlink: ServerAction<UnlinkOidcIdentity>,
+) -> impl IntoView {
+    let rows = identities
+        .into_iter()
+        .map(|identity| {
+            let name = identity.label.clone().unwrap_or_else(|| "Unnamed identity".to_owned());
+            let confirm = format!("Unlink {name}");
+            let status = if identity.current_provider {
+                None
+            } else {
+                Some(view! { <span class="badge badge-muted">"Provider no longer configured"</span> })
+            };
+            view! {
+                <tr>
+                    <td>{name.clone()} " " {status}</td>
+                    <td class="break-all">{identity.issuer}</td>
+                    <td class="nowrap">{utc_minutes(identity.linked_at)}</td>
+                    <td class="nowrap">
+                        {identity.last_used_at.map_or_else(|| "Never".to_owned(), utc_minutes)}
+                    </td>
+                    <td>
+                        <div class="row-actions">
+                            <ConfirmDialog trigger="Unlink" title=format!("{confirm}?")>
+                                <ActionForm action=unlink attr:class="dialog-form">
+                                    <input type="hidden" name="identity_id" value=identity.id.to_string()/>
+                                    <p>"It can no longer be used to sign in to this account. Your password still works."</p>
+                                    <div class="dialog-actions">
+                                        <DialogCancel/>
+                                        <button type="submit" class="button button-danger">{confirm}</button>
+                                    </div>
+                                </ActionForm>
+                            </ConfirmDialog>
+                        </div>
+                    </td>
+                </tr>
+            }
+        })
+        .collect_view();
+    view! {
+        <div class="table-wrap" role="region" aria-label="Linked identities" tabindex="0">
+            <table class="data-table">
+                <caption class="visually-hidden">"Linked identities"</caption>
+                <thead>
+                    <tr>
+                        <th scope="col">"Identity"</th>
+                        <th scope="col">"Issuer"</th>
+                        <th scope="col">"Linked (UTC)"</th>
+                        <th scope="col">"Last used (UTC)"</th>
+                        <th scope="col"><span class="visually-hidden">"Actions"</span></th>
+                    </tr>
+                </thead>
+                <tbody>{rows}</tbody>
+            </table>
+        </div>
     }
 }
 

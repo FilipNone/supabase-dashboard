@@ -18,6 +18,7 @@ http.workspace = true
 # the ring provider and the bundled Mozilla roots, like the HTTP client, and
 # no connection pool or native TLS.
 lettre = { version = "0.11.23", default-features = false, features = ["smtp-transport", "builder", "tokio1-rustls-tls"] }
+openidconnect.workspace = true
 # No default features: TLS comes from the preconfigured rustls config below,
 # with the ring provider, instead of reqwest's aws-lc-rs default.
 # `stream` lets Studio request bodies flow through without buffering.

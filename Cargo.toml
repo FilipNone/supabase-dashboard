@@ -24,6 +24,10 @@ leptos = { version = "0.8" }
 leptos_axum = { version = "0.8" }
 leptos_meta = { version = "0.8" }
 leptos_router = { version = "0.8" }
+# Dashboard sign-in through an OpenID Connect provider. No default features:
+# its HTTP client is the adapters crate's own, with the outbound address
+# policy, so it pulls in no reqwest of its own.
+openidconnect = { version = "4.1.0", default-features = false }
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

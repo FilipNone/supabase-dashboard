@@ -25,7 +25,7 @@ use tower_http::{
     trace::TraceLayer,
 };
 
-use crate::{access_export, api, error, health, session, state::AppState, studio};
+use crate::{access_export, api, error, health, oidc, session, state::AppState, studio};
 
 pub struct HttpLimits {
     pub max_body_bytes: usize,
@@ -72,6 +72,9 @@ pub fn router(state: AppState, limits: &HttpLimits) -> Router {
         .route("/readyz", get(health::ready))
         .route("/auth/sign-in", post(session::sign_in))
         .route("/auth/sign-out", post(session::sign_out))
+        .route(oidc::SIGN_IN_PATH, post(oidc::sign_in))
+        .route(oidc::LINK_PATH, post(oidc::link))
+        .route(oidc::CALLBACK_PATH, get(oidc::callback))
         .route("/dashboard/project/{project_id}", get(studio::launch))
         .route(studio::TLS_ASK_PATH, get(studio::tls_ask))
         .route(
@@ -172,7 +175,7 @@ fn request_span<B>(request: &Request<B>) -> tracing::Span {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
 
     use axum::body::Body;
@@ -216,7 +219,7 @@ mod tests {
     use super::*;
     use crate::{scratch_db::ScratchDb, session::CookieSettings};
 
-    const HOST: &str = "dash.localhost:3000";
+    pub(crate) const HOST: &str = "dash.localhost:3000";
     const ORIGIN: &str = "http://dash.localhost:3000";
 
     async fn router_for(db: Database) -> Router {
@@ -275,7 +278,7 @@ mod tests {
         router_with_auth(db, cipher, access_log_days, dokploy_policy, auth)
     }
 
-    fn router_with_auth(
+    pub(crate) fn router_with_auth(
         db: Database,
         cipher: Option<supabase_dashboard_application::secrets::CredentialCipher>,
         access_log_days: Option<u16>,
@@ -347,7 +350,10 @@ mod tests {
     /// hang, and names the path so a hang in CI points at its request.
     const REQUEST_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 
-    async fn send(router: &Router, request: Request<Body>) -> (http::response::Parts, String) {
+    pub(crate) async fn send(
+        router: &Router,
+        request: Request<Body>,
+    ) -> (http::response::Parts, String) {
         let target = format!("{} {}", request.method(), request.uri());
         let exchange = async {
             let response = router.clone().oneshot(request).await.unwrap();
@@ -360,14 +366,14 @@ mod tests {
             .unwrap_or_else(|_| panic!("{target} took longer than {REQUEST_LIMIT:?}"))
     }
 
-    fn get(path: &str) -> Request<Body> {
+    pub(crate) fn get(path: &str) -> Request<Body> {
         Request::get(path)
             .header(header::HOST, HOST)
             .body(Body::empty())
             .unwrap()
     }
 
-    fn get_with_cookie(path: &str, cookie: &str) -> Request<Body> {
+    pub(crate) fn get_with_cookie(path: &str, cookie: &str) -> Request<Body> {
         Request::get(path)
             .header(header::HOST, HOST)
             .header(header::COOKIE, cookie)
@@ -375,7 +381,7 @@ mod tests {
             .unwrap()
     }
 
-    fn form_post(path: &str, body: &str, cookie: Option<&str>) -> Request<Body> {
+    pub(crate) fn form_post(path: &str, body: &str, cookie: Option<&str>) -> Request<Body> {
         let mut builder = Request::post(path)
             .header(header::HOST, HOST)
             .header(header::ORIGIN, ORIGIN)
@@ -386,7 +392,7 @@ mod tests {
         builder.body(Body::from(body.to_owned())).unwrap()
     }
 
-    fn location(parts: &http::response::Parts) -> &str {
+    pub(crate) fn location(parts: &http::response::Parts) -> &str {
         parts.headers[header::LOCATION].to_str().unwrap()
     }
 

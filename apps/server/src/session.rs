@@ -16,7 +16,7 @@ use supabase_dashboard_application::auth::{RequestContext, SignInError};
 use supabase_dashboard_web::app::{
     CONFIRM_EMAIL_PATH, EMAIL_CHANGE_FN_PATHS, FORGOT_PASSWORD_PATH, HOME_PATH, INVITE_PATH,
     INVITE_PREVIEW_PATH, INVITE_SIGN_UP_PATH, PASSWORD_RESET_FN_PATHS, RESET_PASSWORD_PATH,
-    SIGN_IN_PATH, sign_in_return_path,
+    SIGN_IN_OPTIONS_PATH, SIGN_IN_PATH, sign_in_return_path,
 };
 
 use crate::{error::ApiError, state::AppState};
@@ -43,6 +43,16 @@ impl CookieSettings {
             },
             secure,
             max_age_secs,
+        }
+    }
+
+    /// The cookie that binds a single sign-on flow to the browser that
+    /// started it, for as long as the flow may take.
+    pub fn oidc_flow(secure: bool) -> Self {
+        Self {
+            name: if secure { "__Host-sd-oidc" } else { "sd-oidc" },
+            secure,
+            max_age_secs: supabase_dashboard_application::auth::oidc::FLOW_LIFETIME.as_secs(),
         }
     }
 
@@ -115,7 +125,12 @@ fn classify(path: &str) -> Access {
         | "/favicon.svg"
         | "/auth/sign-in"
         | "/auth/sign-out"
+        | crate::oidc::SIGN_IN_PATH
         | crate::studio::TLS_ASK_PATH => Access::Public,
+        // The callback signs in or links (with the session attached), and
+        // starting a link sends a browser without a session to sign in.
+        crate::oidc::CALLBACK_PATH | crate::oidc::LINK_PATH => Access::Optional,
+        SIGN_IN_OPTIONS_PATH => Access::Optional,
         SIGN_IN_PATH => Access::SignInPage,
         INVITE_PATH | INVITE_PREVIEW_PATH | INVITE_SIGN_UP_PATH => Access::Optional,
         FORGOT_PASSWORD_PATH | RESET_PASSWORD_PATH => Access::Optional,
@@ -250,14 +265,14 @@ pub struct SignInForm {
 }
 
 /// The first value of `name` in a query string.
-fn query_value(query: Option<&str>, name: &str) -> Option<String> {
+pub(crate) fn query_value(query: Option<&str>, name: &str) -> Option<String> {
     url::form_urlencoded::parse(query?.as_bytes())
         .find(|(key, _)| key == name)
         .map(|(_, value)| value.into_owned())
 }
 
 /// The first value of `name` in a URL-encoded form body.
-fn form_value(body: &[u8], name: &str) -> Option<String> {
+pub(crate) fn form_value(body: &[u8], name: &str) -> Option<String> {
     url::form_urlencoded::parse(body)
         .find(|(key, _)| key == name)
         .map(|(_, value)| value.into_owned())
@@ -265,12 +280,12 @@ fn form_value(body: &[u8], name: &str) -> Option<String> {
 
 /// The page to open after signing in: `next` when it is a safe dashboard
 /// page, home otherwise.
-fn after_sign_in(next: Option<&str>) -> &str {
+pub(crate) fn after_sign_in(next: Option<&str>) -> &str {
     next.and_then(sign_in_return_path).unwrap_or(HOME_PATH)
 }
 
 /// The sign-in page, carrying a safe `next` page and an error code.
-fn sign_in_url(next: Option<&str>, error: Option<&str>) -> String {
+pub(crate) fn sign_in_url(next: Option<&str>, error: Option<&str>) -> String {
     let mut query = url::form_urlencoded::Serializer::new(String::new());
     if let Some(code) = error {
         query.append_pair("error", code);
@@ -389,6 +404,11 @@ mod tests {
         assert_eq!(classify("/auth/email-change/other"), Access::Api);
         assert_eq!(classify("/dashboard/confirm-email/extra"), Access::Page);
         assert_eq!(classify("/dashboard/invite/extra"), Access::Page);
+        assert_eq!(classify("/auth/oidc/sign-in"), Access::Public);
+        assert_eq!(classify("/auth/oidc/callback"), Access::Optional);
+        assert_eq!(classify("/auth/oidc/link"), Access::Optional);
+        assert_eq!(classify("/auth/oidc/other"), Access::Api);
+        assert_eq!(classify("/auth/sign-in-options"), Access::Optional);
         assert_eq!(classify("/anything-else"), Access::Page);
     }
 

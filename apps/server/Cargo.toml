@@ -37,6 +37,11 @@ url = "2"
 uuid.workspace = true
 
 [dev-dependencies]
+# The mock OpenID Connect provider in the single sign-on tests signs real
+# RS256 ID tokens with a key generated for each run.
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+openidconnect.workspace = true
+rsa = { version = "0.9.10", features = ["getrandom"] }
 http-body-util = "0.1"
 sqlx.workspace = true
 

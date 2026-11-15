@@ -78,7 +78,27 @@ pub struct Config {
     /// Outgoing email for invitations and password resets. `None` (the
     /// default) sends nothing.
     pub mail: Option<MailConfig>,
+    /// Sign-in through an OpenID Connect provider. `None` (the default)
+    /// offers passwords only.
+    pub oidc: Option<OidcConfig>,
 }
+
+/// The deployment's OpenID Connect provider.
+#[derive(Debug, Clone)]
+pub struct OidcConfig {
+    /// Exactly as the provider names itself in ID tokens, trailing slash
+    /// included.
+    pub issuer: String,
+    pub client_id: String,
+    pub client_secret: SecretKeySource,
+    /// The name on the "Sign in with" button.
+    pub display_name: String,
+    /// The callback URL to register at the provider.
+    pub redirect_url: String,
+}
+
+/// Where the provider sends the browser back to, under the public URL.
+pub const OIDC_CALLBACK_PATH: &str = "/auth/oidc/callback";
 
 /// Outgoing email: where it goes and who it is from.
 #[derive(Debug, Clone)]
@@ -306,6 +326,7 @@ impl Config {
         };
 
         let mail = mail_config(&get, environment, public_url.as_ref())?;
+        let oidc = oidc_config(&get, environment, public_url.as_ref())?;
 
         Ok(Self {
             environment,
@@ -330,8 +351,102 @@ impl Config {
             studio_access_log_days,
             dokploy,
             mail,
+            oidc,
         })
     }
+}
+
+/// Single sign-on is off unless `OIDC_ISSUER_URL` is set, and every other
+/// OIDC setting needs it. The issuer must use HTTPS outside development.
+/// The client secret comes from a file or the environment and is never
+/// echoed.
+fn oidc_config(
+    get: &impl Fn(&str) -> Option<String>,
+    environment: Environment,
+    public_url: Option<&url::Url>,
+) -> Result<Option<OidcConfig>, ConfigError> {
+    const DEPENDENT: [&str; 4] = [
+        "OIDC_CLIENT_ID",
+        "OIDC_CLIENT_SECRET",
+        "OIDC_CLIENT_SECRET_FILE",
+        "OIDC_NAME",
+    ];
+    let Some(raw_issuer) = get("OIDC_ISSUER_URL") else {
+        if let Some(name) = DEPENDENT.into_iter().find(|name| get(name).is_some()) {
+            return Err(invalid(name, "needs SUPABASE_DASHBOARD_OIDC_ISSUER_URL"));
+        }
+        return Ok(None);
+    };
+    let issuer = parse_issuer(&raw_issuer, environment)?;
+    let Some(public_url) = public_url else {
+        return Err(invalid(
+            "OIDC_ISSUER_URL",
+            "the provider sends the browser back to SUPABASE_DASHBOARD_PUBLIC_URL; set it too",
+        ));
+    };
+    let client_id = get("OIDC_CLIENT_ID").ok_or_else(|| missing("OIDC_CLIENT_ID"))?;
+    if client_id.len() > 255 || !client_id.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(invalid(
+            "OIDC_CLIENT_ID",
+            "expected at most 255 printable ASCII characters without spaces",
+        ));
+    }
+    let client_secret = secret_source(get, "OIDC_CLIENT_SECRET")?.ok_or_else(|| {
+        invalid(
+            "OIDC_CLIENT_SECRET_FILE",
+            "is required with SUPABASE_DASHBOARD_OIDC_ISSUER_URL \
+             (or SUPABASE_DASHBOARD_OIDC_CLIENT_SECRET)",
+        )
+    })?;
+    let display_name = match get("OIDC_NAME") {
+        Some(raw) => supabase_dashboard_domain::oidc::check_display_name(&raw)
+            .map_err(|e| invalid("OIDC_NAME", e))?
+            .to_owned(),
+        None => "OpenID Connect".to_owned(),
+    };
+    let redirect_url = format!(
+        "{}{OIDC_CALLBACK_PATH}",
+        public_url.origin().ascii_serialization()
+    );
+    Ok(Some(OidcConfig {
+        issuer,
+        client_id,
+        client_secret,
+        display_name,
+        redirect_url,
+    }))
+}
+
+/// The issuer URL as given (the provider compares it character for
+/// character), checked: HTTPS outside development, no credentials, query,
+/// or fragment.
+fn parse_issuer(raw: &str, environment: Environment) -> Result<String, ConfigError> {
+    const NAME: &str = "OIDC_ISSUER_URL";
+    if raw.len() > supabase_dashboard_domain::oidc::OIDC_ISSUER_MAX_LEN {
+        return Err(invalid(NAME, "is too long"));
+    }
+    let url = url::Url::parse(raw).map_err(|e| invalid(NAME, e))?;
+    match (url.scheme(), environment) {
+        ("https", _) | ("http", Environment::Development) => {}
+        ("http", Environment::Production) => {
+            return Err(invalid(
+                NAME,
+                "must use https outside development (set SUPABASE_DASHBOARD_ENV=development for \
+                 a local provider over HTTP)",
+            ));
+        }
+        _ => return Err(invalid(NAME, "expected an https URL")),
+    }
+    if url.host_str().is_none_or(str::is_empty) {
+        return Err(invalid(NAME, "must name a host"));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(invalid(NAME, "must not contain credentials"));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(invalid(NAME, "must not contain a query or fragment"));
+    }
+    Ok(raw.to_owned())
 }
 
 /// Mail is off unless `SMTP_URL` or a Resend API key is set, and every
@@ -632,6 +747,131 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn single_sign_on_is_off_by_default_and_its_settings_need_an_issuer() {
+        let prod = [DB, ("PUBLIC_URL", "https://dash.example.test")];
+        assert!(load(&prod).unwrap().oidc.is_none());
+        for name in [
+            "OIDC_CLIENT_ID",
+            "OIDC_CLIENT_SECRET",
+            "OIDC_CLIENT_SECRET_FILE",
+            "OIDC_NAME",
+        ] {
+            let err = load(&[prod[0], prod[1], (name, "x")]).unwrap_err();
+            assert_eq!(
+                err,
+                ConfigError::Invalid {
+                    name: format!("{PREFIX}{name}"),
+                    reason: "needs SUPABASE_DASHBOARD_OIDC_ISSUER_URL".to_owned(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn single_sign_on_reads_its_settings_and_derives_the_callback() {
+        let pairs = [
+            DB,
+            ("PUBLIC_URL", "https://dash.example.test/"),
+            (
+                "OIDC_ISSUER_URL",
+                "https://auth.example.test/application/o/dashboard/",
+            ),
+            ("OIDC_CLIENT_ID", "dashboard-client"),
+            ("OIDC_CLIENT_SECRET_FILE", "/run/secrets/oidc"),
+            ("OIDC_NAME", " Authentik "),
+        ];
+        let oidc = load(&pairs).unwrap().oidc.unwrap();
+        // Kept exactly, trailing slash included: ID tokens must match it.
+        assert_eq!(
+            oidc.issuer,
+            "https://auth.example.test/application/o/dashboard/"
+        );
+        assert_eq!(oidc.client_id, "dashboard-client");
+        assert!(matches!(
+            &oidc.client_secret,
+            SecretKeySource::File(path) if path == std::path::Path::new("/run/secrets/oidc")
+        ));
+        assert_eq!(oidc.display_name, "Authentik");
+        assert_eq!(
+            oidc.redirect_url,
+            "https://dash.example.test/auth/oidc/callback"
+        );
+
+        // The name has a default.
+        let unnamed = load(&pairs[..5]).unwrap().oidc.unwrap();
+        assert_eq!(unnamed.display_name, "OpenID Connect");
+    }
+
+    #[test]
+    fn single_sign_on_needs_https_outside_development() {
+        let base = |issuer: &'static str, env: &'static str, public: &'static str| {
+            load(&[
+                DB,
+                ("ENV", env),
+                ("PUBLIC_URL", public),
+                ("OIDC_ISSUER_URL", issuer),
+                ("OIDC_CLIENT_ID", "c"),
+                ("OIDC_CLIENT_SECRET", "s"),
+            ])
+        };
+        let https = "https://dash.example.test";
+        let refused = |result: Result<Config, ConfigError>| matches!(result, Err(ConfigError::Invalid { name, .. }) if name.ends_with("OIDC_ISSUER_URL"));
+        assert!(refused(base(
+            "http://auth.example.test/",
+            "production",
+            https
+        )));
+        assert!(base("https://auth.example.test/", "production", https).is_ok());
+        assert!(
+            base(
+                "http://localhost:9000/application/o/dev/",
+                "development",
+                "http://localhost:3000"
+            )
+            .is_ok()
+        );
+        for bad in [
+            "ftp://auth.example.test/",
+            "https://user:pw@auth.example.test/",
+            "https://auth.example.test/?x=1",
+            "https://auth.example.test/#f",
+            "not a url",
+        ] {
+            assert!(refused(base(bad, "production", https)), "{bad}");
+        }
+    }
+
+    #[test]
+    fn single_sign_on_needs_a_public_url_a_client_and_one_secret() {
+        let dev = ("ENV", "development");
+        let issuer = ("OIDC_ISSUER_URL", "http://localhost:9000/o/");
+        let public = ("PUBLIC_URL", "http://localhost:3000");
+        let id = ("OIDC_CLIENT_ID", "client");
+        let secret = ("OIDC_CLIENT_SECRET", "very-secret-value");
+        let file = ("OIDC_CLIENT_SECRET_FILE", "/run/secrets/oidc");
+
+        let err = load(&[DB, dev, issuer, id, secret]).unwrap_err();
+        assert!(err.to_string().contains("PUBLIC_URL"), "{err}");
+        assert!(matches!(
+            load(&[DB, dev, public, issuer, secret]),
+            Err(ConfigError::Missing { name }) if name.ends_with("OIDC_CLIENT_ID")
+        ));
+        assert!(load(&[DB, dev, public, issuer, id]).is_err());
+        let both = load(&[DB, dev, public, issuer, id, secret, file]).unwrap_err();
+        assert!(!both.to_string().contains("very-secret-value"));
+        assert!(load(&[DB, dev, public, issuer, ("OIDC_CLIENT_ID", "a b"), secret]).is_err());
+        assert!(load(&[DB, dev, public, issuer, id, secret, ("OIDC_NAME", "a\nb")]).is_err());
+
+        let config = load(&[DB, dev, public, issuer, id, secret]).unwrap();
+        let printed = format!("{config:?}");
+        assert!(!printed.contains("very-secret-value"), "{printed}");
+        assert!(matches!(
+            config.oidc.unwrap().client_secret,
+            SecretKeySource::Inline(value) if value.expose_secret() == "very-secret-value"
+        ));
     }
 
     #[test]

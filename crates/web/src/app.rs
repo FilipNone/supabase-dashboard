@@ -80,6 +80,17 @@ pub const HOME_PATH: &str = "/dashboard/organizations";
 /// Reachable without a session; signed-in operators are sent home.
 pub const SIGN_IN_PATH: &str = "/dashboard/sign-in";
 
+/// Public server function the sign-in page reads its options from. It must
+/// match the `prefix` and `endpoint` of its `#[server]` attribute.
+pub const SIGN_IN_OPTIONS_PATH: &str = "/auth/sign-in-options";
+
+/// The account security page, where single sign-on identities are linked.
+pub const ACCOUNT_SECURITY_PATH: &str = "/dashboard/account/security";
+
+/// Form targets for single sign-on, handled by the server outside Leptos.
+pub const OIDC_SIGN_IN_PATH: &str = "/auth/oidc/sign-in";
+pub const OIDC_LINK_PATH: &str = "/auth/oidc/link";
+
 /// Longest page address the sign-in page carries back.
 const RETURN_PATH_MAX_LEN: usize = 2048;
 

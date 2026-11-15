@@ -123,6 +123,28 @@ The From address must be on a domain verified in Resend, and a key limited to se
 
 After an invitation is created, the page says whether the email went out. If the mail server or Resend could not be reached or refused the message, the invitation still works and the link is still shown once to send by hand; the dashboard does not retry. To send it again later, use Resend next to the invitation under Open invitations: it makes a new link, emails it, and the old link stops working. Each send is recorded in the audit log as `organization.invitation_email`, without the message or the link. The settings and their limits are in [Configuration](https://github.com/FilipNone/supabase-dashboard/blob/main/docs/development.md#configuration). With mail set up, the sign-in page's "Forgot your password?" link also emails operators a one-hour link to choose a new password; without it, a forgotten password is reset with `supabase-dashboard-server reset-password` on the server. Mail also lets operators change their sign-in email under Account settings > Profile: the dashboard emails a one-hour confirmation link to the new address, changes nothing until it is opened, and then sends a notice to the old address. Without mail, the sign-in email cannot be changed.
 
+### Signing in with OIDC
+
+Operators can also sign in through an OpenID Connect provider, such as Authentik. It is off by default, and passwords keep working with it on. A provider identity signs in only to the dashboard account it was linked to: the dashboard never finds, links, or creates accounts by email, and the provider cannot sign anyone up.
+
+1. In Authentik, create an OAuth2/OpenID provider (Applications > Providers): client type Confidential, authorization flow of your choice, and one strict redirect URI, `https://<dashboard host>/auth/oidc/callback` (the dashboard's `SUPABASE_DASHBOARD_PUBLIC_URL` followed by `/auth/oidc/callback`). Keep the default scope mappings for `openid`, `email`, and `profile`, and the signing key (an RS256 or ES256 certificate; the dashboard refuses HMAC-signed ID tokens). Then create an application that uses the provider and note its slug.
+2. Put the client secret in a file next to `compose.yaml`, add it as a Compose secret like the encryption key (`oidc_client_secret` under `secrets:` with `file: ./oidc-client-secret`, and listed under the dashboard's `secrets`), and set in `.env`:
+
+   ```sh
+   SUPABASE_DASHBOARD_OIDC_ISSUER_URL=https://authentik.example.com/application/o/<slug>/
+   SUPABASE_DASHBOARD_OIDC_CLIENT_ID=<client id>
+   SUPABASE_DASHBOARD_OIDC_CLIENT_SECRET_FILE=/run/secrets/oidc_client_secret
+   SUPABASE_DASHBOARD_OIDC_NAME=Authentik
+   ```
+
+   The issuer must be written exactly as the provider names itself, trailing slash included. `SUPABASE_DASHBOARD_OIDC_CLIENT_SECRET` also works, but then the secret appears in `docker inspect`.
+3. Restart. The log line `single sign-on is enabled` shows the issuer and the redirect URI to register. The sign-in page now offers "Sign in with Authentik".
+4. Each operator signs in with their password once, opens Account settings > Security, and chooses Link under Single sign-on. After they sign in at the provider, the identity is linked to that account, and from then on "Sign in with Authentik" signs them in. They can unlink it there; their password still works.
+
+The dashboard talks to the provider only at the issuer's origin: discovery, the key set, and the token endpoint must be there, redirects are not followed, no proxy is used, and answers are size- and time-limited. Cloud metadata addresses are always refused. A provider on the same host is allowed, because the issuer is configured by the deployment. If the provider's certificate is from a private authority, add it to `SUPABASE_DASHBOARD_EXTRA_CA_FILE`. Sign-ins, refusals, links, and unlinks are in the audit log, without codes, tokens, or ID token contents. A disabled account cannot sign in this way either.
+
+The sign-in uses the authorization code flow with PKCE, `state`, and `nonce`, and checks the ID token's issuer, audience, signature, and expiry. A started sign-in waits at most 10 minutes, only in the browser that started it, and in the dashboard's memory: restarting the dashboard cancels sign-ins in progress. Signing out of Authentik does not yet sign out of the dashboard, and Authentik groups are not mapped to roles.
+
 ## Studio access
 
 Members open a project's Studio through the dashboard, which serves each project's Studio on its own host under `SUPABASE_DASHBOARD_STUDIO_DOMAIN` (see `docs/adr/0002-studio-access.md`). To turn it on:

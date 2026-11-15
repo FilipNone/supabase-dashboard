@@ -24,6 +24,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 mod email_change;
+pub mod oidc;
 mod password_reset;
 
 pub use email_change::{ConfirmEmailChangeError, EmailChangeError};
@@ -235,6 +236,8 @@ pub struct AuthService {
     reset_mail: Option<password_reset::ResetMailer>,
     /// Emails sign-in email confirmation links when set.
     email_change: Option<email_change::EmailChanger>,
+    /// Signs in through the deployment's OpenID Connect provider when set.
+    oidc: Option<oidc::OidcSignIn>,
 }
 
 impl AuthService {
@@ -251,6 +254,7 @@ impl AuthService {
             dummy_hash,
             reset_mail: None,
             email_change: None,
+            oidc: None,
         })
     }
 
@@ -382,22 +386,7 @@ impl AuthService {
         }
 
         self.throttle.record_success(key);
-        let token = SessionToken::generate().map_err(AuthError::from)?;
-        let lifetime = time::Duration::try_from(self.config.session_lifetime)
-            .map_err(|_| AuthError::LifetimeOutOfRange)?;
-        let expires_at = OffsetDateTime::now_utc()
-            .checked_add(lifetime)
-            .ok_or(AuthError::LifetimeOutOfRange)?;
-        let session_id = Uuid::now_v7();
-        self.db
-            .create_session(&NewSession {
-                id: session_id,
-                account_id: account.id,
-                token_hash: token.hash(),
-                expires_at,
-                user_agent: ctx.user_agent.map(|ua| truncate(ua, 256)),
-            })
-            .await?;
+        let (token, expires_at, session_id) = self.start_session(account.id, ctx).await?;
         self.audit(
             Some(account.id),
             "session.sign_in",
@@ -411,6 +400,32 @@ impl AuthService {
             expires_at,
             account,
         })
+    }
+
+    /// Creates a session for an account that just proved who it is.
+    /// Returns the token for the cookie, its expiry, and the session ID.
+    async fn start_session(
+        &self,
+        account_id: Uuid,
+        ctx: RequestContext<'_>,
+    ) -> Result<(SessionToken, OffsetDateTime, Uuid), AuthError> {
+        let token = SessionToken::generate()?;
+        let lifetime = time::Duration::try_from(self.config.session_lifetime)
+            .map_err(|_| AuthError::LifetimeOutOfRange)?;
+        let expires_at = OffsetDateTime::now_utc()
+            .checked_add(lifetime)
+            .ok_or(AuthError::LifetimeOutOfRange)?;
+        let session_id = Uuid::now_v7();
+        self.db
+            .create_session(&NewSession {
+                id: session_id,
+                account_id,
+                token_hash: token.hash(),
+                expires_at,
+                user_agent: ctx.user_agent.map(|ua| truncate(ua, 256)),
+            })
+            .await?;
+        Ok((token, expires_at, session_id))
     }
 
     /// Resolves a session cookie value to the signed-in operator. Malformed,

@@ -7,6 +7,9 @@ mod cli;
 mod config;
 mod error;
 mod health;
+mod oidc;
+#[cfg(test)]
+mod oidc_tests;
 #[cfg(test)]
 #[path = "../../../crates/persistence/tests/common/mod.rs"]
 mod scratch_db;
@@ -24,13 +27,16 @@ use supabase_dashboard_adapters::{
     gateway::{GatewayError, GatewayProbe, GatewaySettings},
     mail::{SmtpMailer, SmtpSecurity, SmtpSettings, SmtpSetupError},
     net::TargetPolicy,
+    oidc::{OidcClient, OidcSettings, OidcSetupError},
     resend::{RESEND_API_URL, ResendMailer, ResendSettings, ResendSetupError},
     studio_proxy::{StudioProxy, StudioProxySettings},
     tls::{ExtraRoots, ExtraRootsError, MAX_EXTRA_CA_FILE_BYTES},
 };
 use supabase_dashboard_application::{
     api_tokens::{ApiTokenService, TokenApi},
-    auth::{AuthConfig, AuthError, AuthService, BootstrapError, PasswordResetError},
+    auth::{
+        AuthConfig, AuthError, AuthService, BootstrapError, PasswordResetError, oidc::OidcSignIn,
+    },
     connections::{ConnectionService, ScheduledChecks},
     dokploy::{DokployConnector, DokployCredentials, DokployService},
     jobs::{JobHandler, JobRunner, RunnerSettings},
@@ -117,6 +123,8 @@ enum StartupError {
     Mail(#[from] SmtpSetupError),
     #[error("could not set up outgoing mail: {0}")]
     Resend(#[from] ResendSetupError),
+    #[error("could not set up single sign-on: {0}")]
+    Oidc(#[from] OidcSetupError),
     #[error("could not reseal stored credentials: {0}")]
     Rotation(#[from] RotationError),
     #[error("could not set up project connections: {0}")]
@@ -187,7 +195,8 @@ struct OutgoingMail {
     email_changes: EmailChangeMail,
 }
 
-/// Reads an SMTP password or a Resend API key. A file is read once, its
+/// Reads an SMTP password, a Resend API key, or the OpenID Connect client
+/// secret. A file is read once, its
 /// size checked first, and a final newline ignored; nothing from it
 /// appears in an error.
 fn mail_secret(
@@ -218,6 +227,34 @@ fn mail_secret(
         return Err(invalid("the file is empty"));
     }
     Ok(secrecy::SecretString::from(value.to_owned()))
+}
+
+/// Sets up sign-in through the deployment's OpenID Connect provider, if it
+/// configured one. Nothing is fetched from the provider here; discovery
+/// happens when someone signs in, so a provider outage does not stop the
+/// dashboard from starting.
+fn single_sign_on(
+    config: &Config,
+    extra_roots: &ExtraRoots,
+) -> Result<Option<OidcSignIn>, StartupError> {
+    let Some(oidc) = &config.oidc else {
+        return Ok(None);
+    };
+    let provider = OidcClient::shared(OidcSettings {
+        issuer: oidc.issuer.clone(),
+        client_id: oidc.client_id.clone(),
+        client_secret: mail_secret(&oidc.client_secret, "OIDC_CLIENT_SECRET_FILE")?,
+        redirect_url: oidc.redirect_url.clone(),
+        connect_timeout: Duration::from_secs(5),
+        request_timeout: Duration::from_secs(10),
+        extra_roots: extra_roots.clone(),
+    })?;
+    tracing::info!(
+        issuer = %oidc.issuer,
+        redirect_url = %oidc.redirect_url,
+        "single sign-on is enabled"
+    );
+    Ok(Some(OidcSignIn::new(provider, oidc.display_name.clone())))
 }
 
 /// Sets up outgoing email, if the deployment configured a mail server or
@@ -537,6 +574,10 @@ async fn run() -> Result<(), StartupError> {
                 .with_email_change_mail(mail.email_changes),
         ),
         None => (None, auth),
+    };
+    let auth = match single_sign_on(&config, &extra_roots)? {
+        Some(oidc) => auth.with_oidc(oidc),
+        None => auth,
     };
     let auth = Arc::new(auth);
     if !auth.is_initialized().await? {

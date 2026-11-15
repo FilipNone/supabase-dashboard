@@ -13,6 +13,7 @@ pub mod dokploy_targets;
 pub mod email_changes;
 pub mod invitations;
 pub mod jobs;
+pub mod oidc_identities;
 pub mod organizations;
 pub mod password_resets;
 pub mod projects;

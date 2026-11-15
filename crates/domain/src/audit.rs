@@ -90,6 +90,8 @@ pub fn action_label(action: &str) -> &str {
     match action {
         "account.bootstrap_owner" => "Created the first owner",
         "account.create_from_invitation" => "Created an account from an invitation",
+        "account.oidc_link" => "Linked a single sign-on identity",
+        "account.oidc_unlink" => "Unlinked a single sign-on identity",
         "account.password_change" => "Changed the password",
         "account.password_reset" => "Reset the password",
         "account.update_profile" => "Updated the profile",
@@ -133,6 +135,7 @@ pub fn action_label(action: &str) -> &str {
         "session.revoke" => "Signed out a session",
         "session.revoke_others" => "Signed out other sessions",
         "session.sign_in" => "Sign-in",
+        "session.sign_in_oidc" => "Sign-in with single sign-on",
         "session.sign_out" => "Signed out",
         "stack.configure" => "Changed stack settings",
         "stack.destroy" => "Destroyed a stack and its data",

@@ -96,6 +96,11 @@ All settings are environment variables. Invalid values stop the server at startu
 | `SUPABASE_DASHBOARD_RESEND_API_KEY_FILE` | unset | Path to a file holding a [Resend](https://resend.com) API key (a final newline is ignored, at most 4 KiB). Sends the dashboard's own email through Resend's HTTP API instead of SMTP; set this or `SUPABASE_DASHBOARD_SMTP_URL`, not both. Read once at startup |
 | `SUPABASE_DASHBOARD_RESEND_API_KEY` | unset | The same key given directly. Set only one of the two; prefer the file |
 | `SUPABASE_DASHBOARD_RESEND_TIMEOUT_SECS` | 15 | 1 to 120; longest time one email may take through Resend, connecting included |
+| `SUPABASE_DASHBOARD_OIDC_ISSUER_URL` | unset | Issuer of an OpenID Connect provider operators may sign in with, exactly as the provider writes it in ID tokens (for Authentik, `https://<authentik host>/application/o/<slug>/`, trailing slash included). Must be `https://` outside development; no credentials, query, or fragment. Needs `SUPABASE_DASHBOARD_PUBLIC_URL`. Unset turns single sign-on off; see "Signing in with OIDC" in [deployment.md](deployment.md) |
+| `SUPABASE_DASHBOARD_OIDC_CLIENT_ID` | required with the issuer | The client ID registered at the provider, at most 255 printable ASCII characters |
+| `SUPABASE_DASHBOARD_OIDC_CLIENT_SECRET_FILE` | required with the issuer | Path to a file holding the client secret (a final newline is ignored, at most 4 KiB). Read once at startup |
+| `SUPABASE_DASHBOARD_OIDC_CLIENT_SECRET` | unset | The same secret given directly. Set only one of the two; prefer the file |
+| `SUPABASE_DASHBOARD_OIDC_NAME` | `OpenID Connect` | Shown on the sign-in page as "Sign in with <name>", at most 40 characters on one line |
 | `RUST_LOG` | `info,tower_http=info,sqlx=warn` | Standard `tracing` filter |
 | `LEPTOS_SITE_ADDR` | `127.0.0.1:3000` | Listen address |
 
@@ -172,6 +177,9 @@ Requests are queued in memory (4096 entries) and written in batches by a backgro
 - Unknown paths under `/api/` return `404` with `{"error":{"code":"not_found","message":...}}`. API errors always use this envelope; messages never contain credentials or internal error text.
 - `GET /dashboard/sign-in`: the sign-in page. Signed-in operators are redirected to the home page.
 - `POST /auth/sign-in`: form fields `email`, `password`, and optionally `next`. Redirects with a session cookie to `next` when it is a dashboard page on this host (a path starting with `/dashboard/`, printable ASCII, no backslash or `#`, not the sign-in page), and home otherwise, or back to the sign-in page with a fixed `error` code. Five failures for one email within 15 minutes block further attempts for that email until the window passes.
+- `POST /auth/oidc/sign-in`: starts single sign-on, when configured. Optional form field `next`, under the same rules as for sign-in. Redirects to the provider with a short-lived flow cookie (`__Host-sd-oidc`, or `sd-oidc` over plain HTTP; HttpOnly, SameSite=Lax, 10 minutes).
+- `POST /auth/oidc/link`: needs a session; starts linking the provider identity to the signed-in account.
+- `GET /auth/oidc/callback`: where the provider sends the browser back. Needs the flow cookie from the same browser; each `state` works once. A sign-in redirects with a session cookie to `next`; a link goes back to Account settings, Security. Failures redirect with a fixed `error` (sign-in page) or `oidc` (security page) code; the reason is in the server log.
 - `POST /auth/sign-out`: revokes the session and clears the cookie, then redirects to the sign-in page. An optional form field `next` is passed on to the sign-in page under the same rules as for sign-in, so someone switching accounts comes back to the page they were on.
 - `GET /dashboard/confirm-email`: the page a sign-in email confirmation link opens. It and its two server functions under `/auth/email-change/` need no session.
 - `/dashboard/organizations` and `/dashboard/status`: the UI shell. Organizations is an empty state for now.
@@ -180,7 +188,7 @@ Requests are queued in memory (4096 entries) and written in batches by a backgro
 - `GET /tls/ask?domain=<name>`: for a reverse proxy that obtains certificates on demand (Caddy's `on_demand_tls`). 200 when `<name>` is the Studio host of a registered project, written without a port or trailing dot; 404 for every other name and when Studio access is off; 503 when the metadata database does not answer. It needs no session, so keep it off the public site (`deploy/Caddyfile` does).
 - `GET /__dashboard/handoff?code=` on a Studio host: redeems the code, sets the Studio cookie, and redirects to the requested Studio path or `/project/default`. A used or expired code shows a page with a link to start again.
 
-Everything except `/healthz`, `/readyz`, `/tls/ask`, `/favicon.svg`, `/pkg/*`, the sign-in page, the two `/auth/` form endpoints, and the token API under `/api/v1/` requires a session. The token API takes only `Authorization: Bearer` tokens and never a session cookie; see [api.md](api.md). Pages redirect to sign-in, with `?next=` naming the page when it is under `/dashboard/`, so the operator returns there afterwards; `/api/*` and other `/auth/*` paths answer `401` with the JSON error envelope. Signed-in responses are sent with `Cache-Control: no-store`.
+Everything except `/healthz`, `/readyz`, `/tls/ask`, `/favicon.svg`, `/pkg/*`, the sign-in page, the two `/auth/` form endpoints, `/auth/oidc/sign-in`, `/auth/oidc/callback`, `/auth/sign-in-options`, and the token API under `/api/v1/` requires a session. The token API takes only `Authorization: Bearer` tokens and never a session cookie; see [api.md](api.md). Pages redirect to sign-in, with `?next=` naming the page when it is under `/dashboard/`, so the operator returns there afterwards; `/api/*` and other `/auth/*` paths answer `401` with the JSON error envelope. Signed-in responses are sent with `Cache-Control: no-store`.
 
 The session cookie is `__Host-sd-session` with `Secure` when the public URL is HTTPS, and `sd-session` otherwise (local HTTP development). It is HttpOnly and SameSite=Lax. The database stores only a SHA-256 hash of the token.
 
