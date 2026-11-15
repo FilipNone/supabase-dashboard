@@ -211,6 +211,7 @@ Release checks include a fresh installation, Studio access tests for each role, 
 
 ## Revision history
 
+- 2026-11-15: released `v0.3.0-dev.1`, the first release that provisions stacks through Dokploy: placement detection, allowed targets, the provisioning job, stop, start, redeploy, remove and destroy, stack settings with tracking of variables edited in Dokploy, adoption of existing services, and the failed jobs table for installation admins.
 - 2026-11-13: M4 adoption started: owners and admins can adopt a Supabase compose service from an allowed Dokploy environment as a project, copying its keys only when asked.
 - 2026-11-13: Stack settings warn that every exposed schema must exist: a redeploy with a missing schema leaves PostgREST unhealthy and fails, which a browser check hit by editing the variable in Dokploy.
 - 2026-11-13: M4 Studio hosts on Dokploy: `domain.create` refuses wildcard hosts in v0.31.1; documented a Traefik dynamic file instead, not yet tried end to end.
