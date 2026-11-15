@@ -22,6 +22,14 @@ pub enum SettingKind {
     UrlList,
     /// Comma-separated PostgreSQL schema names, at least one.
     SchemaList,
+    /// A host name or IP address, or empty for none.
+    Host,
+    /// A TCP port, 1 to 65535.
+    Port,
+    /// An email address, or empty for none.
+    EmailAddress,
+    /// A login name of plain characters, or empty for none.
+    Username,
 }
 
 /// A variable of the pinned stack the dashboard may change.
@@ -45,7 +53,7 @@ pub const MAX_SCHEMAS: usize = 20;
 pub const MAX_SETTING_LEN: usize = 2048;
 
 /// Every setting the dashboard may change, in display order.
-pub const STACK_SETTINGS: [StackSetting; 7] = [
+pub const STACK_SETTINGS: [StackSetting; 11] = [
     StackSetting {
         name: "SITE_URL",
         label: "Site URL",
@@ -73,7 +81,7 @@ pub const STACK_SETTINGS: [StackSetting; 7] = [
     StackSetting {
         name: "ENABLE_EMAIL_AUTOCONFIRM",
         label: "Confirm email addresses automatically",
-        help: "Users who sign up with an email can sign in without confirming it. The stack has no mail server configured, so turning this off means nobody can confirm.",
+        help: "Users who sign up with an email can sign in without confirming it. Before turning this off, set up the stack's mail server below; without one, nobody can confirm.",
         kind: SettingKind::Bool,
         default: Some("true"),
         services: &["auth"],
@@ -105,7 +113,51 @@ pub const STACK_SETTINGS: [StackSetting; 7] = [
         default: Some("public,storage,graphql_public"),
         services: &["rest", "studio"],
     },
+    StackSetting {
+        name: "SMTP_HOST",
+        label: "Mail server host",
+        help: "The SMTP server Auth sends confirmation, magic link, invitation, and password recovery emails through. Empty means the stack sends no email.",
+        kind: SettingKind::Host,
+        default: Some(""),
+        services: &["auth"],
+    },
+    StackSetting {
+        name: "SMTP_PORT",
+        label: "Mail server port",
+        help: "Usually 587 (STARTTLS) or 465 (TLS).",
+        kind: SettingKind::Port,
+        default: Some("587"),
+        services: &["auth"],
+    },
+    StackSetting {
+        name: "SMTP_USER",
+        label: "Mail server username",
+        help: "Leave empty when the server needs no login. The password is the SMTP_PASS variable, which you set in Dokploy; the dashboard does not read or show it.",
+        kind: SettingKind::Username,
+        default: Some(""),
+        services: &["auth"],
+    },
+    StackSetting {
+        name: "SMTP_ADMIN_EMAIL",
+        label: "Sender address",
+        help: "The From address of the emails Auth sends. The mail server must accept it.",
+        kind: SettingKind::EmailAddress,
+        default: Some(""),
+        services: &["auth"],
+    },
 ];
+
+/// Variables the pinned compose file reads that the dashboard never
+/// writes or shows, because they hold a secret. Operators set them in
+/// Dokploy.
+pub const DOKPLOY_ONLY_VARIABLES: [&str; 1] = ["SMTP_PASS"];
+
+/// Longest host name, per DNS.
+pub const MAX_HOST_LEN: usize = 253;
+/// Longest email address.
+pub const MAX_EMAIL_LEN: usize = 254;
+/// Longest SMTP username.
+pub const MAX_USERNAME_LEN: usize = 256;
 
 /// The setting named `name`.
 pub fn stack_setting(name: &str) -> Option<&'static StackSetting> {
@@ -134,6 +186,20 @@ pub enum SettingError {
         "{label}: enter 1 to {MAX_SCHEMAS} schema names of lowercase letters, digits, and underscores, separated by commas"
     )]
     SchemaList { label: &'static str },
+    #[error(
+        "{label}: enter a host name such as smtp.example.com or an IP address, or leave it empty"
+    )]
+    Host { label: &'static str },
+    #[error("{label}: enter a port from 1 to 65535")]
+    Port { label: &'static str },
+    #[error(
+        "{label}: enter an email address without spaces, quotes, $, #, or backslashes, or leave it empty"
+    )]
+    EmailAddress { label: &'static str },
+    #[error(
+        "{label}: enter at most {MAX_USERNAME_LEN} characters without spaces, quotes, $, #, or backslashes, or leave it empty"
+    )]
+    Username { label: &'static str },
 }
 
 impl StackSetting {
@@ -192,6 +258,33 @@ impl StackSetting {
                     Err(SettingError::SchemaList { label })
                 }
             }
+            SettingKind::Host => {
+                if raw.is_empty() || is_host(raw) {
+                    Ok(raw.to_ascii_lowercase())
+                } else {
+                    Err(SettingError::Host { label })
+                }
+            }
+            SettingKind::Port => raw
+                .parse::<u16>()
+                .ok()
+                .filter(|port| *port > 0 && raw.len() <= 5)
+                .map(|port| port.to_string())
+                .ok_or(SettingError::Port { label }),
+            SettingKind::EmailAddress => {
+                if raw.is_empty() || is_email(raw) {
+                    Ok(raw.to_owned())
+                } else {
+                    Err(SettingError::EmailAddress { label })
+                }
+            }
+            SettingKind::Username => {
+                if raw.len() <= MAX_USERNAME_LEN && raw.bytes().all(is_plain_char) {
+                    Ok(raw.to_owned())
+                } else {
+                    Err(SettingError::Username { label })
+                }
+            }
         }
     }
 
@@ -235,6 +328,33 @@ fn is_redirect_url(url: &str) -> bool {
         })
         && !rest.is_empty()
         && url.bytes().all(|b| is_plain_char(b) && b != b',')
+}
+
+/// A DNS name of letter, digit, and hyphen labels, or an IPv4 address.
+/// IPv6 literals are not accepted: GoTrue joins host and port with a colon.
+fn is_host(host: &str) -> bool {
+    host.len() <= MAX_HOST_LEN
+        && host.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+}
+
+/// `local@domain` of plain characters, where the domain is a host name.
+fn is_email(address: &str) -> bool {
+    let Some((local, domain)) = address.split_once('@') else {
+        return false;
+    };
+    address.len() <= MAX_EMAIL_LEN
+        && !local.is_empty()
+        && local
+            .bytes()
+            .all(|b| is_plain_char(b) && b != b'@' && b != b',')
+        && is_host(domain)
 }
 
 fn is_schema_name(name: &str) -> bool {
@@ -538,6 +658,62 @@ mod tests {
         for bad in ["", "public,public", "Public", "public;drop", "a,,b"] {
             assert!(schemas.normalize(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn mail_server_values_are_normalized_or_refused() {
+        let host = stack_setting("SMTP_HOST").unwrap();
+        assert_eq!(host.normalize("").unwrap(), "");
+        assert_eq!(
+            host.normalize(" SMTP.Example.com ").unwrap(),
+            "smtp.example.com"
+        );
+        assert_eq!(host.normalize("10.0.0.25").unwrap(), "10.0.0.25");
+        assert_eq!(host.normalize("mailpit").unwrap(), "mailpit");
+        for bad in [
+            "smtp.example.com:587",
+            "smtp://x",
+            "-x.example.com",
+            "a..b",
+            "::1",
+            "x y",
+            "x$y",
+        ] {
+            assert!(host.normalize(bad).is_err(), "{bad:?}");
+        }
+        assert!(host.normalize(&"a.".repeat(127)).is_err());
+        let port = stack_setting("SMTP_PORT").unwrap();
+        assert_eq!(port.normalize("0465").unwrap(), "465");
+        for bad in ["", "0", "65536", "587a", "-1"] {
+            assert!(port.normalize(bad).is_err(), "{bad:?}");
+        }
+        let from = stack_setting("SMTP_ADMIN_EMAIL").unwrap();
+        assert_eq!(from.normalize("").unwrap(), "");
+        assert_eq!(
+            from.normalize("no-reply+auth@example.com").unwrap(),
+            "no-reply+auth@example.com"
+        );
+        for bad in [
+            "Name <a@example.com>",
+            "a@@example.com",
+            "@example.com",
+            "a@",
+            "a\"b@example.com",
+            "a@exa mple.com",
+        ] {
+            assert!(from.normalize(bad).is_err(), "{bad:?}");
+        }
+        let user = stack_setting("SMTP_USER").unwrap();
+        assert_eq!(user.normalize("").unwrap(), "");
+        assert_eq!(user.normalize("apikey").unwrap(), "apikey");
+        assert_eq!(
+            user.normalize("ops@example.com").unwrap(),
+            "ops@example.com"
+        );
+        for bad in ["a b", "a$b", "a#b", "a'b"] {
+            assert!(user.normalize(bad).is_err(), "{bad:?}");
+        }
+        assert!(user.normalize(&"u".repeat(MAX_USERNAME_LEN + 1)).is_err());
     }
 
     #[test]

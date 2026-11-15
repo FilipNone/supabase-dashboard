@@ -604,23 +604,46 @@ pub struct SettingsFields {
     pub enable_anonymous_users: Option<String>,
     pub jwt_expiry: Option<String>,
     pub pgrst_db_schemas: Option<String>,
+    pub smtp_host: Option<String>,
+    pub smtp_port: Option<String>,
+    pub smtp_user: Option<String>,
+    pub smtp_admin_email: Option<String>,
 }
 
 impl SettingsFields {
+    /// Each setting's variable name and the submitted value, if any, in
+    /// display order.
+    pub fn entries(&self) -> [(&'static str, Option<&str>); 11] {
+        [
+            ("SITE_URL", self.site_url.as_deref()),
+            (
+                "ADDITIONAL_REDIRECT_URLS",
+                self.additional_redirect_urls.as_deref(),
+            ),
+            ("DISABLE_SIGNUP", self.disable_signup.as_deref()),
+            (
+                "ENABLE_EMAIL_AUTOCONFIRM",
+                self.enable_email_autoconfirm.as_deref(),
+            ),
+            (
+                "ENABLE_ANONYMOUS_USERS",
+                self.enable_anonymous_users.as_deref(),
+            ),
+            ("JWT_EXPIRY", self.jwt_expiry.as_deref()),
+            ("PGRST_DB_SCHEMAS", self.pgrst_db_schemas.as_deref()),
+            ("SMTP_HOST", self.smtp_host.as_deref()),
+            ("SMTP_PORT", self.smtp_port.as_deref()),
+            ("SMTP_USER", self.smtp_user.as_deref()),
+            ("SMTP_ADMIN_EMAIL", self.smtp_admin_email.as_deref()),
+        ]
+    }
+
     #[cfg(feature = "ssr")]
     fn submitted(&self) -> Vec<(&'static str, &str)> {
-        [
-            ("SITE_URL", &self.site_url),
-            ("ADDITIONAL_REDIRECT_URLS", &self.additional_redirect_urls),
-            ("DISABLE_SIGNUP", &self.disable_signup),
-            ("ENABLE_EMAIL_AUTOCONFIRM", &self.enable_email_autoconfirm),
-            ("ENABLE_ANONYMOUS_USERS", &self.enable_anonymous_users),
-            ("JWT_EXPIRY", &self.jwt_expiry),
-            ("PGRST_DB_SCHEMAS", &self.pgrst_db_schemas),
-        ]
-        .into_iter()
-        .filter_map(|(name, value)| value.as_deref().map(|value| (name, value)))
-        .collect()
+        self.entries()
+            .into_iter()
+            .filter_map(|(name, value)| value.map(|value| (name, value)))
+            .collect()
     }
 }
 

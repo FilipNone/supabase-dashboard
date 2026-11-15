@@ -184,7 +184,24 @@ fn section(
             .map(|err| view! { <p class="form-error" role="alert">{err.to_string()}</p> })
     };
     let tracking = tracking_view(view.tracking, project, accept, Signal::derive(busy));
-    let fields = view.settings.into_iter().map(field_view).collect_view();
+    let fields = view
+        .settings
+        .into_iter()
+        .map(|setting| {
+            // The mail server's settings start their own group.
+            let heading = (setting.name == "SMTP_HOST").then(|| {
+                view! {
+                    <h3 class="subsection-title settings-group">"Auth mail server"</h3>
+                    <p class="field-hint">
+                        "Auth emails sign-up confirmations, magic links, invitations, and password recovery links through this server. Set the password as "
+                        <code class="url-text">"SMTP_PASS"</code>
+                        " in the service's environment in Dokploy; the dashboard does not read, store, or show it."
+                    </p>
+                }
+            });
+            view! { {heading} {field_view(setting)} }
+        })
+        .collect_view();
     let summary = move || {
         if !reviewing.get() {
             return None;
@@ -369,7 +386,10 @@ fn field_view(setting: StackSettingView) -> impl IntoView {
                 aria-describedby=help_id.clone() disabled=locked/>
         }
         .into_any(),
-        SettingKind::UrlList | SettingKind::SchemaList => {
+        SettingKind::UrlList
+        | SettingKind::SchemaList
+        | SettingKind::Host
+        | SettingKind::Username => {
             let required = setting.kind == SettingKind::SchemaList;
             view! {
                 <input class="input" id=id.clone() name=name type="text" required=required value=value
@@ -378,6 +398,18 @@ fn field_view(setting: StackSettingView) -> impl IntoView {
             }
             .into_any()
         }
+        SettingKind::Port => view! {
+            <input class="input" id=id.clone() name=name type="number" inputmode="numeric"
+                min="1" max="65535" step="1" required value=value
+                aria-describedby=help_id.clone() disabled=locked/>
+        }
+        .into_any(),
+        SettingKind::EmailAddress => view! {
+            <input class="input" id=id.clone() name=name type="email" value=value
+                autocomplete="off" spellcheck="false"
+                aria-describedby=help_id.clone() disabled=locked/>
+        }
+        .into_any(),
     };
     view! {
         <div class="field">
@@ -401,20 +433,17 @@ fn review_view(
     queued: RwSignal<bool>,
 ) -> impl IntoView {
     let disabled = move || (queued.get() || apply.pending().get()).then_some("true");
-    let hidden = [
-        ("site_url", fields.site_url),
-        ("additional_redirect_urls", fields.additional_redirect_urls),
-        ("disable_signup", fields.disable_signup),
-        ("enable_email_autoconfirm", fields.enable_email_autoconfirm),
-        ("enable_anonymous_users", fields.enable_anonymous_users),
-        ("jwt_expiry", fields.jwt_expiry),
-        ("pgrst_db_schemas", fields.pgrst_db_schemas),
-    ]
-    .into_iter()
-    .filter_map(|(name, value)| {
-        value.map(|value| view! { <input type="hidden" name=name value=value/> })
-    })
-    .collect_view();
+    let hidden = fields
+        .entries()
+        .into_iter()
+        .filter_map(|(name, value)| {
+            value.map(|value| {
+                let name = name.to_lowercase();
+                let value = value.to_owned();
+                view! { <input type="hidden" name=name value=value/> }
+            })
+        })
+        .collect_view();
     let base = preview.base;
     let schemas_changed = preview
         .changed
@@ -460,5 +489,50 @@ fn review_view(
                 </button>
             </ActionForm>
         </div>
+    }
+}
+
+#[cfg(all(test, feature = "ssr"))]
+mod tests {
+    use supabase_dashboard_domain::stack_settings::{STACK_SETTINGS, stack_setting};
+
+    use super::*;
+
+    fn rendered(name: &str, value: &str) -> String {
+        let owner = Owner::new();
+        owner.set();
+        let setting = stack_setting(name).unwrap();
+        field_view(StackSettingView {
+            name: setting.name.to_owned(),
+            label: setting.label.to_owned(),
+            help: setting.help.to_owned(),
+            kind: setting.kind,
+            value: Some(value.to_owned()),
+            state: SettingState::Editable,
+        })
+        .to_html()
+    }
+
+    #[test]
+    fn mail_server_fields_have_labels_types_and_their_form_names() {
+        let host = rendered("SMTP_HOST", "smtp.example.com");
+        assert!(host.contains(r#"for="setting-smtp-host""#), "{host}");
+        assert!(host.contains(r#"name="smtp_host""#), "{host}");
+        assert!(host.contains(r#"type="text""#), "{host}");
+        assert!(!host.contains("required"), "{host}");
+        let port = rendered("SMTP_PORT", "587");
+        assert!(port.contains(r#"type="number""#), "{port}");
+        assert!(port.contains(r#"max="65535""#), "{port}");
+        let from = rendered("SMTP_ADMIN_EMAIL", "");
+        assert!(from.contains(r#"type="email""#), "{from}");
+        assert!(from.contains(r#"aria-describedby="setting-smtp-admin-email-help""#));
+    }
+
+    #[test]
+    fn every_setting_has_a_form_field() {
+        let fields = SettingsFields::default();
+        let names: Vec<&str> = fields.entries().iter().map(|(name, _)| *name).collect();
+        let settings: Vec<&str> = STACK_SETTINGS.iter().map(|s| s.name).collect();
+        assert_eq!(names, settings);
     }
 }

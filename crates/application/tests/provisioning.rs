@@ -48,7 +48,7 @@ use supabase_dashboard_domain::{
     provisioning::{
         ProvisionStep, ProvisionTargets, StackAction, StackDeploymentView, TargetChoice,
     },
-    stack_settings::{EnvChanges, EnvTracking, SettingState},
+    stack_settings::{EnvChanges, EnvTracking, STACK_SETTINGS, SettingState, StackSettingsView},
 };
 use supabase_dashboard_persistence::{Database, accounts::AccountRecord};
 use uuid::Uuid;
@@ -1727,7 +1727,7 @@ async fn owners_change_settings_and_edits_in_dokploy_stop_the_change() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(view.settings.len(), 7);
+    assert_eq!(view.settings.len(), STACK_SETTINGS.len());
     assert!(!view.busy);
     // The provisioning job recorded what it wrote.
     assert_eq!(view.tracking, EnvTracking::Compared(EnvChanges::default()));
@@ -1997,6 +1997,131 @@ async fn owners_change_settings_and_edits_in_dokploy_stop_the_change() {
     .await
     .unwrap();
     assert_eq!(leaked, 0);
+}
+
+#[tokio::test]
+async fn the_stack_mail_server_is_set_and_its_password_stays_in_dokploy() {
+    let Some(scratch) = ScratchDb::create("stack_mail_server").await else {
+        return;
+    };
+    let f = setup(&scratch).await;
+    let (_, project) = provisioned(&f).await;
+    const PASSWORD: &str = "smtp-password-set-in-dokploy";
+
+    // A new stack has no mail server.
+    let view = f
+        .service
+        .stack_settings(&f.owner, project)
+        .await
+        .unwrap()
+        .unwrap();
+    let value = |view: &StackSettingsView, name: &str| {
+        view.settings
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| (s.value.clone(), s.state.clone()))
+            .unwrap()
+    };
+    assert_eq!(
+        value(&view, "SMTP_HOST"),
+        (Some(String::new()), SettingState::Editable)
+    );
+    assert_eq!(value(&view, "SMTP_PORT").0.as_deref(), Some("587"));
+
+    // The password is set in Dokploy; the dashboard neither shows it nor
+    // takes it.
+    if let Some((_, env)) = f.compose.state.lock().unwrap().configured.as_mut() {
+        env.push_str(&format!("SMTP_PASS={PASSWORD}\n"));
+    }
+    let view = f
+        .service
+        .stack_settings(&f.owner, project)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!format!("{view:?}").contains(PASSWORD));
+    assert!(view.settings.iter().all(|s| s.name != "SMTP_PASS"));
+    assert!(matches!(
+        f.service
+            .preview_settings(&f.owner, project, &[("SMTP_PASS", "other")])
+            .await,
+        Err(ProvisionError::SettingUnavailable(_))
+    ));
+    assert!(matches!(
+        f.service
+            .preview_settings(&f.owner, project, &[("SMTP_HOST", "smtp.example.com:587")])
+            .await,
+        Err(ProvisionError::Setting(_))
+    ));
+
+    let submitted = [
+        ("SMTP_HOST", "SMTP.example.com"),
+        ("SMTP_PORT", "465"),
+        ("SMTP_USER", "apikey"),
+        ("SMTP_ADMIN_EMAIL", "no-reply@example.com"),
+    ];
+    let preview = f
+        .service
+        .preview_settings(&f.owner, project, &submitted)
+        .await
+        .unwrap();
+    assert_eq!(
+        preview.changed,
+        ["SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_ADMIN_EMAIL"]
+    );
+    assert_eq!(preview.restarts, ["auth"]);
+    assert!(!format!("{preview:?}").contains(PASSWORD));
+    let job = f
+        .service
+        .queue_settings(&f.owner, project, &submitted, &preview.base, ctx())
+        .await
+        .unwrap();
+    run_all(&f).await;
+    let stored = f.db.get_job(job).await.unwrap().unwrap();
+    assert_eq!(stored.state, "succeeded", "{:?}", stored.message);
+    assert_eq!(variable(&f, "SMTP_HOST"), "smtp.example.com");
+    assert_eq!(variable(&f, "SMTP_PORT"), "465");
+    assert_eq!(variable(&f, "SMTP_USER"), "apikey");
+    assert_eq!(variable(&f, "SMTP_ADMIN_EMAIL"), "no-reply@example.com");
+    // The password set in Dokploy is kept as it was.
+    assert_eq!(variable(&f, "SMTP_PASS"), PASSWORD);
+    // Neither the job nor the audit log holds it.
+    assert_eq!(
+        count(
+            &f.db,
+            "SELECT count(*) FROM jobs j WHERE strpos(row_to_json(j)::text, 'smtp-password-set-in-dokploy') > 0"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        count(
+            &f.db,
+            "SELECT count(*) FROM audit_events a WHERE strpos(row_to_json(a)::text, 'smtp-password-set-in-dokploy') > 0"
+        )
+        .await,
+        0
+    );
+
+    // Clearing the host turns the mail server off again.
+    let view = f
+        .service
+        .stack_settings(&f.owner, project)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        value(&view, "SMTP_HOST").0.as_deref(),
+        Some("smtp.example.com")
+    );
+    let cleared = f
+        .service
+        .preview_settings(&f.owner, project, &[("SMTP_HOST", " ")])
+        .await
+        .unwrap();
+    assert_eq!(cleared.changed, ["SMTP_HOST"]);
+    f.db.close().await;
+    scratch.drop().await;
 }
 
 #[tokio::test]

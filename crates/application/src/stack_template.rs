@@ -205,7 +205,7 @@ mod tests {
 
     #[test]
     fn every_setting_is_a_defaulted_variable_of_the_services_it_names() {
-        use supabase_dashboard_domain::stack_settings::STACK_SETTINGS;
+        use supabase_dashboard_domain::stack_settings::{DOKPLOY_ONLY_VARIABLES, STACK_SETTINGS};
         let defaulted = defaulted_variables();
         for setting in STACK_SETTINGS {
             assert!(setting.read_by(COMPOSE_FILE), "{}", setting.name);
@@ -230,7 +230,15 @@ mod tests {
                 None => assert!(uses.is_empty(), "{}", setting.name),
             }
         }
-        for (name, _, _) in defaulted {
+        for (name, default, _) in defaulted {
+            if DOKPLOY_ONLY_VARIABLES.contains(&name) {
+                assert_eq!(default, "", "{name} has a default");
+                assert!(
+                    STACK_SETTINGS.iter().all(|s| s.name != name),
+                    "{name} is a setting"
+                );
+                continue;
+            }
             assert!(
                 STACK_SETTINGS.iter().any(|s| s.name == name),
                 "{name} is not a setting"
