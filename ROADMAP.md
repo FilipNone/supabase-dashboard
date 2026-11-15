@@ -211,6 +211,7 @@ Release checks include a fresh installation, Studio access tests for each role, 
 
 ## Revision history
 
+- 2026-11-15: released `v0.3.0-dev.5` with password reset by email, Resend, resending invitations, flat Studio hosts, and Auth's mail server, its password, and GitHub and Google sign-in as stack settings.
 - 2026-11-15: owners and admins set up GitHub and Google sign-in from the stack settings. Updated the M5 settings item.
 - 2026-11-15: M3 Studio hosts: `SUPABASE_DASHBOARD_STUDIO_DOMAIN` also takes a flat pattern, `*-studio.example.com`, which serves a project's Studio at `<project id in hex>-studio.example.com`, one level under the parent domain, for certificates and CDNs that cover one level only.
 - 2026-11-15: owners and admins set or remove the stack's SMTP password from the stack settings. Updated the M5 settings item.
