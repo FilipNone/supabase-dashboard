@@ -9,8 +9,8 @@ use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 use supabase_dashboard_domain::{
     account::{
-        AccountSummary, AdminAccountSummary, PasswordResetCode, PasswordResetPreview,
-        SessionSummary,
+        AccountSummary, AdminAccountSummary, Email, EmailChangeCode, EmailChangePreview,
+        EmailChangeSent, PasswordResetCode, PasswordResetPreview, SessionSummary,
     },
     admin::RegisteredResources,
     adoption::{AdoptableServices, AdoptionPreview},
@@ -1040,6 +1040,58 @@ pub async fn change_password(
             &secrecy::SecretString::from(new_password.0),
             audit.get(),
         )
+        .await?)
+}
+
+/// Whether the signed-in operator can change their sign-in email here,
+/// which needs outgoing mail.
+#[server]
+pub async fn email_change_available() -> Result<bool, AppError> {
+    org_context::session()?;
+    Ok(org_context::auth()?.email_change_available())
+}
+
+/// Checks the signed-in operator's password and emails a confirmation link
+/// to `new_email`. The sign-in email changes only when the link is used.
+#[server]
+pub async fn request_email_change(
+    new_email: String,
+    current_password: PasswordInput,
+) -> Result<EmailChangeSent, AppError> {
+    let session = org_context::session()?;
+    let audit = org_context::AuditContext::current();
+    Ok(org_context::auth()?
+        .request_email_change(
+            &session,
+            &secrecy::SecretString::from(current_password.0),
+            &new_email,
+            audit.get(),
+        )
+        .await?)
+}
+
+/// Public: what a sign-in email confirmation link is for, or `None` when
+/// it is not open.
+#[server(prefix = "/auth/email-change", endpoint = "preview")]
+pub async fn preview_email_change(
+    code: EmailChangeCode,
+) -> Result<Option<EmailChangePreview>, AppError> {
+    org_context::auth()?
+        .preview_email_change(code.expose())
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, "email change lookup failed");
+            AppError::Unavailable
+        })
+}
+
+/// Public: uses a sign-in email confirmation link. The code is the
+/// credential, so no session is needed. Returns the new address.
+#[server(prefix = "/auth/email-change", endpoint = "confirm")]
+pub async fn confirm_email_change(code: EmailChangeCode) -> Result<Email, AppError> {
+    let audit = org_context::AuditContext::current();
+    Ok(org_context::auth()?
+        .confirm_email_change(code.expose(), audit.get())
         .await?)
 }
 

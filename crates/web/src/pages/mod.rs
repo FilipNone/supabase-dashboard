@@ -6,6 +6,7 @@ mod admin_dokploy_targets;
 pub mod adopt;
 pub mod api_tokens;
 pub mod audit;
+pub mod email_change;
 mod health_chart;
 mod integrations;
 pub mod invite;

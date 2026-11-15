@@ -195,18 +195,19 @@ mod tests {
         server_fns::{
             AcceptInvitation, AcceptStackVariables, AdminListAccounts, AdminSetAccountDisabled,
             AdoptDokployService, ChangePassword, CheckProjectHealth, ClearDokployPlacement,
-            CompletePasswordReset, ConfirmDokployPlacement, ConnectDokploy, CreateApiToken,
-            CreateInvitation, CreateOrganization, DisconnectDokploy, GetAdoptableServices,
-            GetAdoptionPreview, GetCurrentAccount, GetDokployConnection, GetDokployPlacement,
-            GetInstallationHealth, GetOrganization, GetOrganizationAuditLog, GetProject,
-            GetProjectAuthorities, GetProjectCredentials, GetProjectDeployment, GetProjectHealth,
-            GetProvisionJob, GetProvisionTargets, GetStackSettings, GetStudioAccessLog,
-            ListApiTokens, ListOrganizations, ListProjects, ListProvisionJobs, ListSessions,
-            PasswordResetAvailable, PreviewInvitation, PreviewPasswordReset, PreviewStackSettings,
-            QueueStackAction, QueueStackRemoval, QueueStackSettings, RegisterProject,
-            RemoveProjectAuthorities, RemoveProjectCredential, RenameOrganization,
-            ReplaceDokployKey, ReplaceProjectAuthorities, ReplaceProjectCredential,
-            ReplaceStudioLogin, RequestPasswordReset, RevokeApiToken, RevokeSession,
+            CompletePasswordReset, ConfirmDokployPlacement, ConfirmEmailChange, ConnectDokploy,
+            CreateApiToken, CreateInvitation, CreateOrganization, DisconnectDokploy,
+            EmailChangeAvailable, GetAdoptableServices, GetAdoptionPreview, GetCurrentAccount,
+            GetDokployConnection, GetDokployPlacement, GetInstallationHealth, GetOrganization,
+            GetOrganizationAuditLog, GetProject, GetProjectAuthorities, GetProjectCredentials,
+            GetProjectDeployment, GetProjectHealth, GetProvisionJob, GetProvisionTargets,
+            GetStackSettings, GetStudioAccessLog, ListApiTokens, ListOrganizations, ListProjects,
+            ListProvisionJobs, ListSessions, PasswordResetAvailable, PreviewEmailChange,
+            PreviewInvitation, PreviewPasswordReset, PreviewStackSettings, QueueStackAction,
+            QueueStackRemoval, QueueStackSettings, RegisterProject, RemoveProjectAuthorities,
+            RemoveProjectCredential, RenameOrganization, ReplaceDokployKey,
+            ReplaceProjectAuthorities, ReplaceProjectCredential, ReplaceStudioLogin,
+            RequestEmailChange, RequestPasswordReset, RevokeApiToken, RevokeSession,
             SignUpWithInvitation, StartProvisioning, UnregisterProject, UpdateProfile,
         },
     };
@@ -271,6 +272,16 @@ mod tests {
         let auth = AuthService::new(db.clone(), AuthConfig::default())
             .await
             .unwrap();
+        router_with_auth(db, cipher, access_log_days, dokploy_policy, auth)
+    }
+
+    fn router_with_auth(
+        db: Database,
+        cipher: Option<supabase_dashboard_application::secrets::CredentialCipher>,
+        access_log_days: Option<u16>,
+        dokploy_policy: TargetPolicy,
+        auth: AuthService,
+    ) -> Router {
         let studio_access = Arc::new(StudioAccessService::new(db.clone(), access_log_days));
         let dokploy = dokploy_service(&db, cipher.clone(), dokploy_policy);
         let organizations = Arc::new(OrganizationService::new(db.clone()));
@@ -2863,6 +2874,223 @@ mod tests {
             .unwrap();
         let (parts, _) = send(&router, forged).await;
         assert_eq!(parts.status, StatusCode::FORBIDDEN);
+
+        db.close().await;
+        scratch.drop().await;
+    }
+
+    /// Keeps every message it is asked to send.
+    #[derive(Default)]
+    struct KeptMail(std::sync::Mutex<Vec<supabase_dashboard_application::mail::OutgoingEmail>>);
+
+    impl supabase_dashboard_application::mail::Mailer for KeptMail {
+        fn send<'a>(
+            &'a self,
+            message: &'a supabase_dashboard_application::mail::OutgoingEmail,
+        ) -> supabase_dashboard_application::mail::SendFuture<'a> {
+            self.0.lock().unwrap().push(message.clone());
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn the_sign_in_email_changes_over_http_only_with_the_link() {
+        use supabase_dashboard_web::app::{CONFIRM_EMAIL_PATH, EMAIL_CHANGE_FN_PATHS};
+        // The session guard lets exactly these server functions through.
+        assert_eq!(
+            EMAIL_CHANGE_FN_PATHS,
+            [PreviewEmailChange::PATH, ConfirmEmailChange::PATH]
+        );
+        let Some(scratch) = ScratchDb::create("http_email_change").await else {
+            return;
+        };
+        let db = Database::connect(&scratch.settings).await.unwrap();
+        db.migrate().await.unwrap();
+        let mail = Arc::new(KeptMail::default());
+        let page = format!("{ORIGIN}{CONFIRM_EMAIL_PATH}");
+        let auth = AuthService::new(db.clone(), AuthConfig::default())
+            .await
+            .unwrap()
+            .with_email_change_mail(supabase_dashboard_application::mail::EmailChangeMail {
+                mailer: mail.clone(),
+                confirm_page_url: page.clone(),
+            });
+        auth.bootstrap_owner(
+            "alice@example.test",
+            "Alice",
+            &SecretString::from("correct horse battery staple"),
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO accounts (id, email, display_name, password_hash) \
+             SELECT gen_random_uuid(), 'bob@example.test', 'Bob', password_hash FROM accounts",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let router = router_with_auth(db.clone(), None, None, TargetPolicy::default(), auth);
+        let without_mail = router_for(db.clone()).await;
+        let alice = sign_in_cookie(&router, "alice%40example.test").await;
+        let sent = || mail.0.lock().unwrap().clone();
+
+        // Asking needs a session, and a dashboard that cannot send mail
+        // says so and refuses.
+        for path in [EmailChangeAvailable::PATH, RequestEmailChange::PATH] {
+            let (parts, _) = send(&router, form_post(path, "", None)).await;
+            assert_eq!(parts.status, StatusCode::UNAUTHORIZED, "{path}");
+        }
+        let (_, body) = send(
+            &router,
+            form_post(EmailChangeAvailable::PATH, "", Some(&alice)),
+        )
+        .await;
+        assert_eq!(body, "true");
+        let elsewhere = sign_in_cookie(&without_mail, "alice%40example.test").await;
+        let (_, body) = send(
+            &without_mail,
+            form_post(EmailChangeAvailable::PATH, "", Some(&elsewhere)),
+        )
+        .await;
+        assert_eq!(body, "false");
+        let request =
+            |email: &str, password: &str| format!("new_email={email}&current_password={password}");
+        let (parts, body) = send(
+            &without_mail,
+            form_post(
+                RequestEmailChange::PATH,
+                &request("new%40example.test", "correct+horse+battery+staple"),
+                Some(&elsewhere),
+            ),
+        )
+        .await;
+        assert!(parts.status.is_client_error(), "{body}");
+        assert!(body.contains("cannot send email"), "{body}");
+
+        // A cross-site form cannot ask.
+        let forged = Request::post(RequestEmailChange::PATH)
+            .header(header::HOST, HOST)
+            .header(header::ORIGIN, "https://evil.example")
+            .header(header::COOKIE, &alice)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(request(
+                "new%40example.test",
+                "correct+horse+battery+staple",
+            )))
+            .unwrap();
+        let (parts, _) = send(&router, forged).await;
+        assert_eq!(parts.status, StatusCode::FORBIDDEN);
+
+        // A wrong password and an address in use are refused, and send
+        // nothing.
+        let (parts, body) = send(
+            &router,
+            form_post(
+                RequestEmailChange::PATH,
+                &request("new%40example.test", "wrong+password+here"),
+                Some(&alice),
+            ),
+        )
+        .await;
+        assert!(parts.status.is_client_error(), "{body}");
+        assert!(body.contains("current password is not correct"), "{body}");
+        let (parts, body) = send(
+            &router,
+            form_post(
+                RequestEmailChange::PATH,
+                &request("Bob%40example.test", "correct+horse+battery+staple"),
+                Some(&alice),
+            ),
+        )
+        .await;
+        assert!(parts.status.is_client_error(), "{body}");
+        assert!(body.contains("already uses"), "{body}");
+        assert!(sent().is_empty());
+
+        // The link goes to the new address; the answer does not hold it.
+        let (parts, body) = send(
+            &router,
+            form_post(
+                RequestEmailChange::PATH,
+                &request("New%40Example.test", "correct+horse+battery+staple"),
+                Some(&alice),
+            ),
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        assert!(body.contains("new@example.test"), "{body}");
+        let messages = sent();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].to.as_str(), "new@example.test");
+        let prefix = format!("{page}#");
+        let code = messages[0]
+            .body
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix.as_str()))
+            .unwrap()
+            .to_owned();
+        assert_eq!(code.len(), 64);
+        assert!(!body.contains(&code));
+
+        // The page and both functions need no session, and are not cached.
+        let (parts, _) = send(&router, get(CONFIRM_EMAIL_PATH)).await;
+        assert_eq!(parts.status, StatusCode::OK);
+        assert_eq!(parts.headers[header::CACHE_CONTROL], "no-store");
+        let (parts, body) = send(
+            &router,
+            form_post(PreviewEmailChange::PATH, &format!("code={code}"), None),
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        assert_eq!(parts.headers[header::CACHE_CONTROL], "no-store");
+        assert!(body.contains("new@example.test"), "{body}");
+        let (parts, _) = send(&router, form_post("/auth/email-change/other", "", None)).await;
+        assert_eq!(parts.status, StatusCode::UNAUTHORIZED);
+        // A cross-site form cannot confirm.
+        let forged = Request::post(ConfirmEmailChange::PATH)
+            .header(header::HOST, HOST)
+            .header(header::ORIGIN, "https://evil.example")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(format!("code={code}")))
+            .unwrap();
+        let (parts, _) = send(&router, forged).await;
+        assert_eq!(parts.status, StatusCode::FORBIDDEN);
+        let (parts, body) = send(
+            &router,
+            form_post(ConfirmEmailChange::PATH, &format!("code={code}"), None),
+        )
+        .await;
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+        assert_eq!(body, r#""new@example.test""#);
+        let messages = sent();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].to.as_str(), "alice@example.test");
+        let (parts, body) = send(
+            &router,
+            form_post(ConfirmEmailChange::PATH, &format!("code={code}"), None),
+        )
+        .await;
+        assert!(parts.status.is_client_error(), "{body}");
+        assert!(body.contains("link is not valid"), "{body}");
+
+        // Alice now signs in with the new address only; her session stays.
+        let (parts, _) = send(
+            &router,
+            form_post(
+                "/auth/sign-in",
+                "email=alice%40example.test&password=correct+horse+battery+staple",
+                None,
+            ),
+        )
+        .await;
+        assert_ne!(location(&parts), HOME_PATH);
+        sign_in_cookie(&router, "new%40example.test").await;
+        let (_, body) = send(
+            &router,
+            form_post(GetCurrentAccount::PATH, "", Some(&alice)),
+        )
+        .await;
+        assert!(body.contains("new@example.test"), "{body}");
 
         db.close().await;
         scratch.drop().await;

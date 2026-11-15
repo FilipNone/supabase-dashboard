@@ -219,6 +219,49 @@ pub struct PasswordResetPreview {
     pub expires_at: time::OffsetDateTime,
 }
 
+/// How long an emailed sign-in email confirmation link works.
+pub const EMAIL_CHANGE_LIFETIME: time::Duration = time::Duration::hours(1);
+/// Most sign-in email change requests one account can make per hour after
+/// its password is confirmed.
+pub const EMAIL_CHANGE_LIMIT: u32 = 5;
+
+/// The secret part of a sign-in email confirmation link. Whoever holds it
+/// can move the account to the new address, so it is never logged or
+/// stored in plain form.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EmailChangeCode(String);
+
+impl EmailChangeCode {
+    pub const fn new(code: String) -> Self {
+        Self(code)
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for EmailChangeCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("EmailChangeCode([REDACTED])")
+    }
+}
+
+/// What the confirmation page shows for an open link.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmailChangePreview {
+    pub new_email: Email,
+    pub expires_at: time::OffsetDateTime,
+}
+
+/// A confirmation link went out to `new_email`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmailChangeSent {
+    pub new_email: Email,
+    pub expires_at: time::OffsetDateTime,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

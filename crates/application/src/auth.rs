@@ -23,14 +23,16 @@ use supabase_dashboard_persistence::{
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+mod email_change;
 mod password_reset;
 
+pub use email_change::{ConfirmEmailChangeError, EmailChangeError};
 pub use password_reset::{
     CompletePasswordResetError, PasswordResetRequest, PasswordResetRequestError,
 };
 
 use crate::{
-    mail::PasswordResetMail,
+    mail::{EmailChangeMail, PasswordResetMail},
     password::{PasswordError, PasswordHashing},
     throttle::{LoginThrottle, ThrottleConfig},
     token::{InvitationToken, RandomnessError, SessionToken},
@@ -231,6 +233,8 @@ pub struct AuthService {
     dummy_hash: String,
     /// Emails password reset links when set.
     reset_mail: Option<password_reset::ResetMailer>,
+    /// Emails sign-in email confirmation links when set.
+    email_change: Option<email_change::EmailChanger>,
 }
 
 impl AuthService {
@@ -246,6 +250,7 @@ impl AuthService {
             config,
             dummy_hash,
             reset_mail: None,
+            email_change: None,
         })
     }
 
@@ -253,6 +258,14 @@ impl AuthService {
     #[must_use]
     pub fn with_password_reset_mail(mut self, mail: PasswordResetMail) -> Self {
         self.reset_mail = Some(password_reset::ResetMailer::new(mail));
+        self
+    }
+
+    /// Lets operators change their sign-in email, confirmed from the new
+    /// address.
+    #[must_use]
+    pub fn with_email_change_mail(mut self, mail: EmailChangeMail) -> Self {
+        self.email_change = Some(email_change::EmailChanger::new(mail));
         self
     }
 

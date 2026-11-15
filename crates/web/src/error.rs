@@ -75,7 +75,8 @@ mod server {
         api_tokens::ApiTokenError,
         auth::{
             AccountUpdateError, AdminError, AuthError, CompletePasswordResetError,
-            InvitationSignUpError, PasswordResetRequestError,
+            ConfirmEmailChangeError, EmailChangeError, InvitationSignUpError,
+            PasswordResetRequestError,
         },
         connections::ConnectionError,
         dokploy::DokployServiceError,
@@ -165,6 +166,30 @@ mod server {
                 | CompletePasswordResetError::PasswordMismatch
                 | CompletePasswordResetError::Input(_) => Self::Rejected(err.to_string()),
                 CompletePasswordResetError::Internal(err) => err.into(),
+            }
+        }
+    }
+
+    impl From<EmailChangeError> for AppError {
+        fn from(err: EmailChangeError) -> Self {
+            match err {
+                EmailChangeError::Account(err) => err.into(),
+                EmailChangeError::NotConfigured
+                | EmailChangeError::SameEmail
+                | EmailChangeError::Taken
+                | EmailChangeError::TooMany { .. }
+                | EmailChangeError::NotSent => Self::Rejected(err.to_string()),
+            }
+        }
+    }
+
+    impl From<ConfirmEmailChangeError> for AppError {
+        fn from(err: ConfirmEmailChangeError) -> Self {
+            match err {
+                ConfirmEmailChangeError::InvalidLink | ConfirmEmailChangeError::Taken => {
+                    Self::Rejected(err.to_string())
+                }
+                ConfirmEmailChangeError::Internal(err) => err.into(),
             }
         }
     }

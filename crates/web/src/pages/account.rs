@@ -8,7 +8,8 @@ use leptos::{form::ActionForm, prelude::*};
 use leptos_meta::Title;
 use leptos_router::components::{A, Outlet};
 use supabase_dashboard_domain::account::{
-    AccountSummary, DISPLAY_NAME_MAX_CHARS, PASSWORD_MIN_CHARS, SessionSummary,
+    AccountSummary, DISPLAY_NAME_MAX_CHARS, EMAIL_CHANGE_LIMIT, EMAIL_MAX_LEN, EmailChangeSent,
+    PASSWORD_MIN_CHARS, SessionSummary,
 };
 use time::OffsetDateTime;
 
@@ -20,8 +21,8 @@ use crate::{
     },
     error::AppError,
     server_fns::{
-        ChangePassword, RevokeOtherSessions, RevokeSession, UpdateProfile, get_current_account,
-        list_sessions,
+        ChangePassword, RequestEmailChange, RevokeOtherSessions, RevokeSession, UpdateProfile,
+        email_change_available, get_current_account, list_sessions,
     },
 };
 
@@ -89,7 +90,112 @@ pub fn AccountProfilePage() -> impl IntoView {
             </Transition>
             {feedback}
         </section>
+        <EmailPanel/>
     }
+}
+
+/// Changing the sign-in email: a confirmation link goes to the new address,
+/// and nothing changes until it is opened.
+#[component]
+fn EmailPanel() -> impl IntoView {
+    let available = Resource::new(|| (), |()| email_change_available());
+    view! {
+        <section class="panel" aria-labelledby="email-title">
+            <h2 class="section-title" id="email-title">"Sign-in email"</h2>
+            <Transition fallback=|| view! { <p class="loading" role="status">"Loading…"</p> }>
+                {move || {
+                    available.get().map(|result| match result {
+                        Ok(true) => view! { <EmailChangeForm/> }.into_any(),
+                        Ok(false) => view! {
+                            <StatePanel
+                                tone=StateTone::Empty
+                                title="Changing the sign-in email needs outgoing mail".to_string()
+                                detail="This dashboard cannot send email, so it cannot confirm a new address. \
+                                        Ask an installation administrator to set up outgoing mail."
+                                    .to_string()
+                            />
+                        }
+                        .into_any(),
+                        Err(err) => view! {
+                            <StatePanel
+                                tone=StateTone::Error
+                                title="Could not check whether email can be changed".to_string()
+                                detail=err.to_string()
+                            />
+                        }
+                        .into_any(),
+                    })
+                }}
+            </Transition>
+        </section>
+    }
+}
+
+#[component]
+fn EmailChangeForm() -> impl IntoView {
+    let request = ServerAction::<RequestEmailChange>::new();
+    // Clear the form after a success; a refusal keeps what was typed so it
+    // can be corrected.
+    let form = NodeRef::<leptos::html::Form>::new();
+    Effect::new(move |_| {
+        if matches!(request.value().get(), Some(Ok(_))) {
+            #[cfg(feature = "hydrate")]
+            if let Some(form) = form.get() {
+                form.reset();
+            }
+        }
+    });
+    let feedback = move || {
+        request.value().get().map(|result| match result {
+            Ok(sent) => {
+                view! { <p class="form-ok" role="status">{sent_message(&sent)}</p> }.into_any()
+            }
+            Err(err) => {
+                view! { <p class="form-error" role="alert">{err.to_string()}</p> }.into_any()
+            }
+        })
+    };
+    view! {
+        <p class="field-hint">
+            {format!(
+                "We email a confirmation link to the new address. Your sign-in email changes only when \
+                 the link is opened, and a notice goes to the current address. You can ask {EMAIL_CHANGE_LIMIT} \
+                 times an hour; a new request replaces the previous link."
+            )}
+        </p>
+        <ActionForm action=request node_ref=form attr:class="stacked-form">
+            <label class="field">
+                <span class="field-label">"New email"</span>
+                <input
+                    class="input" type="email" name="new_email" required autocomplete="email"
+                    maxlength=EMAIL_MAX_LEN.to_string() placeholder="you@example.com"
+                />
+            </label>
+            <label class="field">
+                <span class="field-label">"Current password"</span>
+                <input
+                    class="input" type="password" name="current_password" required
+                    autocomplete="current-password" maxlength="256"
+                />
+            </label>
+            <div>
+                <button type="submit" class="button button-primary" disabled=move || request.pending().get()>
+                    "Send confirmation link"
+                </button>
+            </div>
+        </ActionForm>
+        {feedback}
+    }
+}
+
+fn sent_message(sent: &EmailChangeSent) -> String {
+    format!(
+        "A confirmation link is on its way to {}. It works once, until {:02}:{:02} UTC. Until it is \
+         opened, keep signing in with your current email.",
+        sent.new_email.as_str(),
+        sent.expires_at.hour(),
+        sent.expires_at.minute()
+    )
 }
 
 #[component]
@@ -111,7 +217,7 @@ fn ProfileForm(account: AccountSummary, update: ServerAction<UpdateProfile>) -> 
                     value=account.email.to_string() aria-describedby="email-hint"
                 />
                 <span class="field-hint" id="email-hint">
-                    "Your email is your sign-in name. Changing it is not supported yet."
+                    "Your email is your sign-in name. Change it under Sign-in email below."
                 </span>
             </label>
             <div>

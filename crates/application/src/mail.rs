@@ -9,7 +9,7 @@
 use std::{fmt, future::Future, pin::Pin, sync::Arc};
 
 use supabase_dashboard_domain::{
-    account::{DisplayName, Email, PasswordResetCode},
+    account::{DisplayName, Email, EmailChangeCode, PasswordResetCode},
     authz::OrgRole,
     invitation::InvitationCode,
     organization::OrganizationName,
@@ -184,6 +184,70 @@ fn truncate(value: &str, max: usize) -> String {
     out
 }
 
+/// Mail for sign-in email changes: the mailer and where the confirmation
+/// page lives.
+#[derive(Clone)]
+pub struct EmailChangeMail {
+    pub mailer: Arc<dyn Mailer>,
+    /// Absolute URL of the confirmation page, without a fragment, such as
+    /// `https://dashboard.example.com/dashboard/confirm-email`. The code is
+    /// appended as the fragment, so opening the link does not send it to
+    /// the server.
+    pub confirm_page_url: String,
+}
+
+impl EmailChangeMail {
+    /// The link to `new`, which proves the operator receives mail there.
+    pub fn confirmation(
+        &self,
+        old: &Email,
+        new: &Email,
+        code: &EmailChangeCode,
+        expires_at: OffsetDateTime,
+    ) -> OutgoingEmail {
+        let link = format!("{}#{}", self.confirm_page_url, code.expose());
+        let body = format!(
+            "Someone signed in to the dashboard account {old} asked to sign in with \
+             {new} from now on.\n\
+             \n\
+             Open this link to confirm the change:\n\
+             {link}\n\
+             \n\
+             The link works once and expires on {date} at {time} UTC. Until it is used, \
+             the account keeps signing in with {old}.\n\
+             \n\
+             If you did not ask for this, ignore this email; nothing changes.\n",
+            old = old.as_str(),
+            new = new.as_str(),
+            date = expires_at.date(),
+            time = format_args!("{:02}:{:02}", expires_at.hour(), expires_at.minute()),
+        );
+        OutgoingEmail {
+            to: new.clone(),
+            subject: "Confirm your new dashboard sign-in email".to_owned(),
+            body,
+        }
+    }
+
+    /// The notice to `old` once the change is made.
+    pub fn notice(&self, old: &Email, new: &Email) -> OutgoingEmail {
+        let body = format!(
+            "The dashboard account that signed in with {old} now signs in with {new}. \
+             The change was confirmed from {new}.\n\
+             \n\
+             If you did not make this change, ask an installation administrator of the \
+             dashboard to look at the account right away.\n",
+            old = old.as_str(),
+            new = new.as_str(),
+        );
+        OutgoingEmail {
+            to: old.clone(),
+            subject: "Your dashboard sign-in email was changed".to_owned(),
+            body,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -249,6 +313,31 @@ mod tests {
         );
         assert!(message.body.contains("2026-11-22 at 10:30 UTC"));
         assert!(!format!("{message:?}").contains("cd34"));
+    }
+
+    #[test]
+    fn email_change_mail_goes_to_the_right_addresses() {
+        let mail = EmailChangeMail {
+            mailer: Arc::new(Never),
+            confirm_page_url: "https://dash.example.test/dashboard/confirm-email".into(),
+        };
+        let old = Email::parse("old@example.test").unwrap();
+        let new = Email::parse("new@example.test").unwrap();
+        let code = EmailChangeCode::new("ef56".into());
+        let expires_at = OffsetDateTime::from_unix_timestamp(1_795_343_415).unwrap();
+        let confirmation = mail.confirmation(&old, &new, &code, expires_at);
+        assert_eq!(confirmation.to, new);
+        assert!(
+            confirmation
+                .body
+                .contains("https://dash.example.test/dashboard/confirm-email#ef56")
+        );
+        assert!(confirmation.body.contains("2026-11-22 at 10:30 UTC"));
+        assert!(!format!("{confirmation:?}").contains("ef56"));
+        let notice = mail.notice(&old, &new);
+        assert_eq!(notice.to, old);
+        assert!(notice.body.contains("now signs in with new@example.test"));
+        assert!(!notice.body.contains("confirm-email"));
     }
 
     #[test]

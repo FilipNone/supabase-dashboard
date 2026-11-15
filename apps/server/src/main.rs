@@ -35,7 +35,7 @@ use supabase_dashboard_application::{
     dokploy::{DokployConnector, DokployCredentials, DokployService},
     jobs::{JobHandler, JobRunner, RunnerSettings},
     key_rotation::{RotationError, key_usage, reseal_credentials},
-    mail::{InvitationMail, Mailer, PasswordResetMail},
+    mail::{EmailChangeMail, InvitationMail, Mailer, PasswordResetMail},
     organizations::OrganizationService,
     projects::ProjectService,
     provisioning::{ComposeApi, ProvisionStackHandler, ProvisioningService, StackActionHandler},
@@ -179,10 +179,12 @@ fn deployment_dokploy(config: &Config) -> Result<Option<DokployCredentials>, Sta
 /// fails fast.
 const MAX_MAIL_SECRET_FILE_BYTES: u64 = 4096;
 
-/// The dashboard's own outgoing mail: invitation and password reset links.
+/// The dashboard's own outgoing mail: invitation, password reset, and
+/// sign-in email confirmation links.
 struct OutgoingMail {
     invitations: InvitationMail,
     password_resets: PasswordResetMail,
+    email_changes: EmailChangeMail,
 }
 
 /// Reads an SMTP password or a Resend API key. A file is read once, its
@@ -255,7 +257,7 @@ fn outgoing_mail(
                 host = %smtp.endpoint.host,
                 port = smtp.endpoint.port,
                 security = ?smtp.endpoint.security,
-                "invitation and password reset links are emailed over SMTP"
+                "invitation, password reset, and email confirmation links are emailed over SMTP"
             );
             Arc::new(mailer)
         }
@@ -268,7 +270,9 @@ fn outgoing_mail(
                 extra_roots: extra_roots.clone(),
                 api_url,
             })?;
-            tracing::info!("invitation and password reset links are emailed through Resend");
+            tracing::info!(
+                "invitation, password reset, and email confirmation links are emailed through Resend"
+            );
             Arc::new(mailer)
         }
     };
@@ -279,10 +283,17 @@ fn outgoing_mail(
             invite_page_url: format!("{origin}{}", supabase_dashboard_web::app::INVITE_PATH),
         },
         password_resets: PasswordResetMail {
-            mailer,
+            mailer: Arc::clone(&mailer),
             reset_page_url: format!(
                 "{origin}{}",
                 supabase_dashboard_web::app::RESET_PASSWORD_PATH
+            ),
+        },
+        email_changes: EmailChangeMail {
+            mailer,
+            confirm_page_url: format!(
+                "{origin}{}",
+                supabase_dashboard_web::app::CONFIRM_EMAIL_PATH
             ),
         },
     }))
@@ -517,15 +528,17 @@ async fn run() -> Result<(), StartupError> {
     tracing::info!("metadata database migrations are up to date");
 
     let extra_roots = extra_roots(&config)?;
-    let (invitation_mail, reset_mail) = match outgoing_mail(&config, &extra_roots)? {
-        Some(mail) => (Some(mail.invitations), Some(mail.password_resets)),
-        None => (None, None),
-    };
+    let mail = outgoing_mail(&config, &extra_roots)?;
     let auth = AuthService::new(db.clone(), auth_config(&config)).await?;
-    let auth = Arc::new(match reset_mail {
-        Some(mail) => auth.with_password_reset_mail(mail),
-        None => auth,
-    });
+    let (invitation_mail, auth) = match mail {
+        Some(mail) => (
+            Some(mail.invitations),
+            auth.with_password_reset_mail(mail.password_resets)
+                .with_email_change_mail(mail.email_changes),
+        ),
+        None => (None, auth),
+    };
+    let auth = Arc::new(auth);
     if !auth.is_initialized().await? {
         tracing::warn!(
             "no operator account exists; create one with `supabase-dashboard-server create-owner`"

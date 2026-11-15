@@ -10,6 +10,7 @@ pub mod audit;
 pub mod connections;
 pub mod dokploy;
 pub mod dokploy_targets;
+pub mod email_changes;
 pub mod invitations;
 pub mod jobs;
 pub mod organizations;

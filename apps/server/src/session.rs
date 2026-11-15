@@ -14,8 +14,9 @@ use secrecy::SecretString;
 use serde::Deserialize;
 use supabase_dashboard_application::auth::{RequestContext, SignInError};
 use supabase_dashboard_web::app::{
-    FORGOT_PASSWORD_PATH, HOME_PATH, INVITE_PATH, INVITE_PREVIEW_PATH, INVITE_SIGN_UP_PATH,
-    PASSWORD_RESET_FN_PATHS, RESET_PASSWORD_PATH, SIGN_IN_PATH, sign_in_return_path,
+    CONFIRM_EMAIL_PATH, EMAIL_CHANGE_FN_PATHS, FORGOT_PASSWORD_PATH, HOME_PATH, INVITE_PATH,
+    INVITE_PREVIEW_PATH, INVITE_SIGN_UP_PATH, PASSWORD_RESET_FN_PATHS, RESET_PASSWORD_PATH,
+    SIGN_IN_PATH, sign_in_return_path,
 };
 
 use crate::{error::ApiError, state::AppState};
@@ -119,6 +120,8 @@ fn classify(path: &str) -> Access {
         INVITE_PATH | INVITE_PREVIEW_PATH | INVITE_SIGN_UP_PATH => Access::Optional,
         FORGOT_PASSWORD_PATH | RESET_PASSWORD_PATH => Access::Optional,
         _ if PASSWORD_RESET_FN_PATHS.contains(&path) => Access::Optional,
+        CONFIRM_EMAIL_PATH => Access::Optional,
+        _ if EMAIL_CHANGE_FN_PATHS.contains(&path) => Access::Optional,
         _ if path.starts_with("/pkg/") => Access::Public,
         _ if path.starts_with(crate::api::API_V1_PREFIX) => Access::Token,
         _ if path.starts_with("/api/") || path.starts_with("/auth/") => Access::Api,
@@ -380,6 +383,11 @@ mod tests {
         assert_eq!(classify(RESET_PASSWORD_PATH), Access::Optional);
         assert_eq!(classify("/auth/password-reset/complete"), Access::Optional);
         assert_eq!(classify("/auth/password-reset/other"), Access::Api);
+        assert_eq!(classify(CONFIRM_EMAIL_PATH), Access::Optional);
+        assert_eq!(classify("/auth/email-change/preview"), Access::Optional);
+        assert_eq!(classify("/auth/email-change/confirm"), Access::Optional);
+        assert_eq!(classify("/auth/email-change/other"), Access::Api);
+        assert_eq!(classify("/dashboard/confirm-email/extra"), Access::Page);
         assert_eq!(classify("/dashboard/invite/extra"), Access::Page);
         assert_eq!(classify("/anything-else"), Access::Page);
     }

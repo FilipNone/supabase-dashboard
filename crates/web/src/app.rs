@@ -12,6 +12,7 @@ use crate::pages::{
     admin::AdminPage,
     adopt::AdoptStackPage,
     api_tokens::AccountTokensPage,
+    email_change::ConfirmEmailPage,
     invite::InvitePage,
     not_found::NotFound,
     organization::{
@@ -122,6 +123,16 @@ pub const PASSWORD_RESET_FN_PATHS: [&str; 4] = [
     "/auth/password-reset/complete",
 ];
 
+/// Reachable with or without a session: the page a sign-in email
+/// confirmation link opens, with the code in the fragment. The code is the
+/// credential, so the page works in any browser.
+pub const CONFIRM_EMAIL_PATH: &str = "/dashboard/confirm-email";
+
+/// Public server functions behind that page. They must match the `prefix`
+/// and `endpoint` of their `#[server]` attributes.
+pub const EMAIL_CHANGE_FN_PATHS: [&str; 2] =
+    ["/auth/email-change/preview", "/auth/email-change/confirm"];
+
 #[component]
 pub fn App() -> impl IntoView {
     provide_meta_context();
@@ -137,6 +148,7 @@ pub fn App() -> impl IntoView {
                 <Route path=path!("/dashboard/invite") view=InvitePage/>
                 <Route path=path!("/dashboard/forgot-password") view=ForgotPasswordPage/>
                 <Route path=path!("/dashboard/reset-password") view=ResetPasswordPage/>
+                <Route path=path!("/dashboard/confirm-email") view=ConfirmEmailPage/>
                 <ParentRoute path=path!("/dashboard") view=DashboardLayout>
                     <Route path=path!("organizations") view=OrganizationsPage/>
                     <Route path=path!("status") view=StatusPage/>
