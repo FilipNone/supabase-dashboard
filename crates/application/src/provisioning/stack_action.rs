@@ -37,6 +37,11 @@
 //! 3. `act` and `wait`: redeploys as above, so Docker Compose recreates
 //!    the containers that read the variables.
 //!
+//! A change to a secret setting keeps the new value, and the value it
+//! replaces, in the job's sealed secrets; the job's data names the
+//! variable only. `act` deletes them once the variables are written, and
+//! a job that fails drops them too.
+//!
 //! No action unregisters the project; that stays a separate operation.
 
 use secrecy::{ExposeSecret, SecretString};
@@ -47,12 +52,12 @@ use supabase_dashboard_domain::{
     dokploy_placement::DokployId,
     job::{JobKind, JobState},
     provisioning::{StackAction, StackActionSummary},
-    stack_settings::{EnvFile, EnvValue, stack_setting},
+    stack_settings::{EnvFile, EnvValue, secret_setting, stack_setting},
 };
 use supabase_dashboard_persistence::{
     Database,
     audit::AuditOutcome,
-    jobs::{NewJob, StoredJob},
+    jobs::{NewJob, SealedJobSecrets, StoredJob},
 };
 use uuid::Uuid;
 
@@ -66,7 +71,7 @@ use crate::{
     dokploy::{DokployService, is_transient},
     jobs::{ClaimedJob, JobHandler, StepFuture, StepOutcome},
     organizations::event,
-    secrets::CredentialCipher,
+    secrets::{CredentialCipher, Sealed},
 };
 
 /// The job's saved state. Holds no secret.
@@ -87,6 +92,10 @@ struct ActionData {
     /// The variables a settings change writes.
     #[serde(default)]
     settings: Vec<SettingChange>,
+    /// The secret settings a settings change writes, by name. Their
+    /// values are in the job's sealed secrets.
+    #[serde(default)]
+    secrets: Vec<String>,
 }
 
 /// One variable a settings change writes. The settings the dashboard
@@ -100,15 +109,76 @@ pub(super) struct SettingChange {
     pub(super) previous: Option<String>,
 }
 
+/// One secret setting a settings change writes. Kept only in the job's
+/// sealed secrets.
+pub(super) struct SecretChange {
+    pub(super) name: String,
+    /// Empty to remove the value.
+    pub(super) value: SecretString,
+    /// The variable's value when the change was asked for; `None` when it
+    /// was not set.
+    pub(super) previous: Option<SecretString>,
+}
+
+/// The sealed form of a job's secret changes, as JSON.
+#[derive(Serialize, Deserialize)]
+struct SealedChange {
+    name: String,
+    value: String,
+    previous: Option<String>,
+}
+
+const SECRET_CHANGES_VERSION: u8 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct SealedChanges {
+    v: u8,
+    changes: Vec<SealedChange>,
+}
+
+fn secret_changes_json(changes: &[SecretChange]) -> Result<SecretString, ProvisionError> {
+    let sealed = SealedChanges {
+        v: SECRET_CHANGES_VERSION,
+        changes: changes
+            .iter()
+            .map(|change| SealedChange {
+                name: change.name.clone(),
+                value: change.value.expose_secret().to_owned(),
+                previous: change
+                    .previous
+                    .as_ref()
+                    .map(|value| value.expose_secret().to_owned()),
+            })
+            .collect(),
+    };
+    serde_json::to_string(&sealed)
+        .map(SecretString::from)
+        .map_err(|_| ProvisionError::Internal("could not encode the new settings".to_owned()))
+}
+
+fn secret_changes_from_json(json: &SecretString) -> Option<Vec<SecretChange>> {
+    let sealed: SealedChanges = serde_json::from_str(json.expose_secret()).ok()?;
+    (sealed.v == SECRET_CHANGES_VERSION).then(|| {
+        sealed
+            .changes
+            .into_iter()
+            .map(|change| SecretChange {
+                name: change.name,
+                value: SecretString::from(change.value),
+                previous: change.previous.map(SecretString::from),
+            })
+            .collect()
+    })
+}
+
 /// How the operator confirmed an action.
-#[derive(Clone, Copy)]
 enum Confirmation<'a> {
     /// A confirmation checkbox, needed to stop.
     Given(bool),
     /// The project's name as typed, needed to remove or destroy.
     TypedName(&'a str),
     /// A reviewed settings change, with the variables it writes.
-    Settings,
+    Settings(Vec<SettingChange>, Vec<SecretChange>),
 }
 
 fn redeploy_title(job_id: Uuid) -> String {
@@ -133,7 +203,6 @@ impl ProvisioningService {
             project_id,
             action,
             Confirmation::Given(confirmed),
-            Vec::new(),
             ctx,
         )
         .await
@@ -155,27 +224,26 @@ impl ProvisioningService {
             project_id,
             action,
             Confirmation::TypedName(typed_name),
-            Vec::new(),
             ctx,
         )
         .await
     }
 
-    /// Queues writing `settings` and redeploying. The caller read them
-    /// from the service and checked the operator's role.
+    /// Queues writing `settings` and `secrets` and redeploying. The
+    /// caller read them from the service and checked the operator's role.
     pub(super) async fn queue_settings_job(
         &self,
         current: &CurrentSession,
         project_id: Uuid,
         settings: Vec<SettingChange>,
+        secrets: Vec<SecretChange>,
         ctx: RequestContext<'_>,
     ) -> Result<Uuid, ProvisionError> {
         self.queue(
             current,
             project_id,
             StackAction::Configure,
-            Confirmation::Settings,
-            settings,
+            Confirmation::Settings(settings, secrets),
             ctx,
         )
         .await
@@ -187,7 +255,6 @@ impl ProvisioningService {
         project_id: Uuid,
         action: StackAction,
         confirmation: Confirmation<'_>,
-        settings: Vec<SettingChange>,
         ctx: RequestContext<'_>,
     ) -> Result<Uuid, ProvisionError> {
         let audit = action.audit_action();
@@ -217,20 +284,41 @@ impl ProvisioningService {
         if stored.removed_at.is_some() {
             return Err(ProvisionError::AlreadyRemoved);
         }
-        match (action, confirmation) {
+        let (settings, secrets) = match (action, confirmation) {
             (StackAction::Remove | StackAction::Destroy, Confirmation::TypedName(typed))
-                if typed.trim() == access.project.name.as_str() => {}
+                if typed.trim() == access.project.name.as_str() =>
+            {
+                (Vec::new(), Vec::new())
+            }
             (StackAction::Remove | StackAction::Destroy, _) => {
                 return Err(ProvisionError::NameMismatch);
             }
             (StackAction::Stop, Confirmation::Given(false)) => {
                 return Err(ProvisionError::NotConfirmed);
             }
-            (StackAction::Configure, Confirmation::Settings) if !settings.is_empty() => {}
+            (StackAction::Configure, Confirmation::Settings(settings, secrets))
+                if !settings.is_empty() || !secrets.is_empty() =>
+            {
+                (settings, secrets)
+            }
             (StackAction::Configure, _) => return Err(ProvisionError::NoChanges),
-            _ => {}
-        }
+            _ => (Vec::new(), Vec::new()),
+        };
         let job_id = Uuid::now_v7();
+        let sealed = if secrets.is_empty() {
+            None
+        } else {
+            let cipher = self
+                .cipher
+                .as_ref()
+                .ok_or(ProvisionError::NoCipherForSecret)?;
+            let sealed = cipher.seal_job_secrets(job_id, &secret_changes_json(&secrets)?)?;
+            Some(SealedJobSecrets {
+                key_id: sealed.key_id,
+                nonce: sealed.nonce,
+                ciphertext: sealed.ciphertext,
+            })
+        };
         let data = serde_json::to_string(&ActionData {
             project_id,
             action,
@@ -239,6 +327,7 @@ impl ProvisioningService {
             transient_errors: 0,
             delete_answered: false,
             settings,
+            secrets: secrets.into_iter().map(|change| change.name).collect(),
         })
         .map_err(|err| ProvisionError::Internal(err.to_string()))?;
         let queued = self
@@ -250,7 +339,7 @@ impl ProvisioningService {
                     organization_id: access.project.organization_id,
                     step: "check",
                     data: &data,
-                    secrets: None,
+                    secrets: sealed.as_ref(),
                     created_by: current.account.id,
                 },
                 &event(
@@ -342,6 +431,12 @@ impl StackActionHandler {
 impl JobHandler for StackActionHandler {
     fn kind(&self) -> JobKind {
         JobKind::StackAction
+    }
+
+    /// A settings change's sealed values are of no use once it stopped:
+    /// asking again queues a new job.
+    fn keeps_secrets_after_failure(&self) -> bool {
+        false
     }
 
     fn run_step<'a>(&'a self, job: &'a ClaimedJob) -> StepFuture<'a> {
@@ -487,9 +582,53 @@ impl ActionStep<'_> {
         }
     }
 
+    /// The secret changes sealed with the job, in the order its data
+    /// names them.
+    async fn secret_changes(&self, data: &ActionData) -> Result<Vec<SecretChange>, Stop> {
+        if data.secrets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let gone = || {
+            Stop::Fail(
+                "The new values of the secret settings are gone, so nothing was changed. Review the settings again."
+                    .to_owned(),
+            )
+        };
+        let cipher = self.handler.cipher.as_ref().ok_or_else(|| {
+            Stop::Fail(
+                "The server has no credential key to open the new values of the secret settings, so nothing was changed."
+                    .to_owned(),
+            )
+        })?;
+        let stored = self
+            .handler
+            .db
+            .job_secrets(self.job.id)
+            .await
+            .map_err(|err| internal("read the new values of the secret settings", err))?
+            .ok_or_else(gone)?;
+        let json = cipher
+            .open_job_secrets(
+                self.job.id,
+                &Sealed {
+                    key_id: stored.key_id,
+                    nonce: stored.nonce,
+                    ciphertext: stored.ciphertext,
+                },
+            )
+            .map_err(|err| internal("open the new values of the secret settings", err))?;
+        let changes = secret_changes_from_json(&json).ok_or_else(gone)?;
+        let names: Vec<&str> = changes.iter().map(|c| c.name.as_str()).collect();
+        if names != data.secrets {
+            return Err(gone());
+        }
+        Ok(changes)
+    }
+
     /// Writes the changed variables while they still have the values they
     /// had when the change was asked for. Safe to repeat.
     async fn update(&self, data: &ActionData) -> Result<Then, Stop> {
+        let secrets = self.secret_changes(data).await?;
         let (url, key) = self.dokploy().await?;
         let compose = Self::compose_id(data)?;
         let api = &self.handler.compose;
@@ -499,31 +638,57 @@ impl ActionStep<'_> {
             ));
         };
         let mut env = EnvFile::parse(config.env.expose_secret());
+        // Every variable the job writes: its name, new value, previous
+        // value, and whether the compose file still reads it. Values stay
+        // in this step; messages name variables only.
+        let writes: Vec<(&str, &str, Option<&str>, bool)> = data
+            .settings
+            .iter()
+            .map(|change| {
+                let read = stack_setting(&change.name)
+                    .is_some_and(|setting| setting.read_by(&config.compose_file));
+                (
+                    change.name.as_str(),
+                    change.value.as_str(),
+                    change.previous.as_deref(),
+                    read,
+                )
+            })
+            .chain(secrets.iter().map(|change| {
+                let read = secret_setting(&change.name)
+                    .is_some_and(|setting| setting.read_by(&config.compose_file));
+                (
+                    change.name.as_str(),
+                    change.value.expose_secret(),
+                    change.previous.as_ref().map(|v| v.expose_secret()),
+                    read,
+                )
+            }))
+            .collect();
         let value_of = |env: &EnvFile, name: &str| match env.get(name) {
             EnvValue::Missing => Ok(None),
             EnvValue::Set(value) => Ok(Some(value.to_owned())),
             EnvValue::Unreadable => Err(()),
         };
-        let current: Vec<Result<Option<String>, ()>> = data
-            .settings
+        let current: Vec<Result<Option<String>, ()>> = writes
             .iter()
-            .map(|change| value_of(&env, &change.name))
+            .map(|(name, ..)| value_of(&env, name))
             .collect();
-        let applied = data.settings.iter().zip(&current).all(|(change, now)| {
-            now.as_ref()
-                .is_ok_and(|now| now.as_deref() == Some(change.value.as_str()))
+        let applied = writes.iter().zip(&current).all(|((_, value, ..), now)| {
+            now.as_ref().is_ok_and(|now| now.as_deref() == Some(*value))
         });
-        let names: Vec<&str> = data.settings.iter().map(|c| c.name.as_str()).collect();
+        let names: Vec<&str> = writes.iter().map(|(name, ..)| *name).collect();
         if applied {
             self.record_written(data, &env, &names).await;
             return Ok(Then::Next("act"));
         }
-        let edited: Vec<&str> = data
-            .settings
+        let edited: Vec<&str> = writes
             .iter()
             .zip(&current)
-            .filter(|(change, now)| now.as_ref().map_or(true, |now| *now != change.previous))
-            .map(|(change, _)| change.name.as_str())
+            .filter(|((_, _, previous, _), now)| {
+                now.as_ref().map_or(true, |now| now.as_deref() != *previous)
+            })
+            .map(|((name, ..), _)| *name)
             .collect();
         if !edited.is_empty() {
             return Err(Stop::Fail(format!(
@@ -531,17 +696,14 @@ impl ActionStep<'_> {
                 edited.join(", ")
             )));
         }
-        for change in &data.settings {
-            if !stack_setting(&change.name)
-                .is_some_and(|setting| setting.read_by(&config.compose_file))
-            {
+        for (name, value, _, read) in &writes {
+            if !read {
                 return Err(Stop::Fail(format!(
-                    "The service's compose file no longer reads {}, so nothing was changed.",
-                    change.name
+                    "The service's compose file no longer reads {name}, so nothing was changed."
                 )));
             }
-            env.set(&change.name, &change.value)
-                .map_err(|_| Stop::Fail(format!("{} cannot be rewritten safely.", change.name)))?;
+            env.set(name, value)
+                .map_err(|_| Stop::Fail(format!("{name} cannot be rewritten safely.")))?;
         }
         let text = SecretString::from(env.to_text());
         api.update_compose_env(&url, &key, &compose, &text).await?;
@@ -576,6 +738,13 @@ impl ActionStep<'_> {
     }
 
     async fn act(&self, data: &mut ActionData) -> Result<Then, Stop> {
+        if data.action == StackAction::Configure && !data.secrets.is_empty() {
+            // Written by `update`; not needed while the stack redeploys.
+            // When this fails they go with the job's end instead.
+            if let Err(err) = self.handler.db.delete_job_secrets(self.job.id).await {
+                tracing::warn!(error = %err, job = %self.job.id, "could not drop a settings job's secrets");
+            }
+        }
         let (url, key) = self.dokploy().await?;
         let compose = Self::compose_id(data)?;
         let api = &self.handler.compose;

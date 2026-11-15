@@ -269,6 +269,7 @@ mod server {
                 | ProvisionError::TargetNotAllowed
                 | ProvisionError::NotConnected
                 | ProvisionError::NoCipher
+                | ProvisionError::NoCipherForSecret
                 | ProvisionError::LimitReached
                 | ProvisionError::NotProvisioned
                 | ProvisionError::Busy

@@ -80,6 +80,7 @@ mod stack_config;
 pub use adopt::AdoptRequest;
 pub use port::{ComposeApi, ComposeConfig, DokployFuture};
 pub use stack_action::StackActionHandler;
+pub use stack_config::{SecretEdit, SubmittedSecret, SubmittedSetting};
 
 /// How long the job waits at each point. The defaults suit a real
 /// Dokploy; tests shorten them.
@@ -142,6 +143,10 @@ pub enum ProvisionError {
     NotConnected,
     #[error("the server has no credential key, so it cannot keep a new stack's secrets")]
     NoCipher,
+    #[error(
+        "the server has no credential key, so it cannot keep a new secret value until it is written; set it in Dokploy"
+    )]
+    NoCipherForSecret,
     #[error("this organization already has the maximum number of projects")]
     LimitReached,
     #[error("the dashboard did not create this project's stack, so it cannot operate it")]

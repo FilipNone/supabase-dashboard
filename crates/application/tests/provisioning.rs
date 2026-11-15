@@ -21,7 +21,8 @@ use supabase_dashboard_application::{
     key_rotation::reseal_credentials,
     provisioning::{
         AdoptRequest, ComposeApi, ComposeConfig, DokployFuture, ProvisionError, ProvisionRequest,
-        ProvisionStackHandler, ProvisionTimings, ProvisioningService, StackActionHandler,
+        ProvisionStackHandler, ProvisionTimings, ProvisioningService, SecretEdit,
+        StackActionHandler,
     },
     secrets::CredentialCipher,
     stack_secrets::StackSecrets,
@@ -48,7 +49,9 @@ use supabase_dashboard_domain::{
     provisioning::{
         ProvisionStep, ProvisionTargets, StackAction, StackDeploymentView, TargetChoice,
     },
-    stack_settings::{EnvChanges, EnvTracking, STACK_SETTINGS, SettingState, StackSettingsView},
+    stack_settings::{
+        ChangedSecret, EnvChanges, EnvTracking, STACK_SETTINGS, SettingState, StackSettingsView,
+    },
 };
 use supabase_dashboard_persistence::{Database, accounts::AccountRecord};
 use uuid::Uuid;
@@ -1764,8 +1767,9 @@ async fn owners_change_settings_and_edits_in_dokploy_stop_the_change() {
                 &developer,
                 project,
                 &[("DISABLE_SIGNUP", "false")],
+                &[],
                 "any",
-                ctx()
+                ctx(),
             )
             .await,
         Err(ProvisionError::Forbidden)
@@ -1785,33 +1789,33 @@ async fn owners_change_settings_and_edits_in_dokploy_stop_the_change() {
     ];
     let preview = f
         .service
-        .preview_settings(&f.owner, project, &submitted)
+        .preview_settings(&f.owner, project, &submitted, &[])
         .await
         .unwrap();
     assert_eq!(preview.changed, ["DISABLE_SIGNUP"]);
     assert_eq!(preview.restarts, ["auth"]);
     assert!(matches!(
         f.service
-            .preview_settings(&f.owner, project, &[("JWT_EXPIRY", "10")])
+            .preview_settings(&f.owner, project, &[("JWT_EXPIRY", "10")], &[])
             .await,
         Err(ProvisionError::Setting(_))
     ));
     assert!(matches!(
         f.service
-            .preview_settings(&f.owner, project, &[("JWT_EXPIRY", "3600")])
+            .preview_settings(&f.owner, project, &[("JWT_EXPIRY", "3600")], &[])
             .await,
         Err(ProvisionError::NoChanges)
     ));
     assert!(matches!(
         f.service
-            .preview_settings(&f.owner, project, &[("JWT_SECRET", "x")])
+            .preview_settings(&f.owner, project, &[("JWT_SECRET", "x")], &[])
             .await,
         Err(ProvisionError::SettingUnavailable(_))
     ));
     // The settings must still be what the review saw.
     assert!(matches!(
         f.service
-            .queue_settings(&f.owner, project, &submitted, "stale", ctx())
+            .queue_settings(&f.owner, project, &submitted, &[], "stale", ctx())
             .await,
         Err(ProvisionError::PreviewOutdated)
     ));
@@ -1822,7 +1826,7 @@ async fn owners_change_settings_and_edits_in_dokploy_stop_the_change() {
     f.compose.state.lock().unwrap().lose_env_answer = true;
     let job = f
         .service
-        .queue_settings(&f.owner, project, &submitted, &preview.base, ctx())
+        .queue_settings(&f.owner, project, &submitted, &[], &preview.base, ctx())
         .await
         .unwrap();
     assert!(
@@ -1858,7 +1862,7 @@ async fn owners_change_settings_and_edits_in_dokploy_stop_the_change() {
     let schemas = [("PGRST_DB_SCHEMAS", "public, api")];
     let reviewed = f
         .service
-        .preview_settings(&f.owner, project, &schemas)
+        .preview_settings(&f.owner, project, &schemas, &[])
         .await
         .unwrap();
     if let Some((_, env)) = f.compose.state.lock().unwrap().configured.as_mut() {
@@ -1874,7 +1878,7 @@ async fn owners_change_settings_and_edits_in_dokploy_stop_the_change() {
     );
     assert!(matches!(
         f.service
-            .queue_settings(&f.owner, project, &schemas, &reviewed.base, ctx())
+            .queue_settings(&f.owner, project, &schemas, &[], &reviewed.base, ctx())
             .await,
         Err(ProvisionError::PreviewOutdated)
     ));
@@ -1883,12 +1887,12 @@ async fn owners_change_settings_and_edits_in_dokploy_stop_the_change() {
     // anything is written.
     let reviewed = f
         .service
-        .preview_settings(&f.owner, project, &schemas)
+        .preview_settings(&f.owner, project, &schemas, &[])
         .await
         .unwrap();
     let job = f
         .service
-        .queue_settings(&f.owner, project, &schemas, &reviewed.base, ctx())
+        .queue_settings(&f.owner, project, &schemas, &[], &reviewed.base, ctx())
         .await
         .unwrap();
     if let Some((_, env)) = f.compose.state.lock().unwrap().configured.as_mut() {
@@ -1932,7 +1936,7 @@ async fn owners_change_settings_and_edits_in_dokploy_stop_the_change() {
     assert_eq!(jwt.state, SettingState::NotInComposeFile);
     assert!(matches!(
         f.service
-            .preview_settings(&f.owner, project, &[("JWT_EXPIRY", "7200")])
+            .preview_settings(&f.owner, project, &[("JWT_EXPIRY", "7200")], &[])
             .await,
         Err(ProvisionError::SettingUnavailable(_))
     ));
@@ -2000,7 +2004,7 @@ async fn owners_change_settings_and_edits_in_dokploy_stop_the_change() {
 }
 
 #[tokio::test]
-async fn the_stack_mail_server_is_set_and_its_password_stays_in_dokploy() {
+async fn the_stack_mail_server_is_set_and_a_password_set_in_dokploy_is_kept() {
     let Some(scratch) = ScratchDb::create("stack_mail_server").await else {
         return;
     };
@@ -2028,8 +2032,8 @@ async fn the_stack_mail_server_is_set_and_its_password_stays_in_dokploy() {
     );
     assert_eq!(value(&view, "SMTP_PORT").0.as_deref(), Some("587"));
 
-    // The password is set in Dokploy; the dashboard neither shows it nor
-    // takes it.
+    // A password set in Dokploy is not shown, and is not a plain setting
+    // whose value the page holds.
     if let Some((_, env)) = f.compose.state.lock().unwrap().configured.as_mut() {
         env.push_str(&format!("SMTP_PASS={PASSWORD}\n"));
     }
@@ -2043,13 +2047,18 @@ async fn the_stack_mail_server_is_set_and_its_password_stays_in_dokploy() {
     assert!(view.settings.iter().all(|s| s.name != "SMTP_PASS"));
     assert!(matches!(
         f.service
-            .preview_settings(&f.owner, project, &[("SMTP_PASS", "other")])
+            .preview_settings(&f.owner, project, &[("SMTP_PASS", "other")], &[])
             .await,
         Err(ProvisionError::SettingUnavailable(_))
     ));
     assert!(matches!(
         f.service
-            .preview_settings(&f.owner, project, &[("SMTP_HOST", "smtp.example.com:587")])
+            .preview_settings(
+                &f.owner,
+                project,
+                &[("SMTP_HOST", "smtp.example.com:587")],
+                &[]
+            )
             .await,
         Err(ProvisionError::Setting(_))
     ));
@@ -2062,7 +2071,7 @@ async fn the_stack_mail_server_is_set_and_its_password_stays_in_dokploy() {
     ];
     let preview = f
         .service
-        .preview_settings(&f.owner, project, &submitted)
+        .preview_settings(&f.owner, project, &submitted, &[])
         .await
         .unwrap();
     assert_eq!(
@@ -2073,7 +2082,7 @@ async fn the_stack_mail_server_is_set_and_its_password_stays_in_dokploy() {
     assert!(!format!("{preview:?}").contains(PASSWORD));
     let job = f
         .service
-        .queue_settings(&f.owner, project, &submitted, &preview.base, ctx())
+        .queue_settings(&f.owner, project, &submitted, &[], &preview.base, ctx())
         .await
         .unwrap();
     run_all(&f).await;
@@ -2116,10 +2125,304 @@ async fn the_stack_mail_server_is_set_and_its_password_stays_in_dokploy() {
     );
     let cleared = f
         .service
-        .preview_settings(&f.owner, project, &[("SMTP_HOST", " ")])
+        .preview_settings(&f.owner, project, &[("SMTP_HOST", " ")], &[])
         .await
         .unwrap();
     assert_eq!(cleared.changed, ["SMTP_HOST"]);
+    f.db.close().await;
+    scratch.drop().await;
+}
+
+/// How many job and audit rows hold `needle` anywhere.
+async fn rows_holding(db: &Database, needle: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM jobs j WHERE strpos(row_to_json(j)::text, $1) > 0) \
+              + (SELECT count(*) FROM audit_events a WHERE strpos(row_to_json(a)::text, $1) > 0)",
+    )
+    .bind(needle)
+    .fetch_one(db.pool())
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn owners_replace_and_remove_the_mail_server_password() {
+    let Some(scratch) = ScratchDb::create("stack_mail_password").await else {
+        return;
+    };
+    let f = setup(&scratch).await;
+    let (_, project) = provisioned(&f).await;
+    const PASSWORD: &str = "Fresh-smtp-pass_9!";
+    const SECOND: &str = "second-smtp-pass";
+    const IN_DOKPLOY: &str = "set-in-dokploy-pass";
+    let replace = |value: &str| SecretEdit::Replace(SecretString::from(value.to_owned()));
+    let password = |view: &StackSettingsView| {
+        let pass = view.secrets.iter().find(|s| s.name == "SMTP_PASS").unwrap();
+        (pass.set, pass.state.clone())
+    };
+    let settings = || async {
+        f.service
+            .stack_settings(&f.owner, project)
+            .await
+            .unwrap()
+            .unwrap()
+    };
+
+    // A new stack has none.
+    assert_eq!(password(&settings().await), (false, SettingState::Editable));
+
+    // Developers and viewers neither review nor queue a new password, and
+    // the refusal to queue is audited.
+    for (name, role) in [("Dev", OrgRole::Developer), ("Vic", OrgRole::Viewer)] {
+        let member = account(&f.db, name, false).await;
+        add_member(&f.db, f.organization, &member, role).await;
+        assert!(matches!(
+            f.service
+                .preview_settings(&member, project, &[], &[("SMTP_PASS", replace(PASSWORD))])
+                .await,
+            Err(ProvisionError::Forbidden)
+        ));
+        assert!(matches!(
+            f.service
+                .queue_settings(
+                    &member,
+                    project,
+                    &[],
+                    &[("SMTP_PASS", replace(PASSWORD))],
+                    "any",
+                    ctx(),
+                )
+                .await,
+            Err(ProvisionError::Forbidden)
+        ));
+    }
+    assert_eq!(
+        count(
+            &f.db,
+            "SELECT count(*) FROM audit_events WHERE outcome = 'denied' AND action = 'stack.configure'",
+        )
+        .await,
+        2
+    );
+
+    // A value that cannot be written unquoted is refused without
+    // repeating it; removing a password that is not set changes nothing.
+    let Err(ProvisionError::Setting(err)) = f
+        .service
+        .preview_settings(
+            &f.owner,
+            project,
+            &[],
+            &[("SMTP_PASS", replace("pa$$ word"))],
+        )
+        .await
+    else {
+        panic!("an invalid password should be refused");
+    };
+    assert!(!err.to_string().contains("pa$$"), "{err}");
+    assert!(matches!(
+        f.service
+            .preview_settings(&f.owner, project, &[], &[("SMTP_PASS", SecretEdit::Remove)])
+            .await,
+        Err(ProvisionError::NoChanges)
+    ));
+
+    // The review names the variable and the service that restarts.
+    let submitted = [("SMTP_HOST", "smtp.example.com")];
+    let preview = f
+        .service
+        .preview_settings(
+            &f.owner,
+            project,
+            &submitted,
+            &[("SMTP_PASS", replace(PASSWORD))],
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview.changed, ["SMTP_HOST", "SMTP_PASS"]);
+    assert_eq!(
+        preview.secrets,
+        [ChangedSecret {
+            name: "SMTP_PASS".to_owned(),
+            removed: false,
+        }]
+    );
+    assert_eq!(preview.restarts, ["auth"]);
+    assert!(!format!("{preview:?}").contains(PASSWORD));
+
+    // Queued with the password sealed apart from the job's data.
+    let job = f
+        .service
+        .queue_settings(
+            &f.owner,
+            project,
+            &submitted,
+            &[("SMTP_PASS", replace(PASSWORD))],
+            &preview.base,
+            ctx(),
+        )
+        .await
+        .unwrap();
+    assert!(f.db.job_secrets(job).await.unwrap().is_some());
+    let data = f.db.get_job(job).await.unwrap().unwrap().data;
+    assert!(data.contains("SMTP_PASS"), "{data}");
+    assert_eq!(rows_holding(&f.db, PASSWORD).await, 0);
+    run_all(&f).await;
+    let stored = f.db.get_job(job).await.unwrap().unwrap();
+    assert_eq!(stored.state, "succeeded", "{:?}", stored.message);
+    assert_eq!(variable(&f, "SMTP_PASS"), PASSWORD);
+    assert_eq!(variable(&f, "SMTP_HOST"), "smtp.example.com");
+    assert!(f.db.job_secrets(job).await.unwrap().is_none());
+    assert_eq!(rows_holding(&f.db, PASSWORD).await, 0);
+    // The dashboard's own write is not listed as an edit in Dokploy, and
+    // the page learns only that a password is set.
+    let view = settings().await;
+    assert_eq!(view.tracking, EnvTracking::Compared(EnvChanges::default()));
+    assert_eq!(password(&view), (true, SettingState::Editable));
+    assert!(!format!("{view:?}").contains(PASSWORD));
+
+    // A new value is never compared with the current one, so a review
+    // does not tell whether a guess is right.
+    let same = f
+        .service
+        .preview_settings(&f.owner, project, &[], &[("SMTP_PASS", replace(PASSWORD))])
+        .await
+        .unwrap();
+    assert_eq!(same.changed, ["SMTP_PASS"]);
+
+    // A password edited in Dokploy after the change was queued stops the
+    // job before anything is written, and its sealed value goes.
+    let reviewed = f
+        .service
+        .preview_settings(&f.owner, project, &[], &[("SMTP_PASS", replace(SECOND))])
+        .await
+        .unwrap();
+    let job = f
+        .service
+        .queue_settings(
+            &f.owner,
+            project,
+            &[],
+            &[("SMTP_PASS", replace(SECOND))],
+            &reviewed.base,
+            ctx(),
+        )
+        .await
+        .unwrap();
+    if let Some((_, env)) = f.compose.state.lock().unwrap().configured.as_mut() {
+        *env = env.replace(
+            &format!("SMTP_PASS={PASSWORD}\n"),
+            &format!("SMTP_PASS={IN_DOKPLOY}\n"),
+        );
+    }
+    let writes = f.compose.state.lock().unwrap().count("update_compose_env");
+    run_all(&f).await;
+    let stored = f.db.get_job(job).await.unwrap().unwrap();
+    assert_eq!(stored.state, "failed");
+    assert!(
+        stored
+            .message
+            .as_deref()
+            .unwrap()
+            .starts_with("SMTP_PASS changed in Dokploy"),
+        "{:?}",
+        stored.message
+    );
+    assert_eq!(variable(&f, "SMTP_PASS"), IN_DOKPLOY);
+    assert_eq!(
+        f.compose.state.lock().unwrap().count("update_compose_env"),
+        writes
+    );
+    assert!(f.db.job_secrets(job).await.unwrap().is_none());
+    let EnvTracking::Compared(changes) = settings().await.tracking else {
+        panic!("the record should be readable");
+    };
+    assert_eq!(changes.changed, ["SMTP_PASS"]);
+
+    // Removing it writes an empty value, which the record then holds.
+    let reviewed = f
+        .service
+        .preview_settings(&f.owner, project, &[], &[("SMTP_PASS", SecretEdit::Remove)])
+        .await
+        .unwrap();
+    assert_eq!(
+        reviewed.secrets,
+        [ChangedSecret {
+            name: "SMTP_PASS".to_owned(),
+            removed: true,
+        }]
+    );
+    let job = f
+        .service
+        .queue_settings(
+            &f.owner,
+            project,
+            &[],
+            &[("SMTP_PASS", SecretEdit::Remove)],
+            &reviewed.base,
+            ctx(),
+        )
+        .await
+        .unwrap();
+    run_all(&f).await;
+    let stored = f.db.get_job(job).await.unwrap().unwrap();
+    assert_eq!(stored.state, "succeeded", "{:?}", stored.message);
+    assert_eq!(variable(&f, "SMTP_PASS"), "");
+    let view = settings().await;
+    assert_eq!(password(&view), (false, SettingState::Editable));
+    assert_eq!(view.tracking, EnvTracking::Compared(EnvChanges::default()));
+
+    // Whether a password is set is part of the review: one set in Dokploy
+    // after the review outdates it.
+    let reviewed = f
+        .service
+        .preview_settings(&f.owner, project, &[], &[("SMTP_PASS", replace(SECOND))])
+        .await
+        .unwrap();
+    if let Some((_, env)) = f.compose.state.lock().unwrap().configured.as_mut() {
+        *env = env.replace("SMTP_PASS=\n", &format!("SMTP_PASS={IN_DOKPLOY}\n"));
+    }
+    assert!(matches!(
+        f.service
+            .queue_settings(
+                &f.owner,
+                project,
+                &[],
+                &[("SMTP_PASS", replace(SECOND))],
+                &reviewed.base,
+                ctx(),
+            )
+            .await,
+        Err(ProvisionError::PreviewOutdated)
+    ));
+
+    // One set in a form the dashboard does not rewrite is locked, and so
+    // is one the compose file does not read.
+    if let Some((_, env)) = f.compose.state.lock().unwrap().configured.as_mut() {
+        *env = env.replace(&format!("SMTP_PASS={IN_DOKPLOY}\n"), "SMTP_PASS='a$b'\n");
+    }
+    assert_eq!(
+        password(&settings().await),
+        (true, SettingState::Unreadable)
+    );
+    assert!(matches!(
+        f.service
+            .preview_settings(&f.owner, project, &[], &[("SMTP_PASS", replace(SECOND))])
+            .await,
+        Err(ProvisionError::SettingUnavailable(_))
+    ));
+    if let Some((file, env)) = f.compose.state.lock().unwrap().configured.as_mut() {
+        *env = env.replace("SMTP_PASS='a$b'\n", "SMTP_PASS=\n");
+        *file = file.replace("${SMTP_PASS:-}", "");
+    }
+    assert_eq!(
+        password(&settings().await).1,
+        SettingState::NotInComposeFile
+    );
+
+    for needle in [PASSWORD, SECOND, IN_DOKPLOY] {
+        assert_eq!(rows_holding(&f.db, needle).await, 0, "{needle}");
+    }
     f.db.close().await;
     scratch.drop().await;
 }
@@ -2197,7 +2500,7 @@ async fn owners_accept_variables_edited_in_dokploy() {
     // Not while an action on the stack runs.
     let reviewed = f
         .service
-        .preview_settings(&f.owner, project, &[("JWT_EXPIRY", "7200")])
+        .preview_settings(&f.owner, project, &[("JWT_EXPIRY", "7200")], &[])
         .await
         .unwrap();
     f.service
@@ -2205,6 +2508,7 @@ async fn owners_accept_variables_edited_in_dokploy() {
             &f.owner,
             project,
             &[("JWT_EXPIRY", "7200")],
+            &[],
             &reviewed.base,
             ctx(),
         )
